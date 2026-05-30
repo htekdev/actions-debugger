@@ -1,0 +1,91 @@
+id: permissions-auth-003
+title: "Checkout Private Submodules Fails — Permission Denied or Repository Not Found"
+category: permissions-auth
+severity: error
+tags:
+  - checkout
+  - submodules
+  - private-repos
+  - PAT
+  - SSH
+  - GITHUB_TOKEN
+patterns:
+  - regex: "fatal: could not read Username for 'https://github\\.com/'.*terminal prompts disabled"
+    flags: "i"
+  - regex: "git@github\\.com: Permission denied \\(publickey\\)"
+    flags: "i"
+  - regex: "remote: Repository not found\\."
+    flags: "i"
+  - regex: "fatal: clone of '.*' into submodule path .* failed"
+    flags: "i"
+  - regex: "Host key verification failed"
+    flags: "i"
+error_messages:
+  - "fatal: could not read Username for 'https://github.com/': terminal prompts disabled"
+  - "git@github.com: Permission denied (publickey)."
+  - "remote: Repository not found."
+  - "Error: fatal: clone of 'git@github.com:Org/SubRepo.git' into submodule path '<path>' failed"
+  - "Host key verification failed."
+root_cause: |
+  The default `GITHUB_TOKEN` only grants access to the single repository that triggered the workflow.
+  When a repository contains submodules pointing to other private repositories, the checkout action
+  cannot authenticate to those private repos using GITHUB_TOKEN alone.
+
+  Two distinct failure modes exist depending on how submodule URLs are declared in `.gitmodules`:
+
+  1. HTTPS submodule URL (`https://github.com/Org/Repo`) — fails with "terminal prompts disabled"
+     because git cannot interactively prompt for credentials in a non-interactive CI environment,
+     and GITHUB_TOKEN is not forwarded to the submodule clone.
+
+  2. SSH submodule URL (`git@github.com:Org/Repo.git`) — fails with "Permission denied (publickey)"
+     because no SSH private key is configured on the runner.
+
+  This is especially confusing when the parent repository checkout succeeds and only the submodule
+  clone step fails, and because `remote: Repository not found` is the error GitHub returns when
+  authentication fails for a private repo (the repo is hidden from unauthenticated access).
+fix: |
+  The fix depends on the URL scheme used in `.gitmodules`:
+
+  For HTTPS submodule URLs: provide a Personal Access Token (PAT) with `repo` scope via the `token`
+  input of `actions/checkout`. The action will automatically configure git credential helpers using
+  the provided token for all submodule clones.
+
+  For SSH submodule URLs (`git@github.com:...`): provide an SSH deploy key via the `ssh-key` input.
+  A PAT will NOT work for SSH-scheme URLs — the authentication mechanism is fundamentally different.
+
+  For organization-wide private submodule access, a GitHub App installation token is preferred over
+  a personal PAT because it does not depend on an individual user's account.
+fix_code:
+  - language: yaml
+    label: "Checkout private HTTPS submodules using a PAT"
+    code: |
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.GH_PAT_SUBMODULES }}
+          # PAT must have 'repo' scope and access to all private submodule repos
+          # Do NOT use GITHUB_TOKEN — it only covers the current repository
+  - language: yaml
+    label: "Checkout private SSH submodules using a deploy key"
+    code: |
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          ssh-key: ${{ secrets.SUBMODULES_DEPLOY_KEY }}
+          # SSH private key must be added as a deploy key to all private submodule repos
+          # Required when .gitmodules uses SSH-scheme URLs (git@github.com:...)
+prevention:
+  - "Check `.gitmodules` URL scheme first — HTTPS submodules need a PAT, SSH submodules need an SSH deploy key."
+  - "Never use GITHUB_TOKEN for private submodule checkout — it only covers the triggering repository."
+  - "Prefer GitHub App installation tokens over PATs for organization-wide private submodule access."
+  - "Add the PAT or deploy key to repository (or organization) secrets before running the workflow."
+  - "Test with a manual workflow_dispatch run before adding to CI pipelines."
+docs:
+  - url: "https://docs.github.com/en/actions/security-guides/automatic-token-authentication#permissions-for-the-github_token"
+    label: "GITHUB_TOKEN permissions — scope limited to the current repository"
+  - url: "https://github.com/actions/checkout#usage"
+    label: "actions/checkout README — token and ssh-key inputs"
+  - url: "https://github.com/actions/checkout/issues/738"
+    label: "actions/checkout#738 — terminal prompts disabled with private submodules (many affected users)"
+  - url: "https://github.com/actions/checkout/issues/2080"
+    label: "actions/checkout#2080 — Repository not found error with private submodules without PAT"

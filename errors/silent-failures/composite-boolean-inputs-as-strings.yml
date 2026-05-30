@@ -1,0 +1,110 @@
+id: silent-failures-004
+title: "Composite Action Boolean Inputs Treated as Strings — Conditions Always True or Always False"
+category: silent-failures
+severity: silent-failure
+tags:
+  - composite-actions
+  - boolean
+  - inputs
+  - string-coercion
+  - if-condition
+patterns:
+  - regex: "if:\\s*\\$\\{\\{\\s*inputs\\.[a-zA-Z_-]+\\s*\\}\\}"
+    flags: "i"
+  - regex: "inputs\\.[a-zA-Z_-]+\\s*==\\s*true(?!')"
+    flags: "i"
+error_messages:
+  - "realRun==false"
+  - "Step was skipped because it is conditional"
+root_cause: |
+  Composite actions store all inputs internally as strings regardless of the `type:` field declared in
+  `action.yml`. The `type: boolean` annotation is accepted by the YAML parser but has no runtime effect —
+  all values are coerced to strings before expressions are evaluated.
+
+  This creates two distinct silent failure modes:
+
+  1. `if: ${{ inputs.enabled }}` — the string "false" is truthy in GitHub Actions expression syntax,
+     so the step ALWAYS runs even when the caller explicitly passes `enabled: false`.
+
+  2. `if: ${{ inputs.enabled == true }}` — the string "true" never equals the boolean `true` in
+     expression syntax, so the step NEVER runs regardless of the input value.
+
+  In both cases no error is thrown, no warning is emitted, and the workflow succeeds. Only the
+  observable behavior is wrong (unexpected steps run or expected steps are skipped entirely).
+
+  This also affects composite action outputs: any output whose `value:` expression produces a boolean
+  (e.g., `${{ fromJSON(steps.x.outputs.flag) }}`) is silently coerced back to a string before it
+  leaves the composite action.
+fix: |
+  Always compare composite action boolean inputs using string equality:
+
+  - `if: inputs.enabled == 'true'` ✅
+  - `if: ${{ inputs.enabled == 'true' }}` ✅
+  - `if: ${{ inputs.enabled }}` ❌ (always truthy — string "false" is truthy)
+  - `if: ${{ inputs.enabled == true }}` ❌ (never matches — string never equals boolean)
+
+  When passing a boolean workflow_dispatch input into a composite action, cast it to a string explicitly:
+
+  ```yaml
+  with:
+    enabled: ${{ inputs.enabled == true }}   # evaluates to string 'true' or 'false'
+  ```
+fix_code:
+  - language: yaml
+    label: "Use string comparison for boolean inputs inside composite actions"
+    code: |
+      # action.yml (composite action)
+      inputs:
+        enabled:
+          description: "Enable the feature"
+          required: false
+          default: "false"
+          # Note: type: boolean has no runtime effect in composite actions — default must be a string
+
+      runs:
+        using: composite
+        steps:
+          # ❌ WRONG — string "false" is truthy, step always runs
+          # - name: Feature step
+          #   if: ${{ inputs.enabled }}
+
+          # ❌ WRONG — string "true" != boolean true, step never runs
+          # - name: Feature step
+          #   if: ${{ inputs.enabled == true }}
+
+          # ✅ CORRECT — compare as string
+          - name: Feature step
+            if: inputs.enabled == 'true'
+            shell: bash
+            run: echo "Feature is enabled"
+  - language: yaml
+    label: "Cast boolean workflow_dispatch input before passing to composite action"
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            run-tests:
+              type: boolean
+              default: false
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: ./.github/actions/my-composite
+              with:
+                # Explicitly cast to string — inputs.run-tests is boolean at this scope
+                run-tests: ${{ inputs.run-tests == true }}
+prevention:
+  - "Never rely on `type: boolean` in composite action inputs — it is parsed but not enforced at runtime."
+  - "Use string `'false'` not boolean `false` as default values in composite action input definitions."
+  - "Always compare composite action boolean inputs with `== 'true'` or `== 'false'` string comparison."
+  - "When passing boolean workflow inputs into composite actions, cast with `${{ inputs.flag == true }}`."
+  - "Document the string-only convention in the composite action README to prevent future contributors from introducing the bug."
+docs:
+  - url: "https://docs.github.com/en/actions/creating-actions/metadata-syntax-for-github-actions#inputs"
+    label: "Metadata syntax — inputs for composite actions"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions"
+    label: "Evaluate expressions in workflows and actions — truthiness rules"
+  - url: "https://github.com/actions/runner/issues/2238"
+    label: "actions/runner#2238 — Boolean inputs not actually booleans in composite actions (112 reactions)"

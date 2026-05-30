@@ -1,0 +1,92 @@
+id: caching-artifacts-005
+title: "upload-artifact: No Files Found — Artifact Silently Not Uploaded"
+category: caching-artifacts
+severity: warning
+tags:
+  - upload-artifact
+  - paths
+  - working-directory
+  - if-no-files-found
+  - silent-failure
+patterns:
+  - regex: "No files were found with the provided path[^.]*\\."
+    flags: "i"
+  - regex: "No artifacts will be uploaded"
+    flags: "i"
+  - regex: "ENOENT: no such file or directory.*lstat"
+    flags: "i"
+error_messages:
+  - "No files were found with the provided path: dist. No artifacts will be uploaded."
+  - "Warning: No files were found with the provided path"
+  - "Error: ENOENT: no such file or directory, lstat '/home/runner/work/..."
+root_cause: |
+  The `actions/upload-artifact` action resolves `path:` values relative to the workspace root
+  (`$GITHUB_WORKSPACE`, typically `/home/runner/work/{repo}/{repo}`). The five most common
+  failure causes:
+
+  1. Build step outputs to a different directory than expected (e.g., `./build` vs `dist/`).
+  2. A prior step uses `working-directory:` which does not affect how upload-artifact resolves
+     its `path:` — the path must still be relative to `$GITHUB_WORKSPACE`, not to that step's CWD.
+  3. The build step failed silently (non-zero exit code masked by `continue-on-error: true` or
+     a multi-command run where the failure was not the last command) so the output directory was
+     never created.
+  4. A wildcard `path:` glob matches nothing — the directory exists but no files match the pattern.
+  5. The artifact `path:` references a file or directory whose name includes a space or special
+     character that was not quoted correctly.
+
+  By default, `upload-artifact` exits with a WARNING (not an error) when no files match. The
+  job succeeds and the missing artifact is only discovered downstream when a dependent step or
+  job tries to download it — often failing with a cryptic "artifact not found" error.
+fix: |
+  Set `if-no-files-found: error` to turn the silent warning into an immediate job failure.
+  Add a debug step before the upload to confirm the exact path that was actually written.
+fix_code:
+  - language: yaml
+    label: "Add if-no-files-found: error and a debug step to verify the path"
+    code: |
+      steps:
+        - name: Build
+          run: npm run build
+          # outputs to ./dist by default
+
+        - name: Debug — verify build output exists
+          if: always()
+          run: |
+            echo "=== workspace contents ==="
+            ls -la
+            echo "=== dist/ contents ==="
+            ls -la dist/ || echo "dist/ does not exist"
+
+        - uses: actions/upload-artifact@v4
+          with:
+            name: dist-bundle
+            path: dist/
+            if-no-files-found: error   # fail immediately instead of silently skipping
+            retention-days: 7
+  - language: yaml
+    label: "Fix working-directory path mismatch"
+    code: |
+      steps:
+        - name: Build in subdirectory
+          working-directory: packages/app
+          run: npm run build
+          # outputs to packages/app/dist — NOT ./dist relative to workspace root
+
+        - uses: actions/upload-artifact@v4
+          with:
+            name: app-bundle
+            path: packages/app/dist/   # always relative to $GITHUB_WORKSPACE
+            if-no-files-found: error
+prevention:
+  - "Always set `if-no-files-found: error` — the default `warn` silently hides missing artifacts."
+  - "Add a debug `ls` or `find` step before upload-artifact when setting up a new workflow."
+  - "Remember that `path:` is always relative to `$GITHUB_WORKSPACE`, not to any step's `working-directory:`."
+  - "If a build can legitimately produce no files (e.g., no changed files), use `if-no-files-found: ignore` explicitly so the intent is clear."
+  - "Avoid masking build failures with `continue-on-error: true` on steps that produce upload artifacts."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-and-sharing-data-from-a-workflow"
+    label: "Storing and sharing data from a workflow"
+  - url: "https://github.com/actions/upload-artifact#inputs"
+    label: "upload-artifact README — if-no-files-found input"
+  - url: "https://github.com/actions/upload-artifact/issues/232"
+    label: "actions/upload-artifact#232 — No files were found with the provided path"
