@@ -1,0 +1,91 @@
+id: permissions-auth-007
+title: "OIDC Azure Federated Credential Subject Claim Mismatch"
+category: permissions-auth
+severity: error
+tags:
+  - oidc
+  - azure
+  - federated-identity
+  - subject-claim
+  - entra-id
+  - workload-identity
+patterns:
+  - regex: "AADSTS70021"
+    flags: "i"
+  - regex: "No matching federated identity record found"
+    flags: "i"
+  - regex: "federated credential.*subject.*does not match"
+    flags: "i"
+  - regex: "AADSTS70021: No matching federated identity record found for presented assertion"
+    flags: "i"
+error_messages:
+  - "AADSTS70021: No matching federated identity record found for presented assertion subject"
+  - "ClientAuthenticationFailed: AADSTS70021: No matching federated identity record found for presented assertion subject 'repo:owner/repo:ref:refs/heads/feature-branch'"
+root_cause: |
+  Azure Entra ID (formerly Azure AD) federated credentials for GitHub Actions use the
+  OIDC token's `sub` (subject) claim to verify the caller's identity. The `sub` claim
+  is constructed from the workflow's context: repository, ref type (branch, tag,
+  environment, or pull_request), and the specific value.
+
+  The federated credential in Azure must be configured with an entity type and value that
+  **exactly matches** the subject claim of the token GitHub issues. A mismatch on any
+  component — wrong branch name, missing environment, entity type set to `Branch` when
+  the workflow runs from a `pull_request` — causes Azure to reject the token with
+  AADSTS70021.
+
+  Common mismatches:
+  - Entity type set to `Branch: main` but workflow runs from a PR or tag
+  - Using an `environment:` in the workflow job but the federated credential entity type
+    is `Branch` not `Environment`
+  - Repo name case mismatch (Azure is case-sensitive, GitHub is not)
+fix: |
+  Ensure the federated credential's entity type and value exactly match the workflow
+  context. For workflows that run across multiple refs, create one federated credential
+  per entity type (branch, tag, environment, PR) or use the `*` wildcard where supported.
+fix_code:
+  - language: yaml
+    label: "Workflow using environment — federated credential must use entity type Environment"
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          environment: production        # subject: repo:owner/repo:environment:production
+          permissions:
+            id-token: write
+            contents: read
+          steps:
+            - uses: azure/login@v2
+              with:
+                client-id: ${{ secrets.AZURE_CLIENT_ID }}
+                tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+                subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  - language: json
+    label: "Azure federated credential — must use Environment entity type"
+    code: |
+      {
+        "name": "github-actions-production",
+        "subject": "repo:myorg/myrepo:environment:production",
+        "issuer": "https://token.actions.githubusercontent.com",
+        "audiences": ["api://AzureADTokenExchange"]
+      }
+  - language: json
+    label: "Azure federated credential — branch push (no environment)"
+    code: |
+      {
+        "name": "github-actions-main-branch",
+        "subject": "repo:myorg/myrepo:ref:refs/heads/main",
+        "issuer": "https://token.actions.githubusercontent.com",
+        "audiences": ["api://AzureADTokenExchange"]
+      }
+prevention:
+  - "Print the OIDC token subject before `azure/login` to debug mismatches: `run: echo '${{ toJSON(github) }}' | jq .token_id`"
+  - "Create separate federated credentials for each entity type: one for branches, one per environment, one for tags."
+  - "Repo and org names in the subject claim are case-sensitive in Azure — match them exactly."
+  - "Use `azure/login@v2 --debug` flag to see the exact subject claim being presented."
+docs:
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/configuring-openid-connect-in-azure"
+    label: "Configuring OpenID Connect in Azure"
+  - url: "https://learn.microsoft.com/en-us/entra/workload-id/workload-identity-federation-create-trust"
+    label: "Configure a federated identity credential (Microsoft Learn)"
+  - url: "https://learn.microsoft.com/en-us/entra/identity-platform/error-codes#aadsts70021"
+    label: "AADSTS70021 error code reference"

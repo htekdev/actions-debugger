@@ -1,0 +1,82 @@
+id: caching-artifacts-007
+title: "actions/cache Post-Save Step Skipped When Job Is Cancelled Mid-Run"
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - cache
+  - cancellation
+  - save
+  - post-step
+  - cache-miss
+  - actions/cache
+patterns:
+  - regex: "Post job cleanup"
+    flags: "i"
+  - regex: "Cache save skipped"
+    flags: "i"
+  - regex: "Cache service responded with 503"
+    flags: "i"
+  - regex: "cache.*not saved.*cancelled"
+    flags: "i"
+error_messages:
+  - "Cache save skipped due to job cancellation."
+  - "Post job cleanup: Cache was not saved as the job was cancelled."
+root_cause: |
+  `actions/cache` saves the cache in a **post-job step** that runs after all workflow
+  steps complete. When a job is cancelled (via the UI, API, `concurrency: cancel-in-progress`,
+  or reaching the job timeout), the post-step save is skipped — GitHub does not allow
+  post-steps to run when the job is cancelled.
+
+  This causes a **cold cache** on the next run: a build that took 10 minutes to complete
+  its install phase is cancelled just before the cache save fires, so the next run starts
+  from scratch again. In high-frequency CI environments with auto-cancel enabled, this can
+  mean most runs never benefit from caching.
+fix: |
+  Use `actions/cache/save@v4` as an explicit step instead of relying on the post-job
+  hook. Save the cache immediately after the slow step completes rather than waiting for
+  job end. For `cancel-in-progress` workflows, save the cache before the cancellable steps.
+fix_code:
+  - language: yaml
+    label: "WRONG — cache save is a post-job hook, skipped on cancellation"
+    code: |
+      steps:
+        - uses: actions/cache@v4
+          with:
+            path: node_modules
+            key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+
+        - run: npm ci              # slow — if job cancelled here, cache never saves
+        - run: npm run build
+  - language: yaml
+    label: "CORRECT — explicit save step that always runs"
+    code: |
+      steps:
+        - name: Restore cache
+          id: cache
+          uses: actions/cache/restore@v4
+          with:
+            path: node_modules
+            key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+
+        - name: Install dependencies
+          if: steps.cache.outputs.cache-hit != 'true'
+          run: npm ci
+
+        - name: Save cache immediately after install
+          if: steps.cache.outputs.cache-hit != 'true'
+          uses: actions/cache/save@v4
+          with:
+            path: node_modules
+            key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+
+        # If job is cancelled after this point, cache is already saved
+        - run: npm run build
+prevention:
+  - "Use `actions/cache/restore` + `actions/cache/save` separately so cache saves happen as explicit steps, not post-hooks."
+  - "Save the cache immediately after the slow install/build step, before the steps most likely to be cancelled."
+  - "For very long builds, consider saving a partial cache at key checkpoints."
+docs:
+  - url: "https://github.com/actions/cache/blob/main/save/README.md"
+    label: "actions/cache/save — explicit save action"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows"
+    label: "Caching dependencies to speed up workflows"

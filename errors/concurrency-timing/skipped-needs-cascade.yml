@@ -1,0 +1,103 @@
+id: concurrency-timing-004
+title: "Skipped needs Job Cascades Skip to All Dependent Jobs"
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - needs
+  - skipped
+  - cascade
+  - conditionals
+  - job-status
+  - always
+  - dependency
+patterns:
+  - regex: "skipped.*needs.*skipped"
+    flags: "i"
+  - regex: "This job was skipped"
+    flags: "i"
+  - regex: "Result: skipped"
+    flags: "i"
+error_messages:
+  - "This job was skipped."
+  - "Skipping this job because a previous job in the chain was skipped."
+root_cause: |
+  When a job is **skipped** (because its `if:` condition evaluated to false), GitHub
+  Actions propagates the skip status to all jobs that `needs` it. Dependent jobs are
+  skipped automatically unless they explicitly handle this with `if: always()` or by
+  checking `needs.<id>.result == 'skipped'`.
+
+  This cascades silently: if `build` is skipped on non-main branches, then `test` (which
+  needs `build`) is also skipped, and `deploy` (which needs `test`) is also skipped —
+  even if `deploy` has no condition of its own and the developer expected it to run.
+
+  The cascade happens regardless of whether the dependency was skipped by an `if:` guard
+  or by the job being cancelled. The default behavior treats a skipped upstream job the
+  same as a failed one from the perspective of downstream jobs.
+fix: |
+  Use `if: always()` or explicit result checks (`needs.<id>.result == 'success' || needs.<id>.result == 'skipped'`)
+  on downstream jobs that should run regardless of whether an upstream job was skipped.
+fix_code:
+  - language: yaml
+    label: "WRONG — notification job silently skipped when build is skipped"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          if: github.ref == 'refs/heads/main'   # only runs on main
+          steps:
+            - run: npm run build
+
+        notify:
+          needs: build             # skipped when build is skipped (non-main branches)
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./notify-slack.sh "Build complete"
+  - language: yaml
+    label: "CORRECT — notify even when build was skipped"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          if: github.ref == 'refs/heads/main'
+          steps:
+            - run: npm run build
+
+        notify:
+          needs: build
+          if: always()             # runs regardless of build's outcome or skip
+          runs-on: ubuntu-latest
+          steps:
+            - run: |
+                RESULT="${{ needs.build.result }}"
+                if [ "$RESULT" = "success" ]; then
+                  ./notify-slack.sh "Build succeeded"
+                elif [ "$RESULT" = "skipped" ]; then
+                  echo "Build was skipped (non-main branch) — no notification needed"
+                else
+                  ./notify-slack.sh "Build $RESULT"
+                fi
+  - language: yaml
+    label: "CORRECT — final job that always runs regardless of upstream"
+    code: |
+      jobs:
+        deploy:
+          needs: [build, test]
+          # Run if upstream succeeded OR if they were skipped (allows partial pipelines)
+          if: |
+            always() &&
+            (needs.build.result == 'success' || needs.build.result == 'skipped') &&
+            (needs.test.result == 'success' || needs.test.result == 'skipped')
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./deploy.sh
+prevention:
+  - "Use `if: always()` on jobs that must run regardless of upstream outcomes (cleanup, notifications, summaries)."
+  - "Check `needs.<id>.result` explicitly when a job should behave differently based on upstream skip vs success vs failure."
+  - "Document which jobs in your pipeline are optional (skippable) vs required to avoid surprises."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idif"
+    label: "jobs.<job_id>.if"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idneeds"
+    label: "jobs.<job_id>.needs"
+  - url: "https://docs.github.com/en/actions/learn-github-actions/expressions#status-check-functions"
+    label: "Status check functions (always, success, failure, cancelled)"

@@ -1,0 +1,91 @@
+id: yaml-syntax-011
+title: "Accessing Outputs from Non-Direct needs Dependency Fails"
+category: yaml-syntax
+severity: error
+tags:
+  - needs
+  - outputs
+  - context
+  - job-dependencies
+  - expressions
+patterns:
+  - regex: "Unrecognized named-value: 'needs'"
+    flags: "i"
+  - regex: "needs\\.[a-z_-]+\\.outputs\\.[a-z_-]+ is not available"
+    flags: "i"
+  - regex: "Job '[^']+' references output '[^']+' from job '[^']+' that is not a direct dependency"
+    flags: "i"
+error_messages:
+  - "Unrecognized named-value: 'needs'. Located at position 1 within expression: needs.build.outputs.version"
+  - "Job 'deploy' references output 'version' from job 'build' that is not a direct dependency"
+root_cause: |
+  The `needs` context is only populated for the direct dependencies listed in a job's
+  `needs:` array. A job cannot reference outputs from a grandparent job that is not in
+  its own `needs:` list, even if an intermediate job depends on it.
+
+  For example, if `test` needs `build`, and `deploy` needs `test`, then `deploy` cannot
+  access `needs.build.outputs.version` — only `needs.test.outputs.*` is available.
+  `deploy` would need to either also list `build` in its `needs:`, or `test` would need
+  to re-expose `build`'s output as its own output.
+fix: |
+  Either add the upstream job directly to the dependent job's `needs:` list, or re-expose
+  the needed output through each intermediate job in the chain.
+fix_code:
+  - language: yaml
+    label: "WRONG — accessing grandparent output without direct dependency"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          outputs:
+            version: ${{ steps.tag.outputs.version }}
+          steps:
+            - id: tag
+              run: echo "version=1.2.3" >> $GITHUB_OUTPUT
+
+        test:
+          needs: build
+          runs-on: ubuntu-latest
+          steps:
+            - run: npm test
+
+        deploy:
+          needs: test           # build is NOT in this list
+          runs-on: ubuntu-latest
+          steps:
+            # ERROR: needs.build.outputs.version is unavailable here
+            - run: echo "Deploying ${{ needs.build.outputs.version }}"
+  - language: yaml
+    label: "CORRECT option 1 — add build to deploy's needs directly"
+    code: |
+      jobs:
+        deploy:
+          needs: [test, build]   # both listed
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying ${{ needs.build.outputs.version }}"
+  - language: yaml
+    label: "CORRECT option 2 — propagate output through intermediate job"
+    code: |
+      jobs:
+        test:
+          needs: build
+          runs-on: ubuntu-latest
+          outputs:
+            version: ${{ needs.build.outputs.version }}  # re-expose
+          steps:
+            - run: npm test
+
+        deploy:
+          needs: test
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying ${{ needs.test.outputs.version }}"
+prevention:
+  - "Draw your job dependency graph before writing `needs:` — a job can only see outputs from jobs it directly depends on."
+  - "When a value needs to flow through multiple jobs, explicitly re-expose it as an output at each stage."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/passing-information-between-jobs"
+    label: "Passing information between jobs"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idneeds"
+    label: "jobs.<job_id>.needs"
