@@ -1,0 +1,97 @@
+id: concurrency-timing-002
+title: "cancel-in-progress Silently Drops In-Flight Deploy Runs"
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - cancel-in-progress
+  - deployment
+  - silent-failure
+  - queue
+patterns:
+  - regex: "Run was cancelled"
+    flags: "i"
+  - regex: "Canceling since a higher priority waiting run was found"
+    flags: "i"
+  - regex: "This run was cancelled by a more recent run"
+    flags: "i"
+error_messages:
+  - "Run was cancelled"
+  - "Canceling since a higher priority waiting run was found"
+  - "This run was cancelled by a more recent run"
+root_cause: |
+  When a workflow sets `concurrency.cancel-in-progress: true`, GitHub Actions cancels
+  any currently running workflow in the same concurrency group the moment a new run
+  starts. This is intentional for CI (cancel stale PR checks), but is dangerous for
+  **deploy** workflows where every commit must be deployed in order.
+
+  The silent failure happens because:
+  - The cancelled run is marked "CANCELLED" in the UI — it does not appear as a
+    failure, so PR status checks may still pass.
+  - If the cancelled run was mid-deploy (e.g., partway through Terraform apply or a
+    Kubernetes rollout), the environment is left in a partially-updated state.
+  - Developers see the new run succeed and assume all commits were deployed, when in
+    reality one or more intermediate commits were silently skipped.
+
+  A second failure mode occurs with the concurrency queue: GitHub keeps at most one
+  *pending* run per group. If a third run starts while one is running and one is pending,
+  the older pending run is cancelled to queue the latest one — again silently.
+
+  Both behaviors are documented but frequently misunderstood when the same workflow
+  serves both CI (fast feedback) and CD (reliable delivery) purposes.
+fix: |
+  For deploy workflows, set `cancel-in-progress: false` and use a per-branch concurrency
+  group so only one deploy runs per branch at a time but no run is silently dropped.
+
+  If you need cancel-in-progress for PR CI, split your workflow into separate files:
+  one for CI (cancel-in-progress: true) and one for deploys (cancel-in-progress: false).
+fix_code:
+  - language: yaml
+    label: "Safe deploy workflow — never silently cancel"
+    code: |
+      name: Deploy
+      on:
+        push:
+          branches: [main]
+
+      concurrency:
+        # One deploy at a time per branch, but queue — never cancel
+        group: deploy-${{ github.ref }}
+        cancel-in-progress: false
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./scripts/deploy.sh
+  - language: yaml
+    label: "Split CI (cancel ok) vs Deploy (queue, no cancel) in one repo"
+    code: |
+      # .github/workflows/ci.yml — cancel stale PR checks is fine
+      name: CI
+      on: pull_request
+      concurrency:
+        group: ci-${{ github.ref }}
+        cancel-in-progress: true  # OK: PR checks, not deploys
+
+      # .github/workflows/deploy.yml — never drop a deploy
+      name: Deploy
+      on:
+        push:
+          branches: [main, 'release/**']
+      concurrency:
+        group: deploy-${{ github.ref }}
+        cancel-in-progress: false  # Queue; never skip a commit
+prevention:
+  - "Never use `cancel-in-progress: true` on workflows that deploy, apply infrastructure changes, or produce side effects that must run for every commit."
+  - "Monitor the Actions tab for unexpected CANCELLED runs — a CANCELLED deploy job is NOT the same as a skipped/passing check."
+  - "Use separate workflow files for CI and CD to apply different concurrency strategies."
+  - "Set the concurrency group key to include `github.ref` so branches don't cancel each other."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/using-concurrency"
+    label: "Using concurrency"
+  - url: "https://github.com/actions/runner/issues/3722"
+    label: "actions/runner#3722 — Concurrency cancellation behaviors"
+  - url: "https://github.com/orgs/community/discussions/5435"
+    label: "Community discussion: cancel-in-progress semantics"

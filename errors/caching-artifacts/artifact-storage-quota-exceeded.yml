@@ -1,0 +1,118 @@
+id: caching-artifacts-006
+title: "Artifact Upload Fails: Storage Quota Exceeded or 413 Request Too Large"
+category: caching-artifacts
+severity: error
+tags:
+  - artifacts
+  - upload-artifact
+  - storage-quota
+  - 413
+  - size-limit
+patterns:
+  - regex: "Artifact storage quota has been hit"
+    flags: "i"
+  - regex: "Unable to upload any new artifacts"
+    flags: "i"
+  - regex: "413 Request Entity Too Large"
+    flags: "i"
+  - regex: "Create Artifact Container failed"
+    flags: "i"
+  - regex: "No space left on device"
+    flags: "i"
+  - regex: "Status Code: 500 Internal Server Error"
+    flags: "i"
+error_messages:
+  - "Create Artifact Container failed: Artifact storage quota has been hit. Unable to upload any new artifacts"
+  - "413 Request Entity Too Large"
+  - "Unexpected response. Unable to upload chunk to pipelines.actions.githubusercontent.com... Status Code: 500 Internal Server Error"
+  - "Unhandled exception. System.IO.IOException: No space left on device"
+root_cause: |
+  Artifact upload failures in GitHub Actions have three distinct root causes:
+
+  1. **Repository/org storage quota exceeded** (`Artifact storage quota has been hit`):
+     GitHub includes a limited amount of artifact storage per plan (e.g., 500 MB for
+     free, 2 GB for Teams, 50 GB for Enterprise). When the cumulative size of all stored
+     artifacts crosses this limit, the backend refuses to create new artifact containers
+     and every new upload fails immediately.
+
+  2. **Upload chunk too large / server error** (`413 Request Entity Too Large` or `500`):
+     GitHub Actions uploads artifacts in chunks. If a single artifact or its chunk
+     exceeds the backend's per-request limits, the server returns 413 or 500. This
+     typically happens with artifacts larger than ~2 GB in a single upload call.
+
+  3. **Runner disk space exhausted** (`No space left on device`):
+     The hosted runner's ephemeral disk (typically ~14 GB on ubuntu-latest) fills up
+     during artifact packaging/compression. This is common when building large binaries,
+     Docker images, or test results that accumulate over a long job.
+
+  Old or unretained artifacts accumulate silently — developers rarely clean up artifacts
+  manually, so quota errors often appear suddenly after months of builds.
+fix: |
+  **For storage quota errors:**
+  - Delete old artifacts via the GitHub UI (Actions → Artifacts) or the REST API.
+  - Lower artifact retention days using the `retention-days` parameter on upload-artifact
+    so old artifacts expire automatically.
+  - If quota is still consistently exceeded, upgrade the plan or add Actions storage.
+
+  **For 413 / chunk errors:**
+  - Split the artifact into smaller logical pieces using multiple upload-artifact steps.
+  - Compress before uploading (zip/tar the directory first) to reduce payload size.
+
+  **For runner disk exhaustion:**
+  - Use a self-hosted runner with more disk, or add a disk-cleanup step early in the job.
+  - Upload intermediate artifacts (e.g., build outputs) before running additional steps
+    that generate more disk usage.
+fix_code:
+  - language: yaml
+    label: "Set retention to auto-expire artifacts and avoid quota buildup"
+    code: |
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: dist/
+          retention-days: 7   # Delete after 7 days; default is 90
+  - language: yaml
+    label: "Split large artifacts into logical pieces"
+    code: |
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-linux
+          path: dist/linux/
+          retention-days: 3
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-windows
+          path: dist/windows/
+          retention-days: 3
+  - language: yaml
+    label: "Free up runner disk space before large uploads"
+    code: |
+      - name: Free disk space
+        run: |
+          df -h
+          sudo apt-get clean
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h
+  - language: yaml
+    label: "Delete all artifacts older than N days via API"
+    code: |
+      - name: Delete old artifacts
+        uses: c-hive/gha-remove-artifacts@v1
+        with:
+          age: '1 week'
+          skip-recent: 3
+prevention:
+  - "Always set `retention-days` on upload-artifact — the 90-day default accumulates quota quickly in active repos."
+  - "Monitor Actions storage usage in your org settings (Settings → Billing → Actions) before you hit the limit."
+  - "Add a disk-space check step (`df -h`) at the start of jobs that produce large build outputs."
+  - "Split artifacts by purpose (binaries, test results, logs) so each part stays below chunk limits."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-and-sharing-data-from-a-workflow"
+    label: "Storing and sharing data from a workflow (artifacts)"
+  - url: "https://docs.github.com/en/billing/managing-billing-for-your-products/managing-billing-for-github-actions/about-billing-for-github-actions#included-storage-and-minutes"
+    label: "About billing for GitHub Actions — included storage"
+  - url: "https://stackoverflow.com/questions/70730786/github-actions-create-artifact-container-failed-artifact-storage-quota-has-b"
+    label: "Stack Overflow: Artifact storage quota has been hit"
+  - url: "https://github.com/actions/upload-artifact/issues/9"
+    label: "upload-artifact#9 — chunk upload failures and size limits"
