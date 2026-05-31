@@ -1,0 +1,91 @@
+id: known-unsolved-003
+title: "Composite Actions Do Not Set INPUT_* Environment Variables"
+category: known-unsolved
+severity: limitation
+tags:
+  - composite-actions
+  - INPUT_
+  - env-vars
+  - shell-scripts
+  - action-migration
+patterns:
+  - regex: "\\$INPUT_[A-Z_]+"
+    flags: ""
+  - regex: "INPUT_[A-Z_]+:\\s*(unbound variable|empty|command not found)"
+    flags: "i"
+error_messages:
+  - "INPUT_MY_PARAM: unbound variable"
+  - "$INPUT_MY_PARAM: empty"
+root_cause: |
+  JavaScript actions and Docker container actions receive their inputs as `INPUT_*` environment
+  variables at runtime (e.g., the input `my-param` becomes `INPUT_MY-PARAM` or `INPUT_MY_PARAM`).
+  Composite actions do NOT follow this convention — they do not set any `INPUT_*` environment
+  variables on the runner.
+
+  Composite actions make inputs available ONLY through the `${{ inputs.name }}` expression context,
+  which is evaluated by the Actions runner before the shell command is invoked. Shell scripts
+  running inside composite `run:` steps cannot access inputs as `$INPUT_*` environment variables.
+
+  This limitation has been reported and discussed since 2020 (actions/runner#665, 66+ reactions).
+  GitHub has not implemented `INPUT_*` for composite actions. The likely reason is that composite
+  actions support multiple shells (bash, powershell, python) and the runner processes inputs as
+  templated expressions rather than environment variables for composites.
+
+  Developers who migrate a shell-script-based action from a JavaScript wrapper (where INPUT_*
+  was available via `core.getInput()` delegating to `process.env.INPUT_*`) to a composite action,
+  or who copy examples from Docker action documentation, will silently get empty values.
+fix: |
+  There is no way to make composite actions set INPUT_* env vars automatically. The workarounds are:
+
+  Option 1 — inline expression (simple, but creates expression injection risk with untrusted input):
+    `run: echo "${{ inputs.my-param }}"`
+
+  Option 2 — explicit env: mapping on the step (recommended — safe for untrusted input):
+    ```yaml
+    - name: Use input
+      env:
+        MY_PARAM: ${{ inputs.my-param }}
+      run: echo "$MY_PARAM"
+    ```
+
+  Option 3 — convert to a JavaScript action if INPUT_* pattern is deeply embedded in scripts.
+fix_code:
+  - language: yaml
+    label: "Map composite action inputs to env vars explicitly on each step"
+    code: |
+      # action.yml (composite action)
+      inputs:
+        deploy-env:
+          description: "Target environment name"
+          required: true
+        dry-run:
+          description: "Whether to perform a dry run"
+          required: false
+          default: "false"
+
+      runs:
+        using: composite
+        steps:
+          # ❌ WRONG — INPUT_DEPLOY_ENV and INPUT_DRY_RUN are not set in composite actions
+          # - run: ./scripts/deploy.sh "$INPUT_DEPLOY_ENV" "$INPUT_DRY_RUN"
+          #   shell: bash
+
+          # ✅ CORRECT — map to env vars in the step's env: block
+          - name: Deploy
+            env:
+              DEPLOY_ENV: ${{ inputs.deploy-env }}
+              DRY_RUN: ${{ inputs.dry-run }}
+            shell: bash
+            run: ./scripts/deploy.sh "$DEPLOY_ENV" "$DRY_RUN"
+prevention:
+  - "Never reference `INPUT_*` env vars in composite action shell scripts — they are not set."
+  - "When converting a JavaScript or Docker action to composite, audit all `INPUT_*` and `process.env.INPUT_*` references."
+  - "Use the `env:` block on each `run:` step to explicitly map inputs to environment variables."
+  - "For untrusted user inputs, always use the `env:` mapping pattern rather than inline `${{ inputs.name }}` in shell commands to prevent injection."
+docs:
+  - url: "https://docs.github.com/en/actions/creating-actions/metadata-syntax-for-github-actions#runs-for-composite-actions"
+    label: "Metadata syntax — runs for composite actions"
+  - url: "https://docs.github.com/en/actions/creating-actions/creating-a-composite-action"
+    label: "Creating a composite action"
+  - url: "https://github.com/actions/runner/issues/665"
+    label: "actions/runner#665 — INPUT_* env vars missing in composite actions (open since 2020, 66+ reactions)"
