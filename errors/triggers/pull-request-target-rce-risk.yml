@@ -1,0 +1,117 @@
+id: triggers-005
+title: "pull_request_target Runs Fork Code with Base Branch Secrets — RCE Risk"
+category: triggers
+severity: error
+tags:
+  - pull_request_target
+  - security
+  - fork
+  - secrets
+  - code-injection
+  - pwn-request
+  - base-branch
+patterns:
+  - regex: "pull_request_target"
+    flags: "i"
+  - regex: "github\\.event\\.pull_request\\.head\\.sha"
+    flags: "i"
+error_messages:
+  - "Warning: Workflow uses pull_request_target with actions/checkout on PR head — potential code injection vulnerability."
+root_cause: |
+  `pull_request_target` was designed to give workflows triggered by fork PRs access to
+  **base branch secrets and write permissions**. Unlike `pull_request`, it runs in the
+  context of the **base repository**, not the fork — so `secrets.*` is available and
+  `GITHUB_TOKEN` has write permissions.
+
+  The danger: many developers combine `pull_request_target` with
+  `actions/checkout@v4 ref: ${{ github.event.pull_request.head.sha }}` to check out the
+  **fork's code** for testing. Running untrusted fork code with full secret access is a
+  critical Remote Code Execution (RCE) vulnerability — the contributor can exfiltrate
+  all repository secrets simply by adding malicious code to their PR.
+
+  This class of vulnerability is known as "pwn request" and has been exploited against
+  major open-source projects.
+fix: |
+  When using `pull_request_target`, ALWAYS check out the base branch (not the PR head).
+  If you need to run the PR author's code AND have secret access, use a two-workflow pattern:
+  an unprivileged `pull_request` workflow builds and uploads artifacts, then a privileged
+  `workflow_run` workflow (with no access to fork code) deploys them.
+fix_code:
+  - language: yaml
+    label: "CRITICAL VULNERABILITY — checkout of fork code with secret access"
+    code: |
+      on: pull_request_target    # has secret access
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            # DANGEROUS: checking out untrusted PR code with base repo secrets
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.pull_request.head.sha }}   # NEVER DO THIS
+            - run: npm test   # attacker's code runs with your secrets
+  - language: yaml
+    label: "SAFE — pull_request_target checking out base only (for labels/comments)"
+    code: |
+      on:
+        pull_request_target:
+          types: [opened, labeled]
+
+      jobs:
+        label:
+          runs-on: ubuntu-latest
+          permissions:
+            pull-requests: write
+          steps:
+            # SAFE: checking out base repo code only (not the PR branch)
+            - uses: actions/checkout@v4
+              # No 'ref:' — defaults to base branch
+            - name: Add label
+              uses: actions-ecosystem/action-add-labels@v1
+              with:
+                github_token: ${{ secrets.GITHUB_TOKEN }}
+                labels: needs-review
+  - language: yaml
+    label: "SAFE — two-workflow pattern: build unprivileged, deploy privileged"
+    code: |
+      # Workflow 1: ci.yml — triggered by pull_request (no secrets, untrusted code OK)
+      on: pull_request
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4   # fork code, but no secrets
+            - run: npm ci && npm run build
+            - uses: actions/upload-artifact@v4
+              with:
+                name: build-output
+                path: dist/
+
+      # Workflow 2: deploy-pr-preview.yml — triggered by workflow_run (has secrets, no fork code)
+      on:
+        workflow_run:
+          workflows: [CI]
+          types: [completed]
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          if: github.event.workflow_run.conclusion == 'success'
+          steps:
+            - uses: actions/download-artifact@v4   # downloads artifact, not fork code
+              with:
+                github-token: ${{ secrets.GITHUB_TOKEN }}
+                run-id: ${{ github.event.workflow_run.id }}
+                name: build-output
+            - run: ./deploy-preview.sh   # safe: runs base repo script with downloaded artifact
+prevention:
+  - "NEVER use `actions/checkout ref: github.event.pull_request.head.sha` inside a `pull_request_target` workflow."
+  - "Use the two-workflow pattern (unprivileged `pull_request` + privileged `workflow_run`) for PR preview deployments."
+  - "Restrict `pull_request_target` to safe operations: labeling, commenting, and running base repo scripts only."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request_target"
+    label: "pull_request_target event"
+  - url: "https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/"
+    label: "Preventing pwn requests (GitHub Security Lab)"
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions#understanding-the-risk-of-script-injections"
+    label: "Security hardening — script injection"

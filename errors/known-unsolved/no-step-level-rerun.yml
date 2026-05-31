@@ -1,0 +1,94 @@
+id: known-unsolved-006
+title: "No Native Way to Retry a Single Failed Step Without Re-Running the Entire Job"
+category: known-unsolved
+severity: limitation
+tags:
+  - retry
+  - step
+  - flaky
+  - re-run
+  - limitation
+  - idempotency
+patterns:
+  - regex: "Re-run failed jobs"
+    flags: "i"
+  - regex: "retry.*step.*not supported"
+    flags: "i"
+error_messages:
+  - "GitHub Actions does not support step-level re-run — only job-level or failed-jobs-level re-run is available."
+root_cause: |
+  GitHub Actions' "Re-run" feature operates at the **job level** or "re-run failed jobs"
+  level — there is no UI or API to re-run a single failed step within an already-completed
+  job. When you click "Re-run failed jobs," the entire job restarts from the beginning,
+  including all steps that already passed.
+
+  This has three practical consequences:
+  1. **Flaky step recovery is expensive** — a 20-minute job must re-run entirely to retry
+     a 30-second network call that failed transiently.
+  2. **Non-idempotent steps can double-execute** — steps that modify external state
+     (publish to npm, create a GitHub release, push Docker image) will attempt to run again
+     on re-run, even if they succeeded the first time.
+  3. **Re-run artifacts** — artifacts and cache from the first run may or may not be
+     available depending on what step failed and whether post-steps ran.
+
+  This limitation has been requested since GitHub Actions launched. As of 2024, GitHub
+  has not implemented step-level granularity for re-runs.
+fix: |
+  Design workflows with step-level retry in mind from the start. Use retry actions
+  inline, make steps idempotent, and split long workflows into jobs so that a partial
+  re-run covers fewer steps.
+fix_code:
+  - language: yaml
+    label: "Workaround 1 — use nick-fields/retry for flaky steps"
+    code: |
+      steps:
+        - name: Flaky network call (with retry)
+          uses: nick-fields/retry@v3
+          with:
+            timeout_minutes: 5
+            max_attempts: 3
+            retry_wait_seconds: 10
+            command: curl -f https://api.example.com/deploy
+  - language: yaml
+    label: "Workaround 2 — inline retry loop"
+    code: |
+      steps:
+        - name: Deploy with retry
+          run: |
+            for i in 1 2 3; do
+              echo "Attempt $i"
+              ./deploy.sh && break || {
+                echo "Attempt $i failed"
+                if [ $i -eq 3 ]; then
+                  echo "::error::All 3 deploy attempts failed"
+                  exit 1
+                fi
+                sleep 30
+              }
+            done
+  - language: yaml
+    label: "Workaround 3 — idempotent steps that safe to re-run"
+    code: |
+      steps:
+        - name: Create GitHub Release (idempotent — skip if already exists)
+          run: |
+            TAG="${{ github.ref_name }}"
+            if gh release view "$TAG" &>/dev/null; then
+              echo "Release $TAG already exists — skipping creation"
+            else
+              gh release create "$TAG" dist/*.tar.gz
+            fi
+          env:
+            GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+prevention:
+  - "Build retry logic directly into steps using `nick-fields/retry` or shell loops — don't rely on job re-run for flaky operations."
+  - "Make every step idempotent (safe to run twice) so job re-runs don't cause double-execution side effects."
+  - "Split workflows into small jobs — `Re-run failed jobs` is more surgical with smaller jobs."
+  - "Cache and upload artifacts eagerly so a re-run can pick up from near the failure point."
+docs:
+  - url: "https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-workflow-runs/re-running-workflows-and-jobs"
+    label: "Re-running workflows and jobs"
+  - url: "https://github.com/nick-fields/retry"
+    label: "nick-fields/retry — step-level retry action"
+  - url: "https://github.com/orgs/community/discussions/17743"
+    label: "Community discussion: Step-level re-run (GitHub Community)"

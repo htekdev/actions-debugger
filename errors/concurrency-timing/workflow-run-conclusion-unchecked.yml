@@ -1,0 +1,100 @@
+id: concurrency-timing-003
+title: "workflow_run Downstream Job Ignores Source Workflow Conclusion"
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - workflow_run
+  - conclusion
+  - downstream
+  - deploy
+  - conditional
+  - completed
+patterns:
+  - regex: "github\\.event\\.workflow_run\\.conclusion"
+    flags: "i"
+  - regex: "workflow_run.*completed.*always"
+    flags: "i"
+error_messages:
+  - "Warning: workflow_run downstream job ran despite source workflow failing."
+root_cause: |
+  The `workflow_run` trigger fires when a specified workflow completes, regardless of
+  whether that workflow **succeeded or failed**. The trigger type is `completed` — there
+  is no built-in `on_success` equivalent. If you do not check
+  `github.event.workflow_run.conclusion`, your downstream workflow runs even when the
+  upstream workflow failed, was cancelled, or was skipped.
+
+  This is a common mistake in CD pipelines where a deploy workflow is triggered by a CI
+  workflow run. Without a conclusion check, a failed test run triggers the deploy — which
+  may deploy broken code, send a notification for a non-event, or waste runner minutes.
+fix: |
+  Always add a job-level `if:` condition checking `github.event.workflow_run.conclusion == 'success'`
+  in any `workflow_run`-triggered workflow that should only run on success.
+fix_code:
+  - language: yaml
+    label: "WRONG — deploy runs regardless of CI conclusion"
+    code: |
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          # Missing conclusion check — deploys even when CI fails!
+          steps:
+            - run: ./deploy.sh
+  - language: yaml
+    label: "CORRECT — gate on success conclusion"
+    code: |
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          if: ${{ github.event.workflow_run.conclusion == 'success' }}
+          steps:
+            - run: ./deploy.sh
+
+        notify-failure:
+          runs-on: ubuntu-latest
+          if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+          steps:
+            - run: ./notify-slack.sh "CI failed — no deploy"
+  - language: yaml
+    label: "CORRECT — handle all outcomes explicitly"
+    code: |
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+
+      jobs:
+        gate:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Check conclusion
+              run: |
+                CONCLUSION="${{ github.event.workflow_run.conclusion }}"
+                echo "Source workflow concluded: $CONCLUSION"
+                if [ "$CONCLUSION" != "success" ]; then
+                  echo "::error::Upstream CI did not succeed (conclusion: $CONCLUSION) — aborting deploy"
+                  exit 1
+                fi
+
+        deploy:
+          needs: gate
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./deploy.sh
+prevention:
+  - "Always add `if: github.event.workflow_run.conclusion == 'success'` to any job triggered by `workflow_run: completed`."
+  - "Consider adding a separate job for failure notifications to avoid silently swallowing upstream failures."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run"
+    label: "workflow_run event — conclusion values"
+  - url: "https://docs.github.com/en/actions/writing-workflows/triggering-a-workflow#triggering-a-workflow-from-a-workflow"
+    label: "Triggering a workflow from a workflow"

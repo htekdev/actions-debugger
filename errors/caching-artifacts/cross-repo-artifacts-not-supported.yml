@@ -1,0 +1,102 @@
+id: caching-artifacts-008
+title: "Artifacts Are Repository-Scoped — Cross-Repo Download Not Supported"
+category: caching-artifacts
+severity: error
+tags:
+  - artifacts
+  - cross-repo
+  - download
+  - scoping
+  - workflow-run
+  - actions/download-artifact
+patterns:
+  - regex: "Unable to find any artifacts for the associated workflow"
+    flags: "i"
+  - regex: "No artifacts found for"
+    flags: "i"
+  - regex: "Artifact not found.*repository"
+    flags: "i"
+error_messages:
+  - "Unable to find any artifacts for the associated workflow run"
+  - "Error: No artifacts found for workflow run 1234567890"
+  - "HttpError: Not Found — artifacts are scoped to the repository that created them"
+root_cause: |
+  GitHub Actions artifacts are **repository-scoped**. A workflow in `org/repo-a` cannot
+  download artifacts produced by a workflow in `org/repo-b` using `actions/download-artifact`,
+  even if both repos are in the same organization and the caller has read access to both.
+
+  The `actions/download-artifact` action only fetches artifacts from the **current workflow
+  run**. To download artifacts from a different workflow run (same repo), you must use the
+  GitHub Actions REST API with a PAT or GitHub App token. Cross-repository artifact sharing
+  is entirely unsupported natively and requires external storage (S3, Azure Blob, GitHub
+  Releases, GitHub Packages) as an intermediary.
+
+  This surprises teams building release pipelines where a build repo produces artifacts
+  that a deploy repo needs to consume.
+fix: |
+  Use an external storage layer (GitHub Releases, GitHub Packages, S3, Azure Blob) for
+  cross-repo artifact sharing. Within the same repo, use the GitHub API with a PAT to
+  download artifacts from a different workflow run.
+fix_code:
+  - language: yaml
+    label: "WRONG — attempting cross-repo artifact download (always fails)"
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            # This ONLY works for artifacts from THIS workflow run
+            - uses: actions/download-artifact@v4
+              with:
+                name: build-output
+                # There is no 'repository' input — cross-repo not supported
+  - language: yaml
+    label: "CORRECT option 1 — upload to GitHub Releases for cross-repo sharing"
+    code: |
+      # In build repo (org/build-repo):
+      jobs:
+        build:
+          steps:
+            - name: Build
+              run: npm run build
+
+            - name: Upload to GitHub Release
+              uses: softprops/action-gh-release@v2
+              with:
+                files: dist/**
+                token: ${{ secrets.GITHUB_TOKEN }}
+
+      # In deploy repo (org/deploy-repo):
+      jobs:
+        deploy:
+          steps:
+            - name: Download from release
+              run: |
+                gh release download v1.0.0 --repo org/build-repo --pattern "*.tar.gz"
+              env:
+                GH_TOKEN: ${{ secrets.CROSS_REPO_PAT }}
+  - language: yaml
+    label: "CORRECT option 2 — GitHub API to download artifact from same repo, different run"
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Download artifact from specific workflow run
+              uses: dawidd6/action-download-artifact@v6
+              with:
+                github_token: ${{ secrets.GITHUB_TOKEN }}
+                workflow: build.yml
+                run_id: ${{ github.event.workflow_run.id }}
+                name: build-output
+prevention:
+  - "Use GitHub Releases or GitHub Packages (Container Registry, npm registry) for artifacts that must cross repository boundaries."
+  - "Design pipelines so build and deploy are in the same repo if artifact passing is needed."
+  - "Document artifact storage architecture explicitly in repo README — don't let teams discover the limitation at deploy time."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-and-sharing-data-from-a-workflow"
+    label: "Storing and sharing data from a workflow"
+  - url: "https://docs.github.com/en/rest/actions/artifacts"
+    label: "GitHub REST API — Artifacts"
+  - url: "https://github.com/dawidd6/action-download-artifact"
+    label: "dawidd6/action-download-artifact (cross-run downloads)"

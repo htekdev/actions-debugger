@@ -1,0 +1,82 @@
+id: silent-failures-007
+title: "Step Output Only Written When Condition Passes — Downstream Reads Empty String"
+category: silent-failures
+severity: silent-failure
+tags:
+  - outputs
+  - steps
+  - context
+  - conditionals
+  - GITHUB_OUTPUT
+  - empty-string
+patterns:
+  - regex: "steps\\.[a-z_-]+\\.outputs\\.[a-z_-]+"
+    flags: "i"
+  - regex: "GITHUB_OUTPUT"
+    flags: "i"
+error_messages:
+  - "Warning: Unexpected input(s) '', valid inputs are ['version']"
+root_cause: |
+  A step output written to `$GITHUB_OUTPUT` (or the deprecated `set-output` command)
+  only exists if the step that writes it actually executed **and** reached the `echo`
+  statement. When a step is conditional (`if: github.event_name == 'push'`) and the
+  condition is false, the step is skipped entirely — no output is written.
+
+  Downstream steps that reference `${{ steps.<id>.outputs.<key> }}` receive an empty
+  string rather than an error, making the failure silent. The workflow continues, but
+  subsequent steps silently operate on empty values — potentially deploying with no
+  version tag, pushing an empty config, or skipping critical logic without any warning.
+fix: |
+  Guard against empty outputs in consuming steps, or restructure so outputs are always
+  written unconditionally and logic is controlled by the value itself.
+fix_code:
+  - language: yaml
+    label: "WRONG — output only written on push, silently empty on PR"
+    code: |
+      steps:
+        - name: Compute version
+          id: version
+          if: github.event_name == 'push'
+          run: echo "tag=v$(date +%Y%m%d%H%M%S)" >> $GITHUB_OUTPUT
+
+        - name: Build Docker image
+          run: |
+            # On pull_request, steps.version.outputs.tag is "" — image tagged as ""
+            docker build -t myapp:${{ steps.version.outputs.tag }} .
+  - language: yaml
+    label: "CORRECT — always write output, vary value by condition"
+    code: |
+      steps:
+        - name: Compute version
+          id: version
+          run: |
+            if [ "${{ github.event_name }}" = "push" ]; then
+              echo "tag=v$(date +%Y%m%d%H%M%S)" >> $GITHUB_OUTPUT
+            else
+              echo "tag=dev-${{ github.sha }}" >> $GITHUB_OUTPUT
+            fi
+
+        - name: Build Docker image
+          run: docker build -t myapp:${{ steps.version.outputs.tag }} .
+  - language: yaml
+    label: "CORRECT — guard against empty value in consuming step"
+    code: |
+      steps:
+        - name: Deploy
+          if: steps.version.outputs.tag != ''
+          run: ./deploy.sh ${{ steps.version.outputs.tag }}
+
+        - name: Warn if no version
+          if: steps.version.outputs.tag == ''
+          run: |
+            echo "::warning::No version tag output — skipping deploy"
+            exit 1
+prevention:
+  - "Write a default/fallback value in the output step rather than skipping the entire step."
+  - "Validate critical outputs with `if: steps.<id>.outputs.<key> != ''` before consuming them."
+  - "Use `if: always()` or no condition on steps that must always emit outputs."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/passing-information-between-jobs"
+    label: "Passing information between jobs"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions#setting-an-output-parameter"
+    label: "Setting an output parameter"

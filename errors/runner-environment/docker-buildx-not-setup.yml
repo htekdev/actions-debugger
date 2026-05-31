@@ -1,0 +1,106 @@
+id: runner-environment-014
+title: "Docker BuildKit / buildx Not Enabled by Default — Legacy Build Flags Fail"
+category: runner-environment
+severity: error
+tags:
+  - docker
+  - buildx
+  - BuildKit
+  - multi-platform
+  - cache-from
+  - runner
+  - container
+patterns:
+  - regex: "buildx.*not found"
+    flags: "i"
+  - regex: "failed to solve.*no matching manifest"
+    flags: "i"
+  - regex: "DOCKER_BUILDKIT.*invalid"
+    flags: "i"
+  - regex: "multi-platform build is not supported"
+    flags: "i"
+  - regex: "unknown flag: --platform"
+    flags: "i"
+error_messages:
+  - "ERROR: multiple platforms feature is currently not supported for docker driver."
+  - "error: failed to solve: no matching manifest for linux/arm64 in the manifest list entries"
+  - "unknown flag: --platform"
+  - "docker: 'buildx' is not a docker command."
+root_cause: |
+  GitHub Actions runners ship with Docker installed, but the default `docker` driver
+  does not support multi-platform builds (`--platform linux/arm64,linux/amd64`) or
+  advanced BuildKit features like `--cache-from=type=gha`. These require the `docker-container`
+  driver via `docker buildx`.
+
+  On Ubuntu runners, `DOCKER_BUILDKIT=1` is available but `buildx` multi-platform support
+  requires a buildx builder instance to be set up explicitly. When workflows use
+  `docker/build-push-action@v5` or `docker buildx build` without first running
+  `docker/setup-buildx-action`, the build fails with driver capability errors.
+
+  Additionally, `cache-from: type=gha` (GitHub Actions cache) only works with the
+  BuildKit `docker-container` driver — it fails silently or errors on the default `docker`
+  driver.
+fix: |
+  Always call `docker/setup-buildx-action` before any `docker buildx` command or before
+  using `docker/build-push-action`. For multi-platform builds, pass the platform list
+  to the setup step.
+fix_code:
+  - language: yaml
+    label: "WRONG — multi-platform build without buildx setup"
+    code: |
+      steps:
+        - uses: actions/checkout@v4
+        - name: Build multi-platform image
+          run: |
+            docker buildx build --platform linux/amd64,linux/arm64 -t myapp:latest .
+            # ERROR: multiple platforms feature is currently not supported for docker driver
+  - language: yaml
+    label: "CORRECT — setup buildx before multi-platform build"
+    code: |
+      steps:
+        - uses: actions/checkout@v4
+
+        - name: Set up Docker Buildx
+          uses: docker/setup-buildx-action@v3   # creates docker-container driver
+
+        - name: Login to registry
+          uses: docker/login-action@v3
+          with:
+            registry: ghcr.io
+            username: ${{ github.actor }}
+            password: ${{ secrets.GITHUB_TOKEN }}
+
+        - name: Build and push
+          uses: docker/build-push-action@v6
+          with:
+            context: .
+            platforms: linux/amd64,linux/arm64
+            push: true
+            tags: ghcr.io/${{ github.repository }}:latest
+            cache-from: type=gha
+            cache-to: type=gha,mode=max
+  - language: yaml
+    label: "CORRECT — single platform with GHA cache (still needs buildx)"
+    code: |
+      steps:
+        - uses: actions/checkout@v4
+        - uses: docker/setup-buildx-action@v3
+        - uses: docker/build-push-action@v6
+          with:
+            context: .
+            push: false
+            load: true
+            tags: myapp:test
+            cache-from: type=gha
+            cache-to: type=gha,mode=max
+prevention:
+  - "Always add `docker/setup-buildx-action@v3` as a step before any `docker buildx` or `docker/build-push-action` usage."
+  - "Use `docker/build-push-action` instead of raw `docker build` for all CI image builds — it handles BuildKit setup and caching correctly."
+  - "For ARM64/multi-arch builds, expect 3-5x longer build times on x86 runners due to QEMU emulation."
+docs:
+  - url: "https://docs.docker.com/build/ci/github-actions/"
+    label: "Docker Build in GitHub Actions (Docker docs)"
+  - url: "https://github.com/docker/setup-buildx-action"
+    label: "docker/setup-buildx-action"
+  - url: "https://github.com/docker/build-push-action"
+    label: "docker/build-push-action"

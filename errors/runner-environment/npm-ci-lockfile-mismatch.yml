@@ -1,0 +1,112 @@
+id: runner-environment-015
+title: "npm ci Fails with Lockfile Mismatch or Missing package-lock.json"
+category: runner-environment
+severity: error
+tags:
+  - npm
+  - npm-ci
+  - lockfile
+  - package-lock.json
+  - dependencies
+  - node
+  - reproducible
+patterns:
+  - regex: "npm ci.*can only install.*package-lock\\.json"
+    flags: "i"
+  - regex: "Missing script.*ci"
+    flags: "i"
+  - regex: "npm ERR! code EUSAGE"
+    flags: "i"
+  - regex: "npm warn saveError ENOENT.*package-lock\\.json"
+    flags: "i"
+  - regex: "npm ERR!.*lock file.*older npm"
+    flags: "i"
+  - regex: "EBADENGINE"
+    flags: "i"
+error_messages:
+  - "npm error The `npm ci` command can only install with an existing package-lock.json"
+  - "npm warn saveError ENOENT: no such file or directory, open '/home/runner/work/.../package-lock.json'"
+  - "npm error `npm ci` can only install packages when your package.json and package-lock.json are in sync."
+  - "npm error Missing: <package>@<version> from lock file"
+root_cause: |
+  `npm ci` is strict by design — it requires `package-lock.json` to be present and
+  exactly in sync with `package.json`. It fails in several common CI scenarios:
+
+  1. **No lockfile committed** — developers add `package-lock.json` to `.gitignore`
+     (common in library repos) — `npm ci` refuses to run.
+
+  2. **Lockfile out of sync** — a developer ran `npm install` locally which updated
+     the lockfile, but committed `package.json` without the updated lockfile, or vice versa.
+     `npm ci` reports "Missing: package@version from lock file."
+
+  3. **Lockfile from incompatible npm version** — npm v6 lockfiles (lockfileVersion 1)
+     cannot be used with `npm ci` in npm v7+ projects that use workspaces, and vice versa.
+
+  4. **Monorepo workspace packages not locked** — `package-lock.json` at root does not
+     lock workspace packages listed in `packages/*` if each sub-package has its own
+     `package.json` without being part of the root workspaces config.
+fix: |
+  Commit `package-lock.json` to the repository (do not gitignore it in apps). Keep
+  `package.json` and `package-lock.json` in sync by running `npm install` locally
+  after any manifest change and committing both files together.
+fix_code:
+  - language: yaml
+    label: "CORRECT — npm ci with Node version matrix and lockfile caching"
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          strategy:
+            matrix:
+              node-version: ['18.x', '20.x']
+          steps:
+            - uses: actions/checkout@v4
+
+            - uses: actions/setup-node@v4
+              with:
+                node-version: ${{ matrix.node-version }}
+                cache: npm                 # caches ~/.npm using package-lock.json hash
+
+            - name: Install dependencies
+              run: npm ci                  # fails fast if lockfile is out of sync
+
+            - name: Run tests
+              run: npm test
+  - language: yaml
+    label: "Detect lockfile sync issues before CI"
+    code: |
+      steps:
+        - uses: actions/checkout@v4
+        - uses: actions/setup-node@v4
+          with:
+            node-version: 20
+
+        - name: Verify lockfile is up to date
+          run: |
+            npm install --package-lock-only
+            git diff --exit-code package-lock.json || {
+              echo "::error::package-lock.json is out of sync with package.json"
+              echo "Run 'npm install' locally and commit the updated lockfile"
+              exit 1
+            }
+
+        - run: npm ci
+  - language: bash
+    label: "Fix gitignore — ensure lockfile is tracked"
+    code: |
+      # If package-lock.json is gitignored, remove it from .gitignore
+      grep -v "package-lock.json" .gitignore > .gitignore.tmp && mv .gitignore.tmp .gitignore
+      git add package-lock.json
+      git commit -m "chore: track package-lock.json for reproducible CI"
+prevention:
+  - "Always commit `package-lock.json` to git — never gitignore it in application repos."
+  - "Run `npm install` (not just `npm ci`) locally after any `package.json` change and commit both files atomically."
+  - "Add a `Verify lockfile` step to CI that runs `npm install --package-lock-only && git diff --exit-code package-lock.json` to catch drift early."
+  - "Renovate Bot and Dependabot automatically keep lockfiles in sync when configured correctly."
+docs:
+  - url: "https://docs.npmjs.com/cli/v10/commands/npm-ci"
+    label: "npm ci (npmjs docs)"
+  - url: "https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows#caching-npm-packages"
+    label: "Caching npm packages"
+  - url: "https://github.com/actions/setup-node#caching-global-packages-data"
+    label: "actions/setup-node — npm caching"

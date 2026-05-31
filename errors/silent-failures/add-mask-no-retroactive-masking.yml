@@ -1,0 +1,75 @@
+id: silent-failures-006
+title: "add-mask Does Not Retroactively Redact Values Already Printed"
+category: silent-failures
+severity: silent-failure
+tags:
+  - secrets
+  - masking
+  - add-mask
+  - security
+  - log-redaction
+  - sensitive-data
+patterns:
+  - regex: "::add-mask::"
+    flags: "i"
+  - regex: "add_mask"
+    flags: "i"
+error_messages:
+  - "Warning: Secret value was printed to log before masking was applied."
+root_cause: |
+  The `add-mask` workflow command (`echo "::add-mask::$VALUE"`) tells the runner to
+  redact all future occurrences of `$VALUE` from log output. However, it only applies
+  **from the point it is issued forward** — any log lines already written before the
+  `add-mask` command are not retroactively redacted.
+
+  This creates a silent security failure when a step prints a sensitive value in an
+  earlier `run:` command and only calls `add-mask` later. The value appears in plain
+  text in the workflow log for the duration the log is retained (90 days by default).
+
+  A common pattern that triggers this: computing a token at the start of a long `run:`
+  script, printing it for debugging, and only masking it several lines later.
+fix: |
+  Issue `add-mask` as the very first operation after obtaining a sensitive value —
+  before any `echo`, `cat`, or other command that might emit it. Prefer using
+  built-in `secrets.*` context (which is auto-masked) over dynamically computed
+  sensitive values wherever possible.
+fix_code:
+  - language: yaml
+    label: "WRONG — value printed before add-mask is issued"
+    code: |
+      steps:
+        - name: Get dynamic token
+          run: |
+            TOKEN=$(curl -s https://api.example.com/token | jq -r .access_token)
+            echo "Got token: $TOKEN"        # PRINTED IN PLAIN TEXT
+            echo "::add-mask::$TOKEN"       # too late — above line already logged
+            echo "TOKEN=$TOKEN" >> $GITHUB_ENV
+  - language: yaml
+    label: "CORRECT — mask before any output"
+    code: |
+      steps:
+        - name: Get dynamic token
+          run: |
+            TOKEN=$(curl -s https://api.example.com/token | jq -r .access_token)
+            echo "::add-mask::$TOKEN"       # mask FIRST
+            echo "TOKEN=$TOKEN" >> $GITHUB_ENV
+            echo "Token acquired and masked successfully"  # no value, safe to log
+  - language: yaml
+    label: "CORRECT — use secrets context (auto-masked)"
+    code: |
+      steps:
+        - name: Use pre-configured secret
+          env:
+            API_TOKEN: ${{ secrets.API_TOKEN }}  # automatically masked everywhere
+          run: |
+            curl -H "Authorization: Bearer $API_TOKEN" https://api.example.com/data
+prevention:
+  - "Always call `add-mask` as the very first line after obtaining a sensitive value."
+  - "Prefer `secrets.*` context values over dynamically fetched tokens where possible."
+  - "Never print sensitive values for debugging — use `echo 'Token acquired (masked)'` instead."
+  - "Audit workflows that call external APIs and store tokens in env vars for missing `add-mask`."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions#masking-a-value-in-a-log"
+    label: "Masking a value in a log"
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions"
+    label: "Security hardening for GitHub Actions"

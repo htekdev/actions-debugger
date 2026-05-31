@@ -1,0 +1,86 @@
+id: silent-failures-005
+title: "continue-on-error: true Masks Step Failures — Job Reports Success"
+category: silent-failures
+severity: silent-failure
+tags:
+  - continue-on-error
+  - failure
+  - masking
+  - job-status
+  - outcome
+patterns:
+  - regex: "continue-on-error"
+    flags: "i"
+  - regex: "steps\\.[a-z_-]+\\.outcome.*failure"
+    flags: "i"
+error_messages:
+  - "##[error]Process completed with exit code 1."
+  - "Error: Process completed with exit code 1."
+root_cause: |
+  When `continue-on-error: true` is set on a step, GitHub Actions marks the step's
+  `outcome` as `failure` but sets `conclusion` to `success` and allows the job to
+  continue. Critically, the **job itself reports success** even if one or more steps
+  failed — the failure is effectively swallowed.
+
+  This is frequently misunderstood: developers use `continue-on-error` to avoid blocking
+  a pipeline on non-critical steps, but they don't realise the overall job will show a
+  green checkmark even when those steps fail. Branch protection rules, required status
+  checks, and downstream `needs` jobs all see a passing job.
+
+  The `outcome` context (`steps.<id>.outcome`) still reports `failure`, but this is only
+  visible if explicitly checked in a later conditional.
+fix: |
+  If you need a step to be non-blocking, check its outcome explicitly in a downstream
+  step and surface the failure in a way that's visible (job summary, annotation, or
+  dedicated reporting step). Do not rely on `continue-on-error` as a silent suppressor.
+fix_code:
+  - language: yaml
+    label: "WRONG — failure silently swallowed, job shows green"
+    code: |
+      steps:
+        - name: Run flaky integration test
+          id: integration
+          continue-on-error: true
+          run: ./run-integration.sh
+
+        - name: Deploy
+          run: ./deploy.sh   # runs even if integration test failed, job still green
+  - language: yaml
+    label: "CORRECT — check outcome and fail loudly if needed"
+    code: |
+      steps:
+        - name: Run integration test
+          id: integration
+          continue-on-error: true
+          run: ./run-integration.sh
+
+        - name: Report integration failure
+          if: steps.integration.outcome == 'failure'
+          run: |
+            echo "::error::Integration test failed — review before shipping"
+            echo "## ⚠️ Integration Test Failed" >> $GITHUB_STEP_SUMMARY
+            exit 1   # fail the job explicitly if the failure matters
+  - language: yaml
+    label: "CORRECT — use outcome in branch protection-aware way"
+    code: |
+      steps:
+        - name: Lint (non-blocking)
+          id: lint
+          continue-on-error: true
+          run: npm run lint
+
+        - name: Annotate lint result
+          if: always()
+          run: |
+            if [ "${{ steps.lint.outcome }}" = "failure" ]; then
+              echo "::warning::Linting failed but is non-blocking for this branch"
+            fi
+prevention:
+  - "Treat `continue-on-error: true` as a visibility-reduction tool — always pair it with explicit outcome checking."
+  - "Add a final step that fails the job if any non-critical steps failed and the failure actually matters."
+  - "Prefer `allowed-failure` patterns at the matrix level for known-unstable configurations."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idstepscontinue-on-error"
+    label: "continue-on-error"
+  - url: "https://docs.github.com/en/actions/learn-github-actions/expressions#steps-context"
+    label: "Steps context — outcome vs conclusion"
