@@ -1,0 +1,101 @@
+id: known-unsolved-004
+title: "Composite Action Nested Step Outputs Evaluate to null in Calling Workflow"
+category: known-unsolved
+severity: limitation
+tags:
+  - composite-actions
+  - nested-actions
+  - step-outputs
+  - actions-runner
+  - known-bug
+patterns:
+  - regex: "##\\[debug\\]Evaluating: steps\\.[^.]+\\.outputs\\.[^\\s]+"
+    flags: "i"
+  - regex: "##\\[debug\\]=> null"
+    flags: "i"
+  - regex: "value: '' is not"
+    flags: "i"
+error_messages:
+  - "##[debug]Evaluating: steps.setter.outputs.some-val"
+  - "##[debug]=> null"
+  - "Error: value: '' is not 'expected-value'"
+root_cause: |
+  When a composite action is nested inside another composite action (A calls B, and B
+  exposes step outputs), the runner loses the `steps` context for the inner composite.
+  References like `steps.<id>.outputs.<name>` inside the nested composite evaluate to
+  `null`, and the outer composite (or the calling workflow) receives an empty string
+  instead of the intended output value.
+
+  The root cause is a context-wiring bug in the Actions runner (documented in
+  actions/runner#2009): the runner does not correctly register and propagate the
+  `steps` context for nested composite actions, particularly in post-steps. Each
+  composite "layer" should maintain its own steps context, but in practice the context
+  from the outer layer bleeds through or is lost entirely.
+
+  A related issue (actions/runner#2030) describes nested composite post-steps inheriting
+  the wrong context from the parent action.
+
+  **This is a known runner limitation.** There is no clean fix — only workarounds.
+  The runner team is aware; check the issue threads for status on any official fix.
+fix: |
+  There is no direct fix. Use one of these workarounds depending on your situation:
+
+  **Workaround 1 — Flatten nested composites**: Avoid nesting composite actions when
+  step outputs must propagate. Move the logic into a single top-level composite that
+  exposes outputs directly to the calling workflow.
+
+  **Workaround 2 — Use a published remote action**: Reference the inner composite as a
+  published action (`uses: owner/repo@ref`) rather than a local nested reference. Some
+  reporters find the context bug is avoided when the inner action runs in its own
+  repository context.
+
+  **Workaround 3 — Pass values via environment files**: Instead of `steps.*.outputs.*`,
+  write values to `$GITHUB_ENV` or `$GITHUB_OUTPUT` at the top-level composite step and
+  read them from there. This sidesteps the `steps` context lookup entirely.
+
+  **Workaround 4 — Use a JavaScript/Docker action**: If output propagation is critical,
+  rewrite the inner composite as a JavaScript or container action, which has correct
+  lifecycle and output semantics.
+fix_code:
+  - language: yaml
+    label: "Flatten: expose output directly from top-level composite"
+    code: |
+      # action.yml (top-level composite — do NOT nest another composite inside)
+      name: My Action
+      outputs:
+        result:
+          description: "The computed result"
+          value: ${{ steps.compute.outputs.result }}
+      runs:
+        using: composite
+        steps:
+          - id: compute
+            shell: bash
+            run: echo "result=hello-world" >> $GITHUB_OUTPUT
+  - language: yaml
+    label: "Workaround: write to GITHUB_OUTPUT from inner step directly"
+    code: |
+      # Instead of relying on steps.*.outputs.* in a nested composite,
+      # write directly to the top-level $GITHUB_OUTPUT from within the step:
+      runs:
+        using: composite
+        steps:
+          - shell: bash
+            run: |
+              COMPUTED=$(./scripts/compute.sh)
+              # Write directly to top-level output file
+              echo "result=${COMPUTED}" >> $GITHUB_OUTPUT
+prevention:
+  - "Avoid nesting composite actions more than one level deep when step outputs must propagate."
+  - "Test output propagation explicitly (assert the output equals the expected value) before relying on it in production workflows."
+  - "Prefer JavaScript actions over composite actions when reliable output propagation is critical."
+  - "Track actions/runner#2009 for an official fix — the limitation may be resolved in a future runner version."
+docs:
+  - url: "https://github.com/actions/runner/issues/2009"
+    label: "actions/runner#2009 — Composite: Step Outputs not available in nested composite actions"
+  - url: "https://github.com/actions/runner/issues/2030"
+    label: "actions/runner#2030 — Composite: Nested actions post steps have wrong context"
+  - url: "https://github.com/actions/runner/issues/646"
+    label: "actions/runner#646 — Composite action feature limitations"
+  - url: "https://docs.github.com/en/actions/sharing-automations/creating-actions/creating-a-composite-action"
+    label: "Creating a composite action"

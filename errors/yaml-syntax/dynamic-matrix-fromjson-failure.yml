@@ -1,0 +1,99 @@
+id: yaml-syntax-008
+title: "Dynamic Matrix fromJSON Fails on Empty or Malformed JSON"
+category: yaml-syntax
+severity: error
+tags:
+  - matrix
+  - fromJSON
+  - dynamic-matrix
+  - strategy
+  - expressions
+patterns:
+  - regex: "Error when evaluating 'strategy' for job"
+    flags: "i"
+  - regex: "Error parsing fromJson"
+    flags: "i"
+  - regex: "Error reading JToken from JsonReader"
+    flags: "i"
+  - regex: "matrix contains zero elements"
+    flags: "i"
+  - regex: "Unexpected type of value '', expected type: Sequence"
+    flags: "i"
+error_messages:
+  - "Error when evaluating 'strategy' for job 'build'. .github/workflows/ci.yml (Line: 12, Col: 14): Error parsing fromJson"
+  - "Error reading JToken from JsonReader. Path '', line 0, position 0."
+  - "Unexpected type of value '', expected type: Sequence."
+  - "Error when evaluating 'strategy' for job 'test'. matrix contains zero elements"
+root_cause: |
+  When using `fromJSON()` in a matrix strategy to build a dynamic matrix from a previous
+  job's output, three common failure modes occur:
+
+  1. **Empty string**: The upstream step produced no output (empty stdout or unset output
+     variable), so `fromJSON('')` receives an empty string and the JSON parser fails with
+     "Error reading JToken from JsonReader."
+
+  2. **Zero-element array**: The upstream step produces a valid JSON array but it is empty
+     (`[]`). GitHub Actions evaluates the strategy and then immediately fails the job
+     because it has nothing to schedule — "matrix contains zero elements."
+
+  3. **Malformed JSON**: Newlines, unescaped quotes, or shell word-splitting corrupts the
+     JSON string before it reaches fromJSON, producing parse errors such as
+     "Unexpected type of value '', expected type: Sequence."
+
+  All three root causes trace back to the step that generates the matrix JSON, not to
+  fromJSON itself. Using `jq` without `-c` (compact output) can embed literal newlines
+  that break the output variable; similarly, forgetting to set the output with
+  `echo "matrix=..." >> $GITHUB_OUTPUT` leaves the variable empty.
+fix: |
+  1. Always produce compact, single-line JSON with `jq -c` and write it to
+     `$GITHUB_OUTPUT` (not `$GITHUB_ENV`) in the generator step.
+  2. Guard against an empty matrix by providing a fallback single-element array, or add
+     an `if` condition to skip the matrix job when the generator output is empty.
+  3. Echo and verify the generated JSON in a debug step before the matrix job runs.
+fix_code:
+  - language: yaml
+    label: "Correct dynamic matrix pattern with empty-guard"
+    code: |
+      jobs:
+        generate:
+          runs-on: ubuntu-latest
+          outputs:
+            matrix: ${{ steps.set-matrix.outputs.matrix }}
+          steps:
+            - id: set-matrix
+              run: |
+                # Produce compact JSON; default to ["none"] if list is empty
+                ITEMS=$(cat targets.txt | jq -Rc '[.]' | jq -sc 'add // ["none"]')
+                echo "matrix=${ITEMS}" >> $GITHUB_OUTPUT
+
+        build:
+          needs: generate
+          # Skip if only the fallback placeholder is present
+          if: ${{ needs.generate.outputs.matrix != '["none"]' }}
+          strategy:
+            matrix:
+              target: ${{ fromJSON(needs.generate.outputs.matrix) }}
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Building ${{ matrix.target }}"
+  - language: yaml
+    label: "Debug step to verify JSON before matrix job"
+    code: |
+      - name: Verify matrix JSON
+        run: |
+          echo "Matrix value: ${{ needs.generate.outputs.matrix }}"
+          echo '${{ needs.generate.outputs.matrix }}' | jq .
+prevention:
+  - "Always use `jq -c` (compact output) when producing JSON for matrix outputs to avoid embedded newlines."
+  - "Write matrix JSON to `$GITHUB_OUTPUT`, not `$GITHUB_ENV` — environment variables are not available as job outputs."
+  - "Add an empty-matrix guard (`if` condition or fallback value) so a zero-element array does not silently break your pipeline."
+  - "Add a debug step after the generator to echo and validate the JSON before the dependent job runs."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/running-variations-of-jobs-in-a-workflow"
+    label: "Running variations of jobs in a workflow (matrix)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#fromjson"
+    label: "fromJSON expression function"
+  - url: "https://github.com/actions/runner/issues/2424"
+    label: "actions/runner#2424 — fromJSON parsing failures in nested workflows"
+  - url: "https://github.com/orgs/community/discussions/27096"
+    label: "Community: matrix contains zero elements"

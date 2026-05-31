@@ -1,0 +1,105 @@
+id: runner-environment-010
+title: "actions/setup-node Fails When .nvmrc or node-version-file Is Missing"
+category: runner-environment
+severity: error
+tags:
+  - setup-node
+  - nvmrc
+  - node-version
+  - node-version-file
+  - version-resolution
+patterns:
+  - regex: "The specified node version file at.*does not exist"
+    flags: "i"
+  - regex: "Unable to find Node version '\\$\\{.*\\}'"
+    flags: "i"
+  - regex: "Unable to find Node version '.*' for platform"
+    flags: "i"
+  - regex: "Cache service responded with 422"
+    flags: "i"
+error_messages:
+  - "The specified node version file at: /__w/actions/actions/.nvmrc does not exist"
+  - "##[error]Unable to find Node version '${NVMRC}' for platform linux and architecture x64."
+  - "##[error]Unable to find Node version '16.99.0' for platform linux and architecture x64."
+  - "Error: Cache service responded with 422"
+root_cause: |
+  `actions/setup-node` supports three ways to specify a Node.js version:
+  `node-version` (inline), `node-version-file` (reads from a file), or auto-detection.
+  These fail in distinct ways:
+
+  1. **Missing version file** (`node-version-file: '.nvmrc'` or `'.node-version'`):
+     If the file referenced by `node-version-file` does not exist on the runner at the
+     path provided, setup-node throws "The specified node version file … does not exist"
+     and the step fails. This commonly happens when the file exists in the repo root but
+     the workflow runs in a subdirectory, or when the checkout step runs after setup-node.
+
+  2. **Unresolved environment variable** (`node-version: '${{ env.NVMRC }}'`):
+     Using a shell env var (e.g., `$NVMRC`) instead of an Actions expression
+     (`${{ env.NVMRC }}`) means the value is never substituted — setup-node receives a
+     literal `${NVMRC}` string, which is not a valid version, and fails with "Unable to
+     find Node version '${NVMRC}'". Similarly, if `env.NVMRC` is not set at the point
+     setup-node runs, the expression evaluates to empty string.
+
+  3. **Non-existent or misspelled version** (`node-version: '16.99.0'`):
+     Requesting a version that GitHub's node distribution manifest does not list causes
+     "Unable to find Node version." This can happen after pinning to a patch version
+     that was later delisted.
+
+  4. **Old setup-node version + cache service 422**:
+     Older setup-node versions (v1/v2) use a deprecated cache service API that now
+     returns HTTP 422. The fix is upgrading to setup-node@v3 or v4.
+fix: |
+  1. Ensure `actions/checkout` runs **before** any `actions/setup-node` step that reads
+     `node-version-file` — the file must exist on the runner when setup-node reads it.
+  2. Use Actions expressions (`${{ env.VAR }}`) not shell syntax (`$VAR`) for
+     `node-version` values.
+  3. For `.nvmrc`, prefer the `node-version-file: '.nvmrc'` parameter directly rather
+     than reading the file in a shell step and passing it to `node-version`.
+  4. Upgrade to `actions/setup-node@v4` to avoid the deprecated cache service 422 error.
+fix_code:
+  - language: yaml
+    label: "Correct order: checkout before setup-node with node-version-file"
+    code: |
+      steps:
+        - uses: actions/checkout@v4       # Must come BEFORE setup-node
+        - uses: actions/setup-node@v4
+          with:
+            node-version-file: '.nvmrc'   # Reads .nvmrc from the checked-out repo
+            cache: 'npm'
+  - language: yaml
+    label: "Inline version — use Actions expression, not shell variable"
+    code: |
+      env:
+        NODE_VERSION: '20'
+
+      steps:
+        - uses: actions/checkout@v4
+        - uses: actions/setup-node@v4
+          with:
+            node-version: ${{ env.NODE_VERSION }}   # ✅ Actions expression
+            # node-version: $NODE_VERSION           # ❌ Shell syntax — not expanded
+  - language: yaml
+    label: "Read .nvmrc manually when node-version-file is insufficient"
+    code: |
+      steps:
+        - uses: actions/checkout@v4
+        - name: Read .nvmrc
+          id: nvmrc
+          run: echo "version=$(cat .nvmrc)" >> $GITHUB_OUTPUT
+        - uses: actions/setup-node@v4
+          with:
+            node-version: ${{ steps.nvmrc.outputs.version }}
+prevention:
+  - "Always run `actions/checkout` before any step that reads files from the repository, including `node-version-file`."
+  - "Use `actions/setup-node@v4` — v1/v2 are deprecated and trigger cache service 422 errors."
+  - "Prefer `node-version-file: '.nvmrc'` over reading the file in a shell step to avoid shell escaping issues."
+  - "Pin to a Node.js major version (e.g., `20`) rather than a full SemVer patch to avoid version-not-found errors."
+docs:
+  - url: "https://github.com/actions/setup-node"
+    label: "actions/setup-node — README and usage"
+  - url: "https://github.com/actions/setup-node/issues/613"
+    label: "setup-node#613 — node-version-file does not exist error"
+  - url: "https://github.com/actions/setup-node/issues/32"
+    label: "setup-node#32 — Using .nvmrc with env variable substitution"
+  - url: "https://github.com/actions/setup-node/issues/1275"
+    label: "setup-node#1275 — Cache service 422 — upgrade to v3/v4"
