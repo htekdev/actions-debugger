@@ -1,0 +1,130 @@
+id: permissions-auth-008
+title: "GCP OIDC Workload Identity: Pool Path vs Provider Path / Project ID vs Number"
+category: permissions-auth
+severity: error
+tags:
+  - oidc
+  - gcp
+  - google-cloud
+  - workload-identity
+  - auth
+patterns:
+  - regex: "Invalid value for [\"']?audience[\"']?"
+    flags: "i"
+  - regex: "Error code invalid_request.*Invalid value for.*audience"
+    flags: "i"
+  - regex: "workloadIdentityPools.*not.*providers"
+    flags: "i"
+  - regex: "project.*number.*not.*project.*id"
+    flags: "i"
+  - regex: "OAuthError.*Invalid value for.*audience"
+    flags: "i"
+  - regex: "Error parsing credentials.*workload_identity_provider"
+    flags: "i"
+error_messages:
+  - "ERROR: gcloud crashed (OAuthError): Error code invalid_request: Invalid value for \"audience\"."
+  - "Error: google-github-actions/auth failed with: Error code invalid_request: Invalid value for \"audience\"."
+  - "The workload_identity_provider must be the full provider resource name, not the pool resource name."
+root_cause: |
+  `google-github-actions/auth` OIDC authentication fails with "Invalid value for audience"
+  when either of two common misconfiguration patterns is present:
+
+  **Mistake 1 — Pool path instead of Provider path**
+  The `workload_identity_provider` input requires the full *Provider* resource name:
+    `projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL_ID/providers/PROVIDER_ID`
+
+  Many developers mistakenly supply only the *Pool* path (omitting `/providers/PROVIDER_ID`):
+    `projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL_ID`
+
+  GCP's STS token endpoint rejects the audience because it expects the provider URI, not the pool URI.
+
+  **Mistake 2 — Project ID (string) instead of Project Number (integer)**
+  The path requires the numeric GCP project number (e.g. `123456789012`), NOT the human-readable
+  project ID (e.g. `my-gcp-project`). Workload Identity Federation does not accept project IDs.
+  Using a project ID causes the STS endpoint to return "Invalid value for audience" because the
+  resource path does not resolve to a valid identity provider.
+
+  **Mistake 3 — Missing `id-token: write` permission**
+  If `permissions.id-token` is not explicitly set to `write` at the job or workflow level,
+  GitHub will not mint an OIDC token and the auth step fails with a permissions error rather
+  than a token exchange error.
+fix: |
+  Verify the `workload_identity_provider` value against the exact format required:
+    `projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL/providers/PROVIDER`
+
+  Retrieve the correct value:
+    gcloud iam workload-identity-pools providers describe PROVIDER_ID \
+      --project=PROJECT_ID \
+      --location=global \
+      --workload-identity-pool=POOL_ID \
+      --format='value(name)'
+
+  Ensure `id-token: write` is set in the job permissions block.
+
+  Wait at least 5 minutes after changes to Workload Identity Pool / Provider / IAM bindings
+  before testing — these resources are eventually consistent.
+fix_code:
+  - language: yaml
+    label: "Correct workload_identity_provider format (provider path + project number)"
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          permissions:
+            id-token: write    # REQUIRED — grants GitHub the right to mint an OIDC token
+            contents: read
+
+          steps:
+            - uses: actions/checkout@v4
+
+            - id: auth
+              uses: google-github-actions/auth@v2
+              with:
+                # CORRECT: full provider path with numeric project number
+                workload_identity_provider: >-
+                  projects/123456789012/locations/global/workloadIdentityPools/my-pool/providers/my-provider
+                service_account: my-service-account@my-project.iam.gserviceaccount.com
+  - language: yaml
+    label: "Common mistake — pool path (missing /providers/...) causes audience error"
+    code: |
+      # WRONG: pool path only — gcloud crashes with "Invalid value for audience"
+      # workload_identity_provider: >-
+      #   projects/123456789012/locations/global/workloadIdentityPools/my-pool
+
+      # ALSO WRONG: project ID string instead of project number
+      # workload_identity_provider: >-
+      #   projects/my-gcp-project/locations/global/workloadIdentityPools/my-pool/providers/my-provider
+
+      # CORRECT:
+      # workload_identity_provider: >-
+      #   projects/123456789012/locations/global/workloadIdentityPools/my-pool/providers/my-provider
+  - language: yaml
+    label: "Store provider path in a repository variable to avoid typos"
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          permissions:
+            id-token: write
+            contents: read
+          steps:
+            - uses: google-github-actions/auth@v2
+              with:
+                # Store full provider path as a repository variable to avoid typos
+                workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+                service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+prevention:
+  - "Always use `gcloud iam workload-identity-pools providers describe` to copy the exact provider path."
+  - "Store the full provider path in a GitHub Actions variable (`vars.GCP_WIF_PROVIDER`) to prevent manual typos."
+  - "Use numeric project number — retrieve it with `gcloud projects describe PROJECT_ID --format='value(projectNumber)'`."
+  - "After changing Workload Identity Pool config, wait 5 minutes before testing (eventual consistency)."
+  - "Confirm `id-token: write` permission is present at job (not just workflow) level."
+docs:
+  - url: "https://github.com/google-github-actions/auth#setup"
+    label: "google-github-actions/auth: Setup and configuration"
+  - url: "https://github.com/google-github-actions/auth/blob/main/docs/TROUBLESHOOTING.md"
+    label: "google-github-actions/auth: Troubleshooting guide"
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/configuring-openid-connect-in-google-cloud-platform"
+    label: "Configuring OIDC in Google Cloud Platform"
+  - url: "https://cloud.google.com/iam/docs/workload-identity-federation-with-deployment-pipelines"
+    label: "GCP: Workload Identity Federation with deployment pipelines"

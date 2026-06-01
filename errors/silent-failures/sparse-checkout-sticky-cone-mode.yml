@@ -1,0 +1,120 @@
+id: silent-failures-008
+title: "Sparse Checkout Persists to Subsequent Checkout Steps (Sticky Cone Mode)"
+category: silent-failures
+severity: silent-failure
+tags:
+  - checkout
+  - sparse-checkout
+  - cone-mode
+  - composite-actions
+  - file-missing
+patterns:
+  - regex: "sparse.*checkout.*persist"
+    flags: "i"
+  - regex: "core\\.sparseCheckout.*true"
+    flags: "i"
+  - regex: "sparse-checkout.*not disabled"
+    flags: "i"
+error_messages:
+  - "Run actions/checkout@v4"
+  - "Expected full checkout but only sparse tree present"
+root_cause: |
+  When `actions/checkout` is called with `sparse-checkout:` options, it sets the git
+  repository's `core.sparseCheckout = true` config. A subsequent call to `actions/checkout`
+  in the same job — even WITHOUT specifying sparse-checkout — re-uses the existing git
+  repository and inherits the sticky `core.sparseCheckout = true` setting.
+
+  Result: the second checkout appears to succeed (no error), but the working directory
+  still contains only the sparse subset from the first checkout. Files outside the
+  original sparse pattern are silently absent.
+
+  This most commonly occurs in two scenarios:
+  1. A workflow calls `actions/checkout` with sparse-checkout for a fast initial clone,
+     then calls `actions/checkout` again (different ref, different path spec) expecting
+     a full checkout.
+  2. A workflow uses sparse-checkout, then calls a composite action that internally runs
+     its own `actions/checkout`. The composite action's checkout inherits the sparse
+     setting from the parent workflow's checkout.
+
+  Root cause: a bug in `actions/checkout` — the `disableSparseCheckout()` method does not
+  explicitly set `core.sparseCheckout false` when `sparse-checkout` input is absent. A
+  fix PR (#2034) exists in the repo but has not been merged as of 2026.
+fix: |
+  **Option 1 (recommended): Explicitly reset sparse-checkout between checkouts**
+  Add a `git sparse-checkout disable` step between the sparse and full checkouts. This
+  clears the sticky `core.sparseCheckout` flag and ensures subsequent checkouts are full.
+
+  **Option 2: Use separate `path:` directories**
+  Checkout into a unique subdirectory with the `path:` input to prevent git config
+  sharing. Each `path:` gets its own `.git` config.
+
+  **Option 3: Use `sparse-checkout-cone-mode: false` carefully**
+  When in non-cone mode, review that patterns don't accidentally match more or fewer
+  files than expected. Non-cone mode with incorrect patterns is its own source of
+  silent failures.
+fix_code:
+  - language: yaml
+    label: "Reset sparse-checkout before a subsequent full checkout"
+    code: |
+      steps:
+        # First checkout: sparse (fast clone for config files only)
+        - uses: actions/checkout@v4
+          with:
+            sparse-checkout: |
+              .github
+              config/
+
+        - name: Reset sparse-checkout so next checkout is full
+          shell: bash
+          run: git sparse-checkout disable
+
+        # Second checkout (in composite action or next step): now gets full tree
+        - uses: actions/checkout@v4
+          with:
+            ref: ${{ github.sha }}
+  - language: yaml
+    label: "Use separate path: directories to avoid shared git config"
+    code: |
+      steps:
+        # Sparse checkout into 'config-only/' subdirectory
+        - uses: actions/checkout@v4
+          with:
+            path: config-only
+            sparse-checkout: |
+              config/
+
+        # Full checkout into 'full-repo/' — completely separate git repo config
+        - uses: actions/checkout@v4
+          with:
+            path: full-repo
+  - language: yaml
+    label: "Composite action defensive reset (add to composite action's beginning)"
+    code: |
+      # In your composite action's action.yml — reset sparse before own checkout
+      runs:
+        using: composite
+        steps:
+          - name: Reset any inherited sparse-checkout
+            shell: bash
+            run: |
+              if git rev-parse --git-dir > /dev/null 2>&1; then
+                git sparse-checkout disable 2>/dev/null || true
+              fi
+
+          - uses: actions/checkout@v4
+            with:
+              ref: ${{ inputs.ref }}
+prevention:
+  - "Never assume a subsequent `actions/checkout` step gets a full tree if any earlier step used sparse-checkout."
+  - "Add `git sparse-checkout disable` as an explicit step between sparse and full checkouts in the same job."
+  - "When writing composite actions that call `actions/checkout`, add a defensive `git sparse-checkout disable` before your checkout step."
+  - "Use the `path:` input to isolate checkouts that need different content into separate directories."
+docs:
+  - url: "https://github.com/actions/checkout/issues/1498"
+    label: "actions/checkout#1498: Sparse checkout persists in composite action"
+  - url: "https://github.com/actions/checkout/pull/2034"
+    label: "actions/checkout#2034: Fix — disable sparse-checkout on subsequent checkout (open PR)"
+  - url: "https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#jobsjob_idstepsuses"
+    label: "Workflow syntax: steps.uses"
+  - url: "https://github.com/actions/checkout#usage"
+    label: "actions/checkout: Usage and sparse-checkout options"
