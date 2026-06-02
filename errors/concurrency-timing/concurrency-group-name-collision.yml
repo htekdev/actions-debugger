@@ -1,0 +1,165 @@
+id: concurrency-timing-009
+title: "Concurrency Group Name Collision Cancels Unrelated Workflows"
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - concurrency-group
+  - cancel-in-progress
+  - workflow-cancellation
+  - naming
+  - cross-workflow
+patterns:
+  - regex: "concurrency.*group.*cancelled|run.*cancelled.*concurrency"
+    flags: "i"
+  - regex: "previous run.*same concurrency group.*cancelled"
+    flags: "i"
+  - regex: "workflow run.*cancelled.*due to.*concurrency"
+    flags: "i"
+error_messages:
+  - "This workflow run was cancelled because a more recent run with the same concurrency group is in progress."
+  - "Workflow cancelled: superseded by a newer run in the same concurrency group."
+  - "Run #XXXX was cancelled because run #YYYY (same concurrency group 'deploy') is queued."
+root_cause: |
+  GitHub Actions concurrency groups operate **across all workflows** that share the
+  same group name string in the same repository. If two different workflows (or two
+  jobs in different workflows) declare the same `concurrency.group` name, they compete
+  for the same queue — leading to unintended cancellations between completely unrelated
+  workflows.
+
+  **Example of the collision pattern:**
+  ```yaml
+  # workflow-a.yml — CI pipeline
+  concurrency:
+    group: deploy
+    cancel-in-progress: true
+
+  # workflow-b.yml — Release pipeline (independent)
+  concurrency:
+    group: deploy        # ← same name! collides with workflow-a
+    cancel-in-progress: true
+  ```
+
+  In this example, triggering `workflow-b` cancels any in-progress run of `workflow-a`
+  and vice versa, even though they are completely independent processes.
+
+  **Common sources of collisions:**
+  - Copy-pasting a workflow file and forgetting to rename the concurrency group
+  - Using generic names like `deploy`, `build`, `ci`, `test`
+  - Multiple reusable workflows called from different callers with the same
+    `concurrency.group` in the caller
+  - Organization-wide template workflows with hardcoded group names
+
+  **Why this is a silent failure:** The cancellation log message appears in the
+  cancelled workflow run, but developers may not notice or may attribute the cancellation
+  to an unrelated cause. The triggering workflow (the one that caused the cancellation)
+  shows no indication it cancelled another workflow.
+
+  **Note:** Starting May 2026, GitHub Actions added support for **larger concurrency
+  queues** (`queue: max` option), allowing more pending runs instead of cancelling them.
+  This reduces pain but does not eliminate collisions caused by shared group names.
+fix: |
+  Make concurrency group names unique and descriptive by including the workflow name,
+  branch/ref, and optionally the event type. Never use generic single-word names
+  like `deploy`, `ci`, or `build` as the sole concurrency group name.
+
+  A safe pattern is: `${{ github.workflow }}-${{ github.ref }}`
+  This scopes the group to the specific workflow and branch combination, preventing
+  cross-workflow and cross-branch collisions.
+fix_code:
+  - language: yaml
+    label: "Use workflow + ref in concurrency group name"
+    code: |
+      # ✅ Safe pattern: workflow name + branch prevents cross-workflow collisions
+      name: Deploy Production
+
+      on:
+        push:
+          branches: [main]
+
+      concurrency:
+        # Unique per workflow + branch combination
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: true
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./deploy.sh
+  - language: yaml
+    label: "Per-PR concurrency — cancel superseded PR runs only"
+    code: |
+      # ✅ Scope to PR number — only cancels stale runs of the same PR
+      name: CI
+
+      on:
+        pull_request:
+
+      concurrency:
+        group: ${{ github.workflow }}-pr-${{ github.event.pull_request.number }}
+        cancel-in-progress: true
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+  - language: yaml
+    label: "Job-level concurrency — scope to specific job, not whole workflow"
+    code: |
+      name: CI + Deploy
+
+      on:
+        push:
+          branches: [main]
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          # No concurrency on test job — let tests always run
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+
+        deploy:
+          needs: test
+          runs-on: ubuntu-latest
+          # Concurrency only on deploy, scoped to this specific workflow + job
+          concurrency:
+            group: ${{ github.workflow }}-deploy-${{ github.ref }}
+            cancel-in-progress: false  # queue deploys, don't cancel them
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./deploy.sh
+  - language: yaml
+    label: "Larger queue option (May 2026+) — allow pending runs instead of cancelling"
+    code: |
+      # ✅ Use larger queues to queue runs instead of cancelling
+      # Requires GitHub Actions concurrency queue support (May 2026+)
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: false   # do not cancel; queue instead
+        # queue: max                 # allow maximum pending runs (if supported)
+prevention:
+  - "Always include `${{ github.workflow }}` in the concurrency group name to prevent
+    cross-workflow collisions — bare names like `deploy` or `build` are collision-prone."
+  - "Include the ref (`${{ github.ref }}`) in group names so parallel PRs/branches
+    don't cancel each other's runs."
+  - "Audit all workflow files for concurrency group names when onboarding new workflows
+    into a repository — duplicates cause mysterious cancellations that are hard to trace."
+  - "Use job-level concurrency (not workflow-level) when only certain jobs (e.g., deploy)
+    need serialization — keep CI/test jobs unrestricted."
+  - "Document the concurrency group naming convention in your repository's CONTRIBUTING
+    or workflow guidelines so future contributors follow the same pattern."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs"
+    label: "GitHub Docs: Control the concurrency of workflows and jobs"
+  - url: "https://github.blog/changelog/2026-05-07-github-actions-concurrency-groups-now-allow-larger-queues"
+    label: "GitHub Changelog: Concurrency groups now allow larger queues (May 2026)"
+  - url: "https://oneuptime.com/blog/post/2026-01-25-github-actions-concurrency-control/view"
+    label: "GitHub Actions Concurrency Control — best practices blog post"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs#example-using-concurrency-to-cancel-any-in-progress-job-or-run"
+    label: "GitHub Docs: Concurrency examples — cancel in-progress"

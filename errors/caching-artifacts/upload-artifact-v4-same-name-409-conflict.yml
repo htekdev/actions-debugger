@@ -1,0 +1,145 @@
+id: caching-artifacts-012
+title: "upload-artifact v4 Rejects Duplicate Artifact Names from Multiple Jobs (409 Conflict)"
+category: caching-artifacts
+severity: error
+tags:
+  - upload-artifact
+  - artifact-v4
+  - matrix
+  - parallel-jobs
+  - 409
+  - immutability
+patterns:
+  - regex: "Failed to CreateArtifact.*409.*Conflict.*artifact.*already exists"
+    flags: "i"
+  - regex: "artifact.*already exists.*workflow run|duplicate.*artifact.*name"
+    flags: "i"
+  - regex: "Received non-retryable error.*409.*Conflict"
+    flags: "i"
+error_messages:
+  - "Failed to CreateArtifact: Received non-retryable error: Failed request: (409) Conflict: an artifact with this name already exists on the workflow run"
+  - "Error: ENOENT: no such file or directory — artifact upload failed with conflict"
+  - "Upload failed: 409 Conflict — Artifact 'build-output' already exists"
+root_cause: |
+  **actions/upload-artifact v4** (backed by the v2 `@actions/artifact` client) makes
+  artifacts **immutable and job-scoped by default**. Once an artifact name is uploaded
+  by any job in a workflow run, that name is locked — a second job attempting to upload
+  an artifact with the same name will receive a `409 Conflict` error from the Artifact
+  API and the upload fails.
+
+  This is a **breaking behavior change from v3**, which allowed multiple jobs to
+  append to the same artifact name. v4 deliberately prevents this to ensure artifact
+  content integrity and predictable downloads.
+
+  **Common scenarios that trigger this:**
+
+  1. **Matrix jobs** — all matrix jobs use the same artifact name (e.g., `build-output`)
+     and upload in parallel; only the first to complete succeeds.
+
+  2. **Retry logic** — a job is retried (manually or via `retry-on-failure`) and the
+     original run already uploaded the artifact under the same name.
+
+  3. **Split test/build jobs** — multiple parallel jobs each generate and upload an
+     artifact with a shared generic name (e.g., `test-results`).
+
+  4. **Copy-pasted workflows** — two separate jobs have identical `upload-artifact`
+     steps with the same name.
+
+  The artifact immutability change was introduced to enable the new artifact download
+  model where artifacts are uniquely addressable and not corrupted by multiple writers.
+fix: |
+  **Use unique artifact names per job.** The standard pattern is to embed job/matrix
+  context in the artifact name so each upload is distinct.
+
+  For matrix jobs, include the matrix value in the name. For parallel jobs, include
+  the job name. The v4 `download-artifact` action supports wildcard patterns, so all
+  job-scoped artifacts can be downloaded together in a merge step.
+fix_code:
+  - language: yaml
+    label: "Matrix jobs — include matrix value in artifact name"
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest, macos-latest]
+          runs-on: ${{ matrix.os }}
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Build
+              run: make build
+
+            # ❌ Causes 409: all matrix jobs use same name
+            # - uses: actions/upload-artifact@v4
+            #   with:
+            #     name: build-output
+            #     path: dist/
+
+            # ✅ Unique name per matrix dimension
+            - uses: actions/upload-artifact@v4
+              with:
+                name: build-output-${{ matrix.os }}
+                path: dist/
+
+        package:
+          needs: build
+          runs-on: ubuntu-latest
+          steps:
+            # ✅ Download all matrix artifacts with wildcard
+            - uses: actions/download-artifact@v4
+              with:
+                pattern: build-output-*
+                merge-multiple: true
+                path: dist/
+  - language: yaml
+    label: "Parallel jobs — unique names with merge step"
+    code: |
+      jobs:
+        test-unit:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test -- --reporter=junit --output-file=test-results.xml
+            - uses: actions/upload-artifact@v4
+              with:
+                name: test-results-unit      # unique name
+                path: test-results.xml
+
+        test-integration:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm run test:integration -- --output-file=test-results.xml
+            - uses: actions/upload-artifact@v4
+              with:
+                name: test-results-integration    # unique name
+                path: test-results.xml
+
+        report:
+          needs: [test-unit, test-integration]
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/download-artifact@v4
+              with:
+                pattern: test-results-*
+                merge-multiple: true
+                path: all-results/
+prevention:
+  - "Always include a unique identifier in artifact names when multiple jobs upload
+    artifacts — use `${{ matrix.* }}`, `${{ github.job }}`, or a descriptive suffix."
+  - "Treat artifact names like immutable keys: once uploaded in a run, they cannot be
+    overwritten; design names accordingly."
+  - "Use `download-artifact@v4` with `pattern:` and `merge-multiple: true` to collect
+    artifacts from multiple jobs into a single directory in a downstream job."
+  - "If your workflow retries jobs automatically, include the attempt number
+    (`${{ github.run_attempt }}`) in the artifact name to avoid conflicts on retry."
+docs:
+  - url: "https://github.com/actions/upload-artifact/issues/478"
+    label: "actions/upload-artifact#478 — 409 Conflict: artifact with this name already exists"
+  - url: "https://github.com/actions/upload-artifact/blob/main/RELEASES.md"
+    label: "upload-artifact v4 release notes — immutability change"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-and-sharing-data-from-a-workflow"
+    label: "GitHub Docs: Storing and sharing data from a workflow"
+  - url: "https://github.com/actions/download-artifact?tab=readme-ov-file#download-multiple-artifacts"
+    label: "download-artifact: Downloading multiple artifacts with patterns"

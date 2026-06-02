@@ -1,0 +1,127 @@
+id: yaml-syntax-016
+title: "vars Context Rejected Inside Composite Action Expressions"
+category: yaml-syntax
+severity: error
+tags:
+  - composite-actions
+  - vars-context
+  - expression
+  - runner-validation
+  - organization-variables
+  - repository-variables
+patterns:
+  - regex: "Unrecognized named-value.*'?vars'?"
+    flags: "i"
+  - regex: "Unexpected value.*vars\\.\\w+"
+    flags: "i"
+  - regex: "inputs\\.\\w+.*\\|\\|.*vars\\.\\w+.*not.*recognized"
+    flags: "i"
+error_messages:
+  - "Unrecognized named-value: 'vars'. Located at position X within expression: inputs.region || vars.AWS_REGION || 'us-east-1'"
+  - "Error: Unrecognized named-value: 'vars'"
+  - "Invalid workflow file: .github/actions/my-action/action.yml (Line N, Col M): Unrecognized named-value: 'vars'"
+root_cause: |
+  The `vars` context (organization/repository/environment variables) is **not available
+  inside composite action definitions** (`action.yml`). Runner validation enforces
+  context availability rules per the element type, and composite actions are not
+  permitted to reference `vars.*` in their step expressions.
+
+  This was not always enforced — older runner versions allowed some cross-context
+  references in composite actions, but a runner validation tightening (tracked in
+  actions/runner#4311) made this a hard error. Workflows that worked before started
+  failing after runner updates were rolled out to GitHub-hosted and self-hosted runners.
+
+  **Why the restriction exists:** Composite actions are designed to be reusable across
+  repositories and organizations. The `vars` context is scoped to the calling repository
+  or organization — a composite action cannot safely resolve `vars.*` at definition time
+  because it would create an implicit dependency on the caller's variable set without
+  explicit declaration as an `input`.
+
+  **Affected expression positions:**
+  - `with:` value fields in composite action steps
+  - `run:` shell commands using `${{ vars.* }}` syntax
+  - `if:` conditions on composite action steps
+  - Default values for composite action inputs that fall back to `vars.*`
+fix: |
+  Remove `vars.*` references from composite action definitions. Instead, require
+  callers to pass variables explicitly as action `inputs`, and reference those inputs
+  inside the composite action.
+
+  **Pattern:**
+  1. Add an explicit `input` to the composite action for any value currently read from
+     `vars.*`
+  2. Give it a meaningful name and a default value (empty string or a sensible default)
+  3. In the calling workflow, pass the variable value as `with: my-input: ${{ vars.MY_VAR }}`
+  4. Inside the composite action, replace `${{ vars.MY_VAR }}` with `${{ inputs.my-input }}`
+fix_code:
+  - language: yaml
+    label: "action.yml — Replace vars.* with an explicit input"
+    code: |
+      # ❌ BROKEN: vars context not available in composite actions
+      # action.yml
+      inputs:
+        region:
+          description: "AWS region"
+          required: false
+          default: ""   # cannot use: ${{ vars.AWS_REGION }}
+
+      runs:
+        using: composite
+        steps:
+          - name: Deploy
+            shell: bash
+            run: |
+              # ❌ This will fail:
+              # REGION="${{ inputs.region || vars.AWS_REGION || 'us-east-1' }}"
+
+              # ✅ Use only inputs:
+              REGION="${{ inputs.region || 'us-east-1' }}"
+              echo "Deploying to $REGION"
+  - language: yaml
+    label: "caller workflow — Pass vars.* as an explicit input"
+    code: |
+      # ✅ Calling workflow passes vars.* to the composite action explicitly
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: ./.github/actions/deploy
+              with:
+                region: ${{ vars.AWS_REGION }}   # resolved in caller, not inside composite
+  - language: yaml
+    label: "action.yml — Full corrected composite action"
+    code: |
+      # ✅ CORRECT: composite action with explicit input, no vars.* reference
+      name: Deploy to AWS
+      description: Deploy application to AWS
+
+      inputs:
+        region:
+          description: "AWS region (pass vars.AWS_REGION from caller)"
+          required: false
+          default: "us-east-1"
+
+      runs:
+        using: composite
+        steps:
+          - name: Deploy
+            shell: bash
+            run: echo "Deploying to ${{ inputs.region }}"
+prevention:
+  - "Never reference `vars.*`, `secrets.*`, or `env.*` directly inside composite action
+    step expressions — these contexts are not available at composite action evaluation time."
+  - "Treat composite actions like reusable library functions: all runtime values must
+    come in through declared `inputs`."
+  - "In the calling workflow, resolve `vars.*` or `secrets.*` at the `with:` level and
+    pass resulting values as string inputs."
+  - "Run `act` locally or validate with `actionlint` to catch context availability
+    errors before pushing to GitHub."
+docs:
+  - url: "https://github.com/actions/runner/issues/4311"
+    label: "actions/runner#4311 — vars context rejected in composite actions"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#context-availability"
+    label: "GitHub Docs: Context availability by element type"
+  - url: "https://docs.github.com/en/actions/sharing-automations/creating-actions/creating-a-composite-action"
+    label: "GitHub Docs: Creating a composite action"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/variables#using-the-vars-context-to-access-configuration-variable-values"
+    label: "GitHub Docs: Using the vars context"
