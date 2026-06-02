@@ -1,0 +1,128 @@
+id: permissions-auth-011
+title: "GITHUB_TOKEN Cannot Pull Private GitHub Packages Without packages: read Permission"
+category: permissions-auth
+severity: error
+tags:
+  - github-packages
+  - ghcr
+  - container-registry
+  - packages-read
+  - github-token
+  - 401
+  - npm-packages
+  - docker
+patterns:
+  - regex: "401 Unauthorized.*(?:ghcr\\.io|npm\\.pkg\\.github\\.com|maven\\.pkg\\.github\\.com)"
+    flags: "i"
+  - regex: "(?:ghcr\\.io|npm\\.pkg\\.github\\.com).*401 Unauthorized"
+    flags: "i"
+  - regex: "Error response from daemon.*(?:unauthorized|denied).*ghcr\\.io"
+    flags: "i"
+  - regex: "npm ERR!\\s+401\\s+Unauthorized.*npm\\.pkg\\.github\\.com"
+    flags: "i"
+  - regex: "unauthorized: authentication required"
+    flags: "i"
+error_messages:
+  - "Error response from daemon: pull access denied for ghcr.io/org/image, repository does not exist or may require 'docker login': denied: denied"
+  - "npm ERR! 401 Unauthorized - GET https://npm.pkg.github.com/@org%2fpkg/-/pkg-1.0.0.tgz"
+  - "unauthorized: authentication required"
+  - "Error: The process '/usr/bin/docker' failed with exit code 1"
+root_cause: |
+  When a GitHub Actions workflow pulls from the GitHub Container Registry (ghcr.io) or from
+  GitHub Packages registries (npm.pkg.github.com, maven.pkg.github.com), the GITHUB_TOKEN
+  must have the `packages: read` permission explicitly granted.
+
+  The GITHUB_TOKEN's default permissions do NOT include `packages: read` unless:
+  1. The repository's default token permissions (Settings → Actions → General) are set to
+     "Read and write" at the org or repository level.
+  2. The workflow or job explicitly declares `permissions: packages: read`.
+
+  Commonly confused behaviors:
+  - A public package on ghcr.io from the same org is readable without auth — but a private
+    package or a package from a private repository requires authentication.
+  - GITHUB_TOKEN is scoped to the CURRENT repository. Pulling packages published from a
+    DIFFERENT repository in the same org may require a PAT even with packages: read set,
+    because the token only has read access to packages owned by the current repo.
+  - When `permissions:` is set at the workflow level (even just `contents: read`), all
+    unmentioned permissions are downgraded to 'none' — this silently removes packages: read
+    if it was previously implied by repository defaults.
+
+  This error is particularly common when:
+  - A workflow was working until someone added a top-level permissions: block for another
+    purpose (e.g., to set id-token: write for OIDC), silently removing packages: read
+  - The organization was migrated from packages-on-repo to ghcr.io
+  - Running workflows on forks (secrets unavailable, GITHUB_TOKEN scoped differently)
+fix: |
+  Add `packages: read` to the workflow-level or job-level permissions block.
+
+  For cross-repository package pulls where GITHUB_TOKEN is insufficient, create a
+  Classic PAT with `read:packages` scope (or a fine-grained PAT with "Packages: read"
+  for the source repo) and store it as a repository secret.
+fix_code:
+  - language: yaml
+    label: "Grant packages: read to pull from ghcr.io"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          permissions:
+            contents: read
+            packages: read  # ← required for ghcr.io and GitHub Packages
+          steps:
+            - name: Log in to GitHub Container Registry
+              uses: docker/login-action@v3
+              with:
+                registry: ghcr.io
+                username: ${{ github.actor }}
+                password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Pull image
+              run: docker pull ghcr.io/${{ github.repository_owner }}/my-image:latest
+  - language: yaml
+    label: "Authenticate npm to GitHub Packages with GITHUB_TOKEN"
+    code: |
+      jobs:
+        install:
+          runs-on: ubuntu-latest
+          permissions:
+            contents: read
+            packages: read
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Authenticate npm to GitHub Packages
+              run: |
+                echo "//npm.pkg.github.com/:_authToken=${{ secrets.GITHUB_TOKEN }}" >> ~/.npmrc
+                echo "@myorg:registry=https://npm.pkg.github.com" >> ~/.npmrc
+
+            - run: npm ci
+  - language: yaml
+    label: "Cross-repo package pull using PAT (when GITHUB_TOKEN is insufficient)"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Log in to ghcr.io with PAT (cross-repo packages)
+              uses: docker/login-action@v3
+              with:
+                registry: ghcr.io
+                username: ${{ github.actor }}
+                # PAT with read:packages scope stored as repository secret
+                password: ${{ secrets.PACKAGES_READ_PAT }}
+
+            - run: docker pull ghcr.io/other-org/shared-image:latest
+prevention:
+  - "Always declare explicit `permissions:` blocks — adding ANY permission key removes all defaults, so list everything your job needs."
+  - "Include `packages: read` whenever a job pulls from ghcr.io, npm.pkg.github.com, or maven.pkg.github.com."
+  - "Note that GITHUB_TOKEN is scoped to the current repository; cross-repository package pulls may require a PAT with `read:packages` scope."
+  - "When adding `id-token: write` for OIDC, simultaneously audit all other permissions your jobs need to avoid accidentally removing packages: read."
+docs:
+  - url: "https://docs.github.com/en/packages/managing-github-packages-using-github-actions-workflows/publishing-and-installing-a-package-with-github-actions"
+    label: "GitHub docs — Publishing and installing packages with GitHub Actions"
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#permissions-for-the-github_token"
+    label: "GitHub docs — GITHUB_TOKEN permissions reference"
+  - url: "https://stackoverflow.com/questions/64124831/github-actions-401-unauthorized-when-installing-a-github-package-with-npm-or-yarn"
+    label: "Stack Overflow — 401 unauthorized installing GitHub Package with GITHUB_TOKEN"
+  - url: "https://github.com/orgs/community/discussions/162859"
+    label: "Community discussion #162859 — 401 bad request installing GitHub Packages"
