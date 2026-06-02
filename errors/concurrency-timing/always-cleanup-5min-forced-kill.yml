@@ -1,0 +1,140 @@
+id: concurrency-timing-011
+title: "always() Cleanup Jobs Forcibly Killed After 5-Minute Cancellation Timeout"
+category: concurrency-timing
+severity: warning
+tags:
+  - always
+  - cancellation
+  - cleanup
+  - forced-termination
+  - notification
+  - timeout
+  - teardown
+patterns:
+  - regex: "The runner has received a shutdown signal"
+    flags: "i"
+  - regex: "Job was cancelled"
+    flags: "i"
+  - regex: "The operation was canceled"
+    flags: "i"
+error_messages:
+  - "The runner has received a shutdown signal. This can happen when the runner service is stopped, a new job is started, or the runner is in the process of shutting down."
+  - "Job was cancelled"
+root_cause: |
+  When a workflow run is cancelled (manually or via `cancel-in-progress`), GitHub Actions
+  re-evaluates the `if:` condition for every currently running job. Jobs marked with
+  `if: always()` continue running — this is the intended mechanism for cleanup, notifications,
+  and teardown steps.
+
+  However, GitHub enforces a **5-minute hard termination window** after cancellation is
+  initiated. Once 5 minutes have elapsed since the cancellation signal, ALL remaining jobs
+  are forcibly killed by the server, regardless of their `if:` conditions — including jobs
+  explicitly marked `if: always()`.
+
+  This means:
+  - Cleanup jobs that take more than 5 minutes (Terraform destroy, test result uploads,
+    Slack notifications with retries, database teardown) will be killed mid-execution.
+  - The job may appear partially completed in the logs with no clear failure message —
+    it simply stops, often leaving infrastructure in a partial or inconsistent state.
+  - Developers are surprised that `always()` does not guarantee the job completes after
+    a workflow cancellation.
+
+  Common failure scenarios:
+  - Artifact upload in an `if: always()` post-job step when the upload is slow
+  - Terraform `destroy` as a cleanup job when a long-running deployment is cancelled
+  - Notification jobs that retry on transient failures and consume more time than expected
+  - Integration test teardown (database resets, container removal) that exceeds 5 minutes
+
+  Source: GitHub Docs — Canceling a workflow: "After the 5 minute cancellation timeout
+  period, the server will forcibly terminate all jobs that are still running."
+fix: |
+  Design `always()` cleanup jobs to complete well within 5 minutes. Add a job-level
+  `timeout-minutes: 4` to any cleanup job that runs after cancellation so it fails
+  cleanly rather than being force-killed at an unpredictable point.
+
+  For teardown that cannot be shortened, trigger cleanup from a separate workflow using
+  `workflow_run: [completed]` — it runs after the cancelled run fully settles and is
+  not subject to the 5-minute window.
+
+  Use the `cancelled()` expression to detect cancellation and take a fast code path.
+fix_code:
+  - language: yaml
+    label: "Guard cleanup job with timeout-minutes to fail fast before forced kill"
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          timeout-minutes: 60
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./deploy.sh
+
+        cleanup:
+          needs: deploy
+          if: always()
+          runs-on: ubuntu-latest
+          timeout-minutes: 4   # Stay under the 5-min forced-kill window
+          steps:
+            - name: Teardown infrastructure
+              run: ./teardown.sh
+              timeout-minutes: 3   # Per-step guard too
+
+  - language: yaml
+    label: "Use cancelled() to take a fast notification path on cancellation"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./slow-build.sh
+
+        notify:
+          needs: build
+          if: always()
+          runs-on: ubuntu-latest
+          steps:
+            - name: Quick notification (cancellation — must be fast)
+              if: cancelled()
+              run: |
+                curl -s -X POST "$SLACK_WEBHOOK" \
+                  -H 'Content-type: application/json' \
+                  -d '{"text":"⚠️ Workflow cancelled — cleanup may be incomplete"}'
+
+            - name: Full notification (success or failure path — has time)
+              if: "!cancelled()"
+              run: ./full-notify.sh "${{ needs.build.result }}"
+
+  - language: yaml
+    label: "Post-cancellation teardown via workflow_run — not subject to 5-min window"
+    code: |
+      # cleanup.yml — separate workflow triggered after any completion including cancellation
+      on:
+        workflow_run:
+          workflows: ["Deploy"]
+          types: [completed]
+
+      jobs:
+        teardown:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Emergency cleanup when deploy was cancelled
+              if: github.event.workflow_run.conclusion == 'cancelled'
+              run: ./emergency-teardown.sh
+
+            - name: Normal cleanup on success or failure
+              if: github.event.workflow_run.conclusion != 'cancelled'
+              run: ./standard-teardown.sh
+prevention:
+  - "Keep `if: always()` cleanup jobs under 4 minutes — add `timeout-minutes: 4` as a safety guard."
+  - "Use `if: cancelled()` to detect cancellation and take a fast code path rather than the full teardown path."
+  - "For cleanup that takes longer than 5 minutes, use a separate `workflow_run: [completed]` workflow that runs outside the cancellation window."
+  - "Test cancellation behavior by manually cancelling a long-running workflow and verifying cleanup jobs complete before 5 minutes."
+docs:
+  - url: "https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-workflow-runs/canceling-a-workflow"
+    label: "GitHub Docs: Canceling a workflow (5-minute forced termination)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#status-check-functions"
+    label: "Status check functions: always(), cancelled()"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run"
+    label: "workflow_run event — trigger cleanup after completed workflows"

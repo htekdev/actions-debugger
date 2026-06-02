@@ -1,0 +1,146 @@
+id: known-unsolved-017
+title: "timeout-minutes Is Silently Ignored on Steps Inside Composite Actions"
+category: known-unsolved
+severity: limitation
+tags:
+  - timeout-minutes
+  - composite-action
+  - limitation
+  - step-timeout
+  - composite
+  - hung-step
+  - action-yml
+patterns:
+  - regex: "timeout.?minutes.*composite|using.*composite.*timeout"
+    flags: "i"
+  - regex: "Unexpected value 'timeout-minutes'"
+    flags: "i"
+error_messages:
+  - "Unexpected value 'timeout-minutes'"
+root_cause: |
+  GitHub Actions supports `timeout-minutes` at the job level and at individual step level
+  inside regular workflow files. However, `timeout-minutes` is NOT enforced on steps
+  inside composite actions (action.yml files using `runs.using: composite`).
+
+  Adding `timeout-minutes` to a step within a composite action's `steps:` block is
+  accepted by the YAML parser without error, but the timeout is silently NOT applied
+  at runtime. A hung step inside a composite action will run until the parent job's
+  overall `timeout-minutes` is exhausted — up to 6 hours on GitHub-hosted runners by
+  default.
+
+  This creates a dangerous gap:
+  - Network-dependent steps (downloads, API calls, package installs) inside a composite
+    action can hang indefinitely if the network is slow or unresponsive
+  - `actions/cache` intermittently stalls; wrapping it in a composite action with a
+    step `timeout-minutes: 5` provides NO protection
+  - Composite action authors cannot provide defensive step timeouts — users of the
+    composite action must rely entirely on the calling job's `timeout-minutes`
+  - Since the step timeout appears to be set (the YAML is valid), developers believe
+    they have a guard when they actually have none
+
+  The limitation has been tracked and discussed in the community since 2021
+  (actions/runner#1979) and remains unresolved as of 2026.
+
+  Source: actions/runner#1979 — "We would like to see timeout-minutes supported on
+  steps in composite actions. Occasionally actions like actions/cache bug out and run
+  for the default timeout time (6 hours) which causes unnecessary costs."
+fix: |
+  Since step-level timeouts cannot be enforced inside composite actions, use these
+  workarounds:
+
+  1. **Shell-level timeout**: Wrap commands in `timeout <seconds>` (bash) or `Start-Sleep`
+     + `Start-Job` with timeout (PowerShell) to kill hung processes from within the script.
+  2. **Job-level `timeout-minutes`**: Set a conservative timeout on the calling job as a
+     safety net — it limits the composite action's maximum runtime.
+  3. **Step-level timeout in the calling workflow**: When calling a composite action as
+     a step in a workflow file, `timeout-minutes` IS supported at the step level in the
+     workflow (not inside the composite itself). This provides a per-call timeout.
+  4. **Split into multiple reusable actions**: Replace a large composite action with
+     multiple smaller ones, each invoked as a separate workflow step — where step-level
+     `timeout-minutes` IS enforced.
+fix_code:
+  - language: yaml
+    label: "WRONG — timeout-minutes inside composite action step is silently ignored"
+    code: |
+      # action.yml — composite action
+      name: "Setup with Timeout"
+      runs:
+        using: composite
+        steps:
+          - name: Download dependencies
+            timeout-minutes: 5   # ← SILENTLY IGNORED — not enforced at runtime
+            shell: bash
+            run: curl -o deps.tar.gz "${{ inputs.deps-url }}"
+
+  - language: yaml
+    label: "Workaround: shell-level timeout inside composite action"
+    code: |
+      # action.yml — composite action
+      name: "Setup with Shell Timeout"
+      runs:
+        using: composite
+        steps:
+          - name: Download dependencies with shell timeout
+            shell: bash
+            run: |
+              # timeout-minutes on this step would be ignored — use shell timeout instead
+              timeout 300 curl -o deps.tar.gz "${{ inputs.deps-url }}" || {
+                echo "::error::Download timed out after 5 minutes"
+                exit 1
+              }
+
+          - name: Cache restore with timeout guard
+            shell: bash
+            run: |
+              timeout 120 ./restore-cache.sh || {
+                echo "::warning::Cache restore timed out — continuing without cache"
+              }
+
+  - language: yaml
+    label: "Workaround: step-level timeout in the calling WORKFLOW (not inside composite)"
+    code: |
+      # workflow.yml — timeout-minutes at step level in workflow DOES work
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          timeout-minutes: 30   # Job-level safety net
+          steps:
+            - uses: actions/checkout@v4
+
+            # timeout-minutes here is at the WORKFLOW step level — this IS enforced
+            - name: Run composite action
+              uses: ./.github/actions/my-composite-action
+              timeout-minutes: 10   # Works: this is a workflow step, not inside the composite
+
+            - run: npm run build
+
+  - language: yaml
+    label: "Workaround: split composite into multiple actions — each gets timeout"
+    code: |
+      # workflow.yml — multiple smaller actions instead of one large composite
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            # Each step in the workflow gets enforceable timeout-minutes
+            - uses: ./.github/actions/setup-node
+              timeout-minutes: 5    # Enforced — workflow step level
+
+            - uses: ./.github/actions/restore-cache
+              timeout-minutes: 3    # Enforced
+
+            - uses: ./.github/actions/install-deps
+              timeout-minutes: 10   # Enforced
+prevention:
+  - "Never rely on `timeout-minutes` inside composite action `steps:` — the field is accepted but silently ignored."
+  - "Use `timeout <seconds>` (bash) or PowerShell job timeouts as shell-level guards for long-running composite steps."
+  - "Apply `timeout-minutes` at the step level in the CALLING WORKFLOW (not inside the composite) for per-invocation limits."
+  - "Always set a job-level `timeout-minutes` on any job that calls composite actions, as a safety net against runaway steps."
+  - "Composite action authors should document the expected maximum runtime so callers can set appropriate job-level timeouts."
+docs:
+  - url: "https://github.com/actions/runner/issues/1979"
+    label: "actions/runner#1979 — timeout-minutes not enforced in composite action steps (open since 2021)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idstepstimeout-minutes"
+    label: "GitHub Docs: steps[*].timeout-minutes (workflow-level steps — works)"
+  - url: "https://docs.github.com/en/actions/sharing-automations/creating-actions/metadata-syntax-for-github-actions#runs-for-composite-actions"
+    label: "GitHub Docs: Metadata syntax for composite actions"
