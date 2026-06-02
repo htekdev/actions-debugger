@@ -1,0 +1,116 @@
+id: known-unsolved-014
+title: "Reusable Workflows Cannot Be Called from Composite Actions"
+category: known-unsolved
+severity: limitation
+tags:
+  - composite-action
+  - reusable-workflow
+  - workflow-call
+  - limitation
+  - uses-key
+  - no-fix
+patterns:
+  - regex: "Reusable workflows cannot be referenced from composite actions"
+    flags: "i"
+  - regex: "uses:.*\\.github/workflows/.*\\.yml.*composite"
+    flags: "i"
+  - regex: "A reusable workflow cannot be used as a step in a composite action"
+    flags: "i"
+error_messages:
+  - "Error: Reusable workflows cannot be referenced from composite actions."
+  - "A reusable workflow cannot be used as a step in a composite action."
+root_cause: |
+  GitHub Actions enforces a strict separation between two different abstraction levels:
+  - **Actions** (composite, JavaScript, Docker) — called from workflow steps via `uses:`
+  - **Reusable workflows** (called via `workflow_call` trigger) — called from workflow jobs
+    via `uses:` at the JOB level, not the step level
+
+  A composite action runs within a step inside a job. A reusable workflow, however, IS a
+  job (or set of jobs). You cannot embed a job inside a step — this is a fundamental
+  architectural constraint, not a configuration error.
+
+  This fails at validation time with a clear error message. The error is triggered when:
+  - A composite action's `runs.steps` contains a `uses:` entry that points to a
+    `.github/workflows/*.yml` file (a reusable workflow)
+  - An organization tried to nest workflow-level orchestration inside a step-level action
+
+  There is no workaround that preserves both the composite action wrapping and the reusable
+  workflow invocation. GitHub has confirmed this is by design and has no plans to change it.
+  The GitHub Actions team's rationale: reusable workflows operate at the job/runner level
+  and require job-level context (needs:, outputs:, secrets: inheritance) that cannot exist
+  inside a step.
+fix: |
+  There is no fix — this is a platform limitation.
+
+  The recommended alternatives are:
+  1. **Restructure to call the reusable workflow at the job level** (not from inside a
+     composite action). Move the reusable workflow call to a dedicated job in your workflow
+     file using `jobs.my-job.uses:`.
+  2. **Convert the reusable workflow into a composite action** if the logic does not require
+     job-level features (matrix, needs: dependencies, explicit runner selection, secrets
+     inheritance via `secrets: inherit`).
+  3. **Inline the reusable workflow steps** into the composite action directly. While this
+     loses the DRY benefit of the reusable workflow, it resolves the structural constraint.
+fix_code:
+  - language: yaml
+    label: "Call reusable workflow at job level (not from composite action)"
+    code: |
+      # ❌ This FAILS — cannot call reusable workflow from composite action step
+      # In: .github/actions/my-composite/action.yml
+      # runs:
+      #   using: "composite"
+      #   steps:
+      #     - uses: ./.github/workflows/shared-build.yml   # ERROR: not allowed
+      #       with:
+      #         environment: staging
+
+      # ✅ Call reusable workflow at job level in workflow file instead
+      jobs:
+        setup:
+          runs-on: ubuntu-latest
+          steps:
+            # Composite action can still do pre/post steps
+            - uses: ./.github/actions/my-composite
+              with:
+                param: value
+
+        shared-build:
+          needs: setup
+          uses: ./.github/workflows/shared-build.yml
+          with:
+            environment: staging
+          secrets: inherit
+  - language: yaml
+    label: "Convert reusable workflow to composite action (when job-level features not needed)"
+    code: |
+      # .github/actions/shared-build/action.yml
+      name: "Shared Build"
+      description: "Composite action equivalent of the shared-build reusable workflow"
+      inputs:
+        environment:
+          required: true
+          description: "Target environment"
+      runs:
+        using: "composite"
+        steps:
+          - name: Setup Node
+            uses: actions/setup-node@v4
+            with:
+              node-version: '20'
+          - name: Build
+            shell: bash
+            run: npm run build:${{ inputs.environment }}
+prevention:
+  - "Understand the GitHub Actions hierarchy: Docker/JS/composite actions run WITHIN steps; reusable workflows run AS jobs."
+  - "Use composite actions when you want to share steps across workflows within a single job."
+  - "Use reusable workflows (workflow_call) when you want to share an entire job or multi-job sequence."
+  - "If you need both abstraction levels, combine them: a job calls a reusable workflow, and within that workflow's jobs, steps call composite actions."
+docs:
+  - url: "https://docs.github.com/en/actions/sharing-automations/reusing-workflows#limitations"
+    label: "GitHub docs — Reusing workflows: limitations (composite action restriction)"
+  - url: "https://docs.github.com/en/actions/sharing-automations/creating-actions/creating-a-composite-action"
+    label: "GitHub docs — Creating a composite action"
+  - url: "https://github.com/orgs/community/discussions/11834"
+    label: "Community discussion #11834 — reusable workflow called from composite action error"
+  - url: "https://stackoverflow.com/questions/70421268/how-to-reference-a-reusable-workflow-from-a-composite-action"
+    label: "Stack Overflow — reference reusable workflow from composite action"

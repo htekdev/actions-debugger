@@ -1,0 +1,111 @@
+id: silent-failures-018
+title: "github.event.commits and github.event.head_commit Are Null/Empty on Non-Push Triggers"
+category: silent-failures
+severity: silent-failure
+tags:
+  - github-context
+  - workflow-dispatch
+  - schedule
+  - commits
+  - null-access
+  - push-event
+  - expression
+patterns:
+  - regex: "github\\.event\\.commits\\[0\\]"
+    flags: "i"
+  - regex: "github\\.event\\.head_commit\\.(message|id|author)"
+    flags: "i"
+  - regex: "github\\.event\\.commits is not iterable|Cannot read.*commits"
+    flags: "i"
+error_messages:
+  - ""
+  - "Error: Cannot read properties of undefined (reading 'message')"
+  - "Error: github.event.commits[0] is undefined"
+root_cause: |
+  The `github.event.commits` array and `github.event.head_commit` object are ONLY populated
+  for `push` webhook events. They are absent (null / empty array) for all other trigger types:
+
+  - `workflow_dispatch` — manual UI or API trigger, no commit context
+  - `schedule` — cron-triggered run, no specific push associated
+  - `pull_request` / `pull_request_target` — uses github.event.pull_request instead
+  - `workflow_call` — reusable workflow invocation, no commit array
+  - `repository_dispatch` — uses github.event.client_payload, no commits key
+  - `release` — uses github.event.release, no commits array
+
+  When a workflow is triggered on both `push` and `workflow_dispatch` (a common pattern),
+  expressions like:
+    ${{ github.event.commits[0].message }}
+    ${{ github.event.head_commit.id }}
+
+  silently evaluate to empty string ('') on non-push triggers rather than raising an error.
+  GitHub Actions treats missing context properties as empty string, so the step runs but
+  with blank or wrong data — the workflow shows green while producing incorrect output.
+
+  This is a silent failure because there is no error in the logs when the empty string is
+  used in a step (e.g., an echo, a tag, a release title). The problem only becomes visible
+  when the downstream artifact or message is inspected.
+fix: |
+  Use git directly to extract commit information — it works reliably across all trigger types
+  (as long as fetch-depth is not 1 / uses default full clone or depth >= 2):
+
+    git log --format=%s -1      # subject line
+    git log --format=%H -1      # full SHA
+    git log --format=%ae -1     # author email
+
+  Alternatively, guard commit-context access with an event_name check, or use the
+  github.sha context (which IS available on all triggers) when a commit SHA is needed.
+fix_code:
+  - language: yaml
+    label: "Portable commit message extraction via git (works on all triggers)"
+    code: |
+      jobs:
+        release:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                fetch-depth: 2  # depth >= 2 required for git log on non-push
+
+            - name: Get commit message (safe for push, workflow_dispatch, schedule)
+              id: meta
+              run: |
+                echo "sha=${{ github.sha }}" >> $GITHUB_OUTPUT
+                echo "message=$(git log --format=%s -1 ${{ github.sha }})" >> $GITHUB_OUTPUT
+                echo "author=$(git log --format=%ae -1 ${{ github.sha }})" >> $GITHUB_OUTPUT
+
+            - name: Use commit metadata
+              run: |
+                echo "SHA: ${{ steps.meta.outputs.sha }}"
+                echo "Message: ${{ steps.meta.outputs.message }}"
+  - language: yaml
+    label: "Guard push-only context with event_name check"
+    code: |
+      - name: Get commit message (push only)
+        if: github.event_name == 'push' && github.event.commits[0] != null
+        run: |
+          echo "COMMIT_MSG=${{ github.event.commits[0].message }}" >> $GITHUB_ENV
+
+      - name: Fallback for non-push triggers
+        if: github.event_name != 'push'
+        run: |
+          echo "COMMIT_MSG=$(git log --format=%s -1)" >> $GITHUB_ENV
+  - language: yaml
+    label: "Debug: dump full event payload to understand what is available"
+    code: |
+      - name: Debug — dump event context
+        run: echo '${{ toJSON(github.event) }}'
+prevention:
+  - "Never access github.event.commits or github.event.head_commit without first checking github.event_name == 'push'."
+  - "Use `git log --format=%s -1 ${{ github.sha }}` for commit message extraction — it works on all trigger types."
+  - "Note that github.sha IS available on all triggers and points to the relevant commit; use it as a portable substitute for github.event.head_commit.id."
+  - "Add a debug step early in development to dump `${{ toJSON(github.event) }}` so you can see exactly what context is available for each trigger type."
+  - "Test workflows by triggering them manually via workflow_dispatch to catch push-only context assumptions before they hit production."
+docs:
+  - url: "https://docs.github.com/en/webhooks/webhook-events-and-payloads#push"
+    label: "GitHub docs — push event payload (includes commits array)"
+  - url: "https://docs.github.com/en/webhooks/webhook-events-and-payloads#workflow_dispatch"
+    label: "GitHub docs — workflow_dispatch event payload (no commits array)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/accessing-contextual-information-about-workflow-runs#github-context"
+    label: "GitHub docs — github context reference"
+  - url: "https://github.com/orgs/community/discussions/27058"
+    label: "Community discussion — github.event.commits undefined on workflow_dispatch"

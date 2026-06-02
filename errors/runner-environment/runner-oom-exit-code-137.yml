@@ -1,0 +1,117 @@
+id: runner-environment-038
+title: "Runner Job Killed with Exit Code 137 (Out of Memory / OOM Kill)"
+category: runner-environment
+severity: error
+tags:
+  - oom
+  - exit-code-137
+  - memory
+  - killed
+  - sigkill
+  - runner
+patterns:
+  - regex: "Process completed with exit code 137"
+    flags: "i"
+  - regex: "runner has received a shutdown signal"
+    flags: "i"
+  - regex: "The hosted runner.*lost communication with the server"
+    flags: "i"
+  - regex: "Killed\\s*$"
+    flags: "im"
+error_messages:
+  - "Process completed with exit code 137."
+  - "The runner has received a shutdown signal. This can happen when the runner service is stopped, or a manually started runner is canceled."
+  - "The hosted runner: GitHub Actions N runner lost communication with the server. Anything after this message may not be captured."
+  - "Killed"
+root_cause: |
+  Exit code 137 on Linux is 128 + signal 9 (SIGKILL), meaning the process was forcibly
+  terminated by the operating system's OOM (Out of Memory) killer. This happens when a process
+  or the runner VM exhausts available memory and the kernel kills it to recover resources.
+
+  GitHub-hosted runner memory allocations (standard runners):
+  - ubuntu-*/windows-*: 16 GB RAM, 14 GB swap
+  - macos-*: 14 GB RAM (Apple Silicon)
+  - Large runners: 32–64 GB depending on tier
+
+  Common root causes:
+  - JVM tools (Gradle, Maven, Kotlin compiler) defaulting to large heap fractions without
+    explicit -Xmx caps (JVM defaults to up to 25% of system RAM for heap)
+  - Node.js webpack/esbuild bundling large codebases without --max-old-space-size cap
+  - Docker build stages that cache too many layers in memory simultaneously
+  - Test suites with memory leaks that accumulate across hundreds of test cases
+  - cargo/rustc compilation with many parallel units (-j) exceeding available memory
+  - Multiple matrix jobs on a shared self-hosted runner competing for the same memory pool
+
+  The "runner has received a shutdown signal" message is a related pattern that can occur
+  when the runner VM is preempted by GitHub's infrastructure (less common, transient).
+fix: |
+  Option 1 — Cap memory for known heavy tools:
+  - JVM: Set JAVA_OPTS="-Xmx4g -Xms512m" and GRADLE_OPTS="-Xmx4g -Dorg.gradle.daemon=false"
+  - Node.js: Set NODE_OPTIONS="--max-old-space-size=4096"
+  - Rust: Set CARGO_BUILD_JOBS to limit parallel compilation units
+
+  Option 2 — Free memory before intensive steps:
+  - Drop OS page cache: sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+  - Use jlumbroso/free-disk-space action to reclaim space used by pre-installed tools
+
+  Option 3 — Upgrade runner size:
+  - Switch to ubuntu-latest-16-cores (64 GB RAM) for memory-intensive builds
+
+  Option 4 — For transient infrastructure OOM kills:
+  - Simply re-run the failed job — these are often one-off events
+  - Add workflow-level retry for idempotent builds
+fix_code:
+  - language: yaml
+    label: "Cap JVM and Node.js memory to prevent OOM kills"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          env:
+            JAVA_OPTS: "-Xmx4g -Xms512m"
+            GRADLE_OPTS: "-Xmx4g -Dorg.gradle.daemon=false -Dorg.gradle.workers.max=2"
+            NODE_OPTIONS: "--max-old-space-size=4096"
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Free OS page cache
+              run: sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches' || true
+
+            - name: Build
+              run: ./gradlew build
+  - language: yaml
+    label: "Use a larger runner for memory-intensive builds"
+    code: |
+      jobs:
+        build:
+          # Standard: ubuntu-latest = 16 GB RAM
+          # Large runners require billing configuration
+          runs-on: ubuntu-latest-16-cores  # 64 GB RAM
+          steps:
+            - uses: actions/checkout@v4
+            - run: make all
+  - language: yaml
+    label: "Debug memory usage before OOM occurs"
+    code: |
+      - name: Check available memory
+        run: |
+          echo "=== Free memory ==="
+          free -h
+          echo "=== /proc/meminfo ==="
+          grep -E "MemTotal|MemFree|MemAvailable|SwapTotal|SwapFree" /proc/meminfo
+prevention:
+  - "Always set explicit heap caps for JVM-based tools (JAVA_OPTS, GRADLE_OPTS) — never rely on the JVM's auto-detection of available memory."
+  - "Add NODE_OPTIONS=--max-old-space-size=4096 for Node.js build tools processing large codebases."
+  - "Add a 'free memory' step early in memory-intensive jobs using `echo 3 > /proc/sys/vm/drop_caches`."
+  - "Profile memory with `free -h` at start and end of build phases to catch accumulation before hitting the limit."
+  - "Consider the jlumbroso/free-disk-space action which also frees memory by removing unused pre-installed tools."
+  - "For self-hosted runners, set memory limits per job via systemd slice or cgroup to prevent one job from OOM-killing others."
+docs:
+  - url: "https://github.com/actions/runner/issues/3724"
+    label: "actions/runner #3724 — runner shutdown signal reports"
+  - url: "https://github.com/orgs/community/discussions/188508"
+    label: "Community discussion #188508 — unexpected job cancellations and OOM"
+  - url: "https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners/about-github-hosted-runners#supported-runners-and-hardware-resources"
+    label: "GitHub-hosted runner hardware resources"
+  - url: "https://stackoverflow.com/questions/72489714/github-actions-job-cancelled-for-no-obvious-reason"
+    label: "Stack Overflow — job cancelled with no obvious reason (exit 137)"
