@@ -1,0 +1,144 @@
+id: runner-environment-031
+title: "Docker 29.1 + Compose 2.40.3 Runner Update Breaks Compose Commands"
+category: runner-environment
+severity: error
+tags:
+  - docker
+  - docker-compose
+  - docker-29
+  - compose-v2
+  - ubuntu
+  - windows
+  - runner-image-update
+patterns:
+  - regex: "docker compose.*unknown flag|unknown flag.*docker compose"
+    flags: "i"
+  - regex: "docker-compose.*command not found|docker-compose.*deprecated"
+    flags: "i"
+  - regex: "compose.*unknown command|error.*compose.*not a docker command"
+    flags: "i"
+  - regex: "docker compose.*plugin.*not found|failed to get plugins"
+    flags: "i"
+error_messages:
+  - "docker-compose: command not found"
+  - "unknown flag: --compatibility"
+  - "unknown shorthand flag: 'f' in -f"
+  - "Error response from daemon: client version 1.24 is too old. Minimum supported API version is 1.25"
+  - "'docker compose' requires at least 1 argument"
+root_cause: |
+  On **February 9, 2026**, GitHub pushed an update to Ubuntu and Windows runner images
+  that bumped Docker Server and Client from 28.x to **29.1.*** and Docker Compose from
+  2.x to **2.40.3** (announced in actions/runner-images#13474).
+
+  For Ubuntu 24.04, the update was **rolled back** on February 20, 2026 due to multiple
+  reported issues (#13682, #13691, #13684) and is being re-evaluated (tracked in
+  #14105). The Windows runner update proceeded.
+
+  **Breaking changes in Docker Compose 2.40.x and Docker 29.x:**
+
+  1. **`docker-compose` v1 binary removed** — Many older workflows use the hyphenated
+     `docker-compose` command (Compose v1). As of Docker Compose v2, only the plugin
+     form `docker compose` (no hyphen) is installed. Workflows with
+     `run: docker-compose up -d` fail with `command not found`.
+
+  2. **`--compatibility` flag removed** — The `docker compose --compatibility` flag
+     (for mapping v2 configs to v2-compatible behavior) was removed in 2.40.x.
+     Workflows that use `docker compose --compatibility up` fail.
+
+  3. **API version minimums** — Docker 29 raises the minimum supported Docker daemon
+     API version, breaking some older base images in service containers that use the
+     Docker socket with old clients.
+
+  4. **`COMPOSE_DOCKER_CLI_BUILD` env var deprecated** — Setting
+     `COMPOSE_DOCKER_CLI_BUILD=1` no longer has any effect; BuildKit is always used.
+
+  5. **Docker 29.5 `CLONE_NEWTIME` private time namespaces** — Docker 29.5 (released
+     May 2026) enables private time namespaces by default on kernels ≥ 5.6, which
+     breaks Docker-socket-passthrough patterns used in Cloud Native Buildpacks (CNB)
+     lifecycle builds. Buildpack builds via `pack build` or Spring Boot's built-in
+     Buildpacks fail silently or with lifecycle container errors.
+fix: |
+  **For `docker-compose` → `docker compose` migration:**
+  Replace all `docker-compose` (hyphenated) invocations with `docker compose` (space).
+  This is the most common fix.
+
+  **For `--compatibility` flag removal:**
+  Remove the `--compatibility` flag. Docker Compose v2 handles modern compose file
+  formats natively without this flag.
+
+  **For CNB/Buildpack Docker socket passthrough (Docker 29.5+):**
+  Mount the Docker socket without private time namespaces by using
+  `--security-opt=no-new-privileges:false` or by setting
+  `DOCKER_HOST` to use a sidecar daemon.
+
+  **For pinning Docker version on self-hosted runners:**
+  Pin to Docker 28.x until your Compose files and build pipelines are validated against
+  29.x.
+fix_code:
+  - language: yaml
+    label: "Replace docker-compose (v1) with docker compose (v2 plugin)"
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            # ❌ Old (docker-compose v1 — removed)
+            # - run: docker-compose up -d
+            # - run: docker-compose --compatibility up -d
+
+            # ✅ New (docker compose v2 plugin)
+            - name: Start services
+              run: docker compose up -d
+
+            - name: Run tests
+              run: docker compose exec app npm test
+
+            - name: Tear down
+              run: docker compose down
+  - language: yaml
+    label: "Verify Docker and Compose versions in workflow"
+    code: |
+      jobs:
+        debug:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Check Docker version
+              run: |
+                docker version
+                docker compose version
+                # If docker-compose (v1) is needed, install it explicitly:
+                # pip install docker-compose
+  - language: yaml
+    label: "Pin Docker version for self-hosted runners sensitive to 29.x changes"
+    code: |
+      jobs:
+        build:
+          runs-on: self-hosted
+          steps:
+            - name: Pin Docker to 28.x (if 29.x breaks your workflow)
+              run: |
+                sudo apt-get remove -y docker-ce docker-ce-cli
+                sudo apt-get install -y docker-ce=5:28.0.4-1~ubuntu.24.04~noble \
+                  docker-ce-cli=5:28.0.4-1~ubuntu.24.04~noble
+prevention:
+  - "Migrate from `docker-compose` (v1) to `docker compose` (v2 plugin) immediately —
+    v1 is no longer maintained and is removed in Docker 29.x images."
+  - "Remove `--compatibility` flags from all Compose invocations; the flag was
+    deprecated and is removed in Compose 2.40.x."
+  - "Subscribe to `actions/runner-images` announcements to get advance notice of
+    Docker version bumps before they land on hosted runners."
+  - "Pin Docker Compose file format version at `version: '3.8'` or later; v2 Compose
+    files have better compatibility with modern Compose plugin versions."
+  - "Test workflows in a local Docker 29.x environment before relying on them in CI
+    to catch API and behavioral differences early."
+docs:
+  - url: "https://github.com/actions/runner-images/issues/13474"
+    label: "Announcement: Docker 29.1 + Compose 2.40.3 update (runner-images#13474)"
+  - url: "https://github.com/actions/runner-images/issues/14105"
+    label: "Tracking: Ubuntu Docker v29 rollback and re-attempt (runner-images#14105)"
+  - url: "https://docs.docker.com/compose/releases/migrate/"
+    label: "Docker Docs: Migrate from Compose v1 to v2"
+  - url: "https://docs.docker.com/engine/release-notes/29.1/"
+    label: "Docker Engine 29.1 release notes"

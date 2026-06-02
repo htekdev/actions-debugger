@@ -1,0 +1,137 @@
+id: runner-environment-030
+title: "Ubuntu ARM64 Runner Missing Docker — docker: command not found on arm64"
+category: runner-environment
+severity: error
+tags:
+  - arm64
+  - aarch64
+  - docker
+  - ubuntu
+  - partner-runner
+  - docker-buildx
+  - setup-buildx-action
+patterns:
+  - regex: "docker.*command not found|docker.*not found.*arm64"
+    flags: "i"
+  - regex: "docker/setup-buildx-action.*error|setup-buildx.*arm64.*fail"
+    flags: "i"
+  - regex: "Cannot connect to the Docker daemon|Is the docker daemon running"
+    flags: "i"
+  - regex: "Error: Unable to locate executable file: docker"
+    flags: "i"
+error_messages:
+  - "docker: command not found"
+  - "Error: Unable to locate executable file: docker"
+  - "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"
+  - "exec: \"docker\": executable file not found in $PATH"
+root_cause: |
+  GitHub-hosted **Ubuntu 24.04 ARM64** runner images (available via labels such as
+  `ubuntu-24.04-arm64`, `ubuntu-arm`, or partner runner images for ARM64) do **not**
+  have Docker pre-installed on `PATH`, despite the partner image README listing Docker
+  client and server versions.
+
+  This is a **documentation mismatch** affecting ARM64 runner users (actions/runner-
+  images#14051, created March 2026, still open as of May 2026):
+  - The `partner-runner-images` README lists Docker Client 28.0.4 and Docker Server
+    28.0.4 as installed software.
+  - In practice, `docker` is **not present on `PATH`** in these runners.
+  - The runner is identified as `Source: Partner` and `Base Image for Ubuntu Server
+    24.04`.
+
+  **Affected workflows:**
+  - Any step using `docker build`, `docker run`, `docker pull`, or `docker push`
+    directly in a `run:` block.
+  - `docker/setup-buildx-action@v3` fails because it cannot find the Docker CLI.
+  - Container-based jobs that use the host Docker socket.
+  - Multi-platform builds that need BuildKit on ARM64.
+
+  **x86-64 runners are not affected.** This is specific to ARM64 GitHub-hosted
+  runners using the partner image.
+
+  This is distinct from the `docker-buildx-not-setup.yml` entry (which covers x64
+  runners where Docker BuildKit is present but `buildx` is not configured).
+fix: |
+  Install Docker explicitly at the start of ARM64 workflow jobs, or use a Docker
+  action that handles installation automatically.
+
+  **Option 1 — Install Docker via the official convenience script (fastest):**
+  Run the Docker install script at the start of the job. This adds ~60 seconds to
+  job start time but ensures Docker is available.
+
+  **Option 2 — Use `docker/setup-buildx-action@v3` after Docker install:**
+  After installing Docker, `setup-buildx-action` can then install BuildKit buildx.
+
+  **Option 3 — Use a Docker-pre-installed large runner:**
+  If budget allows, use GitHub's x86-64 larger runners which have Docker pre-installed,
+  or a self-hosted ARM64 runner with Docker pre-configured.
+
+  **Option 4 — Use `runs-on: ubuntu-latest` (x86-64) instead of ARM64:**
+  If ARM64 is not strictly required, run on x86-64 which has Docker pre-installed.
+fix_code:
+  - language: yaml
+    label: "Install Docker on ARM64 runner before using it"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-24.04-arm64
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Install Docker
+              run: |
+                curl -fsSL https://get.docker.com -o get-docker.sh
+                sudo sh get-docker.sh
+                sudo usermod -aG docker $USER
+                sudo systemctl start docker
+                docker --version
+
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@v3
+
+            - name: Build image
+              run: docker build -t myapp:latest .
+  - language: yaml
+    label: "Cross-platform build with explicit ARM64 Docker install"
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              include:
+                - runner: ubuntu-latest
+                  platform: linux/amd64
+                - runner: ubuntu-24.04-arm64
+                  platform: linux/arm64
+                  install_docker: true
+          runs-on: ${{ matrix.runner }}
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Install Docker (ARM64 only)
+              if: matrix.install_docker == true
+              run: |
+                curl -fsSL https://get.docker.com | sudo sh
+                sudo usermod -aG docker $USER
+                sudo systemctl enable --now docker
+
+            - name: Build for ${{ matrix.platform }}
+              run: docker build --platform ${{ matrix.platform }} -t myapp .
+prevention:
+  - "Before adding `runs-on: ubuntu-24.04-arm64` to a workflow that uses Docker,
+    verify Docker availability by running `docker --version` in a test job."
+  - "Check the current partner runner image README at
+    https://github.com/actions/partner-runner-images before relying on pre-installed
+    tooling on non-standard runner images."
+  - "Consider using self-hosted ARM64 runners with Docker pre-configured for
+    production workloads that depend on Docker on ARM64."
+  - "Track the open issue (actions/runner-images#14051) for when GitHub adds Docker
+    to ARM64 partner images natively."
+docs:
+  - url: "https://github.com/actions/runner-images/issues/14051"
+    label: "Issue: Ubuntu 24.04 ARM64 missing Docker (runner-images#14051)"
+  - url: "https://github.com/actions/partner-runner-images"
+    label: "actions/partner-runner-images — partner runner image definitions"
+  - url: "https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners/about-github-hosted-runners#standard-github-hosted-runners-for-public-repositories"
+    label: "GitHub Docs: GitHub-hosted runner specifications"
+  - url: "https://docs.docker.com/engine/install/ubuntu/"
+    label: "Docker Docs: Install Docker Engine on Ubuntu"
