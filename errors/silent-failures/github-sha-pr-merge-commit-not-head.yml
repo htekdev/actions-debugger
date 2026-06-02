@@ -1,0 +1,150 @@
+id: silent-failures-021
+title: "GITHUB_SHA on pull_request Is the Synthetic Merge Commit — Not the PR Head Commit"
+category: silent-failures
+severity: silent-failure
+tags:
+  - pull_request
+  - github-sha
+  - GITHUB_SHA
+  - merge-commit
+  - head-sha
+  - docker-tag
+  - commit-lookup
+  - git-show
+patterns:
+  - regex: "github\\.sha"
+    flags: "i"
+  - regex: "GITHUB_SHA"
+    flags: ""
+  - regex: "git show \\$\\{\\{\\s*github\\.sha\\s*\\}\\}"
+    flags: "i"
+  - regex: "commit.*not found|unknown revision or path not in the working tree"
+    flags: "i"
+error_messages:
+  - "fatal: ambiguous argument 'abc1234ef56': unknown revision or path not in the working tree"
+  - "Error: An object named 'abc1234' is not in the repository"
+  - "error: pathspec 'abc1234ef56' did not match any file(s) known to git"
+  - "commit not found: abc1234ef5678"
+root_cause: |
+  When a workflow is triggered by the `pull_request` (or `pull_request_target`) event,
+  `github.sha` and `GITHUB_SHA` do NOT contain the SHA of the PR author's latest commit.
+  Instead, they contain the SHA of a **synthetic merge commit** — a prospective merge of
+  the PR head branch into the target branch, created by GitHub on the fly as
+  `refs/pull/<number>/merge`.
+
+  This merge commit:
+  - Exists only as a special GitHub ref, not as a real commit in the repo's history
+  - Is NOT returned by `git log` on the PR branch
+  - Cannot be resolved by `git show <sha>` after a shallow fetch-depth:1 checkout
+  - Has a different SHA than the PR author's actual commit
+
+  This silently breaks common patterns:
+  - Docker image tagging: `docker build -t myimage:${{ github.sha }}` then looking up
+    that SHA in CI/CD systems finds nothing in the actual branch history
+  - Commit status APIs: posting status to `github.sha` may fail or post to an
+    unexpected ref
+  - Manual `git log --pretty=format:'%H' | grep ${{ github.sha }}` returns nothing
+  - `git show ${{ github.sha }}` after shallow clone fails with "unknown revision"
+
+  The correct variable to get the PR author's head commit SHA is:
+    `github.event.pull_request.head.sha`
+
+  For `workflow_run` events, use:
+    `github.event.workflow_run.head_sha`
+
+  This behavior is documented in the GitHub environment variables reference but not
+  prominently called out, leading to widespread confusion.
+  Source: github/docs#15302 — "GITHUB_SHA on PRs refers to the merge commit"
+  Source: github/docs#17767 — "github.sha description is misleading for pull_request"
+  Source: github/docs#30093 — equivalent of github.sha for other events
+fix: |
+  Replace `github.sha` with `github.event.pull_request.head.sha` whenever you need
+  the actual PR author's commit SHA in a `pull_request`-triggered workflow.
+
+  For `workflow_run`, use `github.event.workflow_run.head_sha`.
+  For `push` events, `github.sha` is correct (it IS the pushed commit's SHA).
+
+  If your workflow must be compatible with multiple event types, add a step to compute
+  the correct SHA once and expose it via `GITHUB_OUTPUT`:
+    ```
+    COMMIT_SHA=${{ github.event.pull_request.head.sha || github.sha }}
+    ```
+  Note: The `||` expression operator works in GitHub Actions expressions —
+  `github.event.pull_request.head.sha` is empty for non-PR events, so `github.sha`
+  becomes the fallback.
+fix_code:
+  - language: yaml
+    label: "Fix: use github.event.pull_request.head.sha for PR head commit"
+    code: |
+      on: pull_request
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            # ❌ WRONG: github.sha is the merge commit SHA, not the PR head commit
+            - name: Tag Docker image (wrong SHA)
+              run: docker build -t myimage:${{ github.sha }} .
+
+            # ✅ CORRECT: use the PR head commit SHA
+            - name: Tag Docker image (correct SHA)
+              run: docker build -t myimage:${{ github.event.pull_request.head.sha }} .
+
+  - language: yaml
+    label: "Cross-event SHA: works for both push and pull_request"
+    code: |
+      on:
+        push:
+        pull_request:
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Resolve correct commit SHA
+              id: sha
+              run: |
+                # For pull_request: use head.sha; for push: fall back to github.sha
+                COMMIT_SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+                echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+
+            - name: Use resolved SHA
+              run: docker build -t myimage:${{ steps.sha.outputs.commit_sha }} .
+
+  - language: yaml
+    label: "workflow_run: use head_sha from the triggering workflow"
+    code: |
+      on:
+        workflow_run:
+          workflows: [CI]
+          types: [completed]
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            # ❌ WRONG: github.sha on workflow_run is the default branch SHA
+            - run: echo "Wrong SHA: ${{ github.sha }}"
+
+            # ✅ CORRECT: head_sha is the SHA of the commit that triggered the upstream workflow
+            - run: echo "Correct SHA: ${{ github.event.workflow_run.head_sha }}"
+
+prevention:
+  - "Never use `github.sha` directly in `pull_request` workflows — always use `github.event.pull_request.head.sha`."
+  - "Add a comment in your workflow YAML calling out which SHA variable to use for which event."
+  - "For Docker tagging and commit status APIs in PR workflows, always derive the SHA from the event payload."
+  - "Add a debug step printing both `github.sha` and `github.event.pull_request.head.sha` when troubleshooting."
+  - "For `workflow_run` events, use `github.event.workflow_run.head_sha` not `github.sha`."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context"
+    label: "GitHub Docs: github context — github.sha"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request"
+    label: "GitHub Docs: pull_request event (GITHUB_SHA value)"
+  - url: "https://github.com/github/docs/issues/15302"
+    label: "github/docs#15302: GITHUB_SHA on PRs refers to the merge commit"
+  - url: "https://github.com/github/docs/issues/17767"
+    label: "github/docs#17767: github.sha description is misleading for pull_request"
