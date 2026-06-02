@@ -1,0 +1,98 @@
+id: silent-failures-023
+title: "upload-artifact Silently Strips Unix File Permissions (chmod +x Lost)"
+category: silent-failures
+severity: silent-failure
+tags:
+  - upload-artifact
+  - download-artifact
+  - file-permissions
+  - chmod
+  - executable
+  - linux
+  - macos
+patterns:
+  - regex: "Permission denied"
+    flags: "i"
+  - regex: "EACCES: permission denied"
+    flags: "i"
+  - regex: "cannot execute.*Permission denied"
+    flags: "i"
+error_messages:
+  - "/bin/sh: ./script.sh: Permission denied"
+  - "Error: EACCES: permission denied, access '/path/to/binary'"
+  - "bash: ./build/my-binary: Permission denied"
+  - "Process completed with exit code 126"
+root_cause: |
+  The `actions/upload-artifact` action zips files using a Node.js-based zip implementation
+  that does not preserve Unix file permission mode bits. When the artifact is downloaded in
+  a subsequent job with `actions/download-artifact`, all files are extracted with default
+  permissions (typically 0644), silently losing any executable bits or other custom permissions
+  that were set in the producing job.
+
+  This affects any workflow that:
+  - Builds a binary in one job and runs it in a downstream job
+  - Produces shell scripts with +x and executes them after download
+  - Compiles Python wheels with C extensions requiring executable shared libraries
+  - Uses tools that detect file mode bits (e.g., `test -x ./binary`)
+
+  The upload and download both complete with no warnings. The failure only surfaces when the
+  downloaded file is executed in the downstream job. This is a known open issue since 2020
+  affecting both `upload-artifact@v3` and `v4`.
+fix: |
+  Wrap files in a tar archive before uploading. Since the tar utility preserves Unix permission
+  mode bits, permissions survive the upload/download cycle. Alternatively, re-apply permissions
+  explicitly with `chmod` in the downstream job after downloading.
+fix_code:
+  - language: yaml
+    label: "Preserve permissions with tar (recommended)"
+    code: |
+      # --- Job A: Build and upload ---
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Build binary
+              run: |
+                make my-binary
+                chmod +x my-binary
+
+            - name: Package with tar to preserve permissions
+              run: tar -czf artifacts.tar.gz my-binary
+
+            - uses: actions/upload-artifact@v4
+              with:
+                name: my-artifacts
+                path: artifacts.tar.gz
+
+      # --- Job B: Download and run ---
+        deploy:
+          needs: build
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/download-artifact@v4
+              with:
+                name: my-artifacts
+
+            - name: Extract and run (permissions restored)
+              run: |
+                tar -xzf artifacts.tar.gz
+                ./my-binary
+  - language: yaml
+    label: "Re-apply chmod after download"
+    code: |
+      - uses: actions/download-artifact@v4
+        with:
+          name: my-artifacts
+
+      - name: Restore executable permissions
+        run: chmod +x my-binary ./scripts/*.sh
+prevention:
+  - "Never rely on upload-artifact to preserve Unix file permissions — always tar or re-chmod"
+  - "If your downstream job runs a downloaded binary, add `chmod +x` before executing it as a safety habit"
+  - "Use `ls -la` after download as a debug step to verify permissions are what you expect"
+  - "For permission-sensitive artifacts, `actions/cache` can be used as an alternative — it preserves permissions"
+docs:
+  - url: "https://github.com/actions/upload-artifact/issues/38"
+    label: "actions/upload-artifact#38 — upload-artifact does not retain artifact permissions (169 reactions)"
+  - url: "https://github.com/actions/download-artifact/issues/14"
+    label: "actions/download-artifact#14 — download-artifact loses permissions on download (54 reactions)"
