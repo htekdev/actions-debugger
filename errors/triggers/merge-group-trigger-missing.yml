@@ -1,0 +1,122 @@
+id: triggers-007
+title: "merge_group Trigger Missing — Required Checks Never Run in Merge Queue"
+category: triggers
+severity: silent-failure
+tags:
+  - merge_group
+  - merge-queue
+  - required-checks
+  - branch-protection
+  - triggers
+  - pull_request
+patterns:
+  - regex: "merge_group"
+    flags: "i"
+  - regex: "Expected.*Waiting.*merge queue"
+    flags: "i"
+  - regex: "merge queue.*required.*status check.*waiting"
+    flags: "i"
+error_messages:
+  - "Required check 'CI' is expected — Waiting"
+  - "All checks have passed except those that are waiting for merge queue"
+  - "The merge queue is waiting for the required check to pass"
+root_cause: |
+  GitHub's merge queue (enabled via branch protection rules → "Require merge queue")
+  creates a `merge_group` event when a PR is added to the queue. This event is distinct
+  from `pull_request` and `push` — a workflow must explicitly declare `on: merge_group:`
+  to receive it.
+
+  When a workflow is required by branch protection but does NOT include `merge_group`
+  as a trigger, the merge queue adds the PR to a temporary merge group branch (format:
+  `gh-readonly-queue/{base}/{pr-number}`) but the required workflow **never starts**.
+  GitHub shows the required check as "Expected — Waiting" indefinitely, and the PR
+  cannot merge.
+
+  **Why this is subtle:**
+  - The workflow runs fine for normal `pull_request` events (dev branch → PR, all checks
+    pass).
+  - The failure only manifests once the PR is actually added to the merge queue.
+  - The "Waiting" status in the merge queue looks different from a failed check, making
+    it unclear that the workflow trigger is misconfigured.
+
+  **The merge_group event payload** is slightly different from `pull_request`:
+  - `github.event.merge_group.base_ref` — the base branch
+  - `github.event.merge_group.head_sha` — the merged commit SHA to test
+  - `github.event.merge_group.head_ref` — the temporary merge branch name
+fix: |
+  Add `merge_group:` to the `on:` block of every workflow that is listed as a required
+  status check for merge queue-protected branches.
+
+  **Important:** `merge_group` does NOT automatically run `pull_request` workflows — it
+  is a completely separate event type. You must add it explicitly.
+
+  If your workflow has conditions that reference `github.event_name == 'pull_request'`,
+  update those conditions to also allow `merge_group` events, or restructure them to
+  check `github.event.pull_request || github.event.merge_group`.
+fix_code:
+  - language: yaml
+    label: "Add merge_group trigger to an existing CI workflow"
+    code: |
+      on:
+        pull_request:
+          branches: [main, develop]
+        merge_group:          # <-- Add this to receive merge queue events
+          types: [checks_requested]
+
+      jobs:
+        ci:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run tests
+              run: npm test
+  - language: yaml
+    label: "Conditional logic that handles both pull_request and merge_group"
+    code: |
+      on:
+        pull_request:
+        merge_group:
+          types: [checks_requested]
+
+      jobs:
+        ci:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            # Access the base SHA correctly for both event types
+            - name: Get base SHA
+              id: base
+              run: |
+                if [ "${{ github.event_name }}" = "merge_group" ]; then
+                  echo "sha=${{ github.event.merge_group.base_sha }}" >> $GITHUB_OUTPUT
+                else
+                  echo "sha=${{ github.event.pull_request.base.sha }}" >> $GITHUB_OUTPUT
+                fi
+  - language: yaml
+    label: "Reusable workflow that supports merge_group via workflow_call"
+    code: |
+      # In the caller workflow:
+      on:
+        pull_request:
+        merge_group:
+          types: [checks_requested]
+
+      jobs:
+        ci:
+          uses: ./.github/workflows/ci-reusable.yml
+          with:
+            ref: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+prevention:
+  - "When enabling merge queue on a branch protection rule, immediately check that every required workflow has `merge_group` in its `on:` triggers."
+  - "Add a repository-level workflow audit that lists all required status checks and verifies each has a matching `merge_group` trigger."
+  - "Test the merge queue setup by creating a test PR and attempting to add it to the queue — if checks show 'Waiting', add the trigger."
+  - "Third-party Actions and path-filter actions (dorny/paths-filter, tj-actions/changed-files) may need explicit `merge_group` support — check their changelogs."
+  - "GitHub's documentation now includes a merge queue section — review it when enabling the feature in your organization."
+docs:
+  - url: "https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue"
+    label: "GitHub Docs: Managing a merge queue"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#merge_group"
+    label: "GitHub Actions: merge_group event trigger"
+  - url: "https://github.blog/changelog/2023-02-08-pull-request-merge-queue-public-beta/"
+    label: "GitHub Changelog: Pull request merge queue public beta (Feb 2023)"
