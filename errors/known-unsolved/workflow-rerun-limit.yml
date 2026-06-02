@@ -1,0 +1,101 @@
+id: known-unsolved-007
+title: "Workflow Rerun Limit: 50 Reruns Maximum Per Workflow Run"
+category: known-unsolved
+severity: limitation
+tags:
+  - rerun
+  - retry
+  - automation
+  - limits
+  - check-suite
+patterns:
+  - regex: "exceeded.*maximum.*rerun.*limit"
+    flags: "i"
+  - regex: "rerun limit.*50"
+    flags: "i"
+  - regex: "This workflow has been rerun too many times"
+    flags: "i"
+  - regex: "maximum rerun limit.*exceeded"
+    flags: "i"
+error_messages:
+  - "This workflow has exceeded the maximum rerun limit of 50."
+  - "You have exceeded the maximum rerun limit for this workflow run."
+  - "Failed check suite: exceeded maximum rerun limit."
+root_cause: |
+  In April 2026 GitHub introduced a hard cap of 50 reruns per workflow run (combining
+  full re-runs and partial job re-runs). When the limit is hit, any subsequent rerun
+  attempt results in a failed check suite with an annotation — no partial or full rerun
+  is permitted on that run ever again.
+
+  The limit was introduced because some automation scripts were issuing hundreds of retry
+  attempts on a single workflow run, adding significant load to GitHub's infrastructure.
+
+  Common triggers of this limit:
+  - Automated retry bots (e.g. flaky-test detection scripts) that loop on `gh run rerun`
+  - CI platforms that aggressively requeue failed runs
+  - Scheduled maintenance pipelines that retry indefinitely on runner-level transient failures
+  - GitHub Apps polling and re-triggering stale check suites on long-lived PRs
+fix: |
+  There is no way to raise the 50-rerun cap — it is a hard platform limit with no bypass.
+
+  Recommended approaches:
+  1. **Fix the root cause instead of retrying** — identify and address flaky tests, network
+     timeouts, or runner instability rather than masking them with reruns.
+  2. **Create a new workflow run instead of rerunning** — close and reopen the PR, push a
+     no-op commit, or trigger `workflow_dispatch` to start a fresh run with its own 50-run
+     budget.
+  3. **Implement retry logic inside the step** — use a step-level retry loop (`for i in 1 2 3`)
+     rather than whole-workflow reruns so flakiness is contained within a single run.
+  4. **Limit automation rerun budgets** — if you operate a retry bot, add a counter check
+     (`gh run view --json runAttempt`) and stop retrying once `runAttempt >= 40` to leave
+     headroom before the limit hits.
+fix_code:
+  - language: yaml
+    label: "Step-level retry instead of whole-workflow rerun"
+    code: |
+      steps:
+        - name: Run flaky integration test (with built-in retry)
+          shell: bash
+          run: |
+            for attempt in 1 2 3; do
+              echo "Attempt $attempt of 3"
+              if npm run test:integration; then
+                echo "Tests passed on attempt $attempt"
+                exit 0
+              fi
+              echo "Attempt $attempt failed, retrying..."
+              sleep 10
+            done
+            echo "All 3 attempts failed"
+            exit 1
+  - language: yaml
+    label: "Check rerun count before auto-retrying in a workflow automation"
+    code: |
+      steps:
+        - name: Guard against rerun limit
+          shell: bash
+          run: |
+            RUN_ATTEMPT="${{ github.run_attempt }}"
+            if [ "$RUN_ATTEMPT" -ge 40 ]; then
+              echo "::error::Run attempt $RUN_ATTEMPT is near the 50-rerun limit. Stopping auto-retry."
+              exit 1
+            fi
+            echo "Run attempt $RUN_ATTEMPT — within safe retry budget"
+  - language: yaml
+    label: "Trigger a fresh run instead of rerunning (workflow_dispatch)"
+    code: |
+      # Instead of gh run rerun <run-id>, dispatch a fresh run:
+      # gh workflow run my-workflow.yml --ref main
+      # This creates a new run ID with its own 50-rerun budget.
+prevention:
+  - "Build retry logic inside steps using shell loops rather than whole-workflow reruns."
+  - "Monitor `github.run_attempt` context value; alert or stop automation at 40+ attempts."
+  - "Fix flaky tests rather than relying on reruns as the primary reliability mechanism."
+  - "If a run regularly hits >10 reruns, treat it as a reliability incident, not a normal CI pattern."
+docs:
+  - url: "https://github.blog/changelog/2026-04-10-actions-workflows-are-limited-to-50-reruns/"
+    label: "GitHub Changelog: Actions workflows are limited to 50 reruns"
+  - url: "https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-workflow-runs/re-running-workflows-and-jobs"
+    label: "Re-running workflows and jobs"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions"
+    label: "Workflow commands for GitHub Actions"

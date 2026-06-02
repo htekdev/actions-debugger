@@ -1,0 +1,140 @@
+id: yaml-syntax-013
+title: "Reusable Workflow Output Missing on.workflow_call.outputs Declaration"
+category: yaml-syntax
+severity: silent-failure
+tags:
+  - reusable-workflow
+  - workflow-call
+  - outputs
+  - silent-failure
+  - job-outputs
+patterns:
+  - regex: "needs\\.[a-zA-Z0-9_-]+\\.outputs\\.[a-zA-Z0-9_-]+"
+    flags: "i"
+  - regex: "on\\.workflow_call\\.outputs.*not defined"
+    flags: "i"
+  - regex: "output.*reusable.*workflow.*empty"
+    flags: "i"
+error_messages:
+  - "The output variable was not found in the called workflow's on.workflow_call.outputs map."
+  - "Output 'version' not found in called workflow."
+root_cause: |
+  A called (reusable) workflow exposes job-level outputs but forgets to declare them at
+  the `workflow_call` trigger level. As a result the caller workflow's
+  `needs.<called-job>.outputs.<name>` expression evaluates to an empty string with NO
+  error message — a silent failure.
+
+  GitHub Actions requires a two-layer output declaration for reusable workflows:
+  1. The job inside the called workflow declares step outputs via `outputs:` on the job.
+  2. The called workflow's `on.workflow_call.outputs:` section explicitly maps workflow-
+     level output names to job-level output expressions.
+
+  If layer 2 is missing, the caller never receives the value even though layer 1 exists.
+  Because the expression resolves to an empty string (not an error), downstream steps may
+  silently receive wrong values — version tags become empty strings, Docker image names
+  become malformed, deploy environment names become blank.
+
+  A second variant occurs when accessing outputs from a called workflow that uses a matrix:
+  matrix job outputs cannot be aggregated automatically at the workflow level, so outputs
+  from individual matrix legs are inaccessible to the caller.
+fix: |
+  Add the `on.workflow_call.outputs:` section to the called workflow, mapping each
+  desired output name to the corresponding job output expression.
+
+  For matrix jobs: aggregate outputs into a single job (e.g. using `toJSON`) or use a
+  final non-matrix aggregator job inside the called workflow that reads matrix outputs
+  and re-exposes them as a single value.
+fix_code:
+  - language: yaml
+    label: "Called workflow — correct two-layer output declaration"
+    code: |
+      # .github/workflows/build-and-version.yml (CALLED workflow)
+      on:
+        workflow_call:
+          # Layer 2: workflow-level outputs (REQUIRED for caller to receive values)
+          outputs:
+            version:
+              description: "The computed version string"
+              value: ${{ jobs.build.outputs.version }}
+            artifact-name:
+              description: "Name of the uploaded artifact"
+              value: ${{ jobs.build.outputs.artifact-name }}
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          # Layer 1: job-level outputs
+          outputs:
+            version: ${{ steps.compute-version.outputs.version }}
+            artifact-name: ${{ steps.upload.outputs.artifact-name }}
+          steps:
+            - id: compute-version
+              run: echo "version=1.2.3-${{ github.sha }}" >> $GITHUB_OUTPUT
+
+            - id: upload
+              uses: actions/upload-artifact@v4
+              with:
+                name: build-output
+                path: dist/
+  - language: yaml
+    label: "Caller workflow — consuming outputs from called workflow"
+    code: |
+      # .github/workflows/deploy.yml (CALLER workflow)
+      jobs:
+        build:
+          uses: ./.github/workflows/build-and-version.yml
+          secrets: inherit
+
+        deploy:
+          needs: build
+          runs-on: ubuntu-latest
+          steps:
+            - name: Deploy version
+              # This only works if the called workflow has on.workflow_call.outputs declared
+              run: |
+                echo "Deploying version: ${{ needs.build.outputs.version }}"
+                echo "Using artifact: ${{ needs.build.outputs.artifact-name }}"
+  - language: yaml
+    label: "Aggregate matrix outputs in a final job for caller consumption"
+    code: |
+      # Called workflow with matrix — aggregate results before exposing as outputs
+      on:
+        workflow_call:
+          outputs:
+            all-results:
+              value: ${{ jobs.aggregate.outputs.results }}
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          strategy:
+            matrix:
+              suite: [unit, integration, e2e]
+          outputs:
+            result-${{ matrix.suite }}: ${{ steps.run.outputs.result }}
+          steps:
+            - id: run
+              run: echo "result=passed" >> $GITHUB_OUTPUT
+
+        # Aggregator job: collects matrix outputs and re-exposes as single value
+        aggregate:
+          needs: test
+          runs-on: ubuntu-latest
+          outputs:
+            results: ${{ steps.collect.outputs.results }}
+          steps:
+            - id: collect
+              run: |
+                echo "results=${{ toJSON(needs.test.outputs) }}" >> $GITHUB_OUTPUT
+prevention:
+  - "Always declare `on.workflow_call.outputs:` in a reusable workflow if any caller needs its outputs."
+  - "Test output propagation by printing `${{ needs.<job>.outputs.<name> }}` in a debug step on the caller side."
+  - "Treat empty string outputs from called workflows as a sign of missing `on.workflow_call.outputs:` mapping."
+  - "Matrix jobs inside called workflows require an aggregator job — matrix outputs cannot be directly mapped."
+docs:
+  - url: "https://docs.github.com/en/actions/sharing-automations/reusing-workflows#using-outputs-from-a-reusable-workflow"
+    label: "Reusable workflows: using outputs"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#onworkflow_calloutputs"
+    label: "Workflow syntax: on.workflow_call.outputs"
+  - url: "https://stackoverflow.com/questions/73702333/github-actions-reuse-outputs-from-other-reusable-workflows"
+    label: "Stack Overflow: Reuse outputs from reusable workflows (82 upvotes)"
