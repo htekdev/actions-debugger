@@ -1,0 +1,124 @@
+id: permissions-auth-014
+title: "GitHub App Installation Tokens New Stateless Format Breaks Length/Regex Validation"
+category: permissions-auth
+severity: error
+tags:
+  - github-app
+  - installation-token
+  - token-format
+  - stateless-token
+  - breaking-change
+  - auth
+patterns:
+  - regex: "invalid.*token.*format|token.*validation.*failed"
+    flags: "i"
+  - regex: "token.*length.*expected|token.*too long"
+    flags: "i"
+  - regex: "Bad credentials|401.*installation.token"
+    flags: "i"
+  - regex: "installation.*token.*truncated|column.*too long.*token"
+    flags: "i"
+error_messages:
+  - "Bad credentials — installation token rejected by downstream validation"
+  - "column 'token' is too long for type character varying(40)"
+  - "token validation failed: expected length 40, got 520"
+  - "ERROR: value too long for type character(40)"
+root_cause: |
+  Starting April 27, 2026, GitHub rolled out a **new stateless format** for GitHub App
+  installation tokens. The new tokens are approximately **520 characters** long and use
+  a new prefix, compared to the previous format which was a fixed **40-character**
+  opaque token.
+
+  **What changed:**
+  - Old format: 40-character token (e.g., `ghs_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`)
+  - New format: ~520-character JWT-like stateless token with a new prefix scheme
+
+  **What breaks:**
+  1. **Database columns sized at `CHAR(40)` or `VARCHAR(40)`** — any app that stores
+     the token in a database field sized for the old format will fail with a column
+     truncation or "value too long" database error.
+  2. **Regex/length validation** — code that validates token format or length (e.g.,
+     `len(token) == 40`, or regex `^ghs_[a-f0-9]{36}$`) will reject the new tokens.
+  3. **HTTP header size limits** — some reverse proxies or WAFs with conservative
+     request header size limits may reject requests with the longer Authorization header.
+  4. **Logging or masking systems** — tools that detect or mask secrets by pattern may
+     not recognize the new format, causing tokens to appear in logs unmasked.
+
+  Source: GitHub Changelog 2026-04-24 — "Notice about upcoming new format for GitHub
+  App installation tokens"
+fix: |
+  **Treat installation tokens as opaque strings of variable length.** Do not assume
+  a specific length, prefix pattern, or character set.
+
+  1. **Database**: Expand token storage columns to `VARCHAR(1024)` or use TEXT type
+     to future-proof against further format changes.
+  2. **Validation**: Remove length checks and pattern-based validation on token values.
+     Validate by making an authenticated API call (e.g., `GET /app/installations`) —
+     if it returns 200, the token is valid.
+  3. **HTTP proxy/WAF**: Increase `LargeClientHeader` or equivalent header size limits
+     if your infrastructure sits in front of the GitHub API requests.
+  4. **Secret masking**: Update any custom masking patterns to match the new prefix
+     or use `add-mask` in workflows rather than pattern-based masking.
+fix_code:
+  - language: yaml
+    label: "Do not validate token length — use API to verify instead"
+    code: |
+      jobs:
+        setup:
+          runs-on: ubuntu-latest
+          permissions:
+            id-token: write
+          steps:
+            - name: Generate GitHub App installation token
+              id: app-token
+              uses: actions/create-github-app-token@v2
+              with:
+                app-id: ${{ vars.APP_ID }}
+                private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+            # ❌ Never validate token by length — new format is ~520 chars
+            # - run: |
+            #     TOKEN="${{ steps.app-token.outputs.token }}"
+            #     [ ${#TOKEN} -eq 40 ] || exit 1  # WILL FAIL with new format
+
+            # ✅ Verify by making an authenticated API call
+            - name: Verify token works
+              env:
+                GH_TOKEN: ${{ steps.app-token.outputs.token }}
+              run: gh api /app --jq '.name'
+  - language: yaml
+    label: "Mask the full new-format token in logs with add-mask"
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Generate token
+              id: app-token
+              uses: actions/create-github-app-token@v2
+              with:
+                app-id: ${{ vars.APP_ID }}
+                private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+            # Explicitly mask the token value so it does not appear in logs
+            # (pattern-based masking may not catch the new ~520-char format)
+            - name: Mask token
+              run: echo "::add-mask::${{ steps.app-token.outputs.token }}"
+
+            - name: Use token
+              env:
+                GH_TOKEN: ${{ steps.app-token.outputs.token }}
+              run: gh api /repos/${{ github.repository }}/releases
+prevention:
+  - "Store GitHub App installation tokens in TEXT or VARCHAR(1024)+ columns — never size to the old 40-character format."
+  - "Remove any code that validates token length or matches against a fixed token-format regex."
+  - "Use `echo '::add-mask::TOKEN'` explicitly in workflows rather than relying on pattern-based log masking for App tokens."
+  - "Subscribe to GitHub Changelog token-format notices — https://github.blog/changelog/ — and test format changes in staging before they reach production."
+  - "Use `actions/create-github-app-token` (the official action) to generate tokens rather than rolling your own JWT exchange, so the action absorbs format changes automatically."
+docs:
+  - url: "https://github.blog/changelog/2026-04-24-notice-about-upcoming-new-format-for-github-app-installation-tokens"
+    label: "GitHub Changelog: Notice about upcoming new format for GitHub App installation tokens"
+  - url: "https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-as-a-github-app-installation"
+    label: "GitHub Docs: Authenticating as a GitHub App installation"
+  - url: "https://github.com/actions/create-github-app-token"
+    label: "actions/create-github-app-token — official token generation action"

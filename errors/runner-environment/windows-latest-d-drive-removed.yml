@@ -1,0 +1,104 @@
+id: runner-environment-043
+title: "windows-latest Windows Server 2025 Runner Removed D: Drive — Paths Fail"
+category: runner-environment
+severity: error
+tags:
+  - windows
+  - runner-image
+  - d-drive
+  - path
+  - windows-server-2025
+  - breaking-change
+patterns:
+  - regex: "The system cannot find the path specified.*D:\\\\"
+    flags: "i"
+  - regex: "D:\\\\.*No such file or directory"
+    flags: "i"
+  - regex: "Path.*D:\\\\.*does not exist"
+    flags: "i"
+  - regex: "cannot find.*'D:\\\\|D:\\\\.*not found"
+    flags: "i"
+error_messages:
+  - "The system cannot find the path specified: 'D:\\a\\'"
+  - "D:\\a\\ : No such file or directory"
+  - "Cannot find path 'D:\\build' because it does not exist."
+  - "Error: ENOENT: no such file or directory, open 'D:\\tools\\...'"
+root_cause: |
+  The Windows Server 2025 runner image, which became the target of `windows-latest`
+  and `windows-2025` starting mid-2026, **removed the D: drive** that was present
+  on earlier Windows runner images (Windows Server 2019 and 2022).
+
+  On Windows Server 2019/2022 runners, the D: drive was a separate disk used for
+  temporary build storage and tools. Some workflows hardcoded paths like
+  `D:\a\`, `D:\tools\`, `D:\hostedtoolcache\`, or `D:\temp\` instead of using
+  environment variables like `${{ runner.tool_cache }}`, `$RUNNER_TOOL_CACHE`,
+  or workspace-relative paths.
+
+  On Windows Server 2025 runners, only the C: drive is available. Any workflow
+  step that writes to or reads from an absolute `D:\` path will immediately fail
+  with a path-not-found error, often as a confusing "system cannot find path" error
+  rather than a clear "D: drive missing" message.
+
+  Root issue thread: actions/runner-images#12416 (D: drive removal discussion)
+  and runner-images#12677 (windows-latest → Windows Server 2025 migration).
+fix: |
+  Replace all hardcoded `D:\` paths with environment variable references or
+  workspace-relative paths:
+
+  | Old (hardcoded D:) | New (portable)                          |
+  |--------------------|----------------------------------------|
+  | `D:\hostedtoolcache` | `${{ runner.tool_cache }}`          |
+  | `D:\a\${{ github.repository }}` | `${{ github.workspace }}`  |
+  | `D:\temp\`         | `${{ runner.temp }}`                   |
+  | `D:\tools\`        | Explicit installation to `C:\tools\`   |
+
+  For existing scripts that reference `D:\` directly, either:
+  1. Update all references to use RUNNER_TEMP, RUNNER_TOOL_CACHE, or GITHUB_WORKSPACE
+  2. Temporarily pin `runs-on: windows-2022` while you migrate
+fix_code:
+  - language: yaml
+    label: "Replace D:\\ paths with portable runner environment variables"
+    code: |
+      jobs:
+        build:
+          runs-on: windows-latest  # Works on Server 2025 (no D: drive)
+          steps:
+            - uses: actions/checkout@v4
+
+            # ❌ Broken: hardcoded D: path
+            # - run: Copy-Item -Path "D:\hostedtoolcache\node\20.0.0\x64\bin\node.exe" -Destination "${{ github.workspace }}"
+
+            # ✅ Fixed: use runner context variables
+            - name: Use portable paths
+              run: |
+                echo "Workspace: ${{ github.workspace }}"
+                echo "Tool cache: ${{ runner.tool_cache }}"
+                echo "Temp dir: ${{ runner.temp }}"
+                # C: drive is always available on all Windows runner images
+                $toolsDir = "C:\tools"
+                New-Item -ItemType Directory -Force -Path $toolsDir
+  - language: yaml
+    label: "Temporary rollback — pin to windows-2022 while migrating"
+    code: |
+      jobs:
+        build:
+          # Pin to windows-2022 (D: drive still present) while fixing hardcoded paths
+          runs-on: windows-2022
+          steps:
+            - uses: actions/checkout@v4
+            - run: msbuild MyProject.sln
+prevention:
+  - "Never hardcode `D:\\` paths in workflows or scripts — always use `${{ runner.tool_cache }}`, `${{ runner.temp }}`, `${{ github.workspace }}`, or `C:\\`-relative paths."
+  - "Audit workflows and called scripts for `D:\\` references before migrating to `windows-latest` (Windows Server 2025)."
+  - "Subscribe to actions/runner-images release announcements so runner image migrations do not catch you off-guard."
+  - "Use `windows-2022` as a temporary pin if immediate migration is not feasible; note that Server 2022 images have a defined EOL."
+  - "Test Windows workflows in a `windows-2025` matrix slot before the `windows-latest` migration window completes."
+docs:
+  - url: "https://github.com/actions/runner-images/issues/12416"
+    label: "runner-images#12416 — D: drive removal discussion"
+  - url: "https://github.com/actions/runner-images/issues/12677"
+    label: "runner-images#12677 — windows-latest migration to Windows Server 2025"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/store-information-in-variables#default-environment-variables"
+    label: "GitHub Docs: Default environment variables (runner.tool_cache, runner.temp)"
+  - url: "https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners#standard-github-hosted-runners-for-public-repositories"
+    label: "About GitHub-hosted runners — Windows Server 2025 specs"

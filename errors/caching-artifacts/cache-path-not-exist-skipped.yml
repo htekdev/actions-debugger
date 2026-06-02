@@ -1,0 +1,152 @@
+id: caching-artifacts-017
+title: "actions/cache Path Validation Error — Specified Path Does Not Exist, Cache Skipped"
+category: caching-artifacts
+severity: warning
+tags:
+  - cache
+  - path
+  - path-validation
+  - cache-miss
+  - warning
+  - actions-cache
+patterns:
+  - regex: "Path Validation Error.*Path.*specified.*action.*caching.*do.*not exist"
+    flags: "i"
+  - regex: "Warning.*Path.*caching.*do.*not exist.*no cache.*saved"
+    flags: "i"
+  - regex: "no cache.*being saved.*path.*not exist"
+    flags: "i"
+error_messages:
+  - "Warning: Path Validation Error: Path(s) specified in the action for caching do(es) not exist, hence no cache is being saved."
+root_cause: |
+  `actions/cache` validates that all paths listed under the `path:` key actually
+  exist on disk **at the time the `Post cache` step runs** (the post-job cleanup
+  step that performs the cache save). If any path does not exist, the action logs a
+  warning and **silently skips the cache save entirely** — no cache entry is written
+  even if other listed paths do exist.
+
+  **Common causes:**
+
+  1. **Conditional install step** — the path is only created when a specific install
+     step runs (e.g., `npm ci` or `pip install`), but the cache step's `key` matched
+     a previous cache, so the install step was skipped. The path therefore doesn't
+     exist when the post step runs.
+
+  2. **Wrong working directory** — the `path:` is relative (e.g., `node_modules`)
+     but the working directory for the run step differs from where `actions/cache`
+     expects to find it.
+
+  3. **Build output cached too early** — the `path:` references build output that
+     hasn't been generated yet (e.g., caching `dist/` before the build step runs).
+
+  4. **Typo in path** — a simple typo (e.g., `node-modules` vs `node_modules`) means
+     the directory is never created under that name.
+
+  5. **Cross-OS path format** — Windows backslash vs Linux forward slash mismatch
+     when the same workflow runs on multiple OS targets.
+
+  The action exits 0 (no failure), making this a **silent failure** — the workflow
+  appears to succeed, but the cache is never saved. Subsequent runs always experience
+  a full cache miss, causing slower CI without any visible error.
+
+  Source: mkdocs-material issue#7990, actions/cache documentation
+fix: |
+  1. **Verify the path exists before relying on it** — add a diagnostic step that
+     lists the directory structure before the cache save to confirm paths are present.
+
+  2. **Always run the install step** — do not skip install steps based on
+     `cache-hit == 'true'`. Instead, use `cache-hit` to skip the install when the
+     restore succeeded, but still let the cache post step validate paths:
+
+     ```yaml
+     - uses: actions/cache@v4
+       id: cache-node
+       with:
+         path: node_modules
+         key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+
+     - run: npm ci
+       if: steps.cache-node.outputs.cache-hit != 'true'
+     ```
+
+  3. **Use `setup-node` with caching** — instead of managing cache manually,
+     `actions/setup-node` with `cache: 'npm'` handles path validation internally.
+
+  4. **Check for path typos** — confirm the literal path string matches exactly
+     what is created on disk (case-sensitive on Linux).
+fix_code:
+  - language: yaml
+    label: "Correct pattern — run install only on cache miss, cache path always present"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - uses: actions/cache@v4
+              id: npm-cache
+              with:
+                path: ~/.npm        # Cache the npm cache dir — always exists
+                key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+                restore-keys: |
+                  ${{ runner.os }}-npm-
+
+            # Always run npm ci so node_modules always exists for the cache post step
+            - run: npm ci
+
+            # ❌ Wrong — skipping npm ci on cache hit means node_modules may not exist
+            # - run: npm ci
+            #   if: steps.npm-cache.outputs.cache-hit != 'true'
+  - language: yaml
+    label: "Use setup-node built-in cache instead of manual actions/cache"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            # setup-node handles path validation and cache lifecycle correctly
+            - uses: actions/setup-node@v4
+              with:
+                node-version: '20'
+                cache: 'npm'   # Manages npm cache path validation internally
+
+            - run: npm ci
+  - language: yaml
+    label: "Debug step — print path existence before cache save"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - uses: actions/cache@v4
+              with:
+                path: |
+                  ~/.cache/pip
+                  .venv
+                key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+
+            - run: pip install -r requirements.txt --target .venv
+
+            # Diagnostic — verify paths exist before cache post step runs
+            - name: Verify cache paths
+              run: |
+                echo "~/.cache/pip exists: $(test -d ~/.cache/pip && echo YES || echo NO)"
+                echo ".venv exists: $(test -d .venv && echo YES || echo NO)"
+prevention:
+  - "Always ensure every path listed under `actions/cache path:` is unconditionally created during the job — do not gate install steps on cache-hit in a way that leaves paths missing."
+  - "Prefer `setup-*` actions with their built-in `cache:` input over raw `actions/cache` — they manage path validation and lifecycle correctly."
+  - "Add a diagnostic step after your install/build steps to verify that each cached path exists before relying on the cache post step."
+  - "Use absolute paths (e.g., `~/.npm`, `~/.cache/pip`) rather than relative paths when caching language package caches."
+  - "Enable `ACTIONS_RUNNER_DEBUG: true` in repository secrets to get verbose cache-step output that reveals path validation details."
+docs:
+  - url: "https://github.com/actions/cache/blob/main/README.md"
+    label: "actions/cache README — path and key documentation"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows"
+    label: "GitHub Docs: Caching dependencies to speed up workflows"
+  - url: "https://github.com/squidfunk/mkdocs-material/issues/7990"
+    label: "mkdocs-material#7990 — Path Validation Error real-world example"
