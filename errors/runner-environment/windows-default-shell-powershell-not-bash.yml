@@ -1,0 +1,137 @@
+id: runner-environment-033
+title: "Windows Runner Default Shell Is PowerShell — Bash Scripts Silently Fail Without shell: bash"
+category: runner-environment
+severity: error
+tags:
+  - windows
+  - shell
+  - bash
+  - powershell
+  - default-shell
+  - run-step
+  - cross-platform
+patterns:
+  - regex: "shell:\\s*C:\\\\Windows\\\\system32\\\\bash\\.EXE"
+    flags: "i"
+  - regex: "The term '.*' is not recognized.*cmdlet.*function.*script"
+    flags: "i"
+  - regex: "pwsh.*noprofile.*noninteractive.*command"
+    flags: "i"
+  - regex: "bash.*error.*not.*recognized.*windows"
+    flags: "i"
+error_messages:
+  - "The term 'set' is not recognized as the name of a cmdlet, function, script file"
+  - "Unrecognized token '||' in pipeline"
+  - "shell: C:\\Windows\\system32\\bash.EXE --noprofile --norc -e -o pipefail {0}: No such file or directory"
+  - "export: The term 'export' is not recognized as the name of a cmdlet"
+root_cause: |
+  GitHub Actions uses a different default shell depending on the runner OS:
+    - Linux (ubuntu-*): bash
+    - macOS (macos-*): bash
+    - Windows (windows-*): PowerShell (pwsh)
+
+  When you write `run:` steps using bash syntax (e.g., `export VAR=value`, `set -e`,
+  `||`, `&&`, heredocs, `$(...)` subshells) without explicitly specifying `shell: bash`,
+  those steps will execute under PowerShell on Windows runners and fail with confusing
+  errors.
+
+  This is especially problematic in:
+    - Matrix workflows that include both Linux and Windows OS variants
+    - Composite actions where the shell is not explicitly set per step
+    - Reusable workflows called from both Linux and Windows jobs
+    - Migration from Linux-only workflows to cross-platform
+
+  A secondary issue: on Windows runners, if `C:\Windows\System32\bash.exe` exists
+  (WSL stub), specifying `shell: bash` may invoke the WSL stub instead of Git Bash
+  (`C:\Program Files\Git\bin\bash.EXE`). This causes "No such file or directory"
+  errors because the WSL stub requires a Linux distribution to be installed.
+  Since runner-images#12646, this is a known issue with no GitHub-side fix.
+
+  Source: actions/runner#1328 (Unable to run bash scripts on Windows runner)
+  Source: runner-images#12646 (Windows WSL bash.exe stub causes shell: bash failures)
+fix: |
+  Always explicitly set `shell: bash` on any `run:` step that uses bash syntax.
+
+  For cross-platform matrix workflows, there are three approaches:
+
+  1. Explicit shell per step — add `shell: bash` to every bash step.
+
+  2. Workflow-level default — set `defaults.run.shell: bash` to apply bash to ALL
+     run steps in the workflow (be consistent — all steps must then use bash syntax).
+
+  3. Job-level default — set `defaults.run.shell: bash` at the job level to scope it.
+
+  If you need PowerShell on Windows AND bash on Linux in the same matrix, use a
+  matrix-aware condition to selectively set the shell, or split into separate jobs.
+fix_code:
+  - language: yaml
+    label: "Fix: explicit shell: bash on individual steps"
+    code: |
+      jobs:
+        test:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest, macos-latest]
+          runs-on: ${{ matrix.os }}
+          steps:
+            - uses: actions/checkout@v4
+
+            # ✅ Always specify shell: bash for bash scripts
+            - name: Run build script
+              shell: bash         # required on Windows — default is PowerShell
+              run: |
+                export BUILD_ENV=production
+                set -euo pipefail
+                ./scripts/build.sh
+
+  - language: yaml
+    label: "Fix: workflow-level default shell (applies to all run steps)"
+    code: |
+      name: Cross-Platform CI
+
+      defaults:
+        run:
+          shell: bash    # override default — all run steps use bash on all OS
+
+      jobs:
+        test:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest, macos-latest]
+          runs-on: ${{ matrix.os }}
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run tests
+              run: |
+                # This runs in bash on all platforms
+                ./scripts/run-tests.sh
+
+  - language: yaml
+    label: "Anti-pattern: bash syntax without shell: bash on Windows fails"
+    code: |
+      # ❌ WRONG on Windows — default shell is PowerShell, bash syntax breaks
+      jobs:
+        build:
+          runs-on: windows-latest
+          steps:
+            - name: Set env
+              run: |
+                export DEPLOY_ENV=production    # ← ERROR: 'export' not recognized
+                echo "env: $DEPLOY_ENV"         # ← ERROR: bash variable expansion
+                ls -la                          # ← ERROR: ls -la not valid in pwsh
+
+prevention:
+  - "Always specify `shell: bash` (or `shell: pwsh`) explicitly on every `run:` step in cross-platform workflows."
+  - "Use `defaults.run.shell: bash` at the workflow or job level to reduce repetition."
+  - "Test all matrix OS variants in CI — don't assume Linux behavior translates to Windows."
+  - "For PowerShell-specific steps on Windows, use `shell: pwsh` explicitly rather than relying on the default."
+  - "Avoid relying on the runner's WSL bash stub on Windows — it requires a WSL distribution installed."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/setting-a-default-shell-and-working-directory"
+    label: "GitHub Docs: Setting a default shell and working directory"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idstepsshell"
+    label: "GitHub Docs: jobs.<job_id>.steps[*].shell"
+  - url: "https://github.com/actions/runner/issues/1328"
+    label: "actions/runner#1328: Unable to run bash scripts on Windows runner"
+  - url: "https://github.com/actions/runner-images/issues/12646"
+    label: "runner-images#12646: Windows WSL bash.exe stub causes shell: bash failures"

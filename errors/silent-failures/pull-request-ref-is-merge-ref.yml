@@ -1,0 +1,134 @@
+id: silent-failures-014
+title: "pull_request github.ref Is refs/pull/N/merge — Branch-Name Conditions Silently Evaluate to False"
+category: silent-failures
+severity: silent-failure
+tags:
+  - pull_request
+  - github-ref
+  - merge-ref
+  - branch-name
+  - if-condition
+  - head-ref
+  - base-ref
+patterns:
+  - regex: "github\\.ref\\s*==\\s*['\"]refs/heads/"
+    flags: "i"
+  - regex: "GITHUB_REF.*refs/pull/\\d+/merge"
+    flags: "i"
+  - regex: "github\\.ref.*startsWith.*refs/heads"
+    flags: "i"
+error_messages:
+  - "refs/pull/123/merge"
+  - "Conditional check 'github.ref == refs/heads/main' evaluated to false on pull_request event"
+  - "GITHUB_REF=refs/pull/47/merge"
+root_cause: |
+  When a workflow is triggered by the `pull_request` (or `pull_request_target`) event,
+  `github.ref` is set to `refs/pull/<number>/merge` — NOT the source branch name.
+
+  This `refs/pull/<N>/merge` is a synthetic Git reference created by GitHub representing
+  the prospective merge commit (the merge of the PR's head branch into the base branch).
+  It does not correspond to any named branch.
+
+  Developers commonly write conditions expecting `github.ref` to contain the branch name:
+    - `if: github.ref == 'refs/heads/feature-branch'`  → always false on PR events
+    - `if: startsWith(github.ref, 'refs/heads/')`       → always false on PR events
+    - `if: github.ref != 'refs/heads/main'`             → always true on PR events
+
+  These conditions silently pass or silently skip — no error is reported. The job
+  simply runs (or doesn't run) with no indication that the ref check was wrong.
+
+  The correct context variables for PR events are:
+    - `github.head_ref` — the source branch name (e.g., "feature/my-branch")
+    - `github.base_ref` — the target branch name (e.g., "main")
+    - `github.event.pull_request.head.ref` — same as head_ref
+    - `github.event.pull_request.base.ref` — same as base_ref
+
+  Note: `github.head_ref` and `github.base_ref` are ONLY set for pull_request events.
+  For push events, use `github.ref_name` instead.
+
+  Source: Stack Overflow #68708792 (what is github.ref when merging PR to master)
+  Source: Stack Overflow #78162051 (obtain branch name in github action on pull_request)
+  Docs: https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context
+fix: |
+  Use the correct context variable depending on what information you need:
+
+  For the PR source branch:
+    Use `github.head_ref` (not `github.ref`)
+
+  For the PR target branch:
+    Use `github.base_ref` (not `github.ref`)
+
+  For branch-scoped conditions that need to work across BOTH push and pull_request:
+    Use `github.ref_name` (gives branch/tag name without refs/heads/ prefix)
+    Or use `github.event_name` to gate the condition by event type
+
+  To check if a push or PR targets the main branch:
+    - Push: `github.ref == 'refs/heads/main'`
+    - PR:   `github.base_ref == 'main'`
+    - Both: use separate conditions gated by `github.event_name`
+fix_code:
+  - language: yaml
+    label: "Fix: use github.head_ref for PR source branch, base_ref for target"
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            # ❌ WRONG: github.ref on pull_request is refs/pull/N/merge — never matches heads/*
+            - name: Wrong branch check
+              if: github.ref == 'refs/heads/feature-branch'  # always false on PR!
+              run: echo "this never runs on PR events"
+
+            # ✅ CORRECT: use head_ref for the source branch name
+            - name: Correct branch check
+              if: github.head_ref == 'feature-branch'
+              run: echo "this runs when PR source branch is feature-branch"
+
+            # ✅ CORRECT: use base_ref for the target branch name
+            - name: Check if targeting main
+              if: github.base_ref == 'main'
+              run: echo "this PR is targeting main"
+
+  - language: yaml
+    label: "Cross-event condition: works for both push and pull_request"
+    code: |
+      jobs:
+        conditional:
+          runs-on: ubuntu-latest
+          steps:
+            # Works for both push (github.ref_name) and PR (github.base_ref)
+            - name: Is this targeting/on main?
+              if: |
+                (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+                (github.event_name == 'pull_request' && github.base_ref == 'main')
+              run: echo "targeting or on main branch"
+
+            # Simpler: github.ref_name works for push; for PR it returns the merge ref number
+            # Best to keep push and pull_request logic separate with event_name guards
+
+  - language: yaml
+    label: "Debug step: print all relevant refs for troubleshooting"
+    code: |
+      - name: Debug refs
+        run: |
+          echo "event_name:  ${{ github.event_name }}"
+          echo "ref:         ${{ github.ref }}"
+          echo "ref_name:    ${{ github.ref_name }}"
+          echo "head_ref:    ${{ github.head_ref }}"
+          echo "base_ref:    ${{ github.base_ref }}"
+          # On push/branch: ref=refs/heads/main, head_ref='', base_ref=''
+          # On pull_request: ref=refs/pull/47/merge, head_ref=feature-x, base_ref=main
+
+prevention:
+  - "Never use `github.ref` to get the branch name in `pull_request` triggered workflows — it is not a branch ref."
+  - "Use `github.head_ref` for the PR source branch and `github.base_ref` for the target branch."
+  - "For conditions that span both push and pull_request events, gate on `github.event_name` first."
+  - "Add a debug step printing `github.ref`, `github.head_ref`, and `github.base_ref` when debugging trigger conditions."
+  - "Use `github.ref_name` (branch/tag name without prefix) for push events instead of stripping `refs/heads/` manually."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context"
+    label: "GitHub Docs: github context (ref, head_ref, base_ref, ref_name)"
+  - url: "https://stackoverflow.com/questions/68708792/what-is-github-ref-when-merging-pr-to-master"
+    label: "Stack Overflow: What is github.ref when merging PR to master?"
+  - url: "https://stackoverflow.com/questions/78162051/obtain-branch-name-in-github-action-on-pull-request"
+    label: "Stack Overflow: Obtain branch name in github action on pull request"

@@ -1,0 +1,134 @@
+id: known-unsolved-012
+title: "uses: Key Does Not Support Expressions or Context Variables — Must Be a Static String"
+category: known-unsolved
+severity: error
+tags:
+  - uses
+  - expression
+  - context
+  - dynamic-action
+  - composite
+  - local-action
+patterns:
+  - regex: "uses:\\s*\\.?/\\$\\{\\{"
+    flags: "i"
+  - regex: "uses:\\s*['\"]?\\$\\{\\{"
+    flags: "i"
+  - regex: "Unrecognized named-value.*uses"
+    flags: "i"
+  - regex: "Invalid workflow file.*uses.*expression"
+    flags: "i"
+error_messages:
+  - "Invalid workflow file: .github/workflows/ci.yml — uses: does not support expression syntax"
+  - "The 'uses' field must be a literal string and cannot contain expressions"
+  - "Unrecognized named-value: 'env' at position 1 within expression in uses:"
+root_cause: |
+  GitHub Actions resolves all `uses:` references (actions and reusable workflows) BEFORE
+  the job starts executing — at workflow evaluation / job queue time. At that point,
+  no runtime contexts (env, inputs, github, matrix, steps, needs) are available.
+
+  As a result, you cannot use `${{ }}` expression syntax in a `uses:` key at any level:
+    - Step-level: `uses: ${{ env.MY_ACTION }}@${{ env.VERSION }}` ❌
+    - Local path with variable: `uses: ./${{ env.DIR }}/my-action` ❌
+    - Dynamic version pin: `uses: actions/setup-node@${{ inputs.node-version }}` ❌
+    - Reusable workflow: `uses: ${{ github.repository }}/.github/workflows/ci.yml@main` ❌
+
+  This is an architectural constraint: the runner must download and validate actions
+  (and reusable workflows) before any step code can run. Allowing runtime expressions
+  would break policy enforcement (org-level allowed-actions lists) and make workflow
+  graphs non-deterministic at parse time.
+
+  Note: `env:` and `with:` inputs to an action DO support expressions — only the `uses:`
+  key itself is restricted.
+
+  Source: actions/runner#1479 (Support context/matrix variables in steps of type 'uses')
+  Source: actions/runner#895 (Allow expressions in uses:)
+  Source: Stack Overflow #75373413 (Reference a variable in uses when pointing to a path)
+fix: |
+  There is no native GitHub Actions solution for dynamic `uses:` values.
+
+  Option 1 — Hard-code the version or path (recommended for most cases):
+    Pin versions explicitly in the workflow file. Use Dependabot or Renovate to keep
+    action versions updated automatically.
+
+  Option 2 — Use a composite action or script as a dispatcher:
+    Create a wrapper composite action that accepts an input and uses `if:` conditions
+    to call different static actions based on the input value.
+
+  Option 3 — Use step-security/dynamic-uses (third-party workaround):
+    The `dynamic-uses` action by step-security resolves and invokes actions dynamically
+    at runtime. This works around the limitation but adds a third-party dependency.
+
+  Option 4 — Restructure to not need dynamic action references:
+    If you're trying to select between local action paths, check out the repo first and
+    use a scripted approach instead of composite action dispatch.
+fix_code:
+  - language: yaml
+    label: "Anti-pattern — expressions in uses: cause parse error"
+    code: |
+      # ❌ WRONG — none of these are supported
+      steps:
+        - uses: ./${{ env.ACTION_DIR }}/my-action         # ← parse error
+        - uses: actions/setup-node@${{ inputs.version }}  # ← parse error
+        - uses: ${{ github.repository }}/.github/workflows/deploy.yml@main  # ← error
+
+  - language: yaml
+    label: "Fix: hard-code the version, use Dependabot to keep it updated"
+    code: |
+      # ✅ CORRECT — static string in uses:
+      steps:
+        - uses: actions/setup-node@v4          # pin to major version
+        - uses: actions/setup-node@11.0.0      # or exact version
+        - uses: ./.github/actions/my-action    # local action: always relative to repo root
+
+      # Keep versions current with Dependabot (.github/dependabot.yml):
+      # version: 2
+      # updates:
+      #   - package-ecosystem: "github-actions"
+      #     directory: "/"
+      #     schedule:
+      #       interval: "weekly"
+
+  - language: yaml
+    label: "Workaround: if-based dispatch when choosing between known static actions"
+    code: |
+      # ✅ Conditional dispatch using if: conditions on static uses:
+      steps:
+        - name: Setup Node (version from input)
+          uses: actions/setup-node@v4
+          with:
+            node-version: ${{ inputs.node-version }}   # ← with: supports expressions
+
+        # If you truly need different actions based on input:
+        - name: Use action for staging
+          if: inputs.environment == 'staging'
+          uses: ./actions/deploy-staging              # static path
+
+        - name: Use action for production
+          if: inputs.environment == 'production'
+          uses: ./actions/deploy-production           # static path
+
+  - language: yaml
+    label: "Workaround: step-security/dynamic-uses third-party action"
+    code: |
+      # Third-party workaround — resolves expressions in uses: at runtime
+      steps:
+        - uses: step-security/dynamic-uses@v1
+          with:
+            uses: actions/setup-node@${{ inputs.node-version }}
+            with: '{ "node-version": 18 }'
+
+prevention:
+  - "Always use static literal strings in `uses:` keys — no `${{ }}` expressions."
+  - "Use `with:` inputs (which DO support expressions) to pass dynamic values to actions."
+  - "Use Dependabot or Renovate to automate action version bumps so manual pinning stays current."
+  - "For environment-specific action selection, use `if:` conditions on separate steps with static `uses:` values."
+docs:
+  - url: "https://github.com/actions/runner/issues/1479"
+    label: "actions/runner#1479: Support context/matrix variables in steps of type 'uses'"
+  - url: "https://github.com/actions/runner/issues/895"
+    label: "actions/runner#895: Allow expressions in uses: key"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-pre-written-building-blocks-in-your-workflow"
+    label: "GitHub Docs: Using pre-written building blocks (actions)"
+  - url: "https://github.com/step-security/dynamic-uses"
+    label: "step-security/dynamic-uses: third-party workaround for dynamic uses:"

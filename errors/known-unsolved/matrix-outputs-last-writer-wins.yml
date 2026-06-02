@@ -1,0 +1,137 @@
+id: known-unsolved-011
+title: "Matrix Job Outputs Are Non-Deterministic — Only Last Completed Job's Value Is Used"
+category: known-unsolved
+severity: silent-failure
+tags:
+  - matrix
+  - outputs
+  - non-deterministic
+  - race-condition
+  - jobs-outputs
+  - strategy
+patterns:
+  - regex: "jobs\\.\\w+\\.outputs\\.\\w+"
+    flags: "i"
+  - regex: "matrix.*output.*overwrite"
+    flags: "i"
+  - regex: "only.*last.*matrix.*job.*output"
+    flags: "i"
+error_messages:
+  - "outputs from matrix returns only the last value"
+  - "matrix job output overwritten by later-completing job"
+root_cause: |
+  GitHub Actions does not support aggregating outputs across matrix jobs. When a job uses
+  `strategy: matrix:` and defines `outputs:`, all matrix instances write to the SAME
+  output key. The value that survives is whichever matrix job completes LAST — and
+  completion order is non-deterministic.
+
+  Example: a 3-element matrix writing `result` as an output. Job [A, B, C] may complete
+  in any order — the downstream job receives only the output from whichever finished last.
+  This can silently produce wrong results that vary between runs.
+
+  The underlying limitation: `jobs.<job_id>.outputs` maps to a single scalar value
+  per key, with no way to collect values from all matrix instances into a structured
+  result. The runner simply last-writes-wins with no conflict detection.
+
+  This is a long-standing limitation tracked in actions/runner#1835 (opened April 2022)
+  and actions/runner#2477. A partial improvement in runner v2.303.0 added `$matrix`
+  context to outputs expressions, but it is still not generally available and has known
+  bugs (runner#2499: workflow won't start with the new syntax on older runners).
+
+  Source: actions/runner#1835 (Outputs from matrix returns only the last value)
+  Source: Stack Overflow #70287603 (Dynamic outputs for job with strategy.matrix)
+fix: |
+  There is no native GitHub Actions solution for collecting all matrix job outputs into
+  a structured result. Use one of these workarounds:
+
+  Workaround 1 — Write to artifacts, aggregate downstream:
+    Each matrix job writes its result to a uniquely-named artifact file. A downstream
+    aggregator job downloads all artifacts and processes them.
+
+  Workaround 2 — Encode outputs in artifact JSON, then use as dynamic matrix:
+    Popularized by the `matrix-output` marketplace action. Each job appends a JSON row
+    to an artifact, and a reporting job downloads and merges them.
+
+  Workaround 3 — Use reusable workflows with known job indices:
+    Reusable workflows allow accessing specific job outputs via the caller's
+    `jobs.<reusable_workflow_job>.outputs` context.
+
+  Workaround 4 — Consolidate into a single non-matrix job:
+    If the matrix outputs must be consumed, consider restructuring to run the work
+    sequentially in one job or use a scripted loop.
+fix_code:
+  - language: yaml
+    label: "Workaround: write output to artifact file, aggregate in downstream job"
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              component: [api, web, worker]
+          runs-on: ubuntu-latest
+          steps:
+            - name: Build component
+              run: |
+                # ... build logic ...
+                echo "build_status=success" >> result-${{ matrix.component }}.txt
+
+            - name: Upload result artifact
+              uses: actions/upload-artifact@v4
+              with:
+                name: result-${{ matrix.component }}
+                path: result-${{ matrix.component }}.txt
+
+        aggregate:
+          needs: build
+          runs-on: ubuntu-latest
+          steps:
+            - name: Download all results
+              uses: actions/download-artifact@v4
+              with:
+                pattern: result-*
+                merge-multiple: true
+
+            - name: Aggregate results
+              run: |
+                for f in result-*.txt; do
+                  echo "=== $f ==="
+                  cat "$f"
+                done
+
+  - language: yaml
+    label: "Anti-pattern: matrix outputs — only one value survives (last writer wins)"
+    code: |
+      # ❌ WRONG — only last-completing job's output is used by downstream-job
+      jobs:
+        build:
+          strategy:
+            matrix:
+              component: [api, web, worker]
+          runs-on: ubuntu-latest
+          outputs:
+            status: ${{ steps.build.outputs.status }}   # ← non-deterministic!
+          steps:
+            - id: build
+              run: echo "status=done-${{ matrix.component }}" >> $GITHUB_OUTPUT
+
+        downstream-job:
+          needs: build
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "${{ needs.build.outputs.status }}"
+            # Prints ONE value (whichever matrix job finished last) — unpredictable
+
+prevention:
+  - "Never rely on matrix job outputs for per-job values — outputs are not aggregated."
+  - "Use upload-artifact/download-artifact with unique names per matrix dimension to collect per-job results."
+  - "If a downstream job needs all matrix results, prefer artifact-based aggregation over job outputs."
+  - "Document in your workflow comments that matrix outputs are single-valued and non-deterministic."
+docs:
+  - url: "https://github.com/actions/runner/issues/1835"
+    label: "actions/runner#1835: Outputs from matrix returns only the last value"
+  - url: "https://stackoverflow.com/questions/70287603/dynamic-outputs-for-job-with-strategy-matrix"
+    label: "Stack Overflow: Dynamic outputs for job with strategy.matrix"
+  - url: "https://github.com/marketplace/actions/matrix-output"
+    label: "Marketplace: matrix-output action (artifact-based aggregation workaround)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/passing-information-between-jobs"
+    label: "GitHub Docs: Passing information between jobs"
