@@ -1,0 +1,99 @@
+id: concurrency-timing-010
+title: "env Context Unavailable in Concurrency Group Expression Collapses All Runs"
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - env-context
+  - expression
+  - silent-failure
+  - group-collision
+patterns:
+  - regex: "Canceling since a higher priority waiting"
+    flags: "i"
+  - regex: "concurrency.*group.*\"\""
+    flags: "i"
+error_messages:
+  - "Canceling since a higher priority waiting request for '' exists"
+  - "Canceling since a higher priority waiting run was found for ''"
+root_cause: |
+  The `concurrency.group` expression is evaluated at workflow scheduling time, before
+  most runtime contexts are available. The `env` context is one of the contexts that
+  is NOT available when concurrency expressions are evaluated.
+
+  When you use `${{ env.MY_VAR }}` in a concurrency group key:
+  - The expression silently evaluates to an empty string `""`
+  - Every workflow run (across all branches, all events) shares the same group: `""`
+  - Runs from completely unrelated branches cancel each other unexpectedly
+  - The runner may emit "Canceling since a higher priority waiting request for '' exists"
+    with an empty group name — which is the giveaway
+
+  Contexts available in `concurrency.group`: `github`, `inputs`, `vars`
+  Contexts NOT available: `env`, `steps`, `job`, `runner`, `secrets`, `matrix`, `needs`
+
+  This is a documented limitation but easy to miss because the expression evaluates
+  silently without error — it just returns empty string.
+
+  Sources: GitHub Community #26308, #45734, #69704
+fix: |
+  Replace `env` context references in concurrency group expressions with supported
+  contexts. Use `github` (event properties, ref, workflow name), `inputs` (for
+  workflow_dispatch or workflow_call), or `vars` (repository/org variables).
+
+  For environment-specific group keys, use `github.event_name`, `github.ref_name`,
+  `github.workflow`, or pass an explicit input to workflow_dispatch.
+fix_code:
+  - language: yaml
+    label: "Broken — env context evaluates to empty string in concurrency group"
+    code: |
+      # ❌ BROKEN: ${{ env.ENVIRONMENT }} returns "" at scheduling time
+      env:
+        ENVIRONMENT: production
+
+      concurrency:
+        group: deploy-${{ env.ENVIRONMENT }}  # Always evaluates to "deploy-"
+        cancel-in-progress: false
+  - language: yaml
+    label: "Fixed — use github context or vars instead of env"
+    code: |
+      # ✅ FIXED: use github context properties (available at scheduling time)
+      concurrency:
+        group: deploy-${{ github.ref_name }}-${{ github.workflow }}
+        cancel-in-progress: false
+  - language: yaml
+    label: "Fixed — pass environment as workflow_dispatch input for dynamic group key"
+    code: |
+      # ✅ FIXED: expose the value as an input so it's available via `inputs` context
+      on:
+        workflow_dispatch:
+          inputs:
+            environment:
+              required: true
+              type: choice
+              options: [production, staging]
+
+      concurrency:
+        group: deploy-${{ inputs.environment }}
+        cancel-in-progress: false
+  - language: yaml
+    label: "Fixed — use repository variable (vars context is available)"
+    code: |
+      # ✅ FIXED: vars context is available in concurrency expressions
+      concurrency:
+        group: deploy-${{ vars.DEPLOY_ENV }}-${{ github.ref_name }}
+        cancel-in-progress: false
+prevention:
+  - "Only use `github`, `inputs`, and `vars` contexts in `concurrency.group` expressions."
+  - "If you see runs from unrelated branches cancelling each other, inspect the concurrency group key for empty-string evaluation."
+  - "Test concurrency group expressions by adding a step that echoes the group key: `run: echo 'group=${{ github.workflow }}-${{ github.ref_name }}'`."
+  - "If concurrency cancellation messages show an empty group name `''`, the expression evaluated to an empty string."
+  - "Use `vars` (repository/org variables) rather than `env` when you need a configured value in the group key."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/using-concurrency"
+    label: "Using concurrency — supported expression contexts"
+  - url: "https://github.com/orgs/community/discussions/26308"
+    label: "GitHub Community #26308 — env context not available in concurrency"
+  - url: "https://github.com/orgs/community/discussions/69704"
+    label: "GitHub Community #69704 — concurrency group context limitations"
+  - url: "https://github.com/orgs/community/discussions/45734"
+    label: "GitHub Community #45734 — concurrency expression supported contexts"

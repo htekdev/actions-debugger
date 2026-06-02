@@ -1,0 +1,114 @@
+id: permissions-auth-012
+title: "Reusable Workflow Permissions Not Inherited from Caller — Must Be Granted Explicitly"
+category: permissions-auth
+severity: error
+tags:
+  - reusable-workflow
+  - permissions
+  - github-token
+  - caller
+  - contents
+patterns:
+  - regex: "is requesting '([^']+)', but is only allowed '([^']+)'"
+    flags: "i"
+  - regex: "The workflow.*is requesting.*but is only allowed"
+    flags: "i"
+  - regex: "Resource not accessible by integration"
+    flags: "i"
+error_messages:
+  - "The workflow is not valid. .github/workflows/caller.yml: Error calling workflow 'org/repo/.github/workflows/reusable.yml@main'. The workflow 'org/repo/.github/workflows/reusable.yml@main' is requesting 'contents: read', but is only allowed 'contents: none'."
+  - "Resource not accessible by integration"
+root_cause: |
+  When a workflow calls a reusable workflow using `jobs.<job>.uses`, the called workflow
+  runs with a GITHUB_TOKEN whose permissions are the INTERSECTION of:
+  1. The permissions declared in the caller workflow (or job)
+  2. The permissions the called reusable workflow needs
+
+  Reusable workflows do NOT automatically inherit the caller's permissions. If the caller
+  workflow declares a restrictive permissions block (or relies on repository-default
+  read-all), but the reusable workflow declares or needs broader permissions, the call
+  fails at validation time with:
+
+    "The workflow 'X' is requesting 'contents: read', but is only allowed 'contents: none'."
+
+  This also manifests at runtime as "Resource not accessible by integration" (HTTP 403)
+  when the reusable workflow's steps attempt API calls or git operations that require
+  permissions not granted by the caller.
+
+  Common scenarios:
+  - Caller explicitly sets `permissions: {}` (no permissions) for security hardening
+  - Caller sets only `id-token: write` for OIDC but reusable workflow needs `contents: read`
+  - Repository setting "Read and write permissions" is overridden to "Read repository
+    contents and packages permissions" at org level, reducing the default token scope
+  - Caller passes `secrets: inherit` but forgets to also pass `permissions:`
+
+  Source: GitHub Community Discussion #52665
+fix: |
+  Explicitly grant the required permission scopes in the **caller** workflow, at either
+  the workflow level or the specific job level that uses the reusable workflow.
+
+  To discover which permissions a reusable workflow needs, check its `on.workflow_call`
+  declaration or read its steps to see which GitHub API/resource operations it performs.
+
+  Follow least privilege: grant only what the reusable workflow actually needs, not
+  blanket read-all.
+fix_code:
+  - language: yaml
+    label: "Broken — caller grants no permissions, reusable workflow needs contents"
+    code: |
+      # ❌ BROKEN: caller sets permissions: {} — reusable workflow inherits none
+      name: Release
+      on: push
+
+      permissions: {}  # Locks down all permissions — nothing passes through
+
+      jobs:
+        release:
+          uses: my-org/shared-workflows/.github/workflows/release.yml@main
+          # Error: release.yml requests 'contents: write' but caller allows 'contents: none'
+  - language: yaml
+    label: "Fixed — grant required scopes explicitly at the job level"
+    code: |
+      # ✅ FIXED: grant only what the reusable workflow needs
+      name: Release
+      on: push
+
+      permissions: {}  # Lock down at workflow level for security
+
+      jobs:
+        release:
+          permissions:
+            contents: write       # Required by the reusable workflow for creating releases
+            id-token: write       # Required for OIDC if the reusable workflow uses it
+          uses: my-org/shared-workflows/.github/workflows/release.yml@main
+  - language: yaml
+    label: "Fixed — grant permissions at workflow level when multiple jobs use reusable workflows"
+    code: |
+      # ✅ FIXED: grant at workflow level when multiple jobs need the same scopes
+      name: CI
+      on: [push, pull_request]
+
+      permissions:
+        contents: read          # Needed for checkout in reusable workflows
+        packages: write         # Needed for reusable workflow that publishes packages
+        pull-requests: write    # Needed for reusable workflow that adds PR comments
+
+      jobs:
+        build:
+          uses: my-org/shared-workflows/.github/workflows/build.yml@main
+        publish:
+          needs: build
+          uses: my-org/shared-workflows/.github/workflows/publish.yml@main
+prevention:
+  - "Always read the reusable workflow's steps to know which permissions it needs before calling it."
+  - "Test reusable workflow calls from a caller with explicit `permissions: {}` first — failures reveal required scopes."
+  - "Document required permissions in the reusable workflow's `on.workflow_call` block as comments."
+  - "When adding `permissions:` to a caller, remember that declaring ANY permission sets all others to `none` — enumerate every scope you need."
+  - "Use job-level `permissions:` rather than workflow-level to apply least-privilege per job."
+docs:
+  - url: "https://docs.github.com/en/actions/sharing-automations/reusing-workflows"
+    label: "Reusing workflows — permissions and access"
+  - url: "https://github.com/orgs/community/discussions/52665"
+    label: "GitHub Community #52665 — reusable workflow permissions"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/controlling-permissions-for-github_token"
+    label: "Controlling permissions for GITHUB_TOKEN"
