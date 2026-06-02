@@ -1,0 +1,120 @@
+id: caching-artifacts-013
+title: "Cross-OS Cache Miss — enableCrossOsArchive Not Set"
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - cache
+  - cross-os
+  - windows
+  - linux
+  - cache-miss
+  - enableCrossOsArchive
+patterns:
+  - regex: "Cache not found for input keys"
+    flags: "i"
+  - regex: "enableCrossOsArchive.*false"
+    flags: "i"
+  - regex: "cache miss.*windows"
+    flags: "i"
+  - regex: "tar.*posix.*failed"
+    flags: "i"
+error_messages:
+  - "Cache not found for input keys: <key>"
+  - "enableCrossOsArchive: false"
+  - "Cache saved successfully"
+  - "Post job cleanup."
+root_cause: |
+  `actions/cache` uses different archive formats depending on the runner OS:
+  - Linux/macOS: GNU tar (gnutar) with zstd compression
+  - Windows: BSD tar bundled with Git for Windows (`C:\Program Files\Git\usr\bin\tar.exe`)
+
+  When a cache is created on Linux or macOS, the archive is in GNU tar format. When
+  Windows attempts to restore it (or vice versa), the different tar implementation
+  fails to decompress the archive, resulting in a silent cache miss.
+
+  The `enableCrossOsArchive` option (default: `false`) controls whether the cache is
+  stored in a cross-platform-compatible format. Setting it to `true` forces GNU tar
+  format on all platforms, enabling cache sharing across OSes.
+
+  This is particularly common in monorepos where:
+  - Node modules or package caches are written by a Linux job and expected to be
+    restored by a Windows job in the same workflow run
+  - A "seed cache" job runs on Linux and downstream jobs run on Windows
+  - The matrix includes multiple OS values sharing the same cache key
+
+  Tracked in actions/cache#1275 (Cache miss on Windows despite a successful
+  cache-write) — confirmed fixed by setting `enableCrossOsArchive: true`.
+fix: |
+  Add `enableCrossOsArchive: true` to ALL cache steps (both the write and the restore
+  steps) that need to share caches across different OS runners.
+
+  IMPORTANT: The option must be set consistently on both the writing and reading jobs.
+  Setting it only on one side will not work.
+
+  If true cross-OS caching is not needed, ensure each OS creates its own native cache
+  by including `${{ runner.os }}` in the cache key.
+fix_code:
+  - language: yaml
+    label: "Enable cross-OS archive on cache steps that share between Linux and Windows"
+    code: |
+      - name: Cache node modules (cross-OS compatible)
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: node-${{ hashFiles('**/package-lock.json') }}
+          enableCrossOsArchive: true   # Required for Linux↔Windows cache sharing
+
+  - language: yaml
+    label: "OS-specific cache keys (alternative — each OS gets its own cache)"
+    code: |
+      - name: Cache dependencies (OS-scoped key — no cross-OS needed)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          # Include runner.os so each OS writes its own cache entry
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+  - language: yaml
+    label: "Matrix workflow with consistent enableCrossOsArchive on all jobs"
+    code: |
+      jobs:
+        seed-cache:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Seed shared cache
+              uses: actions/cache@v4
+              with:
+                path: node_modules
+                key: node-${{ hashFiles('**/package-lock.json') }}
+                enableCrossOsArchive: true
+
+        build:
+          needs: seed-cache
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest]
+          runs-on: ${{ matrix.os }}
+          steps:
+            - uses: actions/checkout@v4
+            - name: Restore shared cache
+              uses: actions/cache@v4
+              with:
+                path: node_modules
+                key: node-${{ hashFiles('**/package-lock.json') }}
+                enableCrossOsArchive: true   # Must match the write job
+
+prevention:
+  - "Always include `runner.os` in your cache key unless you explicitly need cross-OS sharing."
+  - "When cross-OS sharing IS required, set `enableCrossOsArchive: true` on every step that reads or writes the shared cache."
+  - "Treat cross-OS cache sharing as an explicit opt-in, not the default."
+  - "Test cache restoration on all target OSes during initial workflow setup."
+docs:
+  - url: "https://github.com/actions/cache/blob/main/README.md"
+    label: "actions/cache README: enableCrossOsArchive option"
+  - url: "https://github.com/actions/cache/blob/main/tips-and-workarounds.md"
+    label: "actions/cache: Tips and workarounds (cross-OS section)"
+  - url: "https://github.com/actions/cache/issues/1275"
+    label: "actions/cache#1275: Cache miss on Windows despite a successful cache-write"
