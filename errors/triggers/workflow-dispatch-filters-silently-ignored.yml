@@ -1,0 +1,131 @@
+id: triggers-011
+title: "workflow_dispatch branches/paths Filters Silently Ignored or Cause Validation Error"
+category: triggers
+severity: warning
+tags:
+  - workflow_dispatch
+  - branches
+  - paths
+  - filters
+  - trigger
+  - manual-dispatch
+patterns:
+  - regex: "Unexpected value 'branches'"
+    flags: "i"
+  - regex: "workflow_dispatch.*branches.*paths"
+    flags: "i"
+  - regex: "The workflow is not valid.*Unexpected value"
+    flags: "i"
+  - regex: "on\\.workflow_dispatch.*branches"
+    flags: "i"
+error_messages:
+  - "The workflow is not valid. .github/workflows/deploy.yml (Line: X, Col: Y): Unexpected value 'branches'"
+  - "Unexpected value 'branches'"
+  - "Unexpected value 'tags'"
+  - "Unexpected value 'paths'"
+root_cause: |
+  `workflow_dispatch` is a manual trigger — it runs when a user (or the API) explicitly
+  triggers the workflow. Because it is not event-driven by a push or pull request, the
+  `branches`, `paths`, `tags`, and `paths-ignore` filters that apply to push/pull_request
+  events are **not valid** for `workflow_dispatch`.
+
+  Two failure modes exist:
+
+  **Mode 1: Validation error (branches, tags)**
+  Adding `branches` or `tags` under `on.workflow_dispatch` now produces a schema
+  validation error: "Unexpected value 'branches'" or "Unexpected value 'tags'".
+  GitHub used to silently ignore these keys (pre-2022), leading to copy-paste templates
+  with these keys still floating around. The workflow may fail to queue at all.
+
+  **Mode 2: Silent ignore (paths)**
+  The `paths` filter under `on.workflow_dispatch` was silently ignored historically.
+  The workflow runs regardless of which files changed (or didn't change), because
+  workflow_dispatch has no file-change context to filter on.
+
+  Developers commonly copy a push-triggered workflow and add workflow_dispatch without
+  removing the push-specific filters, producing this mistake:
+
+  ```yaml
+  on:
+    push:
+      branches: [main]
+      paths: ['src/**']
+    workflow_dispatch:
+      branches: [main]   # ← INVALID for workflow_dispatch
+      paths: ['src/**']  # ← silently ignored for workflow_dispatch
+  ```
+
+  Tracked in github/docs#34884 ("documentation on workflow_dispatch is not
+  correct/complete") and blog post by Jon Gallant (2022): "workflow_dispatch never
+  supported branches, but GH silently ignored it."
+fix: |
+  Remove `branches`, `paths`, `tags`, and `paths-ignore` from the `workflow_dispatch`
+  block entirely. These filters only apply to `push`, `pull_request`, and
+  `pull_request_target` triggers.
+
+  If you want manual dispatch to only be available on specific branches, use the
+  GitHub Actions UI branch selector at runtime — it allows choosing which branch to
+  run the workflow on during manual dispatch without needing a filter in the YAML.
+
+  If you need path-based conditional logic in a manually-triggered workflow, use
+  `dorny/paths-filter` or a custom `git diff` step to check which files changed after
+  the workflow starts.
+fix_code:
+  - language: yaml
+    label: "Remove invalid filters from workflow_dispatch block"
+    code: |
+      on:
+        push:
+          branches: [main]
+          paths: ['src/**']   # ← valid here for push
+        workflow_dispatch:
+          # ← Do NOT add branches/paths/tags here — they are not supported
+          # Use inputs if you need runtime parameterization:
+          inputs:
+            environment:
+              description: "Target environment"
+              required: true
+              default: "staging"
+              type: choice
+              options: [staging, production]
+
+  - language: yaml
+    label: "Path-based conditional logic inside a manually-dispatched workflow"
+    code: |
+      on:
+        workflow_dispatch:
+
+      jobs:
+        check-and-deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                fetch-depth: 2
+
+            - name: Check changed paths
+              id: filter
+              uses: dorny/paths-filter@v3
+              with:
+                filters: |
+                  src:
+                    - 'src/**'
+
+            - name: Deploy (only if src changed)
+              if: steps.filter.outputs.src == 'true'
+              run: echo "Deploying..."
+
+prevention:
+  - "Never copy `branches`, `paths`, or `tags` filters from a `push` block into a `workflow_dispatch` block."
+  - "Treat `workflow_dispatch` as a parameter-based trigger, not a filter-based one — use `inputs` instead."
+  - "If the GitHub Actions linter flags 'Unexpected value branches', remove it from the workflow_dispatch block."
+  - "Use the branch selector in the GitHub Actions UI for branch scoping at runtime."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_dispatch"
+    label: "GitHub Docs: workflow_dispatch event trigger"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#onpushpull_requestpull_request_targetpathspaths-ignore"
+    label: "GitHub Docs: paths filter (push/pull_request only)"
+  - url: "https://github.com/github/docs/issues/34884"
+    label: "github/docs#34884: documentation on workflow_dispatch is not correct/complete"
+  - url: "https://blog.jongallant.com/2022/04/github-actions-failing-with-unexpected-value-branches"
+    label: "Jon Gallant: workflow_dispatch never supported branches (2022)"

@@ -1,0 +1,104 @@
+id: silent-failures-013
+title: "Shallow Clone (fetch-depth: 1) Silently Breaks Git History Operations"
+category: silent-failures
+severity: silent-failure
+tags:
+  - checkout
+  - fetch-depth
+  - shallow-clone
+  - git-describe
+  - changelog
+  - versioning
+patterns:
+  - regex: "fatal:.*No names found.*cannot describe anything"
+    flags: "i"
+  - regex: "fatal:.*no tag can describe"
+    flags: "i"
+  - regex: "git describe.*failed with exit code 128"
+    flags: "i"
+  - regex: "fetch-depth.*1"
+    flags: "i"
+error_messages:
+  - "fatal: No names found, cannot describe anything."
+  - "fatal: no tag can describe ''"
+  - "error: process completed with exit code 128"
+  - "git describe --tags --abbrev=0 failed"
+root_cause: |
+  `actions/checkout` defaults to `fetch-depth: 1`, which creates a shallow clone containing
+  only the most recent commit. This means:
+  - No commit history beyond the latest commit is available
+  - No tags are fetched (unless `fetch-tags: true` is set separately)
+  - Git operations that need history context fail silently or produce wrong results
+
+  Affected operations include:
+  - `git describe --tags` — fails with "No names found, cannot describe anything"
+  - `git log --oneline HEAD~10..HEAD` — returns nothing or errors
+  - Semantic versioning tools (semantic-release, standard-version, release-please)
+  - Changelog generators that diff HEAD against previous tags
+  - `git rev-list --count HEAD` — returns "1" instead of full commit count
+  - GitVersion, MinVer, and similar tag-based version calculators
+
+  The failure is silent in many cases: the step appears to succeed, but produces an
+  empty string, "0.0.0", or a fallback version instead of the expected semver.
+
+  Tracked in actions/checkout#217 (RFC: fetch-depth: 1 and not cloning tags are dangerous
+  defaults) with 22 thumbs-up reactions.
+fix: |
+  **Option 1 (recommended for most cases): Fetch full history**
+  Set `fetch-depth: 0` to fetch all commits and tags.
+
+  **Option 2: Fetch only enough history**
+  For large repos, fetch only the depth needed (e.g., last 50 commits). Use
+  `fetch-tags: true` (available in actions/checkout@v4) to fetch all tags without
+  the full commit history.
+
+  **Option 3: Unshallow after checkout**
+  Fetch the necessary history lazily with `git fetch --unshallow` or
+  `git fetch --tags --unshallow` as a subsequent step.
+fix_code:
+  - language: yaml
+    label: "Full history checkout (simplest fix)"
+    code: |
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 0 = full history; default 1 = shallow
+
+      - name: Generate changelog
+        run: git log --oneline $(git describe --tags --abbrev=0 @^)..@ --no-merges
+
+  - language: yaml
+    label: "Fetch tags only without full history (faster for large repos)"
+    code: |
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0     # Required for tag-based versioning
+          fetch-tags: true   # Explicitly fetch all tags (actions/checkout v4.1.1+)
+
+  - language: yaml
+    label: "Unshallow lazily if full history is not needed upfront"
+    code: |
+      - uses: actions/checkout@v4
+        # fetch-depth: 1 (default — shallow clone)
+
+      - name: Fetch tags for versioning
+        run: |
+          git fetch --tags --force
+          # Or for full history:
+          # git fetch --unshallow
+
+      - name: Get version from tags
+        run: git describe --tags --abbrev=0
+
+prevention:
+  - "Add `fetch-depth: 0` to any checkout step that precedes git history, tag, or versioning operations."
+  - "Set `fetch-tags: true` in actions/checkout@v4 when using tag-based versioning tools."
+  - "When using semantic-release, release-please, or GitVersion, always use `fetch-depth: 0`."
+  - "Test locally with `git clone --depth 1` to reproduce the shallow clone environment before debugging in CI."
+  - "Audit all checkout steps in release workflows — shallow clones are fine for build/test but break release automation."
+docs:
+  - url: "https://github.com/actions/checkout#usage"
+    label: "actions/checkout: fetch-depth and fetch-tags inputs"
+  - url: "https://github.com/actions/checkout/issues/217"
+    label: "actions/checkout#217: RFC — fetch-depth: 1 and not cloning tags are dangerous defaults"
+  - url: "https://stackoverflow.com/questions/66349002/get-latest-tag-git-describe-tags-when-repo-is-cloned-with-depth-1"
+    label: "Stack Overflow: git describe fails when cloned with depth=1"
