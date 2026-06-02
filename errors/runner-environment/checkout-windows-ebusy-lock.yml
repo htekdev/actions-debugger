@@ -1,0 +1,124 @@
+id: runner-environment-042
+title: "actions/checkout EBUSY File Lock on Windows Self-Hosted Runners"
+category: runner-environment
+severity: error
+tags:
+  - windows
+  - self-hosted
+  - checkout
+  - ebusy
+  - file-lock
+  - git-fsmonitor
+patterns:
+  - regex: "EBUSY.*resource busy or locked"
+    flags: "i"
+  - regex: "File was unable to be removed.*EBUSY"
+    flags: "i"
+  - regex: "Unable to remove.*_temp.*EBUSY"
+    flags: "i"
+error_messages:
+  - "Error: File was unable to be removed Error: EBUSY: resource busy or locked, rmdir 'C:\\Users\\...\\runner\\_temp\\...'"
+  - "Error: EBUSY: resource busy or locked, rmdir"
+  - "Error: The process cannot access the file because it is being used by another process"
+root_cause: |
+  On Windows self-hosted runners, `actions/checkout` fails with an `EBUSY` (resource
+  busy or locked) error when attempting to clean up temp directories during checkout.
+
+  **Primary cause — Git FSMonitor:**
+  Git's `core.fsmonitor` daemon (enabled by default in Git 2.36+) keeps a file handle
+  open on the repository directory. When `actions/checkout` tries to remove or clean the
+  `_temp` directory between runs, the FSMonitor process holds the lock, causing EBUSY.
+
+  **Secondary causes:**
+  - Windows Defender / antivirus scanning files that checkout is trying to delete
+  - Other processes (IDE file watchers, npm watchers, running Node processes) holding
+    handles on workspace files
+  - Concurrent runner jobs accessing the same workspace directory
+
+  **Why Windows only:**
+  Linux/macOS do not enforce EBUSY locks in the same way. Windows file locking is
+  advisory on Unix but mandatory on NTFS, so the same handle that would succeed on
+  Linux causes a hard error on Windows.
+
+  Source: actions/checkout#1388
+fix: |
+  **Option 1 (recommended): Disable Git FSMonitor on the runner**
+
+  Configure Git globally on the self-hosted runner to disable fsmonitor:
+  ```
+  git config --global core.fsmonitor false
+  git config --global core.useBuiltinFSMonitor false
+  ```
+
+  **Option 2: Add a pre-checkout cleanup step**
+
+  Kill any lingering Git processes before checkout:
+  ```yaml
+  - name: Kill lingering git processes
+    shell: pwsh
+    run: Get-Process -Name "git" -ErrorAction SilentlyContinue | Stop-Process -Force
+  ```
+
+  **Option 3: Configure antivirus exclusions**
+
+  Add the runner workspace directory (e.g., `C:\actions-runner\_work\`) to Windows
+  Defender's exclusion list on the self-hosted runner machine.
+
+  **Option 4: Use `clean: false` and handle cleanup manually**
+
+  Setting `clean: false` on `actions/checkout` prevents the step from attempting to
+  clean the workspace, avoiding the lock conflict entirely.
+fix_code:
+  - language: yaml
+    label: "Workaround — disable git FSMonitor before checkout"
+    code: |
+      jobs:
+        build:
+          runs-on: [self-hosted, windows]
+          steps:
+            # Kill git fsmonitor daemon before checkout to release file locks
+            - name: Disable git fsmonitor
+              shell: pwsh
+              run: |
+                git config --global core.fsmonitor false
+                git config --global core.useBuiltinFSMonitor false
+                Get-Process -Name "git" -ErrorAction SilentlyContinue | Stop-Process -Force
+
+            - uses: actions/checkout@v4
+  - language: yaml
+    label: "Workaround — skip workspace clean to avoid EBUSY on _temp"
+    code: |
+      jobs:
+        build:
+          runs-on: [self-hosted, windows]
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                clean: false   # Skip workspace clean; avoids EBUSY on locked dirs
+  - language: yaml
+    label: "Workaround — retry checkout on EBUSY failure"
+    code: |
+      jobs:
+        build:
+          runs-on: [self-hosted, windows]
+          steps:
+            - name: Checkout with retry
+              uses: nick-fields/retry@v3
+              with:
+                timeout_minutes: 5
+                max_attempts: 3
+                command: git checkout
+            - uses: actions/checkout@v4
+prevention:
+  - "Disable Git FSMonitor globally on Windows self-hosted runners: `git config --global core.fsmonitor false`."
+  - "Add the runner `_work` directory to Windows Defender exclusions — AV scanning causes EBUSY on files checkout needs to delete."
+  - "Avoid running multiple workflow jobs concurrently on the same workspace directory on a single Windows self-hosted runner."
+  - "Upgrade to `actions/checkout@v4` — later versions have improved retry logic and are more resilient to transient locks."
+  - "Consider using ephemeral self-hosted runners that start fresh for each job, eliminating stale workspace lock issues entirely."
+docs:
+  - url: "https://github.com/actions/checkout/issues/1388"
+    label: "actions/checkout#1388 — EBUSY resource busy or locked on Windows self-hosted"
+  - url: "https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners"
+    label: "GitHub Docs: About self-hosted runners"
+  - url: "https://git-scm.com/docs/git-config#Documentation/git-config.txt-corefsmonitor"
+    label: "Git config: core.fsmonitor"
