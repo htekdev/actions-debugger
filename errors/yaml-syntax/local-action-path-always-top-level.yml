@@ -1,0 +1,142 @@
+id: yaml-syntax-019
+title: "Local Composite Action 'uses:' Paths Always Resolve From Repository Root"
+category: yaml-syntax
+severity: error
+tags:
+  - composite-action
+  - local-action
+  - uses
+  - path-resolution
+  - runner
+  - file-not-found
+patterns:
+  - regex: "Can't find '.*action\\.ya?ml'"
+    flags: "i"
+  - regex: "Unable to resolve action.*local"
+    flags: "i"
+  - regex: "Action.*not found.*\\./"
+    flags: "i"
+  - regex: "Error.*action.ya?ml.*does not exist"
+    flags: "i"
+error_messages:
+  - "Can't find 'action.yml', 'action.yaml' or 'Dockerfile' under '/home/runner/work/repo/repo/actions/my-action'. Did you forget to run actions/checkout?"
+  - "Error: Unable to resolve action `./actions/my-action`, unable to find action at path: /home/runner/work/repo/repo/actions/my-action"
+  - "Error: Can't find action.yml at referenced path ./relative/path/to/action"
+root_cause: |
+  When referencing a **local composite action** with a relative path (`uses: ./path/to/action`),
+  the GitHub Actions runner **always resolves the path relative to the root of the repository
+  that was checked out**, regardless of where the calling workflow or action lives.
+
+  This surprises developers who expect relative paths to resolve from the current file's
+  location (like `import './relative'` in Node.js or `include` in languages). GitHub Actions
+  does not work that way.
+
+  **Common mistake — calling a composite action from another composite action:**
+  ```yaml
+  # In .github/actions/build/action.yml
+  runs:
+    using: composite
+    steps:
+      - uses: ./actions/shared/setup   # Developer expects: relative to THIS file's location
+                                        # Reality: resolves from repo root → correct if structure matches
+                                        # BUT: when called FROM another repo, it resolves in the caller's repo
+  ```
+
+  **Cross-repo misunderstanding:**
+  When a reusable workflow or composite action is stored in a **different repository** and
+  called externally (e.g., `uses: org/shared-actions/.github/workflows/build.yml@main`),
+  local `./` paths inside that called action resolve from the **caller's** repository root,
+  not the shared action's repository. The files don't exist there.
+
+  **Why it fails:**
+  - The runner checks out the correct repo but resolves `./` from that checkout root
+  - Nested relative paths in composite actions called from another repo fail entirely
+  - Error messages mention the runner's workspace path, making the root cause unclear
+
+  Source: actions/runner#1348
+fix: |
+  **Option 1 (recommended): Use absolute repository-relative paths from the repo root**
+
+  Design your repository layout so all local action references make sense from the repo root.
+  All `uses: ./` paths must be valid paths starting from the repository root.
+
+  **Option 2: Publish shared actions as versioned releases**
+
+  For actions shared across repositories, publish them as proper GitHub Actions in their
+  own repository and reference them with `uses: org/repo/path@version` rather than
+  relative paths.
+
+  **Option 3: Avoid nesting composite actions that reference other local actions**
+
+  Flatten composite action steps so they do not call other local composite actions with
+  relative paths — inline the shared steps or extract them into a single action.
+fix_code:
+  - language: yaml
+    label: "Broken — relative path in composite action misunderstood as file-relative"
+    code: |
+      # ❌ BROKEN: Developer expects ./setup to resolve relative to this action file
+      # File: .github/actions/build/action.yml
+      runs:
+        using: composite
+        steps:
+          # This resolves from REPO ROOT as ./setup — NOT from .github/actions/build/
+          - uses: ./setup          # Fails if there is no 'setup/action.yml' at repo root
+          - uses: ./shared/lint    # Same problem
+
+      # ✅ What the developer meant (but is not how it works):
+      #   ./setup → .github/actions/build/setup/action.yml  (WRONG assumption)
+      # What the runner does:
+      #   ./setup → <repo-root>/setup/action.yml            (CORRECT behavior)
+  - language: yaml
+    label: "Fixed — use full repo-root-relative paths"
+    code: |
+      # ✅ FIXED: Use paths that are correct relative to the repo root
+      # Repo layout:
+      #   .github/actions/build/action.yml
+      #   .github/actions/setup/action.yml   ← shared action
+
+      # File: .github/actions/build/action.yml
+      runs:
+        using: composite
+        steps:
+          - uses: ./.github/actions/setup   # ✅ Correct: resolves from repo root
+  - language: yaml
+    label: "Fixed — publish shared action to its own repo for cross-repo use"
+    code: |
+      # ✅ FIXED: For cross-repo shared actions, publish as a versioned action
+      # Instead of local ./path references, use:
+      runs:
+        using: composite
+        steps:
+          - uses: org/shared-actions/setup@v1   # ✅ Explicit repo + version reference
+
+      # This avoids ALL path resolution ambiguity when calling across repositories
+  - language: yaml
+    label: "Fixed — flatten composite action to avoid nested local references"
+    code: |
+      # ✅ ALTERNATIVE: Inline shared steps instead of nesting composite calls
+      # File: .github/actions/build/action.yml
+      runs:
+        using: composite
+        steps:
+          # Inline what ./setup would have done:
+          - name: Setup Node
+            uses: actions/setup-node@v4
+            with:
+              node-version: '20'
+          - name: Install dependencies
+            run: npm ci
+            shell: bash
+prevention:
+  - "Always verify that local `uses: ./path` references point to valid paths from the **repository root**, not from the file containing the reference."
+  - "Use `ls .github/actions/` and verify the path structure before expecting `./` local action references to resolve correctly."
+  - "For actions used across multiple repositories, always use a versioned `org/repo/path@ref` reference — never `./` relative paths."
+  - "Avoid deeply nested composite actions that call other local composite actions; flatten where possible to reduce path resolution complexity."
+  - "When a composite action is called from an external repo via `uses: org/repo/.github/workflows/...`, remember that all `./` paths inside it resolve in the CALLER's repo."
+docs:
+  - url: "https://github.com/actions/runner/issues/1348"
+    label: "actions/runner#1348 — Local composite action path resolution always from top-level repo"
+  - url: "https://docs.github.com/en/actions/sharing-automations/creating-actions/about-custom-actions#using-an-action-in-the-same-repository-as-a-workflow"
+    label: "GitHub Docs: Using a local action in the same repository"
+  - url: "https://docs.github.com/en/actions/sharing-automations/creating-actions/creating-a-composite-action"
+    label: "GitHub Docs: Creating a composite action"

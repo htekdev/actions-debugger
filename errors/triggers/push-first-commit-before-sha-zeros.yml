@@ -1,0 +1,160 @@
+id: triggers-014
+title: "github.event.before Is All Zeros on First Push to a New Branch — git diff Fails"
+category: triggers
+severity: error
+tags:
+  - push
+  - first-push
+  - git-diff
+  - before-sha
+  - new-branch
+  - branch-creation
+patterns:
+  - regex: "fatal.*bad revision.*0000000000000000000000000000000000000000"
+    flags: "i"
+  - regex: "fatal.*ambiguous argument '0{40}'"
+    flags: "i"
+  - regex: "unknown revision or path not in the working tree.*0{10}"
+    flags: "i"
+  - regex: "0{40}\\.\\.\\.\\$\\{\\{.*github\\.event\\.before"
+    flags: "i"
+error_messages:
+  - "fatal: bad revision '0000000000000000000000000000000000000000...HEAD'"
+  - "fatal: ambiguous argument '0000000000000000000000000000000000000000': unknown revision or path not in the working tree"
+  - "error: object file .git/objects/00/00000000000000000000000000000000000000 is empty"
+root_cause: |
+  When a **new branch is pushed for the first time**, `github.event.before` is set to
+  `0000000000000000000000000000000000000000` (40 zeros), representing the null/empty SHA.
+  This indicates there was no previous commit on this branch — it is a branch creation event.
+
+  Workflows that use `github.event.before` to compute a diff range (e.g., to find changed
+  files) fail when run on a first push because `git diff` or `git log` cannot resolve the
+  null SHA:
+
+  ```yaml
+  run: git diff ${{ github.event.before }}...HEAD
+  # On first push: git diff 0000000000000000000000000000000000000000...HEAD → FATAL ERROR
+  ```
+
+  **When this occurs:**
+  - First push to a new branch (branch creation)
+  - `push` events that create a new branch (`github.event.created == true`)
+  - Forced pushes that reference a non-existent before-SHA (rare)
+
+  **Why it's painful:**
+  - Workflows work fine for subsequent pushes (where `before` is a real commit)
+  - The error only appears on the first push, often during branch creation in a PR workflow
+  - The error message references the git object store internals, not the workflow context
+  - Developers check out the diff command syntax without realizing the SHA is invalid
+fix: |
+  **Option 1 (recommended): Guard against the null SHA before running git diff**
+
+  Check if `github.event.before` is the null SHA and fall back to diffing against the
+  merge base or the initial commit.
+
+  **Option 2: Use the `dorny/paths-filter` action**
+
+  The `dorny/paths-filter` action handles first-push, force-push, and all edge cases
+  in branch diff computation automatically.
+
+  **Option 3: Use `github.event.created` to skip diff-based logic on branch creation**
+
+  Add an `if: github.event.created != true` guard to diff-dependent steps so they only
+  run on non-creation push events.
+fix_code:
+  - language: yaml
+    label: "Broken — git diff with github.event.before fails on first push"
+    code: |
+      # ❌ BROKEN: Fails when branch is pushed for the first time
+      on: push
+
+      jobs:
+        lint-changed:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                fetch-depth: 0
+            - name: Lint only changed files
+              run: |
+                CHANGED=$(git diff --name-only ${{ github.event.before }}...HEAD)
+                # FATAL on first push: 0000000000000000000000000000000000000000 is not a commit
+  - language: yaml
+    label: "Fixed — guard against null SHA before git diff"
+    code: |
+      # ✅ FIXED: Check for null SHA and fall back to first commit
+      on: push
+
+      jobs:
+        lint-changed:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                fetch-depth: 0
+            - name: Lint only changed files
+              run: |
+                BEFORE="${{ github.event.before }}"
+                NULL_SHA="0000000000000000000000000000000000000000"
+
+                if [ "$BEFORE" = "$NULL_SHA" ]; then
+                  # First push to new branch — diff against the initial commit or all files
+                  echo "First push to branch, diffing all files"
+                  CHANGED=$(git diff --name-only $(git rev-list --max-parents=0 HEAD)...HEAD)
+                else
+                  CHANGED=$(git diff --name-only "$BEFORE"...HEAD)
+                fi
+                echo "$CHANGED"
+  - language: yaml
+    label: "Fixed — skip diff steps on branch creation using github.event.created"
+    code: |
+      # ✅ FIXED: Skip diff-based steps entirely on first push (branch creation)
+      on: push
+
+      jobs:
+        lint-changed:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                fetch-depth: 0
+            - name: Lint only changed files
+              # Skip on branch creation (before SHA is null)
+              if: github.event.created != true
+              run: |
+                git diff --name-only ${{ github.event.before }}...HEAD | xargs eslint
+  - language: yaml
+    label: "Fixed — use dorny/paths-filter which handles null SHA automatically"
+    code: |
+      # ✅ RECOMMENDED: dorny/paths-filter handles first-push and force-push edge cases
+      on: push
+
+      jobs:
+        lint-changed:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: dorny/paths-filter@v3
+              id: changes
+              with:
+                filters: |
+                  src:
+                    - 'src/**'
+                  tests:
+                    - 'tests/**'
+            - name: Lint src changes
+              if: steps.changes.outputs.src == 'true'
+              run: npm run lint
+prevention:
+  - "Never use `git diff ${{ github.event.before }}` without guarding against the null SHA (`0000000000000000000000000000000000000000`) — this is guaranteed to fail on first push."
+  - "Prefer `dorny/paths-filter` for changed-file detection — it handles all SHA edge cases (first push, force push, merge commits) internally."
+  - "If you must use raw git diff, always add: `if [ \"$BEFORE\" = \"$NULL_SHA\" ]; then echo 'first push'; exit 0; fi`."
+  - "Test your diff workflows by creating a fresh test branch — don't only test on subsequent pushes where `before` is always valid."
+  - "Use `github.event.created == true` in `if:` conditions to identify branch creation events and handle them separately."
+docs:
+  - url: "https://docs.github.com/en/webhooks/webhook-events-and-payloads#push"
+    label: "GitHub Docs: push webhook event payload — before field"
+  - url: "https://github.com/dorny/paths-filter"
+    label: "dorny/paths-filter — changed file detection with edge case handling"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#push"
+    label: "GitHub Docs: Events that trigger workflows — push"
