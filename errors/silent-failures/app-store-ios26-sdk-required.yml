@@ -1,0 +1,113 @@
+id: silent-failures-017
+title: "iOS App Store Upload Fails Silently — macOS-latest Uses Xcode 16.4 but Apple Requires iOS 26 SDK"
+category: silent-failures
+severity: silent-failure
+tags:
+  - macos
+  - xcode
+  - ios
+  - app-store
+  - sdk
+  - silent-failure
+  - apple
+patterns:
+  - regex: "built with the iOS (?:18|17|16)\\.\\d SDK"
+    flags: "i"
+  - regex: "must be built with the iOS 26 SDK or later.*App Store"
+    flags: "i"
+  - regex: "Invalid Toolchain.*iOS.*SDK.*required"
+    flags: "i"
+  - regex: "ITMS-90725|ITMS-90206"
+    flags: "i"
+error_messages:
+  - "This app was built with the iOS 18.5 SDK. All iOS and iPadOS apps must be built with the iOS 26 SDK or later in order to be uploaded to App Store Connect."
+  - "ERROR ITMS-90725: SDK Version Issue - This app was built with the iOS 18.5 SDK"
+  - "Invalid Toolchain. New apps and app updates must be built with the public iOS 26 SDK or later"
+root_cause: |
+  Apple requires that all new iOS/iPadOS App Store submissions be built with the
+  iOS 26 SDK or later (enforced starting mid-2026). However, `macos-latest` currently
+  points to macOS 15 (until the macOS 26 migration completes in July 2026), and
+  macOS 15 runner images ship with Xcode 16.4 as the default — which includes the
+  iOS 18.5 SDK, NOT the iOS 26 SDK.
+
+  The failure is a classic silent-failure pattern:
+  - The build step SUCCEEDS with zero errors or warnings.
+  - The archive step SUCCEEDS.
+  - The upload/export to App Store Connect FAILS with the SDK version error.
+  - Because the failure occurs at the distribution stage (not compilation), it
+    can be misdiagnosed as a signing, provisioning, or network issue.
+
+  Workflows that use `uses: maxim-lobanov/setup-xcode` with an explicit 16.x version,
+  or that rely on `macos-latest` defaults without explicit Xcode pinning, will
+  silently produce an .ipa or .xcarchive that cannot be submitted to App Store Connect.
+
+  After the `macos-latest` migration to macOS 26 completes (July 15, 2026), the default
+  Xcode will be 26.4.1+, which includes the iOS 26 SDK and resolves this issue.
+  Until then, explicit Xcode pinning is required.
+
+  Source: actions/runner-images#14165
+fix: |
+  **Immediate fix**: Pin Xcode to 26.x explicitly using `maxim-lobanov/setup-xcode`
+  before any build or archive steps. Use `macos-26` as the runner to ensure Xcode 26
+  is available.
+
+  **For teams not ready to migrate to Xcode 26**: Use `macos-26` and pin to Xcode 26.4.1
+  or later — this is required by Apple regardless of code changes.
+
+  **Verify the SDK in use** by adding `xcodebuild -showsdks` before the build step.
+fix_code:
+  - language: yaml
+    label: "Pin to macOS 26 + Xcode 26 for App Store submissions"
+    code: |
+      jobs:
+        release:
+          runs-on: macos-26   # Explicit: don't rely on macos-latest during transition
+          steps:
+            - uses: actions/checkout@v4
+
+            # Explicitly select Xcode 26 (includes iOS 26 SDK required by App Store)
+            - uses: maxim-lobanov/setup-xcode@v1
+              with:
+                xcode-version: '26.4'   # or '26.5' once generally available
+
+            - name: Verify SDK
+              run: xcodebuild -showsdks | grep -i iphoneos
+
+            - name: Archive
+              run: |
+                xcodebuild archive \
+                  -scheme MyApp \
+                  -archivePath $RUNNER_TEMP/MyApp.xcarchive \
+                  -destination generic/platform=iOS
+
+            - name: Export for App Store
+              run: |
+                xcodebuild -exportArchive \
+                  -archivePath $RUNNER_TEMP/MyApp.xcarchive \
+                  -exportOptionsPlist ExportOptions.plist \
+                  -exportPath $RUNNER_TEMP/MyApp.ipa
+  - language: yaml
+    label: "Check installed Xcode versions and default SDK (diagnosis)"
+    code: |
+      - name: Diagnose Xcode and SDK versions
+        run: |
+          echo "=== Default Xcode ==="
+          xcode-select -p
+          xcodebuild -version
+          echo "=== Available SDKs ==="
+          xcodebuild -showsdks | grep -i iphone
+prevention:
+  - "Never rely on `macos-latest` default Xcode for App Store release builds — always pin the Xcode version explicitly."
+  - "Use `xcodebuild -showsdks` as an early workflow step to emit the active iOS SDK version to logs."
+  - "Run a smoke test of the App Store export (not just the build) in CI to catch SDK requirement errors before manual submission."
+  - "Subscribe to Apple Developer news for SDK requirement enforcement dates and plan runner image migrations in advance."
+  - "Pin `runs-on: macos-26` explicitly rather than `macos-latest` for release workflows during the macOS version transition period."
+docs:
+  - url: "https://github.com/actions/runner-images/issues/14165"
+    label: "runner-images#14165 — macOS-latest Xcode 16.4 breaks App Store submissions"
+  - url: "https://github.com/actions/runner-images/issues/14167"
+    label: "runner-images#14167 — macos-latest will use macos-26 in June 2026"
+  - url: "https://github.com/maxim-lobanov/setup-xcode"
+    label: "maxim-lobanov/setup-xcode — Pin Xcode version in workflows"
+  - url: "https://developer.apple.com/news/releases/"
+    label: "Apple Developer News — SDK requirement announcements"
