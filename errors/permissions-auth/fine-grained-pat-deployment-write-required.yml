@@ -1,0 +1,146 @@
+id: permissions-auth-015
+title: "Fine-Grained PAT Requires 'deployments: write' to Approve or Reject Deployments (Was 'read')"
+category: permissions-auth
+severity: error
+tags:
+  - fine-grained-pat
+  - deployments
+  - permissions
+  - pat
+  - environments
+  - approval
+  - breaking-change
+patterns:
+  - regex: "Resource not accessible by integration.*deployment|403.*deployment.*approve"
+    flags: "i"
+  - regex: "Must have admin rights to Repository.*approve.*deployment|permission.*deployments.*write"
+    flags: "i"
+  - regex: "HttpError: Resource not accessible by integration.*reviewers"
+    flags: "i"
+  - regex: "403.*Unable to approve deployment|Forbidden.*approve.*pending.*deployment"
+    flags: "i"
+error_messages:
+  - "Resource not accessible by integration"
+  - "HttpError: Resource not accessible by integration"
+  - "Error: RequestError [HttpError]: Resource not accessible by integration"
+  - "Must have admin rights to Repository. - https://docs.github.com/rest/deployments/deployments"
+  - "403: Forbidden - You need deployments:write permission to approve or reject a deployment."
+root_cause: |
+  On April 1, 2025, GitHub changed how deployment approval permissions work for
+  fine-grained personal access tokens (PATs). Prior to this change, a fine-grained PAT
+  with `deployments: read` permission could approve, approve-with-comment, or reject pending
+  deployments in protected environments. After April 1, 2025, the `deployments: write`
+  permission is **required** to review deployments.
+
+  This change was announced in the GitHub Changelog on March 20, 2025. Impacted customers
+  were notified by email in early March 2025. Fine-grained PATs that were created before
+  the change and only granted `deployments: read` stopped being able to approve or reject
+  deployments on April 1, 2025 without any change to the token itself — existing tokens
+  suddenly lost the ability they previously had.
+
+  **Affected scenarios:**
+  - GitHub Actions workflows that call `POST /repos/{owner}/{repo}/actions/runs/{run_id}/approvals`
+    or `POST /repos/{owner}/{repo}/actions/runs/{run_id}/pending_deployments` with a
+    fine-grained PAT that only has `deployments: read`
+  - Custom deployment orchestration scripts using fine-grained PATs
+  - GitHub Apps or OAuth apps authenticated via fine-grained PAT that approved deployments
+
+  **Note:** Classic PATs and GitHub Apps with `deployments: write` scope are unaffected.
+  GitHub Apps using their own installation token (not a fine-grained PAT) are also
+  unaffected as long as they have the `deployments: write` permission in their app settings.
+fix: |
+  Update the fine-grained PAT to grant `deployments: write` permission instead of
+  `deployments: read`:
+
+  1. Go to GitHub Settings → Developer settings → Personal access tokens → Fine-grained tokens
+  2. Click the PAT used in your workflow
+  3. Click "Regenerate token"
+  4. Under "Permissions → Repository permissions → Deployments", change from "Read" to "Read and write"
+  5. Update the secret in your repository/organization with the new token value
+
+  If you use a GitHub App instead of a PAT for deployments, ensure the App's repository
+  permission for "Deployments" is set to "Read and write" in the App settings.
+fix_code:
+  - language: yaml
+    label: "Workflow using octokit to approve deployments — ensure PAT has deployments:write"
+    code: |
+      jobs:
+        approve-deployment:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Approve pending deployment
+              uses: actions/github-script@v7
+              with:
+                # This PAT MUST have deployments:write permission (not just read)
+                github-token: ${{ secrets.DEPLOYMENT_APPROVAL_PAT }}
+                script: |
+                  const pendingDeployments = await github.rest.actions.getPendingDeploymentsForRun({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    run_id: context.runId
+                  });
+
+                  const environmentIds = pendingDeployments.data
+                    .filter(d => d.environment.name === 'production')
+                    .map(d => d.environment.id);
+
+                  await github.rest.actions.reviewPendingDeploymentsForRun({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    run_id: context.runId,
+                    environment_ids: environmentIds,
+                    state: 'approved',
+                    comment: 'Auto-approved by CI orchestration'
+                  });
+  - language: yaml
+    label: "Verify token permissions before attempting deployment approval"
+    code: |
+      jobs:
+        check-permissions:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Verify deployment token scope
+              uses: actions/github-script@v7
+              with:
+                github-token: ${{ secrets.DEPLOYMENT_APPROVAL_PAT }}
+                script: |
+                  // Try a read operation first to confirm token is valid
+                  const token = process.env.GITHUB_TOKEN;
+
+                  // Check deployments permission by listing — uses read; write needed for approve
+                  const deployments = await github.rest.repos.listDeployments({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo
+                  });
+                  console.log(`Token valid — found ${deployments.data.length} deployments.`);
+                  console.log('NOTE: To APPROVE deployments, this PAT needs deployments:write, not just read.');
+  - language: yaml
+    label: "Use GITHUB_TOKEN with environment protection rules instead of fine-grained PAT"
+    code: |
+      # Better pattern: let GitHub's environment protection handle approvals
+      # rather than auto-approving via API with a PAT
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          environment:
+            name: production
+            # Configure required reviewers in Environment settings
+            # No custom PAT needed — GITHUB_TOKEN works for normal deployment flows
+          steps:
+            - name: Deploy
+              run: echo "Deploying to production..."
+              # The 'environment' key above enforces approval through GitHub UI
+              # without needing deployments:write in a PAT
+prevention:
+  - "When creating fine-grained PATs for CI/CD deployment workflows, always grant `deployments: write` upfront — even if you only need read today, write is required for any approval-related operation."
+  - "Audit all fine-grained PATs used in GitHub Actions for their `deployments` permission level after the April 2025 change."
+  - "Prefer using GitHub's built-in environment protection rules (required reviewers, wait timers) over custom approval scripts with PATs — fewer moving parts."
+  - "Subscribe to the GitHub Changelog to receive advance notice of breaking permission changes."
+docs:
+  - url: "https://github.blog/changelog/2025-03-20-notification-of-upcoming-breaking-changes-in-github-actions/"
+    label: "GitHub Changelog: Modification to deployment permissions (March 20, 2025)"
+  - url: "https://docs.github.com/en/rest/actions/workflow-runs#review-pending-deployments-for-a-workflow-run"
+    label: "GitHub REST API: Review pending deployments for a workflow run"
+  - url: "https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#creating-a-fine-grained-personal-access-token"
+    label: "GitHub Docs: Creating a fine-grained personal access token"

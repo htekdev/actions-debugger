@@ -1,0 +1,145 @@
+id: runner-environment-046
+title: "CUDA nvcc Rejects Visual Studio 2026 Host Compiler on windows-latest"
+category: runner-environment
+severity: error
+tags:
+  - windows
+  - windows-latest
+  - cuda
+  - nvcc
+  - visual-studio-2026
+  - vs2026
+  - runner-image
+  - breaking-change
+  - gpu
+patterns:
+  - regex: "unsupported Microsoft Visual Studio version.*Only the versions between 2019 and 2022"
+    flags: "i"
+  - regex: "fatal error C1189.*unsupported Microsoft Visual Studio version"
+    flags: "i"
+  - regex: "nvcc.*error.*host_config\\.h.*C1189"
+    flags: "i"
+  - regex: "CUDA.*requires Visual Studio.*2022|nvcc.*does not support.*Visual Studio 18"
+    flags: "i"
+  - regex: "error:\\s+--\\s+unsupported Microsoft Visual Studio version"
+    flags: "i"
+error_messages:
+  - "fatal error C1189: #error:  -- unsupported Microsoft Visual Studio version! Only the versions between 2019 and 2022 (inclusive) are supported!"
+  - "Error in C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.1\\include\\crt/host_config.h(164)"
+  - "nvcc fatal   : Host compiler targets unsupported OS."
+  - "nvcc error  : Failed to preprocess the host compiler properties."
+root_cause: |
+  GitHub Actions migrated `windows-latest` (and `windows-2025`) from Visual Studio 2022 to
+  Visual Studio 2026 (version 18.x) beginning June 8, 2026, completing by June 15, 2026.
+  Additionally, some users saw the switch as early as May 5, 2026 when `windows-2025`
+  started serving the `windows-2025-vs2026` image label prematurely (runner-images#14004).
+
+  CUDA toolkits up to and including CUDA 13.x hard-code supported Visual Studio version
+  ranges inside `<CUDA_ROOT>/include/crt/host_config.h`. The file checks the `_MSC_VER`
+  compiler macro and rejects any version outside the explicitly listed range. Visual Studio
+  2022 (MSVC 19.3x) is the last version supported by all CUDA releases through CUDA 13.x.
+  Visual Studio 2026 (MSVC 19.4x / VS version 18.x) falls outside these ranges and triggers
+  an immediate hard compiler error:
+
+    fatal error C1189: #error:  -- unsupported Microsoft Visual Studio version! Only the
+    versions between 2019 and 2022 (inclusive) are supported! The nvcc flag
+    '-allow-unsupported-compiler' can be used to override this version check; however,
+    using an unsupported host compiler may cause compilation failure or incorrect run time
+    execution. Use at your own risk.
+
+  The error fires at the preprocessing stage — before any CUDA code is compiled — so it
+  affects any project that invokes `nvcc`, regardless of the CUDA source code content.
+
+  Source: actions/runner-images#14017, runner-images#14004, NVIDIA CUDA Installation Guide
+fix: |
+  **Option 1 — Use `-allow-unsupported-compiler` flag** (quick unblock, use at own risk):
+  Adds a flag to nvcc that bypasses the version check. Works for many projects but NVIDIA
+  does not guarantee correctness with unsupported compilers.
+
+  **Option 2 — Pin to windows-2022** (safest immediate fix):
+  `windows-2022` still ships Visual Studio 2022. It is not yet deprecated.
+
+  **Option 3 — Upgrade to a CUDA version that supports VS 2026** (best long-term):
+  NVIDIA releases new CUDA toolkits that list VS 2026 in their supported compiler matrix.
+  Check the CUDA Toolkit Release Notes for the current supported VS version table.
+
+  **Option 4 — Use CMake's `CUDAARCHS` + VS2022 generator explicitly**:
+  If using CMake, pin the generator to `Visual Studio 17 2022` even on windows-latest by
+  specifying `-G "Visual Studio 17 2022"` in your cmake configure step. This forces CMake
+  to use the VS 2022 tools even if VS 2026 is the default.
+fix_code:
+  - language: yaml
+    label: "Pin to windows-2022 to avoid VS 2026 entirely"
+    code: |
+      jobs:
+        build-cuda:
+          runs-on: windows-2022   # VS 2022 — supported by CUDA up to 13.x
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Build with CUDA
+              run: cmake --build . --config Release
+  - language: yaml
+    label: "Pass -allow-unsupported-compiler to nvcc (quick unblock)"
+    code: |
+      jobs:
+        build-cuda:
+          runs-on: windows-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            # Pass flag via CMake CUDA_NVCC_FLAGS
+            - name: Configure CMake
+              run: |
+                cmake -B build -DCMAKE_CUDA_FLAGS="-allow-unsupported-compiler"
+
+            - name: Build
+              run: cmake --build build --config Release
+  - language: yaml
+    label: "Force VS 2022 CMake generator on windows-latest (VS 2026 image)"
+    code: |
+      jobs:
+        build-cuda:
+          runs-on: windows-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            # Explicitly select VS 2022 generator even when VS 2026 is default
+            - name: Configure with VS 2022 generator
+              run: |
+                cmake -B build `
+                  -G "Visual Studio 17 2022" `
+                  -A x64
+
+            - name: Build
+              run: cmake --build build --config Release
+  - language: yaml
+    label: "Upgrade CUDA toolkit version that supports VS 2026"
+    code: |
+      jobs:
+        build-cuda:
+          runs-on: windows-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            # Install a CUDA version that explicitly supports VS 2026
+            # (check NVIDIA release notes for the current minimum supported version)
+            - name: Install CUDA Toolkit
+              uses: Jimver/cuda-toolkit@v0.2.21
+              with:
+                cuda: '12.8.0'   # Check if this version lists VS 2026 in its support matrix
+
+            - name: Build
+              run: cmake --build build --config Release
+prevention:
+  - "Never assume CUDA is forward-compatible with new Visual Studio versions — CUDA hard-codes supported MSVC version ranges."
+  - "Pin `runs-on: windows-2022` for CUDA workflows until the CUDA version you use explicitly lists VS 2026 as supported."
+  - "Subscribe to runner-images#14017 and similar announcements before the windows-latest label migration date."
+  - "Check the CUDA Toolkit Release Notes for your version's supported host compiler table before upgrading either Visual Studio or CUDA."
+docs:
+  - url: "https://github.com/actions/runner-images/issues/14017"
+    label: "runner-images#14017: windows-latest will use VS 2026 image in June 2026"
+  - url: "https://github.com/actions/runner-images/issues/14004"
+    label: "runner-images#14004: windows-2025 serving VS 2026 image prematurely (May 2026)"
+  - url: "https://docs.nvidia.com/cuda/cuda-installation-guide-microsoft-windows/"
+    label: "NVIDIA CUDA Installation Guide — supported Visual Studio versions"
