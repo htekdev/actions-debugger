@@ -1,0 +1,99 @@
+id: silent-failures-024
+title: "GITHUB_TOKEN commits and tags do not trigger downstream workflow runs"
+category: silent-failures
+severity: silent-failure
+tags:
+  - github-token
+  - trigger
+  - tokens
+  - infinite-loop-prevention
+  - downstream-workflow
+patterns:
+  - regex: "token:\\s+\\$\\{\\{\\s*secrets\\.GITHUB_TOKEN\\s*\\}\\}"
+    flags: "i"
+  - regex: "GITHUB_TOKEN.*checkout"
+    flags: "i"
+error_messages:
+  - "(No error shown -- downstream workflow simply does not start)"
+root_cause: |
+  GitHub intentionally prevents the default GITHUB_TOKEN from triggering new
+  workflow runs on events it creates. When a workflow step uses GITHUB_TOKEN
+  to commit, create a tag, open a PR, or dispatch a repository_dispatch event,
+  the resulting event will NOT fire any additional workflow runs.
+
+  This is a deliberate security safeguard to prevent infinite workflow loops
+  (e.g., a workflow that auto-commits could otherwise trigger itself endlessly).
+  There is no error message -- the downstream workflow simply never starts, and
+  nothing in the logs explains why.
+
+  Documented in GitHub Docs:
+  "When you use the repository's GITHUB_TOKEN to perform tasks, events
+  triggered by the GITHUB_TOKEN will not create a new workflow run."
+
+  Affected scenarios:
+  - Automated version bumps or changelog commits that should trigger CI
+  - Bot commits to a release branch that should trigger a deployment workflow
+  - Auto-merge commits that should re-trigger required status checks
+  - Release tagging workflows expecting a tag event to fire release.yml
+fix: |
+  Replace GITHUB_TOKEN with a token that CAN trigger downstream workflows.
+
+  Option 1 (PAT): Create a Personal Access Token with repo scope, store it
+  as a repository secret, and pass it to actions/checkout (token: input).
+  Subsequent write operations using that PAT credential WILL trigger
+  downstream workflow runs.
+
+  Option 2 (GitHub App): Install a GitHub App on the repo and generate an
+  installation token at runtime using actions/create-github-app-token.
+  Preferred for org-wide automation because it does not tie to a human account
+  and allows fine-grained permissions.
+
+  Option 3 (workflow_dispatch): Instead of relying on a downstream event,
+  explicitly dispatch the target workflow using the GitHub CLI or REST API
+  from within your current workflow.
+fix_code:
+  - language: yaml
+    label: "Use a PAT for checkout so subsequent writes trigger downstream workflows"
+    code: |
+      jobs:
+        release:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                # Swap in a PAT -- writes made with this token trigger downstream runs
+                token: ${{ secrets.RELEASE_PAT }}
+
+            - name: Bump version and commit
+              run: |
+                git config user.name "github-actions[bot]"
+                git config user.email "github-actions[bot]@users.noreply.github.com"
+                npm version patch
+                git add package.json package-lock.json
+                git commit -m "chore: bump version [skip ci optional]"
+                git push origin HEAD   # PAT-authenticated -- WILL trigger downstream
+  - language: yaml
+    label: "Dispatch downstream workflow explicitly instead of relying on event cascade"
+    code: |
+      jobs:
+        release:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Trigger downstream CI via workflow_dispatch
+              run: |
+                gh workflow run ci.yml --ref main --field reason=release-bot
+              env:
+                # A PAT is required here too -- GITHUB_TOKEN dispatch is also silently blocked
+                GH_TOKEN: ${{ secrets.RELEASE_PAT }}
+prevention:
+  - "Never rely on GITHUB_TOKEN-triggered events to cascade into other workflows"
+  - "Document which workflows use PAT or App tokens vs GITHUB_TOKEN to track trigger chains"
+  - "Use workflow_call or workflow_dispatch for explicit, auditable cross-workflow invocation"
+  - "Prefer GitHub App tokens over PATs to avoid tying automation to a personal account"
+docs:
+  - url: "https://docs.github.com/en/actions/security-guides/automatic-token-authentication#using-the-github_token-in-a-workflow"
+    label: "GitHub Docs -- GITHUB_TOKEN does not trigger new workflow runs"
+  - url: "https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/creating-a-personal-access-token"
+    label: "GitHub Docs -- Creating a Personal Access Token"
+  - url: "https://github.com/orgs/community/discussions/27028"
+    label: "GitHub Community #27028 -- GITHUB_TOKEN commit not triggering workflow"
