@@ -1,0 +1,107 @@
+id: caching-artifacts-019
+title: "Docker BuildKit type=gha cache silently stops working when repo cache is full"
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - docker
+  - buildkit
+  - buildx
+  - cache
+  - gha-cache
+  - type-gha
+patterns:
+  - regex: "cache export feature is currently not supported"
+    flags: "i"
+  - regex: "failed to fetch remote cache"
+    flags: "i"
+  - regex: "importing cache manifest from gha"
+    flags: "i"
+  - regex: "exporting cache.*SKIPPED"
+    flags: "i"
+error_messages:
+  - "WARNING: cache export feature is currently not supported for docker driver"
+  - "#0 importing cache manifest from gha"
+  - "failed to fetch remote cache: importing cache manifest: not found"
+  - "WARNING: failed to get cache: httpReadSeeker: failed open: unexpected status code 410 Gone"
+root_cause: |
+  Docker BuildKit supports storing build layer cache directly in GitHub Actions
+  cache (type=gha) via docker/build-push-action. This cache backend shares the
+  same 10 GB per-repository cache limit enforced by actions/cache.
+
+  When large images or many active branches push their layer caches, the 10 GB
+  limit is reached. GitHub silently evicts the oldest cache entries using LRU
+  eviction. On the next run the build starts from scratch with no layers cached,
+  but the workflow still reports success — the only symptom is a much slower
+  build with no warning.
+
+  Additional silent failure mode: using the default docker driver (not
+  docker-container) causes "cache export feature is currently not supported"
+  warnings that are easy to miss. The type=gha backend requires the
+  docker-container (or docker-buildx) driver and the containerd image store.
+
+  Per-key limits: individual cache entries exceeding ~5 GB may fail to write
+  completely, resulting in partial caches that are never reusable on restore.
+fix: |
+  Use mode=min so that only the final image layer is cached rather than all
+  intermediate build stages. This dramatically reduces cache pressure.
+
+  For large production images that need full layer caching, use
+  cache-to: type=registry pointing to GHCR (free for public repos) to bypass
+  the 10 GB GitHub Actions cache limit entirely.
+
+  Always configure setup-buildx-action before build-push-action to ensure
+  the docker-container driver is active and type=gha export is supported.
+fix_code:
+  - language: yaml
+    label: "Use mode=min and ensure docker-container driver is configured"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@v3
+              # docker-container driver is the default for setup-buildx-action
+              # Required for type=gha cache export to work at all
+
+            - name: Build and push
+              uses: docker/build-push-action@v6
+              with:
+                push: true
+                tags: ghcr.io/${{ github.repository }}:latest
+                cache-from: type=gha
+                cache-to: type=gha,mode=min  # min = final layer only, not all stages
+  - language: yaml
+    label: "Use GHCR registry cache to bypass the 10 GB GitHub Actions cache limit"
+    code: |
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push with registry cache
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: ghcr.io/${{ github.repository }}:latest
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max
+prevention:
+  - "Always add docker/setup-buildx-action before docker/build-push-action to enable type=gha"
+  - "Prefer mode=min for type=gha to minimize cache footprint per build"
+  - "Monitor cache usage in Settings > Actions > Caches — eviction is silent until builds slow down"
+  - "Use scope parameter to separate caches per branch: cache-to: type=gha,scope=${{ github.ref_name }},mode=min"
+  - "For large production images prefer type=registry (GHCR) over type=gha to avoid the 10 GB cap"
+docs:
+  - url: "https://docs.docker.com/build/ci/github-actions/cache/#github-cache"
+    label: "Docker Docs — GitHub Actions cache backend for BuildKit"
+  - url: "https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows#usage-limits-and-eviction-policy"
+    label: "GitHub Docs — Cache usage limits and eviction policy (10 GB limit)"
+  - url: "https://github.com/docker/build-push-action/issues/818"
+    label: "docker/build-push-action#818 — type=gha cache eviction behavior"
+  - url: "https://github.com/docker/setup-buildx-action"
+    label: "docker/setup-buildx-action — Required to enable BuildKit cache backends"

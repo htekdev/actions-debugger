@@ -1,0 +1,99 @@
+id: yaml-syntax-021
+title: "fromJSON() on empty or undefined step output throws Unexpected end of JSON input"
+category: yaml-syntax
+severity: error
+tags:
+  - fromjson
+  - outputs
+  - expression
+  - json
+  - step-outputs
+  - dynamic-matrix
+patterns:
+  - regex: "Unexpected end of JSON input"
+    flags: "i"
+  - regex: "Invalid JSON for parameter"
+    flags: "i"
+  - regex: "is not valid JSON"
+    flags: "i"
+  - regex: "fromJSON.*failed"
+    flags: "i"
+error_messages:
+  - "Unexpected end of JSON input"
+  - "Error: Invalid JSON for parameter 'matrix': Unexpected end of JSON input"
+  - "Error: The expression result is not valid JSON"
+root_cause: |
+  fromJSON() is a GitHub Actions expression function that parses a JSON string.
+  When the input string is empty ("") — which happens when a step output was
+  never set or when the step that set it was skipped due to an if: condition —
+  fromJSON() throws a fatal parse error: "Unexpected end of JSON input".
+
+  This is especially common in dynamic matrix strategies:
+
+    matrix:
+      include: ${{ fromJSON(steps.generate.outputs.matrix) }}
+
+  If the generate step was skipped (e.g., if: github.event_name == 'push'),
+  steps.generate.outputs.matrix evaluates to empty string, and fromJSON("")
+  crashes the entire job before any steps run.
+
+  The expression evaluator does NOT treat empty string as null or as valid
+  empty JSON — it passes the raw empty string directly to the JSON parser,
+  which rejects it immediately.
+fix: |
+  Provide a fallback JSON value using the || operator so that fromJSON always
+  receives valid JSON even when the output is empty:
+
+    fromJSON(steps.generate.outputs.matrix || '[]')
+    fromJSON(steps.generate.outputs.config || '{}')
+
+  For dynamic matrix strategies, also ensure the generating step always
+  outputs valid JSON (at minimum '[]' or '{}') rather than leaving the
+  output unset when there is nothing to process.
+
+  Add an if: condition on downstream jobs to skip entirely when the matrix
+  output is empty or equals the empty-array sentinel.
+fix_code:
+  - language: yaml
+    label: "Guard fromJSON with a valid JSON fallback using the || operator"
+    code: |
+      jobs:
+        compute-matrix:
+          runs-on: ubuntu-latest
+          outputs:
+            matrix: ${{ steps.gen.outputs.matrix }}
+          steps:
+            - id: gen
+              run: |
+                # Always emit valid JSON — even when there is nothing to build
+                TARGETS=$(cat targets.json 2>/dev/null || echo '[]')
+                echo "matrix=$TARGETS" >> $GITHUB_OUTPUT
+
+        build:
+          needs: compute-matrix
+          if: ${{ needs.compute-matrix.outputs.matrix != '[]' }}
+          strategy:
+            matrix:
+              # fromJSON never sees empty string — falls back to []
+              include: ${{ fromJSON(needs.compute-matrix.outputs.matrix || '[]') }}
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Building ${{ matrix.target }}"
+  - language: yaml
+    label: "Inline fallback for dynamic matrix include"
+    code: |
+      strategy:
+        matrix:
+          include: ${{ fromJSON(needs.setup.outputs.matrix || '[{"env":"default"}]') }}
+prevention:
+  - "Always provide a valid JSON fallback: fromJSON(steps.x.outputs.val || '{}')"
+  - "Ensure output-producing steps always write a value even if it is an empty array or object"
+  - "Add if: conditions to skip downstream jobs entirely when the matrix output is empty"
+  - "Validate fromJSON expressions with an empty-output test scenario in a draft workflow"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#fromjson"
+    label: "GitHub Docs — fromJSON expression function"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/passing-information-between-jobs"
+    label: "GitHub Docs — Passing information between jobs using outputs"
+  - url: "https://github.com/orgs/community/discussions/26671"
+    label: "GitHub Community #26671 — fromJSON fails when output is empty string"

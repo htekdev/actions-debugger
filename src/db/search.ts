@@ -136,9 +136,11 @@ function matchEntry(entry: ErrorEntry, input: string): number {
   }
 
   // 3. Title keyword matching (lowest confidence)
+  // Require words > 5 chars to avoid false positives from common short words
+  // (e.g. "text", "that", "some", "runs", "jobs" appearing in unrelated inputs)
   const inputLower = input.toLowerCase();
   const titleWords = entry.title.toLowerCase().split(/\s+/);
-  const matchingWords = titleWords.filter(w => w.length > 3 && inputLower.includes(w));
+  const matchingWords = titleWords.filter(w => w.length > 5 && inputLower.includes(w));
   if (matchingWords.length >= 2) {
     bestScore = Math.max(bestScore, 20 + matchingWords.length * 5);
   }
