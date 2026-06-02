@@ -1,0 +1,116 @@
+id: triggers-010
+title: "repository_dispatch Event Type Not in types: Filter — Workflow Silently Skipped"
+category: triggers
+severity: silent-failure
+tags:
+  - repository_dispatch
+  - event-type
+  - types-filter
+  - triggers
+  - api
+  - silent
+patterns:
+  - regex: "repository_dispatch"
+    flags: "i"
+  - regex: "types:\\s*\\[.*\\]"
+    flags: "i"
+  - regex: "client_payload"
+    flags: "i"
+error_messages:
+  - "No runs found for workflow"
+  - "Workflow not triggered by repository_dispatch event"
+root_cause: |
+  A `repository_dispatch` workflow only fires when the dispatched `event_type` value
+  matches one of the values in the `types:` filter. If the event type sent via the API
+  does not match, GitHub silently drops it — no error, no notification, the workflow simply
+  never starts.
+
+  **Common failure scenarios:**
+
+  1. **Typo or case mismatch**: `event_type: "Deploy_Staging"` dispatched but workflow
+     has `types: [deploy_staging]` (underscore vs case sensitivity). Event types are
+     case-sensitive.
+
+  2. **Omitting the types: filter entirely — workflow fires for ALL events** (opposite
+     problem): Without a `types:` filter, the workflow runs for every `repository_dispatch`
+     event, including internal automation events not intended to trigger it.
+
+  3. **API payload uses wrong field name**: The REST API requires the `event_type` field
+     under the JSON body. Some clients accidentally nest it differently or omit it entirely,
+     causing the dispatch to use the default empty event type which matches nothing.
+
+  4. **Cross-workflow automation chain**: Workflow A dispatches event type `build-complete`.
+     Workflow B listens for `build_complete` (underscore). The chain silently breaks with no
+     logs in either workflow.
+
+  **API payload shape:**
+  ```
+  POST /repos/{owner}/{repo}/dispatches
+  {
+    "event_type": "deploy_staging",       ← Must exactly match types: filter
+    "client_payload": { ... }
+  }
+  ```
+fix: |
+  Verify that the `event_type` string in the API POST body matches exactly (case-sensitive)
+  one of the values declared in the workflow's `types:` filter.
+
+  To debug: add a catch-all workflow with no `types:` filter (matches all repository_dispatch
+  events) to confirm the event is arriving at all, then compare the `github.event.action`
+  value to what your workflow expects.
+fix_code:
+  - language: yaml
+    label: "Workflow with correctly declared repository_dispatch types filter"
+    code: |
+      on:
+        repository_dispatch:
+          types:
+            - deploy_staging        # ← Must match event_type exactly (case-sensitive)
+            - deploy_production
+            - run_smoke_tests
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Show dispatched event
+              run: |
+                echo "Event: ${{ github.event.action }}"
+                echo "Payload: ${{ toJSON(github.event.client_payload) }}"
+  - language: yaml
+    label: "Debugging workflow — catch ALL repository_dispatch events"
+    code: |
+      # Temporarily add this workflow to diagnose missing dispatches
+      on:
+        repository_dispatch:    # No types: filter = receives everything
+
+      jobs:
+        debug:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Log event details
+              run: |
+                echo "event_type / action: ${{ github.event.action }}"
+                echo "client_payload: ${{ toJSON(github.event.client_payload) }}"
+  - language: yaml
+    label: "Dispatching via REST API — correct payload structure"
+    code: |
+      # Using gh api to dispatch correctly
+      gh api \
+        --method POST \
+        -H "Accept: application/vnd.github+json" \
+        /repos/ORG/REPO/dispatches \
+        -f event_type="deploy_staging" \      # ← Matches types: [deploy_staging]
+        -F client_payload='{"version":"v1.2.3","env":"staging"}'
+prevention:
+  - "Treat `event_type` values as constants — define them in a shared location (e.g., a constants file or workflow comment) used by both the dispatcher and the listener."
+  - "Add an `echo` step that logs `github.event.action` at the start of every repository_dispatch workflow to confirm the correct event type was received."
+  - "Use a catch-all debug workflow (no `types:` filter) when setting up a new dispatch chain for the first time."
+  - "Avoid changing event type strings in active automation chains — add new types instead of renaming existing ones."
+  - "Event types are case-sensitive — stick to snake_case by convention to avoid case mismatch bugs."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#repository_dispatch"
+    label: "GitHub Actions: repository_dispatch event"
+  - url: "https://docs.github.com/en/rest/repos/repos#create-a-repository-dispatch-event"
+    label: "REST API: Create a repository dispatch event"

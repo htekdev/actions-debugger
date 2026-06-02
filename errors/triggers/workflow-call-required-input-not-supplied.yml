@@ -1,0 +1,115 @@
+id: triggers-009
+title: "Reusable Workflow Required Input Not Supplied — workflow_call Fails at Runtime"
+category: triggers
+severity: error
+tags:
+  - workflow_call
+  - reusable-workflow
+  - inputs
+  - required
+  - validation
+  - caller
+patterns:
+  - regex: "Input required and not supplied:\\s*\\w+"
+    flags: "i"
+  - regex: "Required input '\\w+' not provided"
+    flags: "i"
+  - regex: "Error: Input required and not supplied"
+    flags: "i"
+error_messages:
+  - "Error: Input required and not supplied: deploy_env"
+  - "Input required and not supplied: version"
+  - "Required input 'environment' not provided by caller"
+root_cause: |
+  Unlike `workflow_dispatch` (which treats `required: true` as UI-only), the GitHub Actions
+  runner DOES validate required inputs for `on.workflow_call` reusable workflows. If a caller
+  workflow invokes a reusable workflow without passing a declared required input, the runner
+  emits `Error: Input required and not supplied: {input_name}` and fails the job immediately.
+
+  **Common scenarios:**
+  1. **Adding a required input to an existing reusable workflow** without updating all callers.
+     Callers that worked before immediately break because the new required input is missing.
+
+  2. **Calling a reusable workflow from a matrix job** where one matrix variation doesn't
+     apply the needed input conditionally.
+
+  3. **Caller passes the input only under certain conditions** (via `if:`) — when the condition
+     is false, the input is omitted entirely rather than being passed as an empty string.
+
+  4. **Typo in the input name** — caller passes `deploy-env` but the reusable workflow expects
+     `deploy_env` (hyphens vs underscores). The declared input is not satisfied.
+
+  **Note:** The error fires at job evaluation time, not step execution time, so the entire job
+  is skipped rather than reaching the failing step.
+fix: |
+  Ensure every caller workflow passes all required inputs declared in the reusable workflow's
+  `on.workflow_call.inputs` block.
+
+  When adding a new required input to a reusable workflow, update all callers before merging.
+  Use `required: false` with a default value if backward compatibility must be preserved.
+
+  If the input is only sometimes needed, declare it as `required: false` and check it
+  at runtime inside the reusable workflow using an early-exit validation step.
+fix_code:
+  - language: yaml
+    label: "Reusable workflow with required input declaration"
+    code: |
+      # .github/workflows/deploy-reusable.yml
+      on:
+        workflow_call:
+          inputs:
+            environment:
+              description: "Target environment"
+              required: true    # Runner enforces this for all callers
+              type: string
+            version:
+              description: "Version tag"
+              required: false
+              default: "latest"
+              type: string
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./deploy.sh "${{ inputs.environment }}" "${{ inputs.version }}"
+  - language: yaml
+    label: "Caller workflow — always pass all required inputs"
+    code: |
+      # .github/workflows/release.yml
+      on:
+        push:
+          tags: ["v*"]
+
+      jobs:
+        deploy:
+          uses: ./.github/workflows/deploy-reusable.yml
+          with:
+            environment: production   # ✅ Required input provided
+            version: ${{ github.ref_name }}
+  - language: yaml
+    label: "Backward-compatible: change required to optional with default"
+    code: |
+      # When adding new inputs to existing reusable workflows, use required: false
+      # with a default to avoid breaking existing callers.
+      on:
+        workflow_call:
+          inputs:
+            environment:
+              required: true
+              type: string
+            notify_slack:      # New input — safe to add with required: false
+              required: false
+              default: "false"
+              type: string
+prevention:
+  - "When adding a new `required: true` input to a reusable workflow, search all callers with `grep -r 'uses:.*deploy-reusable'` and update them simultaneously."
+  - "Prefer `required: false` with a sensible default when backward compatibility matters — validate the value inside the reusable workflow if needed."
+  - "Use consistent naming conventions (all underscores or all hyphens) for input names to avoid typo-related mismatches between callers and the called workflow."
+  - "Test reusable workflow changes in a draft PR that also updates all callers."
+docs:
+  - url: "https://docs.github.com/en/actions/sharing-automations/reusing-workflows#using-inputs-and-secrets-in-a-reusable-workflow"
+    label: "GitHub Docs: Inputs in reusable workflows"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_call"
+    label: "GitHub Actions: workflow_call event"

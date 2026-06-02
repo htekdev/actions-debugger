@@ -1,0 +1,128 @@
+id: permissions-auth-010
+title: "Fine-Grained PAT Missing Actions Permission — Workflow Dispatch and API Calls Fail 403"
+category: permissions-auth
+severity: error
+tags:
+  - fine-grained-pat
+  - pat
+  - personal-access-token
+  - actions
+  - workflow-dispatch
+  - 403
+  - api
+patterns:
+  - regex: "HTTP 403.*fine.?grained.*token"
+    flags: "i"
+  - regex: "Resource not accessible by integration"
+    flags: "i"
+  - regex: "Must have admin rights to Repository\\."
+    flags: "i"
+  - regex: "403.*workflow.*dispatch"
+    flags: "i"
+error_messages:
+  - "HTTP 403: {\"message\":\"Resource not accessible by integration\",\"documentation_url\":\"https://docs.github.com/rest/actions/workflows\"}"
+  - "Error: error making HTTP request: 403 Resource not accessible by integration"
+  - "gh: Could not run workflow: HTTP 422 Unprocessable Entity"
+  - "RequestError [HttpError]: Resource not accessible by integration"
+root_cause: |
+  GitHub fine-grained personal access tokens (introduced 2022, GA 2023) do NOT include
+  the "Actions" permission scope by default when created. This is different from classic
+  PATs where the `repo` scope implicitly granted access to Actions APIs.
+
+  When a fine-grained PAT is used to:
+  - Trigger workflows via REST API (`POST /repos/{owner}/{repo}/actions/workflows/{id}/dispatches`)
+  - List or cancel workflow runs
+  - Download workflow run logs
+  - Use `gh workflow run` / `gh run list` with the PAT as `GH_TOKEN`
+
+  ...the API returns HTTP 403 "Resource not accessible by integration" because the
+  fine-grained token lacks the explicit `Actions: read` or `Actions: write` permission.
+
+  **Why this affects more users over time:**
+  - GitHub is progressively deprecating classic PATs in favor of fine-grained PATs.
+  - Organization policies can require fine-grained PATs only, blocking classic PAT usage.
+  - Automation pipelines that worked with classic `repo`-scoped PATs silently break when
+    migrated to fine-grained PATs if the Actions permission is not explicitly added.
+  - The error message "Resource not accessible by integration" is the same as the one
+    shown for missing `GITHUB_TOKEN` scopes, making diagnosis harder.
+
+  **Required permissions on the fine-grained PAT by use case:**
+  | Use case | Required permission |
+  |---|---|
+  | Trigger workflow (`workflow_dispatch`) | Actions: write |
+  | Cancel / re-run workflow run | Actions: write |
+  | List workflow runs / jobs | Actions: read |
+  | Download workflow run logs | Actions: read |
+  | Read workflow YAML definitions | Actions: read |
+fix: |
+  Regenerate or edit the fine-grained PAT and add the **Actions** permission with the
+  appropriate access level:
+
+  - **Read-only** — for listing runs, reading logs, checking run status.
+  - **Read and write** — for dispatching workflows, cancelling runs, re-triggering jobs.
+
+  Navigate to: GitHub → Settings → Developer Settings → Personal access tokens →
+  Fine-grained tokens → (select token) → Permissions → Repository permissions →
+  Actions → set to "Read and write".
+
+  If the repository is in an organization, also ensure the organization has not restricted
+  fine-grained PAT usage to specific resources that exclude this repository.
+fix_code:
+  - language: yaml
+    label: "Using a fine-grained PAT with Actions permission to trigger a workflow"
+    code: |
+      # Store the fine-grained PAT as a repository secret: DEPLOY_PAT
+      # The PAT must have: Actions: write, Contents: read (minimum)
+
+      name: Trigger Deployment
+
+      on:
+        workflow_dispatch:
+
+      jobs:
+        trigger:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Dispatch downstream workflow
+              run: |
+                gh workflow run deploy.yml \
+                  -f environment=production \
+                  --repo org/downstream-repo
+              env:
+                GH_TOKEN: ${{ secrets.DEPLOY_PAT }}   # Fine-grained PAT with Actions: write
+  - language: yaml
+    label: "Required PAT permissions checklist for common Actions API uses"
+    code: |
+      # Fine-grained PAT permission requirements:
+      #
+      # Trigger workflow dispatch      → Actions: Write
+      # Cancel a workflow run          → Actions: Write
+      # Re-run failed jobs             → Actions: Write
+      # List workflow runs             → Actions: Read
+      # Download run logs              → Actions: Read
+      # Get workflow definition        → Actions: Read
+      # Approve environment deployment → Actions: Write + Environments: Write
+      #
+      # Classic PAT 'repo' scope covers all of the above implicitly.
+      # Fine-grained PATs require explicit opt-in per permission category.
+
+      # To check if your PAT has the right permissions:
+      - name: Verify PAT has Actions permission
+        run: |
+          gh api /repos/${{ github.repository }}/actions/workflows \
+            --jq '.total_count'
+        env:
+          GH_TOKEN: ${{ secrets.DEPLOY_PAT }}   # Returns 403 if Actions: read is missing
+prevention:
+  - "When migrating from classic PATs to fine-grained PATs, explicitly audit which permission categories the classic `repo` scope was implicitly covering and add each one."
+  - "Add `Actions: read` at minimum to any fine-grained PAT that will be used in GitHub Actions pipelines, even for read-only operations."
+  - "Store fine-grained PATs as org-level or repository secrets and add a comment documenting which permissions the PAT requires."
+  - "Use a dedicated machine account (bot user) for automation PATs so permissions can be audited independently of individual developer accounts."
+  - "If an organization policy requires fine-grained PATs, update all automation onboarding docs to include the Actions permission explicitly."
+docs:
+  - url: "https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#creating-a-fine-grained-personal-access-token"
+    label: "GitHub Docs: Creating a fine-grained personal access token"
+  - url: "https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event"
+    label: "REST API: Create a workflow dispatch event"
+  - url: "https://docs.github.com/en/organizations/managing-programmatic-access-to-your-organization/setting-a-personal-access-token-policy-for-your-organization"
+    label: "GitHub Docs: PAT policy for organizations"
