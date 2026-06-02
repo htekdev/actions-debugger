@@ -1,0 +1,135 @@
+id: caching-artifacts-011
+title: "Repository Cache Storage Limit (10 GB) — Silent Eviction Causes Cache Miss Spike"
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - cache
+  - storage-limit
+  - eviction
+  - cache-miss
+  - actions/cache
+  - 10gb
+  - lru
+patterns:
+  - regex: "cache.*evict|evict.*cache"
+    flags: "i"
+  - regex: "cache size.*limit|limit.*cache size"
+    flags: "i"
+  - regex: "exceeds.*10.*GB|10.*GB.*limit"
+    flags: "i"
+  - regex: "cache.*storage.*limit.*exceeded"
+    flags: "i"
+error_messages:
+  - "Cache entry is too big. Maximum cache size is 10GB"
+  - "Warning: Cache size of XY GB (ZZZZ MB) is over the 10 GB limit, so some older caches will be removed"
+  - "Failed to save cache entry. Exiting with error: Cache storage quota has been reached for the current repository"
+root_cause: |
+  GitHub limits the total Actions cache storage per repository to **10 GB**. When the
+  10 GB limit is reached, GitHub automatically evicts the **least-recently-used (LRU)**
+  cache entries to make room for new ones. Additionally, cache entries that have not been
+  accessed in **7 days** are automatically deleted.
+
+  **This is a silent failure** because:
+  - Eviction happens asynchronously — the job that triggers eviction does not fail.
+  - The workflow that was relying on an evicted cache simply gets a cache miss on the
+    next run and reinstalls from scratch, adding minutes to build time.
+  - There is no notification, no warning in the workflow log, and no failed check.
+  - Engineers often diagnose this as a "flaky cache" without realizing the 10 GB limit
+    is being hit regularly.
+
+  **Common causes of limit exhaustion:**
+  1. **Matrix builds with many OS/version combinations** each storing large dependency
+     caches (node_modules, .cargo, ~/.gradle, etc.).
+  2. **Large monorepo caches** where the entire dependency tree exceeds 10 GB.
+  3. **Docker layer caches** stored via `actions/cache` for repeated builds.
+  4. **Accumulation without cleanup** — cache keys rotate on every dependency update
+     but old entries aren't explicitly purged.
+
+  **How to check current cache usage:**
+  Repository → Actions → Management → Caches (or via `gh cache list --repo owner/repo`).
+fix: |
+  Reduce total cache storage by improving cache key strategy and explicitly pruning old
+  cache entries.
+
+  **Immediate steps:**
+  1. Audit current cache usage with `gh cache list --repo owner/repo --sort size --order desc`
+  2. Delete oversized or stale entries with `gh cache delete <id> --repo owner/repo`
+  3. Review matrix build cache keys — large matrices with OS+version combinations
+     multiply cache storage proportionally.
+
+  **Structural fixes:**
+  - Use more specific cache keys to avoid storing redundant versions.
+  - Split large caches into smaller focused caches (dependencies vs. build outputs).
+  - Add a periodic workflow to prune old caches before the limit is reached.
+  - For Docker layer caches, consider using GitHub Container Registry or a dedicated
+    cache registry instead of Actions cache.
+fix_code:
+  - language: yaml
+    label: "Check cache usage and delete stale entries in a workflow"
+    code: |
+      jobs:
+        cleanup-caches:
+          runs-on: ubuntu-latest
+          steps:
+            - name: List and clean old caches
+              env:
+                GH_TOKEN: ${{ github.token }}
+              run: |
+                # List all caches sorted by last accessed time (oldest first)
+                gh cache list \
+                  --repo ${{ github.repository }} \
+                  --sort last-accessed \
+                  --order asc \
+                  --limit 100 \
+                  --json id,key,sizeInBytes,lastAccessedAt \
+                  | jq -r '.[] | "\(.id)\t\(.sizeInBytes)\t\(.lastAccessedAt)\t\(.key)"'
+  - language: yaml
+    label: "Prune caches older than N days using the Actions API"
+    code: |
+      jobs:
+        prune-caches:
+          runs-on: ubuntu-latest
+          permissions:
+            actions: write
+          steps:
+            - name: Delete caches not accessed in 5 days
+              env:
+                GH_TOKEN: ${{ github.token }}
+                REPO: ${{ github.repository }}
+              run: |
+                CUTOFF=$(date -d '5 days ago' --iso-8601=seconds)
+                gh api "repos/$REPO/actions/caches" \
+                  --paginate \
+                  --jq ".actions_caches[] | select(.last_accessed_at < \"$CUTOFF\") | .id" \
+                | xargs -I{} gh api --method DELETE "repos/$REPO/actions/caches/{}"
+  - language: yaml
+    label: "Optimize matrix builds to share a single cache entry"
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest, macos-latest]
+              node: ['18', '20', '22']
+          runs-on: ${{ matrix.os }}
+          steps:
+            - uses: actions/cache@v4
+              with:
+                path: ~/.npm
+                # Share cache across Node versions — hash only package-lock.json
+                key: npm-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
+                restore-keys: npm-${{ runner.os }}-
+prevention:
+  - "Monitor total cache usage regularly with `gh cache list --repo owner/repo` or the GitHub UI (Actions → Caches) — set up an alert when approaching 8 GB."
+  - "Add a weekly scheduled workflow that prunes caches older than 5-7 days to stay well under the 10 GB limit."
+  - "Use `actions: write` permission and the REST API to manage caches programmatically as part of your CI housekeeping."
+  - "Design cache keys to be OS-specific but NOT dependency-version-specific where possible — this reduces the number of unique cache entries stored simultaneously."
+  - "For Docker layer caches, prefer GitHub Container Registry or an external caching service to avoid eating into the 10 GB Actions cache budget."
+  - "Check for cache key patterns that change too frequently (e.g., including `github.run_id`) — these create orphaned entries that accumulate until evicted."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows#usage-limits-and-eviction-policy"
+    label: "GitHub Docs: Cache usage limits and eviction policy"
+  - url: "https://docs.github.com/en/rest/actions/cache?apiVersion=2022-11-28"
+    label: "GitHub REST API: Actions cache endpoints"
+  - url: "https://github.com/actions/cache/blob/main/tips-and-workarounds.md"
+    label: "actions/cache: Tips and workarounds"
