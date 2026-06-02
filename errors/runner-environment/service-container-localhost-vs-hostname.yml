@@ -1,0 +1,130 @@
+id: runner-environment-025
+title: "Service Container Network: localhost Works on Runner, Service Name Required in Container Jobs"
+category: runner-environment
+severity: error
+tags:
+  - service-containers
+  - networking
+  - localhost
+  - postgres
+  - mysql
+  - redis
+  - container-jobs
+  - docker-networking
+patterns:
+  - regex: "Connection refused.*(?:localhost|127\\.0\\.0\\.1).*(?:5432|3306|6379|27017)"
+    flags: "i"
+  - regex: "could not connect to server.*Connection refused.*localhost"
+    flags: "i"
+  - regex: "ECONNREFUSED.*(?:5432|3306|6379|27017)"
+    flags: "i"
+  - regex: "dial tcp 127\\.0\\.0\\.1:\\d+: connect: connection refused"
+    flags: "i"
+error_messages:
+  - "Error: connect ECONNREFUSED 127.0.0.1:5432"
+  - "could not connect to server: Connection refused (Is the server running on host \"localhost\" (127.0.0.1) and accepting TCP/IP connections on port 5432?)"
+  - "OperationalError: connection to server at \"localhost\" (127.0.0.1), port 5432 failed: Connection refused"
+  - "Error: getaddrinfo ENOTFOUND postgres"
+root_cause: |
+  GitHub Actions service containers run as Docker containers on the runner machine.
+  The correct hostname to reach them depends on **how the job itself runs**:
+
+  **Scenario A — Job runs directly on the runner (no `container:` key):**
+  The runner process runs natively on the VM. Docker maps service container ports to the
+  runner's loopback interface. Services are reachable at `localhost:<mapped_port>`.
+  Using the service name (e.g. `postgres`) as a hostname will **fail** with ENOTFOUND.
+
+  **Scenario B — Job runs inside a container (`container:` key present):**
+  Both the job container and service containers are on the same Docker user-defined network.
+  Docker's built-in DNS resolves container names. Services are reachable by their
+  **service name** (e.g. `postgres`, `redis`) as the hostname, NOT `localhost`.
+  Using `localhost` here will produce "Connection refused" because the service port is
+  not bound to the job container's loopback interface.
+
+  This asymmetry is the root of most service container connectivity bugs:
+  developers copy a working non-containerized workflow config into a containerized job
+  (or vice versa) without updating the hostname.
+
+  Additionally, when using `ports:` mapping in service definitions, the runner maps the
+  container port to a randomly assigned host port (unless pinned with `host:container`
+  syntax). The `${{ job.services.postgres.ports['5432'] }}` expression returns the
+  actual host-side port, which may differ from 5432.
+fix: |
+  **For jobs running directly on the runner (no `container:` key):**
+  Connect to services via `localhost` (or `127.0.0.1`) and the mapped port.
+  Use `${{ job.services.<service>.ports['<container_port>'] }}` to get the dynamic host port
+  when not using explicit port pinning.
+
+  **For jobs running in a container (`container:` key):**
+  Connect to services via the **service name** as the hostname and the container's
+  internal port directly. No port mapping is required — both containers share the same
+  Docker network and communicate directly.
+
+  Use the `options: --add-host` trick only if you need the same workflow YAML to work
+  in both contexts (rare — avoid this complexity).
+fix_code:
+  - language: yaml
+    label: "Correct connectivity for a runner-native job (no container:)"
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          # No 'container:' key — job runs directly on the runner VM
+          services:
+            postgres:
+              image: postgres:16
+              env:
+                POSTGRES_PASSWORD: postgres
+              ports:
+                - 5432:5432    # pin host:container port for simplicity
+              options: >-
+                --health-cmd pg_isready
+                --health-interval 10s
+                --health-timeout 5s
+                --health-retries 5
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run tests
+              env:
+                # Use localhost — runner-native job maps service ports to loopback
+                DATABASE_URL: postgres://postgres:postgres@localhost:5432/testdb
+              run: npm test
+  - language: yaml
+    label: "Correct connectivity for a containerized job (container: key present)"
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          container:
+            image: node:20  # Job itself runs inside a container
+          services:
+            postgres:
+              image: postgres:16
+              env:
+                POSTGRES_PASSWORD: postgres
+              # NO ports: mapping needed — containers share the Docker network
+              options: >-
+                --health-cmd pg_isready
+                --health-interval 10s
+                --health-timeout 5s
+                --health-retries 5
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run tests
+              env:
+                # Use service NAME "postgres" — Docker DNS resolves it within the network
+                DATABASE_URL: postgres://postgres:postgres@postgres:5432/testdb
+              run: npm test
+prevention:
+  - "When your job uses `container:`, always connect to services via the service name (e.g. `postgres`, `redis`), NOT `localhost`."
+  - "When your job runs natively (no `container:`), always connect to services via `localhost` and the mapped host port."
+  - "Use `options: --health-cmd / --health-interval / --health-retries` on service containers to ensure they are ready before steps execute."
+  - "Avoid using `localhost` as the database hostname in connection strings — parameterize it so the same code works in both runner-native and containerized jobs."
+  - "If you move a job from runner-native to containerized (or vice versa), always audit all service hostnames in env variables and connection strings."
+docs:
+  - url: "https://docs.github.com/en/actions/use-cases-and-examples/using-containerized-services/about-service-containers"
+    label: "GitHub Docs: About service containers"
+  - url: "https://docs.github.com/en/actions/use-cases-and-examples/using-containerized-services/creating-postgresql-service-containers"
+    label: "GitHub Docs: Creating PostgreSQL service containers"
+  - url: "https://docs.github.com/en/actions/use-cases-and-examples/using-containerized-services/creating-redis-service-containers"
+    label: "GitHub Docs: Creating Redis service containers"

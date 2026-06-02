@@ -1,0 +1,125 @@
+id: runner-environment-024
+title: "Docker Hub Pull Rate Limit — toomanyrequests in GitHub Actions"
+category: runner-environment
+severity: error
+tags:
+  - docker
+  - docker-hub
+  - rate-limit
+  - container
+  - pull
+  - authentication
+patterns:
+  - regex: "toomanyrequests: You have reached your pull rate limit"
+    flags: "i"
+  - regex: "You have reached your unauthenticated pull rate limit"
+    flags: "i"
+  - regex: "pull rate limit reached"
+    flags: "i"
+  - regex: "ERROR: toomanyrequests"
+    flags: "i"
+  - regex: "429 Too Many Requests.*docker"
+    flags: "i"
+error_messages:
+  - "toomanyrequests: You have reached your pull rate limit. You may increase the limit by authenticating and upgrading: https://www.docker.com/increase-rate-limit"
+  - "Error response from daemon: toomanyrequests: You have reached your unauthenticated pull rate limit."
+  - "pull access denied, repository does not exist or may require 'docker login'"
+root_cause: |
+  Docker Hub enforces anonymous pull rate limits on all IP addresses. GitHub-hosted
+  runners share a pool of egress IPs — multiple concurrent workflow runs from different
+  repositories hit Docker Hub from the same IP address, exhausting the shared quota
+  rapidly.
+
+  **Rate limit tiers (as of 2024):**
+  - **Unauthenticated (anonymous):** 100 pulls per 6 hours per IP
+  - **Authenticated free account:** 200 pulls per 6 hours per account
+  - **Docker Hub Pro/Team/Business:** unlimited
+
+  Because GitHub-hosted runners use a small set of shared egress IPs, popular runners
+  can hit the anonymous 100-pull limit within minutes during peak hours. The error
+  surfaces as a hard failure when the runner attempts `docker pull` for job containers,
+  service containers, container actions, or explicit `docker pull` commands in steps.
+
+  Even after adding `docker/login-action`, workflows can still hit the limit if they use
+  actions that internally pull images (e.g., `docker/build-push-action`, `docker/bake-action`)
+  before the login step has executed.
+fix: |
+  Add `docker/login-action` as the **first step** in any job that pulls from Docker Hub.
+  The action authenticates with Docker Hub, switching from anonymous to authenticated rate
+  limits (200 pulls/6 hours per account) or unlimited for Pro/Team accounts.
+
+  **Recommended approach:**
+  1. Create a Docker Hub account (free tier) or use an existing one.
+  2. Store credentials as repository secrets: `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`
+     (use an Access Token, not your password — generate at hub.docker.com > Account Settings > Security).
+  3. Add the login step before any image-pulling step.
+
+  **For self-hosted runners:** Configure a Docker Hub mirror or use GitHub Packages /
+  Amazon ECR / Google Artifact Registry to cache images and avoid Docker Hub entirely.
+fix_code:
+  - language: yaml
+    label: "Authenticate with Docker Hub before pulling images"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            # Login FIRST — before any step that pulls from Docker Hub
+            - name: Log in to Docker Hub
+              uses: docker/login-action@v3
+              with:
+                username: ${{ secrets.DOCKERHUB_USERNAME }}
+                password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+            - uses: actions/checkout@v4
+
+            - name: Build and push
+              uses: docker/build-push-action@v5
+              with:
+                push: true
+                tags: myorg/myimage:latest
+  - language: yaml
+    label: "Authenticate for jobs using a container image"
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          container:
+            image: python:3.12
+            credentials:
+              username: ${{ secrets.DOCKERHUB_USERNAME }}
+              password: ${{ secrets.DOCKERHUB_TOKEN }}
+          steps:
+            - uses: actions/checkout@v4
+            - run: python -m pytest
+  - language: yaml
+    label: "Authenticate for service containers pulling from Docker Hub"
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          services:
+            postgres:
+              image: postgres:16
+              credentials:
+                username: ${{ secrets.DOCKERHUB_USERNAME }}
+                password: ${{ secrets.DOCKERHUB_TOKEN }}
+              env:
+                POSTGRES_PASSWORD: postgres
+          steps:
+            - uses: actions/checkout@v4
+prevention:
+  - "Store a Docker Hub access token (not password) in secrets and use docker/login-action@v3 in all jobs that pull images."
+  - "Place the docker/login-action step first in the job — before any action that internally pulls Docker Hub images."
+  - "Consider mirroring frequently-used base images to GitHub Container Registry (ghcr.io) or your cloud provider's registry to eliminate Docker Hub dependency."
+  - "Use Docker Hub's Automated Builds or a scheduled workflow to keep mirror images up to date."
+  - "For service containers and job containers, always provide `credentials:` block alongside `image:` when pulling from Docker Hub."
+docs:
+  - url: "https://docs.docker.com/docker-hub/download-rate-limit/"
+    label: "Docker Hub: Download rate limit documentation"
+  - url: "https://github.com/docker/login-action"
+    label: "docker/login-action — GitHub Marketplace"
+  - url: "https://docs.github.com/en/actions/use-cases-and-examples/publishing-packages/publishing-docker-images"
+    label: "GitHub Docs: Publishing Docker images"
+  - url: "https://github.com/actions/runner-images/issues/1445"
+    label: "actions/runner-images #1445 — Did Docker Hub rate limit affect GitHub Action?"
