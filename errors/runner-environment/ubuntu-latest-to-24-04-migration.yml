@@ -1,0 +1,138 @@
+id: runner-environment-026
+title: "ubuntu-latest Switched to Ubuntu 24.04 — Breaks Python 3.8/3.9, System Packages, OpenSSL"
+category: runner-environment
+severity: error
+tags:
+  - ubuntu
+  - ubuntu-24.04
+  - runner-image
+  - python
+  - openssl
+  - apt
+  - migration
+  - breaking-change
+patterns:
+  - regex: "Unable to locate package python3\\.[89]"
+    flags: "i"
+  - regex: "python3\\.[89].*not found.*ubuntu.*24"
+    flags: "i"
+  - regex: "E: Package 'python3\\.[89]' has no installation candidate"
+    flags: "i"
+  - regex: "error.*openssl.*libssl1\\.1.*not available"
+    flags: "i"
+  - regex: "deadsnakes.*ppa.*focal.*not available.*noble"
+    flags: "i"
+  - regex: "ubuntu-latest.*ubuntu 24"
+    flags: "i"
+error_messages:
+  - "E: Package 'python3.8' has no installation candidate"
+  - "E: Package 'python3.9' has no installation candidate"
+  - "E: Package 'libssl1.1' has no installation candidate"
+  - "Error: The version '3.8' with architecture 'x64' was not found for Ubuntu 24.04"
+  - "Error: deadsnakes/ppa does not provide Python 3.8 packages for Ubuntu Noble (24.04)"
+root_cause: |
+  GitHub began rolling out Ubuntu 24.04 as the new target for `ubuntu-latest` on
+  **December 5, 2024**, completing the transition on **January 17, 2025** (tracked in
+  actions/runner-images #10636, 266 👍 reactions). Any workflow using `runs-on: ubuntu-latest`
+  without explicit version pinning now runs on Ubuntu 24.04 ("Noble Numbat") instead of 22.04.
+
+  **Key breaking changes in Ubuntu 24.04:**
+
+  1. **Python 3.8 and 3.9 are end-of-life and not available** — not via `apt` and not via
+     the `deadsnakes/ppa` PPA (which only backports for supported Ubuntu releases). Workflows
+     that `apt-get install python3.8` or use `setup-python` with version `3.8` or `3.9` fail.
+
+  2. **OpenSSL 1.1 removed** — Ubuntu 24.04 ships only OpenSSL 3.x. Packages and Python
+     versions that were compiled against OpenSSL 1.1 (`libssl1.1`) will fail to install or
+     run. This affects older Ruby gems, some Go binaries, and legacy pip packages.
+
+  3. **System Python is 3.12** — the `python3` system binary points to Python 3.12, which
+     may break scripts that relied on the 3.10 default in 22.04.
+
+  4. **`apt` package name changes** — some packages were renamed or split between 22.04 and
+     24.04 (e.g., `python3-distutils` is gone; functionality merged into `python3`).
+
+  5. **`/usr/bin/python` symlink absent by default** — workflows calling bare `python`
+     (not `python3`) fail with "python: command not found".
+fix: |
+  **Short-term — pin to ubuntu-22.04:**
+  Replace `runs-on: ubuntu-latest` with `runs-on: ubuntu-22.04` to freeze the runner image
+  while you migrate. Note: ubuntu-22.04 will eventually reach end-of-support (~April 2027).
+
+  **Long-term — migrate to supported Python/package versions:**
+  - Replace Python 3.8/3.9 with Python 3.10, 3.11, or 3.12 using `actions/setup-python`.
+    `actions/setup-python` downloads a pre-built binary from the tool cache — it works
+    regardless of the runner's system Python.
+  - Replace `libssl1.1` dependencies by upgrading the affected package to an OpenSSL-3
+    compatible version, or adding a compatibility shim if available.
+  - Replace bare `python` calls with `python3`.
+
+  **For `deadsnakes` PPA users:** `deadsnakes/ppa` only provides Python 3.8/3.9 for
+  Ubuntu 20.04 (Focal) and 22.04 (Jammy) — not 24.04 (Noble). There is no supported
+  workaround; upgrade to a supported Python version.
+fix_code:
+  - language: yaml
+    label: "Pin to ubuntu-22.04 as a short-term fix while migrating"
+    code: |
+      jobs:
+        test:
+          # Pin explicitly until Python 3.8/3.9 dependencies are upgraded
+          runs-on: ubuntu-22.04
+          steps:
+            - uses: actions/checkout@v4
+            - run: python3.9 -m pytest
+  - language: yaml
+    label: "Use actions/setup-python to install any Python version on ubuntu-latest"
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest  # Now 24.04
+          steps:
+            - uses: actions/checkout@v4
+            - name: Set up Python
+              uses: actions/setup-python@v5
+              with:
+                # setup-python downloads pre-built binaries — works on any runner OS
+                python-version: '3.9'
+            - run: python --version  # 3.9.x from setup-python's tool cache
+            - run: pip install -r requirements.txt
+  - language: yaml
+    label: "Test matrix against multiple Python versions to find breakages early"
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          strategy:
+            matrix:
+              python-version: ['3.9', '3.10', '3.11', '3.12']
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-python@v5
+              with:
+                python-version: ${{ matrix.python-version }}
+            - run: pip install -r requirements.txt && pytest
+  - language: yaml
+    label: "Fix bare 'python' command not found on Ubuntu 24.04"
+    code: |
+      steps:
+        - name: Ensure python symlink exists
+          run: |
+            # Ubuntu 24.04 no longer creates /usr/bin/python by default
+            sudo ln -sf /usr/bin/python3 /usr/bin/python
+        # Or: use actions/setup-python which sets up the PATH correctly
+prevention:
+  - "Pin `runs-on: ubuntu-22.04` explicitly if your workflow depends on Python 3.8/3.9, libssl1.1, or other 22.04-specific packages."
+  - "Use `actions/setup-python@v5` to install a specific Python version instead of relying on `apt-get install python3.x` — it works across all Ubuntu versions."
+  - "When you upgrade Ubuntu runner versions, scan `apt-get install` lines in run steps for packages that may not exist in the new Ubuntu release."
+  - "Replace bare `python` invocations with `python3` or use `actions/setup-python` which adds an alias."
+  - "Test your workflows against `ubuntu-24.04` explicitly before `ubuntu-latest` changes, by running on both runner images in a matrix."
+  - "Subscribe to https://github.com/actions/runner-images/issues for announcements about upcoming `ubuntu-latest` image transitions."
+docs:
+  - url: "https://github.com/actions/runner-images/issues/10636"
+    label: "actions/runner-images #10636 — Ubuntu-latest workflows will use Ubuntu-24.04 image"
+  - url: "https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2404-Readme.md"
+    label: "Ubuntu 24.04 runner image — installed software reference"
+  - url: "https://github.com/actions/setup-python"
+    label: "actions/setup-python — install any Python version on any runner"
+  - url: "https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners#supported-runners-and-hardware-resources"
+    label: "GitHub Docs: Supported runners and hardware resources"

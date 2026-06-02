@@ -1,0 +1,112 @@
+id: silent-failures-011
+title: "GITHUB_OUTPUT Multiline Values Silently Truncated — Heredoc EOF Required"
+category: silent-failures
+severity: silent-failure
+tags:
+  - github-output
+  - multiline
+  - output
+  - heredoc
+  - truncation
+  - environment-files
+patterns:
+  - regex: "echo\\s+['\"]?\\w+=.*\\$\\([^)]+\\).*>>\\s+\\$GITHUB_OUTPUT"
+    flags: "i"
+  - regex: "invalid value.*GITHUB_OUTPUT.*contains newline"
+    flags: "i"
+  - regex: "Error: Unable to process file command 'output'"
+    flags: "i"
+  - regex: "GITHUB_OUTPUT.*multiline"
+    flags: "i"
+error_messages:
+  - "Error: Unable to process file command 'output' successfully."
+  - "Invalid format 'key=line1\\nline2' - value contains newline, use heredoc syntax"
+  - "Warning: Unexpected input(s) 'output', valid inputs are"
+root_cause: |
+  The `GITHUB_OUTPUT` environment file protocol (introduced November 2022 as a replacement
+  for the deprecated `::set-output` command) uses a line-based key=value format that does
+  NOT support literal newline characters in values when using simple `echo "key=value"` syntax.
+
+  When a step sets a multiline output using the naive approach:
+  ```bash
+  echo "REPORT=$(cat report.txt)" >> $GITHUB_OUTPUT
+  ```
+  the shell expands `$(cat report.txt)` into a multiline string, which is then written as:
+  ```
+  REPORT=line1
+  line2
+  line3
+  ```
+  The runner reads the first newline as end-of-value for `REPORT`, then tries to parse `line2`
+  as a new key=value entry (which fails silently or errors). The downstream step reading
+  `${{ steps.id.outputs.REPORT }}` receives only `line1` — or an empty string if the parser
+  rejects the entry entirely.
+
+  This is a **silent failure** because the workflow step itself does not fail — the `echo`
+  command exits successfully. The broken output only surfaces downstream, often as an empty
+  variable or a truncated value that's hard to trace back to the output-setting step.
+
+  The same issue affects `$GITHUB_ENV` for multiline environment variable values.
+fix: |
+  Use the **heredoc (multi-line delimiter) syntax** documented by GitHub for multiline values.
+  The format is:
+  ```
+  {name}<<{delimiter}
+  {value}
+  {delimiter}
+  ```
+  where `{delimiter}` is any string that does NOT appear in the value itself. `EOF` is the
+  conventional choice, but using a random string (e.g. `$(uuidgen)`) prevents injection
+  attacks if the value is untrusted.
+
+  **For `$GITHUB_ENV` multiline values:** use the identical heredoc pattern with `$GITHUB_ENV`.
+
+  **For JavaScript/TypeScript actions:** use `core.setOutput('name', value)` from
+  `@actions/core` — it handles serialization automatically and is not subject to this limitation.
+fix_code:
+  - language: yaml
+    label: "Correct multiline GITHUB_OUTPUT using heredoc EOF syntax"
+    code: |
+      - name: Set multiline output
+        id: report
+        run: |
+          # WRONG: echo "REPORT=$(cat report.txt)" >> $GITHUB_OUTPUT
+          # Correct: heredoc syntax
+          echo "REPORT<<EOF" >> $GITHUB_OUTPUT
+          cat report.txt >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Use multiline output
+        run: |
+          echo "${{ steps.report.outputs.REPORT }}"
+  - language: yaml
+    label: "Use random delimiter to prevent injection from untrusted content"
+    code: |
+      - name: Set multiline output safely
+        id: data
+        run: |
+          DELIMITER=$(openssl rand -hex 16)
+          echo "JSON_OUTPUT<<${DELIMITER}" >> $GITHUB_OUTPUT
+          curl -s https://api.example.com/data >> $GITHUB_OUTPUT
+          echo "${DELIMITER}" >> $GITHUB_OUTPUT
+  - language: yaml
+    label: "Multiline GITHUB_ENV using heredoc (same pattern)"
+    code: |
+      - name: Set multiline environment variable
+        run: |
+          echo "CHANGELOG<<EOF" >> $GITHUB_ENV
+          git log --oneline -10 >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+prevention:
+  - "Never use `echo \"KEY=$(command)\" >> $GITHUB_OUTPUT` when the command output may span multiple lines."
+  - "Always use the heredoc EOF syntax for any output value that could contain newlines: `echo \"KEY<<EOF\" >> $GITHUB_OUTPUT && <value> >> $GITHUB_OUTPUT && echo \"EOF\" >> $GITHUB_OUTPUT`."
+  - "Use a random delimiter (`$(openssl rand -hex 16)`) instead of `EOF` when the value originates from untrusted input to prevent delimiter injection."
+  - "In JavaScript/TypeScript actions, use `@actions/core`'s `core.setOutput()` which handles serialization automatically."
+  - "Test multiline outputs locally with `act` or by printing `cat $GITHUB_OUTPUT` in a subsequent step to verify the full value was captured."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions#multiline-strings"
+    label: "GitHub Docs: Workflow commands — Multiline strings"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/passing-information-between-jobs"
+    label: "GitHub Docs: Passing information between jobs"
+  - url: "https://github.blog/changelog/2022-10-11-github-actions-deprecating-save-state-and-set-output-commands/"
+    label: "GitHub Changelog: Deprecating save-state and set-output commands"
