@@ -16,7 +16,12 @@ export function suggestFix(
   // Try regex matching first
   let results = lookupByPattern(db, errorContext, 5);
 
-  // If no regex matches, try keyword search
+  // Apply category filter if provided (pattern matching doesn't filter by category)
+  if (category) {
+    results = results.filter(r => r.entry.category === category);
+  }
+
+  // If no matches after filtering, fall back to keyword search with category filter
   if (results.length === 0) {
     results = searchByKeyword(db, errorContext, { category, maxResults: 5 });
   }
