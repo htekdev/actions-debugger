@@ -1,0 +1,112 @@
+id: known-unsolved-008
+title: "GITHUB_STEP_SUMMARY Upload Aborted When Content Exceeds 1024k"
+category: known-unsolved
+severity: error
+tags:
+  - step-summary
+  - GITHUB_STEP_SUMMARY
+  - size-limit
+  - job-summary
+  - markdown
+  - limitation
+patterns:
+  - regex: "\\$GITHUB_STEP_SUMMARY upload aborted, supports content up to a size of 1024k, got \\d+k"
+    flags: "i"
+  - regex: "upload aborted.*supports content up to a size of 1024k"
+    flags: "i"
+  - regex: "Error: GITHUB_STEP_SUMMARY.*1024"
+    flags: "i"
+error_messages:
+  - "$GITHUB_STEP_SUMMARY upload aborted, supports content up to a size of 1024k, got 1387k"
+  - "$GITHUB_STEP_SUMMARY upload aborted, supports content up to a size of 1024k, got 2048k"
+root_cause: |
+  GitHub Actions imposes a hard 1 MiB (1024 KiB) size limit on the content written to
+  `$GITHUB_STEP_SUMMARY`. When a step writes more than this limit, the runner aborts
+  the summary upload and logs an error.
+
+  This is a **platform limit with no workaround** — you cannot increase it. GitHub has not
+  announced plans to raise the limit.
+
+  Common triggers:
+  1. **Test reporters** — tools like `dorny/test-reporter`, `ctrf-io/github-actions-ctrf`,
+     or `EnricoMi/publish-unit-test-result-action` write per-test result tables. Large
+     test suites (thousands of test cases, especially with long failure messages) easily
+     exceed 1 MiB.
+  2. **Dependency review action** — `actions/dependency-review-action` writes full
+     dependency diff tables. Large projects with hundreds of transitive dependencies produce
+     summaries well above 1 MiB.
+  3. **Coverage reports** — HTML-style coverage tables written to `$GITHUB_STEP_SUMMARY`
+     with per-file rows can grow unboundedly on large monorepos.
+  4. **Log echo pipelines** — `cat large-file >> $GITHUB_STEP_SUMMARY` without size
+     checking is the most direct way to hit the limit.
+
+  The error aborts the summary upload but does **not** fail the step or job by default.
+  Depending on the action's error handling, the step may succeed (exit 0) even though the
+  summary was not written — making this a silent failure from a reporting perspective.
+fix: |
+  Truncate or paginate summary content before writing it. Most test reporters provide
+  options to limit which results are written (e.g., only failures, not all passed tests).
+  For custom summary generation, check the size before writing and truncate with a note.
+fix_code:
+  - language: yaml
+    label: "Truncate summary content with size check before writing"
+    code: |
+      - name: Generate test report
+        run: |
+          # Generate report to a temp file first
+          ./scripts/generate-report.sh > /tmp/report.md
+
+          # Check size before writing to summary
+          SIZE_KB=$(du -k /tmp/report.md | cut -f1)
+          MAX_KB=800  # Leave headroom below 1024k limit
+
+          if [ "$SIZE_KB" -gt "$MAX_KB" ]; then
+            echo "⚠️ Full report too large (${SIZE_KB}k). Showing failures only." >> "$GITHUB_STEP_SUMMARY"
+            ./scripts/generate-report.sh --failures-only >> "$GITHUB_STEP_SUMMARY"
+          else
+            cat /tmp/report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+  - language: yaml
+    label: "dorny/test-reporter — limit to failures only for large test suites"
+    code: |
+      - name: Test Report
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Test Results
+          path: test-results/**/*.xml
+          reporter: jest-junit
+          # Limit output to avoid 1024k summary limit on large suites
+          only-summary: true          # Write only totals, not per-test rows
+          fail-on-error: false
+  - language: yaml
+    label: "Upload full report as artifact instead of writing to summary"
+    code: |
+      - name: Generate full coverage report
+        run: ./scripts/coverage.sh > /tmp/coverage-full.md
+
+      - name: Write summary (truncated)
+        run: |
+          head -100 /tmp/coverage-full.md >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "_Full report available as workflow artifact._" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload full report as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: /tmp/coverage-full.md
+prevention:
+  - "Never pipe unbounded command output directly to `$GITHUB_STEP_SUMMARY` — always size-check or limit first."
+  - "Configure test reporter actions to write only failures (not all passing tests) when the test suite is large."
+  - "Upload large reports as workflow artifacts and link to them from a short summary, instead of embedding all content in the summary."
+  - "The undocumented historical limit of 65,535 characters cited in older docs/answers is no longer accurate — the current limit is 1024 KiB (1 MiB)."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions#adding-a-job-summary"
+    label: "Workflow commands: Adding a job summary"
+  - url: "https://github.com/actions/dependency-review-action/issues/786"
+    label: "dependency-review-action#786 — Job Summary Size Limitation aborts the job"
+  - url: "https://github.com/dorny/test-reporter/issues/379"
+    label: "dorny/test-reporter#379 — Is the step summary limit for 65535 characters still accurate?"
+  - url: "https://docs.github.com/en/actions/administering-github-actions/usage-limits-billing-and-administration#usage-limits"
+    label: "Usage limits — GitHub Actions"

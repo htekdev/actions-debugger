@@ -1,0 +1,113 @@
+id: concurrency-timing-007
+title: "Matrix Sibling Jobs Silently Cancelled by fail-fast Default"
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - matrix
+  - fail-fast
+  - cancellation
+  - silent-failure
+  - strategy
+  - job-cancelled
+patterns:
+  - regex: "Some jobs were not run because a sibling job failed"
+    flags: "i"
+  - regex: "Canceling since a higher priority waiting run was found"
+    flags: "i"
+  - regex: "The workflow run was canceled\\."
+    flags: "i"
+error_messages:
+  - "Some jobs were not run because a sibling job failed. To allow them to run anyway, add 'continue-on-error: true' to the matrix job."
+  - "Job was cancelled"
+root_cause: |
+  GitHub Actions matrix strategy defaults to `fail-fast: true`. When ANY matrix leg fails,
+  GitHub immediately cancels all other in-progress and pending legs in the same matrix.
+
+  This default is rarely what developers want during debugging or CI investigation, and
+  produces a confusing failure pattern:
+
+  1. **Cancelled legs appear as "Cancelled" not "Failed"** — matrix siblings killed by
+     `fail-fast` show as CANCELLED in the UI (grey icon) rather than red failures. Developers
+     scanning the run summary see one red failure and many grey cancellations, and may not
+     realize those sibling legs had reached significant progress (e.g., partway through a
+     test suite on a different OS or Node version) before being killed.
+
+  2. **Root cause is obscured** — the only failing leg that matters for diagnosis is the one
+     that triggered `fail-fast`, but with multiple cancellations in the UI, it can be hard to
+     identify which leg failed first.
+
+  3. **`fail-fast` is inherited silently** — there is no warning annotation that says
+     "fail-fast is enabled and cancelled 5 sibling legs." The default is documented but
+     easy to forget when adding a new matrix.
+
+  4. **Re-running failed jobs doesn't re-run cancelled siblings** — "Re-run failed jobs"
+     only re-runs the legs that explicitly FAILED, not the ones that were cancelled by
+     fail-fast. Developers re-running failed jobs think they'll see results from all legs,
+     but cancelled siblings stay cancelled. Only "Re-run all jobs" restarts everything.
+
+  Example: a 3-OS matrix (ubuntu, windows, macos) where ubuntu fails. With fail-fast,
+  windows and macos are immediately cancelled. The developer sees one failure and two
+  cancellations, re-runs the failed ubuntu job, and never discovers that windows also
+  had an independent failing test.
+fix: |
+  Set `fail-fast: false` explicitly on any matrix where you need full signal from all
+  legs — especially for cross-platform or multi-version compatibility matrices. Use
+  `fail-fast: true` intentionally only when running the full matrix after one failure is
+  wasteful (e.g., expensive build matrices during pre-merge CI).
+fix_code:
+  - language: yaml
+    label: "Disable fail-fast to see all matrix leg results"
+    code: |
+      jobs:
+        test:
+          strategy:
+            fail-fast: false  # All legs run regardless of siblings failing
+            matrix:
+              os: [ubuntu-latest, windows-latest, macos-latest]
+              node: [18, 20, 22]
+          runs-on: ${{ matrix.os }}
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                node-version: ${{ matrix.node }}
+            - run: npm ci
+            - run: npm test
+  - language: yaml
+    label: "Use fail-fast: true only for expensive pre-merge CI"
+    code: |
+      jobs:
+        # Pre-merge: fail fast to conserve minutes — just need to know if it passes
+        lint-and-typecheck:
+          strategy:
+            fail-fast: true  # OK: fast, cheap, fail early
+            matrix:
+              node: [20, 22]
+          runs-on: ubuntu-latest
+          steps:
+            - run: npm run lint && npm run typecheck
+
+        # Post-merge: always see all platform results
+        full-test-suite:
+          if: github.event_name == 'push'
+          strategy:
+            fail-fast: false  # Need full signal on all platforms
+            matrix:
+              os: [ubuntu-latest, windows-latest, macos-latest]
+          runs-on: ${{ matrix.os }}
+          steps:
+            - run: npm test
+prevention:
+  - "Always set `fail-fast: false` explicitly on cross-platform or multi-version matrices where you need full compatibility signal."
+  - "After a matrix failure, use 'Re-run all jobs' (not 'Re-run failed jobs') to get results from previously-cancelled siblings."
+  - "Add a workflow summary step with `if: always()` to collect and consolidate test results across all matrix legs even when some are cancelled."
+  - "Be aware that cancelled legs (grey) are NOT the same as passed legs (green) — visually scan for both red and grey when investigating failures."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idstrategyfail-fast"
+    label: "Workflow syntax: jobs.<job_id>.strategy.fail-fast"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idstrategymatrix"
+    label: "Workflow syntax: jobs.<job_id>.strategy.matrix"
+  - url: "https://github.com/orgs/community/discussions/26822"
+    label: "Community: fail-fast cancels matrix siblings unexpectedly"
+  - url: "https://stackoverflow.com/questions/57850553/github-actions-check-steps-status"
+    label: "Stack Overflow: Matrix job cancellation behavior with fail-fast"

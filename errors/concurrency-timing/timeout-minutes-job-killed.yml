@@ -1,0 +1,107 @@
+id: concurrency-timing-005
+title: "Job Silently Cancelled When timeout-minutes Is Exceeded"
+category: concurrency-timing
+severity: error
+tags:
+  - timeout
+  - timeout-minutes
+  - job-cancelled
+  - timing
+  - runner
+patterns:
+  - regex: "##\\[error\\]The operation was cancelled\\."
+    flags: "i"
+  - regex: "The job '.*' was cancelled because it exceeded the maximum execution time"
+    flags: "i"
+  - regex: "Error: The operation was canceled"
+    flags: "i"
+  - regex: "cancel is received"
+    flags: "i"
+error_messages:
+  - "##[error]The operation was cancelled."
+  - "Error: The operation was canceled"
+  - "The runner has received a shutdown signal. This can happen when the runner service is stopped, or a manually started runner is canceled."
+root_cause: |
+  When a job (or step) exceeds its configured `timeout-minutes`, GitHub Actions sends a
+  cancellation signal to the runner. The runner has 5 minutes to complete graceful shutdown,
+  after which it is forcibly terminated.
+
+  The failure mode has two layers of confusion:
+
+  1. **Status shows "Cancelled" not "Failed"** — a timed-out job is marked CANCELLED in the
+     UI. It does not appear as a red failure. Developers scanning the Actions tab may miss it
+     entirely, especially if another run succeeded after it.
+
+  2. **No step-level attribution** — the job log shows "The operation was cancelled" but does
+     not identify which specific step was still running or how far it had progressed. Long
+     builds, network-heavy steps, and interactive prompts are common culprits.
+
+  3. **Default timeout is 360 minutes (6 hours)** — if `timeout-minutes` is not explicitly
+     set, GitHub uses the platform default of 6 hours for GitHub-hosted runners. A job that
+     accidentally blocks (waiting for user input, infinite loop, hung network call) will silently
+     consume 6 hours of runner minutes before being cancelled with no diagnostic output.
+
+  4. **Step-level timeouts are independent** — `timeout-minutes` on a `steps[*]` entry cancels
+     only that step; the job continues. `timeout-minutes` on `jobs[*]` cancels the entire job.
+     Mixing both is valid but must be understood deliberately.
+fix: |
+  Always set explicit `timeout-minutes` at the job level to bound worst-case runner cost.
+  Tune based on your typical build time (e.g., 2-3× the median duration). Add step-level
+  timeouts on known slow steps (network downloads, test suites) to get better attribution.
+
+  To diagnose which step was running at cancellation: add a step near the end that dumps
+  elapsed time, or use `if: cancelled()` post-steps to capture diagnostics on timeout.
+fix_code:
+  - language: yaml
+    label: "Explicit job-level timeout with diagnostic post-step"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          timeout-minutes: 30  # Set explicitly — don't rely on 6h default
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Build
+              run: make build
+
+            - name: Tests
+              timeout-minutes: 15  # Step-level timeout for attribution
+              run: make test
+
+            # Always runs — captures which step caused the timeout
+            - name: Dump elapsed time on cancellation
+              if: cancelled()
+              run: echo "Job was cancelled at $(date -u). Check step durations above."
+  - language: yaml
+    label: "Identify which step timed out with job summary annotation"
+    code: |
+      steps:
+        - name: Long network operation
+          timeout-minutes: 10
+          run: |
+            # Use --max-time with curl to avoid relying solely on timeout-minutes
+            curl --max-time 300 https://example.com/large-asset -o output.bin
+
+        - name: Report timeout if cancelled
+          if: cancelled()
+          run: |
+            echo "## ⏱️ Job Timed Out" >> $GITHUB_STEP_SUMMARY
+            echo "The job was cancelled. Review step durations in the log." >> $GITHUB_STEP_SUMMARY
+prevention:
+  - "Always set `timeout-minutes` at the job level — never rely on the 6-hour GitHub default."
+  - "Add step-level `timeout-minutes` on network-heavy or test steps so cancellation is attributed to a specific step."
+  - "Use `if: cancelled()` post-steps to write a job summary annotation explaining the timeout."
+  - "Run commands with their own timeout flags (e.g., `curl --max-time`, `pytest --timeout`) in addition to runner timeouts."
+  - "Monitor job duration trends — a job approaching its timeout limit is a signal to investigate performance."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idtimeout-minutes"
+    label: "Workflow syntax: jobs.<job_id>.timeout-minutes"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idstepstimeout-minutes"
+    label: "Workflow syntax: jobs.<job_id>.steps[*].timeout-minutes"
+  - url: "https://github.com/actions/runner/issues/1326"
+    label: "actions/runner#1326 — Steps hanging until timeout with no log output"
+  - url: "https://github.com/orgs/community/discussions/38004"
+    label: "Community: Job stops producing output and is later cancelled"
+  - url: "https://docs.github.com/en/actions/administering-github-actions/usage-limits-billing-and-administration#usage-limits"
+    label: "Usage limits: maximum job execution time"

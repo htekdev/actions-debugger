@@ -1,0 +1,127 @@
+id: known-unsolved-009
+title: "Job Killed After Maximum Execution Time (6h Hosted / 35-Day Workflow)"
+category: known-unsolved
+severity: limitation
+tags:
+  - timeout
+  - execution-time
+  - job-limits
+  - platform-limit
+  - self-hosted
+  - workflow-duration
+  - limitation
+patterns:
+  - regex: "The job running has exceeded the maximum execution time"
+    flags: "i"
+  - regex: "exceeded the maximum (?:time|execution time)"
+    flags: "i"
+  - regex: "job .* exceeded .* maximum"
+    flags: "i"
+error_messages:
+  - "The job running on runner GitHub Actions X has exceeded the maximum execution time of 360 minutes."
+  - "The job running has exceeded the maximum execution time"
+root_cause: |
+  GitHub Actions enforces hard platform-level execution time limits that cannot be
+  overridden or extended by workflow configuration. These limits exist to protect
+  shared infrastructure and prevent runaway jobs from consuming unlimited resources.
+
+  **GitHub-hosted runner limits:**
+  - Maximum job execution time: **6 hours** (360 minutes)
+  - Maximum workflow run time: **35 days** (across all jobs, including queued time)
+  - Default `timeout-minutes` when not set: **360 minutes** (6 hours)
+
+  **Self-hosted runner limits:**
+  - Maximum job execution time: **5 days** (7,200 minutes) by default
+  - Maximum workflow run time: **35 days** (same as hosted)
+  - Self-hosted limits can be customized in enterprise plans via org/enterprise policies
+
+  **When limits are hit:**
+  - The runner process is sent a SIGTERM (graceful) then SIGKILL (forced) after a grace period
+  - The job is marked CANCELLED (not FAILED) in the UI
+  - The log message "The job running has exceeded the maximum execution time" appears in
+    the runner log (may be visible in the step logs depending on where the runner was killed)
+  - Any `post:` steps for active actions (e.g., cache save, artifact upload) are skipped
+  - No email notification is sent to the repo owner about the cancellation
+
+  **Why this is a limitation, not just misconfiguration:**
+  - There is no way to set `timeout-minutes` above 21600 (360 hours) to extend the GitHub-hosted 6h cap
+  - The workflow `timeout-minutes` field cannot override the platform cap on GitHub-hosted runners
+  - Jobs requiring more than 6 hours on GitHub-hosted runners have NO supported path without
+    migrating to self-hosted or restructuring the job into multiple shorter sequential jobs
+fix: |
+  There is no way to extend the GitHub-hosted runner 6-hour job cap. Options:
+
+  1. **Break the job into smaller sequential jobs** — split long-running work (e.g., build
+     artifacts first, test in separate parallel jobs, deploy last). Each job has its own
+     6-hour budget.
+
+  2. **Migrate to self-hosted runners** — self-hosted runners support up to 5-day jobs.
+     Use actions-runner-controller (ARC) or cloud auto-scaling for elastic capacity.
+
+  3. **Optimize the slow step** — profile build/test times; parallelize with matrix
+     strategy; use incremental builds or test sharding to reduce per-job duration.
+
+  4. **Use caching aggressively** — `actions/cache` reduces download/build time between
+     runs, but does not extend limits.
+fix_code:
+  - language: yaml
+    label: "Split a long job into sequential jobs to stay within 6h per job"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          timeout-minutes: 120  # 2h budget for build
+          outputs:
+            artifact-id: ${{ steps.upload.outputs.artifact-id }}
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build
+              run: make build-release
+            - name: Upload build artifact
+              id: upload
+              uses: actions/upload-artifact@v4
+              with:
+                name: release-build
+                path: dist/
+
+        # Separate job — gets its own 6h budget
+        test:
+          needs: build
+          runs-on: ubuntu-latest
+          timeout-minutes: 180  # 3h budget for tests
+          steps:
+            - uses: actions/download-artifact@v4
+              with:
+                artifact-id: ${{ needs.build.outputs.artifact-id }}
+            - run: make test-full
+  - language: yaml
+    label: "Self-hosted runner for jobs requiring more than 6 hours"
+    code: |
+      jobs:
+        long-running-job:
+          # Self-hosted runners support up to 5-day job duration
+          runs-on: [self-hosted, linux, x64]
+          timeout-minutes: 2880  # 48h — only possible on self-hosted
+          steps:
+            - uses: actions/checkout@v4
+            - name: Long-running process
+              run: ./scripts/full-dataset-processing.sh
+prevention:
+  - "Set explicit `timeout-minutes` on every job — don't rely on the implicit 6h GitHub-hosted cap as your only safeguard."
+  - "Profile job duration regularly and alert when a job's P99 duration approaches 80% of its timeout budget."
+  - "Parallelize test suites using matrix strategy or `actions/github-script` dynamic matrix generation to reduce per-job time."
+  - "Use self-hosted runners for any workflow that legitimately requires more than 2-3 hours per job (e.g., large model training, full database rebuild, exhaustive integration tests)."
+  - "Be aware that post-run actions (cache save, artifact upload) will NOT execute if the parent job is killed for exceeding the time limit."
+docs:
+  - url: "https://docs.github.com/en/actions/administering-github-actions/usage-limits-billing-and-administration#usage-limits"
+    label: "Usage limits: job execution time and workflow run time"
+  - url: "https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners#usage-limits"
+    label: "Self-hosted runner usage limits"
+  - url: "https://github.com/orgs/community/discussions/48790"
+    label: "Community: Workflow run time limit 35 days"
+  - url: "https://github.com/orgs/community/discussions/150900"
+    label: "Community: Job cancellation after 6 hours"
+  - url: "https://stackoverflow.com/questions/70187174/github-actions-self-hosted-runner-the-job-running-has-exceeded-the-maximum-exe"
+    label: "Stack Overflow: The job running has exceeded the maximum execution time"
+  - url: "https://github.com/actions/actions-runner-controller"
+    label: "Actions Runner Controller (ARC) — Kubernetes-based self-hosted runner auto-scaling"
