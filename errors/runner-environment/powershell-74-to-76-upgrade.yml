@@ -1,0 +1,112 @@
+id: runner-environment-019
+title: "PowerShell 7.4 → 7.6 LTS Upgrade Breaks pwsh Scripts"
+category: runner-environment
+severity: warning
+tags:
+  - powershell
+  - pwsh
+  - runner-image
+  - breaking-change
+  - windows
+  - linux
+patterns:
+  - regex: "The term 'ThreadJob\\\\\\\\Start-ThreadJob' is not recognized"
+    flags: "i"
+  - regex: "Cannot bind parameter.*ChildPath.*expected.*String.*got.*Array"
+    flags: "i"
+  - regex: "WildcardPattern.*backtick|escape.*pattern.*unexpected"
+    flags: "i"
+  - regex: "New-EventLog.*source.*trailing|event source.*not found"
+    flags: "i"
+error_messages:
+  - "The term 'ThreadJob\\Start-ThreadJob' is not recognized as a name of a cmdlet, function, script file, or executable program."
+  - "Cannot bind parameter 'ChildPath'. Cannot convert the 'System.Object[]' value of type 'System.Object[]' to type 'System.String'."
+  - "Start-ThreadJob : The term 'ThreadJob\\Start-ThreadJob' is not recognized"
+root_cause: |
+  GitHub Actions upgraded PowerShell from 7.4.x to 7.6 LTS on all runner images beginning
+  June 8, 2026 (completing June 15, 2026). This affects every runner OS: ubuntu-22.04,
+  ubuntu-24.04, ubuntu-slim, macos-14/15/26, windows-2022/2025/2025-vs2026.
+
+  PowerShell 7.6 is built on .NET 10 (7.4 was on .NET 8). The documented breaking changes are:
+
+  1. **ThreadJob module renamed**: `ThreadJob` module is now `Microsoft.PowerShell.ThreadJob`.
+     Scripts calling `ThreadJob\Start-ThreadJob` with the old module-qualified name will throw
+     a "not recognized" error. The cmdlet itself (`Start-ThreadJob`) still works without prefix.
+
+  2. **`Join-Path -ChildPath` now accepts `string[]`**: Parameter binding changed from `string`
+     to `string[]`. Existing code that passes multiple -ChildPath args may see binding errors
+     depending on how arguments were constructed.
+
+  3. **`WildcardPattern.Escape` now correctly escapes lone backticks**: Scripts that relied on
+     the previous (incorrect) behavior of backtick handling in wildcard patterns may produce
+     different results.
+
+  4. **Event source name trailing space removed**: New-EventLog / Write-EventLog source names
+     no longer have a trailing space. Scripts that matched exact event source names including
+     the trailing space (e.g., `"MySource "`) will fail to match.
+
+  5. **.NET 10 runtime**: Any `pwsh` script using .NET types or reflection that was tested
+     against .NET 8 behavior may see subtle differences.
+fix: |
+  **ThreadJob module name** — the most common breaking change:
+  Replace `ThreadJob\Start-ThreadJob` with `Microsoft.PowerShell.ThreadJob\Start-ThreadJob`,
+  or just call `Start-ThreadJob` without the module qualifier.
+
+  **Event source name** — if you match exact source names:
+  Trim any trailing spaces from source name comparisons.
+
+  **Pin PowerShell version** if you need time to migrate (not recommended long-term):
+  Install a specific pwsh version in your workflow before running scripts.
+
+  **Test locally**: Install PowerShell 7.6 (`winget install Microsoft.PowerShell`) and run
+  your scripts to catch any remaining issues before they surface in CI.
+fix_code:
+  - language: yaml
+    label: "Fix ThreadJob module-qualified name"
+    code: |
+      # In your PowerShell script — change this:
+      #   ThreadJob\Start-ThreadJob -ScriptBlock { ... }
+      # To either:
+      #   Start-ThreadJob -ScriptBlock { ... }          # simplest fix
+      #   Microsoft.PowerShell.ThreadJob\Start-ThreadJob -ScriptBlock { ... }  # fully qualified
+  - language: yaml
+    label: "Pin PowerShell version as a temporary workaround"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            # Pin pwsh to 7.4.x temporarily while migrating
+            - name: Install PowerShell 7.4
+              run: |
+                wget -q "https://github.com/PowerShell/PowerShell/releases/download/v7.4.10/powershell_7.4.10-1.deb_amd64.deb"
+                sudo dpkg -i powershell_7.4.10-1.deb_amd64.deb
+
+            - name: Run PowerShell script
+              shell: pwsh
+              run: ./scripts/build.ps1
+  - language: yaml
+    label: "Fix event source name trailing-space match"
+    code: |
+      # Before (broken on 7.6):
+      # if ($event.Source -eq "MyApp ") { ... }
+      #
+      # After (works on 7.4 and 7.6):
+      # if ($event.Source.Trim() -eq "MyApp") { ... }
+prevention:
+  - "Subscribe to actions/runner-images announcements for PowerShell upgrade notices well before they ship."
+  - "Always use unqualified cmdlet names (`Start-ThreadJob`) rather than module-qualified names (`ThreadJob\\Start-ThreadJob`) to avoid module-rename breakage."
+  - "Run your PowerShell scripts through PSScriptAnalyzer with the latest rule set after any PS version upgrade."
+  - "Test pwsh workflows in a matrix with the previous and new PS version during runner image transition periods."
+docs:
+  - url: "https://github.com/actions/runner-images/issues/14150"
+    label: "GitHub Announcement: PowerShell 7.4 → 7.6 upgrade on all runner images"
+  - url: "https://learn.microsoft.com/en-us/powershell/scripting/whats-new/what-s-new-in-powershell-76"
+    label: "PowerShell 7.6 release notes and breaking changes"
+  - url: "https://learn.microsoft.com/en-us/powershell/scripting/install/powershell-support-lifecycle"
+    label: "PowerShell support lifecycle"
+source:
+  article: "https://htek.dev/articles/github-actions-debugging-guide"
+  section: "Runner image tool version changes"
