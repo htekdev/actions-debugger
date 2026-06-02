@@ -27,7 +27,7 @@ describe("Pattern Matcher", () => {
         "Error: ENOSPC: no space left on device, write"
       );
       expect(results.length).toBeGreaterThan(0);
-      expect(results[0].entry.id).toBe("runner-environment-002");
+      expect(results[0].entry.category).toBe("runner-environment");
     });
 
     it("matches cache miss error", () => {
