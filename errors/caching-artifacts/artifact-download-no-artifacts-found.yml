@@ -1,0 +1,118 @@
+id: caching-artifacts-010
+title: "Artifact Download Fails — Unable to Find Any Artifacts for Run"
+category: caching-artifacts
+severity: error
+tags:
+  - artifact
+  - download
+  - run-id
+  - cross-workflow
+  - upload-artifact
+  - download-artifact
+patterns:
+  - regex: "Unable to find any artifacts for the associated workflow"
+    flags: "i"
+  - regex: "No artifacts found for run"
+    flags: "i"
+  - regex: "Error: Unable to find any artifacts"
+    flags: "i"
+error_messages:
+  - "Unable to find any artifacts for the associated workflow"
+  - "Error: Unable to find any artifacts for the associated workflow"
+  - "No artifacts were found with the provided name and filters."
+root_cause: |
+  GitHub Actions artifacts are scoped to a specific workflow run. The
+  `actions/download-artifact@v4` action (and v3 with `run-id:`) will fail with
+  "Unable to find any artifacts" when:
+
+  1. **Wrong or stale run-id** — The run ID is hard-coded or fetched from a
+     prior run that no longer has the expected artifact (artifacts expire after
+     the configured retention period, default 90 days).
+
+  2. **Upload step never ran** — The producing workflow job was cancelled, the
+     upload step was skipped due to a failed prior step, or the `if:` condition
+     on the upload step evaluated to false.
+
+  3. **Name mismatch** — The `name:` specified in `download-artifact` doesn't
+     exactly match the name used in `upload-artifact` (case-sensitive).
+
+  4. **Cross-workflow download without explicit run-id** — In v4, downloading
+     artifacts from a different workflow run requires an explicit `run-id:`.
+     Omitting it defaults to the current run, which may not have those artifacts.
+
+  Documented in GitHub Community discussion #109905.
+fix: |
+  For cross-workflow artifact sharing:
+  1. Capture the producing workflow's run-id dynamically using the GitHub REST
+     API or by passing it as a workflow_dispatch input or repository_dispatch payload.
+  2. Verify the upload step ran successfully in the producer workflow before
+     downloading in a consumer workflow.
+  3. Ensure `name:` matches exactly (case-sensitive) between upload and download.
+  4. For same-workflow jobs, omit `run-id:` — download-artifact v4 defaults to
+     the current run automatically.
+fix_code:
+  - language: yaml
+    label: "WRONG — hard-coded run-id that may be stale"
+    code: |
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-output
+          run-id: 12345678  # ❌ hard-coded run ID — stale if re-run or wrong workflow
+  - language: yaml
+    label: "RIGHT — same-workflow, no run-id needed"
+    code: |
+      # Job A (producer)
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - run: make build
+            - uses: actions/upload-artifact@v4
+              with:
+                name: build-output       # ✅ exact name matters
+                path: dist/
+
+        test:
+          needs: build
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/download-artifact@v4
+              with:
+                name: build-output       # ✅ same name, no run-id needed for current run
+  - language: yaml
+    label: "RIGHT — cross-workflow download, run-id from API"
+    code: |
+      - name: Get latest successful run ID
+        id: get-run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUN_ID=$(gh run list \
+            --workflow=build.yml \
+            --branch=main \
+            --status=success \
+            --limit=1 \
+            --json databaseId \
+            --jq '.[0].databaseId')
+          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-output
+          run-id: ${{ steps.get-run.outputs.run_id }}  # ✅ dynamic run ID
+          github-token: ${{ github.token }}
+prevention:
+  - "Never hard-code run-id values — always fetch them dynamically via the GitHub API or pass them as workflow inputs."
+  - "Always verify artifact upload completed successfully before writing a consuming workflow that depends on it."
+  - "Use exact case-matching artifact names — `build-output` and `Build-Output` are different artifacts."
+  - "For same-workflow artifact sharing between jobs, omit `run-id:` entirely — it defaults to the current run."
+  - "Check artifact retention settings — artifacts expire after 90 days (public) or 400 days (private) by default."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-and-sharing-data-from-a-workflow"
+    label: "Storing and sharing data from a workflow"
+  - url: "https://github.com/actions/download-artifact"
+    label: "actions/download-artifact — README and cross-run download docs"
+  - url: "https://github.com/orgs/community/discussions/109905"
+    label: "GitHub Community #109905 — Unable to find any artifacts troubleshooting"
+  - url: "https://stackoverflow.com/questions/78238187/unable-to-find-any-artifacts-for-the-associated-workflow-github-actions"
+    label: "Stack Overflow — Unable to find any artifacts for the associated workflow"

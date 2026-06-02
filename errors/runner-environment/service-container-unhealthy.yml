@@ -1,0 +1,126 @@
+id: runner-environment-021
+title: "Service Container Marked Unhealthy — Health Check Timeout"
+category: runner-environment
+severity: error
+tags:
+  - service-container
+  - healthcheck
+  - docker
+  - timeout
+  - postgres
+  - redis
+  - rabbitmq
+patterns:
+  - regex: "service is unhealthy"
+    flags: "i"
+  - regex: "Failed to initialize.*service is unhealthy"
+    flags: "i"
+  - regex: "##\\[error\\]Failed to initialize.*service"
+    flags: "i"
+  - regex: "container_id.*unhealthy"
+    flags: "i"
+error_messages:
+  - "##[error]Failed to initialize, rabbitmq service is unhealthy."
+  - "##[error]Failed to initialize, postgres service is unhealthy."
+  - "##[error]Failed to initialize, redis service is unhealthy."
+  - "unhealthy"
+  - "service is starting, waiting 29 seconds before checking again."
+root_cause: |
+  GitHub Actions checks the Docker HEALTHCHECK status of service containers
+  before allowing dependent job steps to run. If the container does not
+  transition to `healthy` within the runner's fixed retry window, the job
+  fails with "service is unhealthy".
+
+  This commonly occurs because:
+  1. **No options specified** — Docker uses the image's built-in HEALTHCHECK,
+     which may be missing, too aggressive, or unsuitable for the CI environment.
+  2. **Startup time** — services like PostgreSQL, RabbitMQ, or Elasticsearch
+     take longer to initialize on GitHub-hosted runners than on local machines,
+     and the default health-check interval/retries expire before they're ready.
+  3. **Wrong health-check command** — a network ping health check may fail if
+     the service port isn't yet bound even though the process is running.
+  4. **Missing `--health-start-period`** — without a start period, Docker counts
+     health-check failures from container start, before the service has had time
+     to initialize.
+
+  Documented in actions/example-services issue #3.
+fix: |
+  Add `options:` to the service container definition with explicit health-check
+  parameters suited to the service and GitHub-hosted runner environment:
+
+  - `--health-cmd`: Use a service-native health check command, not a TCP probe.
+    Examples:
+      PostgreSQL: `pg_isready -U postgres`
+      Redis:      `redis-cli ping`
+      MySQL:      `mysqladmin ping -h localhost`
+      RabbitMQ:   `rabbitmqctl node_health_check`
+
+  - `--health-interval 10s`: Check every 10 seconds
+  - `--health-timeout 5s`: Allow up to 5 seconds per check
+  - `--health-retries 5`: Retry up to 5 times before marking unhealthy
+  - `--health-start-period 30s`: Give 30 seconds before counting failures
+
+  If the image lacks a health check and the options approach is insufficient,
+  add an explicit wait step after job start using the service label name to
+  poll readiness with a loop.
+fix_code:
+  - language: yaml
+    label: "PostgreSQL service container with proper health check"
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          services:
+            postgres:
+              image: postgres:16
+              env:
+                POSTGRES_PASSWORD: postgres
+                POSTGRES_DB: testdb
+              ports:
+                - 5432:5432
+              options: >-
+                --health-cmd "pg_isready -U postgres"
+                --health-interval 10s
+                --health-timeout 5s
+                --health-retries 5
+                --health-start-period 30s
+          steps:
+            - run: psql postgresql://postgres:postgres@localhost:5432/testdb -c "SELECT 1"
+  - language: yaml
+    label: "Redis service container with proper health check"
+    code: |
+      services:
+        redis:
+          image: redis:7
+          ports:
+            - 6379:6379
+          options: >-
+            --health-cmd "redis-cli ping"
+            --health-interval 10s
+            --health-timeout 5s
+            --health-retries 5
+  - language: yaml
+    label: "Fallback — explicit wait step if health check unreliable"
+    code: |
+      steps:
+        - name: Wait for PostgreSQL to be ready
+          run: |
+            until pg_isready -h localhost -p 5432 -U postgres; do
+              echo "Waiting for postgres..."
+              sleep 2
+            done
+          timeout-minutes: 2
+prevention:
+  - "Always specify `options:` with `--health-cmd`, `--health-interval`, `--health-retries`, and `--health-start-period` for every service container."
+  - "Use service-native health check commands (pg_isready, redis-cli ping) rather than generic TCP probes."
+  - "Add `--health-start-period` of 20-30 seconds for services with slow initialization (PostgreSQL, Elasticsearch, RabbitMQ)."
+  - "Test health check timing locally in Docker before relying on it in CI: `docker run --health-cmd '...' --health-interval 5s <image>`."
+docs:
+  - url: "https://docs.github.com/en/actions/using-containerized-services/about-service-containers"
+    label: "About service containers"
+  - url: "https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#jobsjob_idservicesservice_idoptions"
+    label: "Workflow syntax — services options"
+  - url: "https://github.com/actions/example-services/issues/3"
+    label: "actions/example-services #3 — Service container health check questions and fixes"
+  - url: "https://stackoverflow.com/questions/66763353/how-to-health-check-a-service-in-github"
+    label: "Stack Overflow — How to health check a service in GitHub Actions"
