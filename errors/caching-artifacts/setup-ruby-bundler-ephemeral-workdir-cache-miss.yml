@@ -1,0 +1,147 @@
+id: caching-artifacts-018
+title: "setup-ruby Bundler Cache Always Misses on Ephemeral Self-Hosted Runners Due to Workdir in Cache Key"
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - ruby
+  - setup-ruby
+  - bundler
+  - cache
+  - self-hosted
+  - ephemeral
+  - cache-miss
+  - cache-key
+patterns:
+  - regex: "Cache not found for.*setup-ruby-bundler-cache.*wd-.*[0-9]{8,}"
+    flags: "i"
+  - regex: "setup-ruby-bundler-cache.*wd-\\/.*[a-f0-9]{8,}.*Gemfile\\.lock"
+    flags: "i"
+  - regex: "No cache found.*setup-ruby-bundler.*workdir.*ephemeral"
+    flags: "i"
+  - regex: "Cache miss.*bundler.*setup-ruby.*self-hosted"
+    flags: "i"
+error_messages:
+  - "Cache not found for input keys: setup-ruby-bundler-cache-v6-ubuntu-22.04-x64-ruby-3.3.6-wd-/codebuild/output/src1813367680/src/actions-runner/_work/myapp/myapp-with--without--only--Gemfile.lock-3f96ad38..."
+  - "No cache found for key: setup-ruby-bundler-cache-v6-..."
+root_cause: |
+  `ruby/setup-ruby` includes the absolute working directory path (`wd-<path>`) as a
+  component of the Bundler cache key. The full cache key format is:
+
+    setup-ruby-bundler-cache-v{VERSION}-{OS}-{ARCH}-ruby-{RUBY_VERSION}-wd-{WORKDIR}-...{GEMFILE_HASH}
+
+  On GitHub-hosted runners, the working directory is deterministic per run
+  (`/home/runner/work/{repo}/{repo}` on Linux), so the cache key is stable across runs
+  and the cache is reused correctly.
+
+  On **ephemeral self-hosted runners** (e.g., AWS CodeBuild, GitLab CI runners with
+  unique workspace paths, or any runner that generates a unique working directory path
+  per run for isolation), the `wd-` component changes with each run. This makes every
+  cache lookup a miss — the Bundler gems are reinstalled from scratch on every run,
+  completely defeating the purpose of caching.
+
+  This affects:
+  - AWS CodeBuild with GitHub Actions runners (CodeBuild generates unique src paths per build)
+  - Kubernetes-based ephemeral runners where the pod workspace path includes a job ID
+  - Any custom runner setup that includes a timestamp or job ID in the workspace path
+
+  The issue is open (ruby/setup-ruby#904, April 2026) and has no upstream fix yet as of
+  mid-2026. The workdir was included in the cache key to allow multiple Ruby projects to
+  have separate caches within the same repository, but it breaks ephemeral runners as a
+  side effect.
+
+  Note: This is a **silent failure** — no error is thrown; the workflow succeeds but Bundler
+  installs all gems on every run, causing slow CI with no visible warning about cache
+  effectiveness.
+fix: |
+  **Workaround 1 — Disable setup-ruby's built-in bundler cache, use actions/cache manually**:
+  Set `bundler-cache: false` in setup-ruby and manage the Bundler cache yourself with
+  `actions/cache`, using only the `BUNDLE_PATH` and `Gemfile.lock` hash as the key
+  (no workdir component). This is the most reliable fix for ephemeral runners.
+
+  **Workaround 2 — Normalize the working directory** (if your runner supports it):
+  Configure your runner to use a fixed, predictable working directory path instead of
+  a unique-per-job path. This makes the setup-ruby cache key stable.
+
+  **Workaround 3 — Cache the Ruby gems directory directly**:
+  Cache `~/.bundle` or the Bundler install path rather than the per-project `vendor/bundle`,
+  since the home directory path is typically stable even on ephemeral runners.
+fix_code:
+  - language: yaml
+    label: "Disable setup-ruby cache and use actions/cache with stable key"
+    code: |
+      jobs:
+        test:
+          runs-on: self-hosted   # ephemeral runner
+          steps:
+            - uses: actions/checkout@v4
+
+            - uses: ruby/setup-ruby@v1
+              with:
+                ruby-version: '3.3'
+                bundler-cache: false   # Disable built-in cache (broken on ephemeral runners)
+
+            # Cache gems using a workdir-independent key
+            - uses: actions/cache@v4
+              id: bundle-cache
+              with:
+                path: ~/.bundle/cache
+                key: ${{ runner.os }}-bundle-${{ hashFiles('**/Gemfile.lock') }}
+                restore-keys: |
+                  ${{ runner.os }}-bundle-
+
+            - name: Install gems
+              run: bundle install --path ~/.bundle/cache
+              if: steps.bundle-cache.outputs.cache-hit != 'true'
+
+            - name: Bundle check
+              run: bundle check || bundle install
+  - language: yaml
+    label: "Cache vendor/bundle with BUNDLE_PATH and stable key (no workdir)"
+    code: |
+      jobs:
+        test:
+          runs-on: self-hosted
+          steps:
+            - uses: actions/checkout@v4
+
+            - uses: ruby/setup-ruby@v1
+              with:
+                ruby-version: '3.3'
+                bundler-cache: false
+
+            - uses: actions/cache@v4
+              with:
+                path: vendor/bundle
+                key: ${{ runner.os }}-gems-${{ hashFiles('**/Gemfile.lock') }}
+                restore-keys: |
+                  ${{ runner.os }}-gems-
+
+            - name: Install gems
+              run: |
+                bundle config path vendor/bundle
+                bundle install --jobs 4 --retry 3
+  - language: yaml
+    label: "GitHub-hosted runner — built-in cache works fine (no workaround needed)"
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest   # GitHub-hosted: stable workdir, cache works
+          steps:
+            - uses: actions/checkout@v4
+
+            - uses: ruby/setup-ruby@v1
+              with:
+                ruby-version: '3.3'
+                bundler-cache: true   # Works correctly on GitHub-hosted runners
+prevention:
+  - "Always use `bundler-cache: false` with `ruby/setup-ruby` on ephemeral self-hosted runners (CodeBuild, ephemeral Kubernetes runners) and manage caching manually."
+  - "Verify cache effectiveness by checking the `cache-hit` output and monitoring job duration across runs — a stable cache hit means no Bundler reinstall."
+  - "Use workdir-independent cache keys: `${{ runner.os }}-bundle-${{ hashFiles('**/Gemfile.lock') }}` instead of paths that include dynamic segments."
+  - "Track ruby/setup-ruby#904 for an upstream fix that makes the cache key workdir-independent by default."
+docs:
+  - url: "https://github.com/ruby/setup-ruby/issues/904"
+    label: "ruby/setup-ruby#904: Bundler cache not working due to ephemeral workdir (open)"
+  - url: "https://github.com/ruby/setup-ruby#caching-bundle-install-automatically"
+    label: "setup-ruby README: Caching bundle install automatically"
+  - url: "https://github.com/actions/cache/blob/main/README.md"
+    label: "actions/cache README: manual caching approach"

@@ -1,0 +1,141 @@
+id: runner-environment-045
+title: "macOS-15 Removes Old Xcode Simulator SDKs — Only 3 Latest Xcode Versions Keep Platform Tools"
+category: runner-environment
+severity: error
+tags:
+  - macos
+  - macos-15
+  - xcode
+  - ios
+  - simulator
+  - sdk
+  - runner-image
+  - breaking-change
+patterns:
+  - regex: "Requested.*simulator runtime.*not available|Could not find.*runtime.*for.*platform"
+    flags: "i"
+  - regex: "iphonesimulator.*SDK.*not found|No such SDK.*iphonesimulator"
+    flags: "i"
+  - regex: "error.*tvos.*simulator.*not.*installed|watchos.*sdk.*unavailable"
+    flags: "i"
+  - regex: "xcodebuild.*error.*platform.*version.*not.*installed"
+    flags: "i"
+  - regex: "Simulator runtime.*not installed.*for destination"
+    flags: "i"
+error_messages:
+  - "xcodebuild: error: SDK 'iphonesimulator17.0' cannot be located."
+  - "error: The requested simulator runtime is not installed."
+  - "xcodebuild: error: Unable to find a destination matching the provided destination specifier"
+  - "Could not find the tvOS simulator runtime for the version specified."
+  - "Requested runtime 'com.apple.CoreSimulator.SimRuntime.watchOS-10-0' was not found."
+root_cause: |
+  Beginning August 11, 2025, GitHub Actions macOS-15 (and later) runner images changed
+  their Xcode platform support policy: **only the three most recently installed Xcode versions
+  retain their platform tools** (SDK and simulator runtimes for iOS, tvOS, watchOS, visionOS).
+  Older Xcode versions remain on the image but have their simulator runtimes removed to
+  reclaim disk space.
+
+  The motivation was severe disk pressure on macOS runners caused by visionOS simulator
+  runtimes. Each Xcode version ships multiple runtimes (iOS, watchOS, tvOS, visionOS), and
+  keeping them for every installed Xcode version was exhausting the fixed disk allocation.
+
+  **Practical impact for macOS-15 images:**
+  The macOS-15 image ships with Xcode versions 16.0, 16.2, 16.3, 16.4, and 26.0 Beta
+  (as of mid-2026). Only the three most recent (16.3, 16.4, 26.0 Beta) retain full platform
+  tools. Workflows that target iOS 17.x or earlier simulators (which required Xcode ≤ 16.1)
+  will fail because those simulator runtimes are no longer present.
+
+  Workflows pinned to `macos-14` are unaffected but must migrate before macOS-14 retires
+  (November 2, 2026). The policy does NOT apply to macOS-13 or macOS-14 images — only
+  macOS-15 and newer.
+
+  Source: actions/runner-images#12541 (announced July 8, 2025; deployed August 11, 2025)
+fix: |
+  **Option 1 — Upgrade your minimum deployment target** (recommended):
+  If your app targets iOS 17.x or earlier purely for historical support, update the
+  `IPHONEOS_DEPLOYMENT_TARGET` in your Xcode project to 18.x (iOS 18 = Xcode 16.x).
+  Modern apps rarely need to support OS versions older than what Xcode's latest SDK covers.
+
+  **Option 2 — Use xcode-select to pin a supported Xcode version**:
+  Check which Xcode versions have full platform tools on the macOS-15 image
+  (the README lists them), then use the correct destination syntax:
+
+  ```yaml
+  - name: Select Xcode 16.4
+    run: sudo xcode-select -s /Applications/Xcode_16.4.app
+  ```
+
+  **Option 3 — Test on device targets instead of simulators**:
+  If your CI only needs to build (not run on simulator), use `generic/platform=iOS`
+  instead of specifying a simulator runtime version.
+
+  **Option 4 — Install missing runtimes** (not recommended — slow, fragile):
+  You can download and install older simulator runtimes via `xcodebuild -downloadPlatform`
+  but this is time-consuming (~5-10 min) and fragile in CI.
+fix_code:
+  - language: yaml
+    label: "Pin to a supported Xcode version with full platform tools"
+    code: |
+      jobs:
+        test-ios:
+          runs-on: macos-latest   # macOS-15
+          steps:
+            - uses: actions/checkout@v4
+
+            # Select Xcode with full platform tools (check macos-15 README for current list)
+            - name: Select Xcode 16.4
+              run: sudo xcode-select -s /Applications/Xcode_16.4.app
+
+            - name: Build and Test
+              run: |
+                xcodebuild test \
+                  -scheme MyApp \
+                  -destination 'platform=iOS Simulator,name=iPhone 16,OS=18.4' \
+                  CODE_SIGN_IDENTITY="" \
+                  CODE_SIGNING_REQUIRED=NO
+  - language: yaml
+    label: "Build without specifying simulator runtime (avoids SDK lookup)"
+    code: |
+      jobs:
+        build-ios:
+          runs-on: macos-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Build for generic iOS (no simulator runtime needed)
+              run: |
+                xcodebuild build \
+                  -scheme MyApp \
+                  -destination 'generic/platform=iOS' \
+                  CODE_SIGN_IDENTITY="" \
+                  CODE_SIGNING_REQUIRED=NO
+  - language: yaml
+    label: "Use a matrix to target only Xcode versions with platform tools"
+    code: |
+      jobs:
+        test:
+          runs-on: macos-latest
+          strategy:
+            matrix:
+              # Only include Xcode versions that have full platform tools on macOS-15
+              xcode: ['16.3', '16.4', '26.0']
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Select Xcode ${{ matrix.xcode }}
+              run: sudo xcode-select -s /Applications/Xcode_${{ matrix.xcode }}.app
+
+            - name: Test
+              run: xcodebuild test -scheme MyApp -destination 'platform=iOS Simulator,OS=latest,name=iPhone 16'
+prevention:
+  - "Check the macOS runner README (linked below) to see which Xcode versions have full platform tools before writing xcodebuild destinations."
+  - "Avoid specifying old iOS/watchOS/tvOS SDK versions in xcodebuild -destination — always use 'OS=latest' or a version compatible with the most recent 3 Xcode releases."
+  - "Subscribe to runner-images announcements so you know which Xcode versions have platform tools on each image before they ship."
+  - "Don't hardcode simulator runtime versions — derive them from the Xcode version you're selecting."
+docs:
+  - url: "https://github.com/actions/runner-images/issues/12541"
+    label: "runner-images#12541: Xcode platform tools support policy change announcement"
+  - url: "https://github.com/actions/runner-images/blob/main/images/macos/macos-15-Readme.md"
+    label: "macOS-15 runner README — Xcode versions and installed SDKs"
+  - url: "https://developer.apple.com/documentation/xcode/installing-additional-simulator-runtimes"
+    label: "Apple Docs: Installing additional simulator runtimes"
