@@ -1,0 +1,114 @@
+id: known-unsolved-013
+title: "GITHUB_ENV Set in Composite Action Not Updated on Repeated Calls in Same Job"
+category: known-unsolved
+severity: silent-failure
+tags:
+  - composite-action
+  - GITHUB_ENV
+  - env-var
+  - repeated-calls
+  - known-limitation
+patterns:
+  - regex: "echo.*>>\\s*\\$GITHUB_ENV"
+    flags: "i"
+  - regex: "GITHUB_ENV.*composite"
+    flags: "i"
+error_messages:
+  - "environment variable not updated on second call"
+  - "variable retains value from first call"
+root_cause: |
+  When a composite action sets an environment variable by appending to $GITHUB_ENV,
+  that variable is propagated to the parent job context after the composite action
+  completes. On the first call this works correctly. However, if the same composite
+  action is called a second time in the same job, the GITHUB_ENV write succeeds
+  internally but the parent job environment variable retains the value from the
+  first call.
+
+  This is a known platform limitation: GITHUB_ENV writes from within composite
+  actions are processed at step-boundary transitions. On repeated calls to the
+  same composite action in the same job, the runner does not re-apply the env
+  file changes correctly for variables already set — the first written value
+  persists for the job duration.
+
+  The limitation affects parameterized composite actions used as reusable units
+  that produce environment state, especially when called in loops, matrices, or
+  sequential steps with different inputs.
+
+  GitHub has not fixed this behavior; the recommended migration path is to use
+  GITHUB_OUTPUT instead of GITHUB_ENV for composite action outputs.
+fix: |
+  Replace $GITHUB_ENV writes with $GITHUB_OUTPUT writes inside composite actions.
+  Step outputs are properly scoped per-invocation and do not have the repeated-call
+  limitation. Read the output in the calling workflow using steps.<id>.outputs.<name>.
+
+  If environment variables are strictly required at the job level, set them in the
+  calling workflow from the composite action outputs, not inside the composite action.
+fix_code:
+  - language: yaml
+    label: "BROKEN composite action — GITHUB_ENV silently not updated on 2nd call"
+    code: |
+      # my-action/action.yml
+      inputs:
+        label:
+          required: true
+      runs:
+        using: composite
+        steps:
+          - run: echo "MY_LABEL=${{ inputs.label }}" >> $GITHUB_ENV
+            shell: bash
+      # Calling workflow:
+      # steps:
+      #   - uses: ./my-action
+      #     with: { label: "first" }   # MY_LABEL = "first" ✓
+      #   - uses: ./my-action
+      #     with: { label: "second" }  # MY_LABEL still "first" — silent bug!
+  - language: yaml
+    label: "CORRECT composite action — use GITHUB_OUTPUT"
+    code: |
+      # my-action/action.yml
+      inputs:
+        label:
+          required: true
+      outputs:
+        label:
+          description: "The resolved label"
+          value: ${{ steps.set.outputs.label }}
+      runs:
+        using: composite
+        steps:
+          - id: set
+            run: echo "label=${{ inputs.label }}" >> $GITHUB_OUTPUT
+            shell: bash
+  - language: yaml
+    label: "CORRECT calling workflow — propagate to env if needed"
+    code: |
+      steps:
+        - id: first
+          uses: ./my-action
+          with:
+            label: build-${{ github.sha }}
+
+        - id: second
+          uses: ./my-action
+          with:
+            label: deploy-${{ github.sha }}
+
+        - name: Use outputs from both calls
+          env:
+            FIRST_LABEL: ${{ steps.first.outputs.label }}
+            SECOND_LABEL: ${{ steps.second.outputs.label }}
+          run: |
+            echo "First: $FIRST_LABEL"
+            echo "Second: $SECOND_LABEL"
+prevention:
+  - "Never use $GITHUB_ENV in composite actions that may be called more than once per job."
+  - "Migrate all composite action side effects from GITHUB_ENV to GITHUB_OUTPUT."
+  - "Test composite actions by calling them twice in the same job to catch this bug early."
+  - "Prefer outputs over env-var side effects for cleaner and predictable reuse semantics."
+docs:
+  - url: "https://docs.github.com/en/actions/sharing-automations/creating-actions/metadata-syntax-for-github-actions#outputs-for-composite-actions"
+    label: "Outputs for composite actions"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions#setting-an-environment-variable"
+    label: "Workflow commands — setting an environment variable"
+  - url: "https://github.com/actions/runner/issues/789"
+    label: "actions/runner#789 — GITHUB_ENV does not update when running composite actions multiple times"
