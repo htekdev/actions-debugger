@@ -1,0 +1,83 @@
+id: caching-artifacts-014
+title: "actions/cache Exclusion Globs (! patterns) Silently Ignored"
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - cache
+  - glob
+  - exclusion
+  - negation
+  - silent-failure
+patterns:
+  - regex: "path:(?:[^#\\n]*\\n)+\\s*!\\S"
+    flags: "im"
+  - regex: "path:.*\\n.*!~/"
+    flags: "im"
+error_messages:
+  - "Cache saved with key"
+  - "Cache hit occurred on the primary key"
+root_cause: |
+  The `actions/cache` action uses `@actions/glob` with `implicitDescendants: false`
+  to resolve the `path:` input into a file list for `tar`. With this setting, each
+  pattern is matched only at the top level — subdirectory enumeration does not happen.
+  As a result, negation patterns like `!~/cache/temp` never find anything to exclude
+  because there are no implicitly enumerated descendants to match against.
+
+  The cache save and restore operations complete successfully with no error or warning.
+  The "excluded" directory is silently included in the archive, leading to:
+  - Larger caches than intended, consuming quota faster
+  - Sensitive or temporary files accidentally persisted across runs
+  - False-positive cache key hits (excluded dir content changes don't invalidate cache)
+
+  This is a long-standing known limitation of `actions/cache` that has been reported
+  since v1 and remains unfixed in v4.
+fix: |
+  `actions/cache` does not support exclusion globs. Restructure directories so the
+  content you want to cache lives in a dedicated subdirectory, and reference only that
+  path. If directory restructuring is not feasible, use a `run` step to create a
+  filtered `tar` archive before caching.
+fix_code:
+  - language: yaml
+    label: "BROKEN — exclusion pattern silently does nothing"
+    code: |
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/cache
+            !~/cache/temp     # Silently ignored — temp/ is still cached
+          key: ${{ runner.os }}-cache-${{ hashFiles('**/package-lock.json') }}
+  - language: yaml
+    label: "CORRECT — restructure: cache only the subdirectory you need"
+    code: |
+      # Put persistent cache content in ~/cache/persistent/
+      # Put temp files in ~/cache/temp/  (not cached)
+      - uses: actions/cache@v4
+        with:
+          path: ~/cache/persistent   # Cache only the isolated subdirectory
+          key: ${{ runner.os }}-cache-${{ hashFiles('**/package-lock.json') }}
+  - language: yaml
+    label: "CORRECT — manual tar with --exclude for complex cases"
+    code: |
+      - name: Save cache with exclusion
+        run: |
+          tar --exclude='$HOME/cache/temp' \
+              --exclude='$HOME/cache/.git' \
+              -czf /tmp/my-cache.tar.gz \
+              ~/cache
+
+      - uses: actions/cache@v4
+        with:
+          path: /tmp/my-cache.tar.gz
+          key: ${{ runner.os }}-filtered-${{ hashFiles('**/package-lock.json') }}
+prevention:
+  - "Never rely on `!` negation patterns in `actions/cache` `path:` — they are silently ignored."
+  - "Audit cache paths to confirm no sensitive, secret, or large temporary files are included."
+  - "Isolate cacheable build artifacts into dedicated subdirectories at project setup time."
+  - "Set `enableCrossOsArchive: false` (default) and test on each OS independently."
+docs:
+  - url: "https://github.com/actions/toolkit/issues/713"
+    label: "actions/toolkit#713 — Cache: excluding files or folders with ! not working"
+  - url: "https://github.com/actions/cache/blob/main/tips-and-workarounds.md"
+    label: "actions/cache — Tips and workarounds"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows"
+    label: "Caching dependencies to speed up workflows"

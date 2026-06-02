@@ -1,0 +1,100 @@
+id: yaml-syntax-018
+title: "Job if: Condition Skipped When Needed Job Is Skipped — Requires always() &&"
+category: yaml-syntax
+severity: error
+tags:
+  - needs
+  - skipped
+  - if-condition
+  - always
+  - job-level
+patterns:
+  - regex: "needs.*result.*skipped"
+    flags: "i"
+  - regex: "if:.*needs\\.[a-z_-]+\\.outputs"
+    flags: "i"
+error_messages:
+  - "Skipping job: due to job needs not meeting conditions"
+  - "Job was skipped"
+root_cause: |
+  When a job declares `needs: [job_a, job_b]` and any of those upstream jobs is in
+  a `skipped` state, GitHub Actions propagates the skip to the dependent job by
+  default — even when that job has its own `if:` condition that evaluates to `true`.
+
+  GitHub Actions imposes an implicit rule: all `needs` jobs must have
+  `result == 'success'` unless the dependent job's condition explicitly overrides
+  the check. A skipped upstream job does NOT satisfy the implicit success requirement.
+  The `if:` condition is NOT evaluated as a full override — it is only evaluated
+  AFTER the implicit needs-success check passes, so if that check fails the `if:`
+  is never reached.
+
+  The fix is `always() &&` at the start of the `if:` condition, which bypasses the
+  implicit needs-success requirement and forces the runner to evaluate the full condition.
+fix: |
+  Prepend `always() &&` to any job-level `if:` where an upstream `needs` job may be
+  legitimately skipped. Alternatively, explicitly allow skipped results:
+  `needs.job_name.result == 'success' || needs.job_name.result == 'skipped'`.
+fix_code:
+  - language: yaml
+    label: "WRONG — deploy skipped even though if evaluates true"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          outputs:
+            should_deploy: ${{ steps.check.outputs.deploy }}
+          steps:
+            - id: check
+              run: echo "deploy=true" >> $GITHUB_OUTPUT
+
+        integration-tests:
+          needs: build
+          if: ${{ needs.build.outputs.should_deploy == 'false' }}
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "optional integration tests"
+
+        deploy:
+          needs: [build, integration-tests]
+          # PROBLEM: integration-tests was skipped → deploy is also skipped
+          # even though the condition below is true
+          if: ${{ needs.build.outputs.should_deploy == 'true' }}
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./deploy.sh
+  - language: yaml
+    label: "CORRECT — prepend always() to force evaluation"
+    code: |
+      jobs:
+        deploy:
+          needs: [build, integration-tests]
+          if: always() && needs.build.outputs.should_deploy == 'true'
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./deploy.sh
+  - language: yaml
+    label: "CORRECT — explicit skipped result check"
+    code: |
+      jobs:
+        deploy:
+          needs: [build, integration-tests]
+          if: |
+            always() &&
+            needs.build.result == 'success' &&
+            (needs.integration-tests.result == 'success' ||
+             needs.integration-tests.result == 'skipped')
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./deploy.sh
+prevention:
+  - "Add `always() &&` to any job `if:` condition where upstream `needs` jobs may be skipped."
+  - "Treat a skipped upstream need as equivalent to a failed need unless `always()` is used."
+  - "Map your workflow DAG — anywhere a branch is optionally skipped, downstream jobs need `always()`."
+  - "Use `actionlint` to surface potential needs/if interaction issues statically."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idif"
+    label: "jobs.<job_id>.if — Workflow syntax"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-conditions-to-control-job-execution#using-status-check-functions"
+    label: "Using status check functions (always, failure, success, cancelled)"
+  - url: "https://github.com/actions/runner/issues/491"
+    label: "actions/runner#491 — Job if condition not evaluated correctly if needs job is skipped"

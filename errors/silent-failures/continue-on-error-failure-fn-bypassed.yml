@@ -1,0 +1,90 @@
+id: silent-failures-016
+title: "failure() Returns false After continue-on-error Step"
+category: silent-failures
+severity: silent-failure
+tags:
+  - continue-on-error
+  - failure
+  - status-functions
+  - error-handler
+  - silent-failure
+patterns:
+  - regex: "continue-on-error:\\s*true"
+    flags: "i"
+  - regex: "if:\\s*(\\$\\{\\{\\s*)?failure\\(\\)"
+    flags: "i"
+error_messages:
+  - "Skipping step: due to a failed condition"
+root_cause: |
+  When a step has `continue-on-error: true` and that step fails, GitHub Actions
+  records the step outcome as failure but immediately converts the job aggregate
+  status back to success before evaluating the next step. This means that
+  failure() in a subsequent step's if condition evaluates to false — the runner
+  sees the job as currently-successful, not currently-failed.
+
+  The continue-on-error flag was designed to allow a job to proceed past a failing
+  step, but the side effect is that it consumes the failure signal from all
+  status-check functions. Developers commonly write error-handler steps using
+  if: failure(), expecting them to trigger when the prior step fails, but this
+  pattern silently breaks when continue-on-error: true is present on that prior step.
+
+  The step individual outcome context (steps.<id>.outcome) is the only reliable
+  way to detect the specific step result after continue-on-error.
+fix: |
+  Replace if: failure() with if: steps.<step_id>.outcome == 'failure' when
+  writing error handlers for specific steps that use continue-on-error: true.
+  The steps.<id>.outcome context holds the actual step result regardless of
+  job-level status modifications.
+fix_code:
+  - language: yaml
+    label: "WRONG — failure() never triggers after continue-on-error"
+    code: |
+      steps:
+        - name: Risky operation
+          id: risky
+          continue-on-error: true
+          run: ./might-fail.sh
+
+        - name: Handle failure
+          if: failure()      # NEVER RUNS — job status was reset to success
+          run: ./notify-on-failure.sh
+  - language: yaml
+    label: "CORRECT — check specific step outcome"
+    code: |
+      steps:
+        - name: Risky operation
+          id: risky
+          continue-on-error: true
+          run: ./might-fail.sh
+
+        - name: Handle failure
+          if: steps.risky.outcome == 'failure'
+          run: ./notify-on-failure.sh
+
+        - name: Continue regardless
+          run: echo "Job continues either way"
+  - language: yaml
+    label: "CORRECT — combine with always() for comprehensive guards"
+    code: |
+      steps:
+        - name: Risky operation
+          id: risky
+          continue-on-error: true
+          run: ./might-fail.sh
+
+        - name: Handle step failure
+          if: always() && steps.risky.outcome == 'failure'
+          run: |
+            echo "::warning::Risky operation failed"
+            echo "## Failed" >> $GITHUB_STEP_SUMMARY
+prevention:
+  - "Never use if: failure() as handler for a step with continue-on-error: true — use steps.<id>.outcome."
+  - "Reserve failure() for handlers that should trigger on any upstream job failure."
+  - "Add step IDs to all continue-on-error steps so outcome checking is always possible."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-conditions-to-control-job-execution"
+    label: "Using conditions to control job execution"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idstepscontinue-on-error"
+    label: "continue-on-error workflow syntax"
+  - url: "https://github.com/actions/toolkit/issues/1034"
+    label: "actions/toolkit#1034 — Wrong behaviour combining continue-on-error and failure()"
