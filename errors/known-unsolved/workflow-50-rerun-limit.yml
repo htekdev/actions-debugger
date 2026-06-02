@@ -1,0 +1,110 @@
+id: known-unsolved-018
+title: "Workflow rerun limit of 50 exceeded — subsequent reruns fail permanently"
+category: known-unsolved
+severity: limitation
+tags:
+  - rerun
+  - retry
+  - automation
+  - limits
+  - platform-limit
+patterns:
+  - regex: "exceeded.*maximum.*reruns|maximum.*reruns.*exceeded"
+    flags: "i"
+  - regex: "rerun limit.*50|50.*rerun limit"
+    flags: "i"
+  - regex: "This workflow run was cancelled because it exceeded"
+    flags: "i"
+error_messages:
+  - "This workflow run exceeded the limit of 50 reruns"
+  - "exceeded the maximum number of reruns (50)"
+  - "Cannot rerun this workflow: rerun limit reached"
+root_cause: |
+  Since April 10, 2026, GitHub Actions enforces a hard limit of 50 reruns
+  per individual workflow run (counting both full reruns and re-runs of
+  individual job subsets). Once a workflow run reaches 50 attempts, any
+  further rerun request — whether triggered manually, via the GitHub CLI,
+  the REST API, or an automated rerun action — will fail with an error
+  annotation on the check suite.
+
+  The limit was introduced to stop automation patterns that use infinite-retry
+  loops (e.g., rerunning every failed job automatically, retrying flaky
+  infrastructure hundreds of times) from adding excessive load to GitHub's
+  infrastructure. The count is tied to the original workflow run ID — creating
+  a new workflow run by re-pushing or re-dispatching does NOT inherit the
+  count.
+
+  This limitation is most frequently encountered by:
+  - Flaky test environments that rely on automated rerun tooling
+    (k1LoW/rerun-action, lewagon/retry-workflow-action, etc.)
+  - Long-running deployment pipelines with retry-until-success patterns
+  - Teams using merge queues or merge trains that auto-requeue failed checks
+  - Internal automation that retries status checks repeatedly against a PR
+
+  There is no way to exceed this limit — it is enforced server-side with no
+  configuration option. The only resolution is to trigger a fresh workflow run.
+fix: |
+  There is no way to raise or bypass the 50-rerun limit. Mitigation strategies:
+
+  1. Fix the underlying flakiness so retries are rare (<50 per workflow run).
+  2. Trigger a fresh workflow run rather than retrying the same run ID:
+     - Re-push to the branch or rebase (creates new push event → new run)
+     - For pull_request: close and reopen the PR (creates new run ID)
+     - For workflow_dispatch: dispatch again (creates a completely new run)
+  3. Redesign retry logic to use a separate `workflow_run` triggered workflow
+     that dispatches a NEW workflow instead of rerunning the same one.
+  4. For flaky infra: fix at the infra layer (idempotent step design, retry
+     at the shell/script level within a single attempt) rather than rerunning
+     the entire workflow.
+fix_code:
+  - language: yaml
+    label: "Use shell-level retry for flaky steps instead of workflow-level rerun"
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Flaky deploy step with shell retry
+              run: |
+                # Retry up to 5 times with 30s backoff — no workflow rerun needed
+                for i in 1 2 3 4 5; do
+                  echo "Attempt $i..."
+                  ./scripts/deploy.sh && break || {
+                    if [ $i -lt 5 ]; then
+                      echo "Deploy failed, retrying in 30s..."
+                      sleep 30
+                    else
+                      echo "All $i attempts failed"
+                      exit 1
+                    fi
+                  }
+                done
+  - language: yaml
+    label: "Dispatch a new workflow run instead of rerunning the same run"
+    code: |
+      # If you need automated rerun logic, trigger a fresh dispatch
+      # rather than using gh run rerun (which increments the rerun counter)
+      jobs:
+        retry-via-dispatch:
+          runs-on: ubuntu-latest
+          if: failure()
+          steps:
+            - name: Trigger fresh run via workflow_dispatch
+              run: |
+                gh workflow run ci.yml \
+                  --ref ${{ github.ref }} \
+                  --field triggered_by=auto-retry
+              env:
+                GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+prevention:
+  - "Treat workflow reruns as a debugging tool, not a reliability mechanism — fix flakiness at the source"
+  - "Use shell-level retry loops (for loop with sleep) for individual steps that are inherently flaky"
+  - "Use workflow_dispatch to start a fresh run rather than rerunning the same run ID when automation needs to retry"
+  - "Monitor workflows that regularly exceed 5 reruns — they signal a deeper reliability problem that needs fixing"
+docs:
+  - url: "https://github.blog/changelog/2026-04-10-actions-workflows-are-limited-to-50-reruns/"
+    label: "GitHub Changelog — Actions workflows are limited to 50 reruns (Apr 2026)"
+  - url: "https://docs.github.com/en/actions/managing-workflow-runs/re-running-workflows-and-jobs"
+    label: "GitHub Docs — Re-running workflows and jobs"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_dispatch"
+    label: "GitHub Docs — workflow_dispatch event"
