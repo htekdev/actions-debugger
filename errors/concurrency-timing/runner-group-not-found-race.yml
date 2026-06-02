@@ -1,0 +1,97 @@
+id: "concurrency-timing-008"
+title: "Intermittent 'Required runner group not found' when ephemeral runner registers after job dispatch"
+category: "concurrency-timing"
+severity: "error"
+tags:
+  - "runner-group"
+  - "self-hosted"
+  - "ephemeral"
+  - "race-condition"
+  - "dispatch"
+  - "organization"
+patterns:
+  - regex: "Required runner group '.*' not found"
+    flags: "i"
+  - regex: "runner_group_id.*null"
+    flags: "i"
+error_messages:
+  - "Required runner group 'x' not found"
+root_cause: |
+  In autoscaling self-hosted runner setups (EC2, GKE ephemeral runners, ARC), the runner
+  must register with GitHub BEFORE the job dispatcher resolves runner group membership.
+
+  The race condition occurs when:
+  1. A workflow is triggered and GitHub's broker immediately tries to assign the job
+  2. The ephemeral runner is still initializing (EC2 bootstrap, container pull, ~2:30 min)
+  3. The broker resolves runner group membership before the new runner completes registration
+  4. The broker reports "Required runner group 'X' not found" and fails the job
+
+  This is intermittent: matrix jobs expose it clearly because some cells get
+  already-running (pre-registered) runners while others need a fresh runner, triggering
+  the race. Inspecting the failed job via the Jobs API shows `runner_group_id: null`
+  and `runner_name: null` throughout the queue duration even though the runner group
+  exists and has the correct repository access.
+
+  A separate but related pattern occurs with org-level runner group repository access
+  grants not propagating to the broker V2 protocol in time, causing identical symptoms
+  regardless of runner initialization speed.
+
+  Reported upstream: https://github.com/actions/runner/issues/4252
+  Related: https://github.com/actions/runner/issues/4429
+fix: |
+  For ephemeral autoscaling runners:
+  Implement a registration wait loop that polls the GitHub Runners API before signaling
+  the runner as available. The runner should only become eligible for jobs after the
+  broker has acknowledged its registration.
+
+  For org-level runner group access issues:
+  Verify that the target repository is in the runner group's allowed repositories list
+  via API. If misconfigured, re-registering the runner at repository level instead of
+  org level is a reliable workaround.
+
+  General mitigation: Add timeout-minutes to all jobs on self-hosted runners so stuck
+  queued jobs fail fast rather than waiting until the 6-hour workflow timeout.
+fix_code:
+  - language: yaml
+    label: "Add timeout-minutes to detect stuck queued jobs quickly"
+    code: |
+      jobs:
+        build:
+          runs-on:
+            group: my-runner-group
+            labels: [self-hosted, linux]
+          timeout-minutes: 10  # Fail fast if runner never picks up the job
+          steps:
+            - uses: actions/checkout@v4
+            - run: echo "Runner assigned successfully"
+  - language: yaml
+    label: "Verify runner group repository access via API"
+    code: |
+      jobs:
+        debug-runner-group:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Check runner group repository access
+              env:
+                GH_TOKEN: ${{ secrets.ORG_RUNNER_READ_TOKEN }}
+              run: |
+                echo "Runner groups and their visibility:"
+                gh api /orgs/${{ github.repository_owner }}/actions/runner-groups \
+                  --jq '.runner_groups[] | "\(.name) (id: \(.id)) — visibility: \(.visibility)"'
+
+                echo "Repositories allowed for runner group ID 1:"
+                gh api /orgs/${{ github.repository_owner }}/actions/runner-groups/1/repositories \
+                  --jq '.repositories[].full_name'
+prevention:
+  - "Add timeout-minutes to all jobs using self-hosted runners so stuck-queued jobs fail fast instead of waiting for the 6h workflow limit"
+  - "For ephemeral runners (EC2/ARC), implement a registration health check that polls the Runners API before the runner accepts jobs"
+  - "For org-level runners, verify group repository access via API after any runner group configuration change"
+  - "For matrix jobs with ephemeral runners, keep N idle pre-registered runners to avoid cold-start races"
+  - "Monitor runner_group_id via the Jobs API to detect dispatch failures early in autoscaling pipelines"
+docs:
+  - url: "https://github.com/actions/runner/issues/4252"
+    label: "actions/runner #4252 — Intermittent runner group not found"
+  - url: "https://github.com/actions/runner/issues/4429"
+    label: "actions/runner #4429 — Org-level runner never dispatched"
+  - url: "https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/managing-access-to-self-hosted-runners-using-groups"
+    label: "GitHub Docs — Managing runner group access"
