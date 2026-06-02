@@ -1,0 +1,125 @@
+id: concurrency-timing-012
+title: "Deployment wait-timer + cancel-in-progress: true Creates Permanent Deployment Starvation Loop"
+category: concurrency-timing
+severity: warning
+tags:
+  - wait-timer
+  - cancel-in-progress
+  - deployment
+  - environment
+  - starvation
+  - concurrency
+  - production
+patterns:
+  - regex: "Run was cancelled|Canceling since a higher priority waiting request"
+    flags: "i"
+  - regex: "wait.?timer|waiting for environment.*approval"
+    flags: "i"
+error_messages:
+  - "Run was cancelled"
+  - "Canceling since a higher priority waiting request for 'production' exists"
+root_cause: |
+  When a deployment workflow combines `concurrency.cancel-in-progress: true` with a
+  deployment environment that has a `wait-timer` configured (a mandatory delay before
+  deployment proceeds), every new commit to the branch creates a starvation loop where
+  no deployment ever reaches the execution phase:
+
+  1. Run A starts → deployment job begins waiting out the environment wait-timer (e.g., 5 min)
+  2. A new commit is pushed → Run B starts in the same concurrency group
+  3. `cancel-in-progress: true` fires → Run A is cancelled while still in the wait-timer
+  4. Run B now begins its own wait-timer countdown
+  5. Another commit arrives → Run B is cancelled during its timer
+  6. This repeats indefinitely — no deployment ever executes
+
+  This loop is particularly insidious because:
+  - All cancellations appear expected and benign in the Actions UI (no failures shown)
+  - The repository looks healthy — CI passes, deployments start — but production is
+    silently never updated
+  - Active development repos where commits arrive faster than the wait-timer duration
+    are especially vulnerable
+
+  Note: GitHub's concurrency model allows only ONE pending run per group. With
+  `cancel-in-progress: true`, a new run cancels the RUNNING run (not just queues) —
+  so even a very short wait-timer cannot escape this if commits arrive frequently.
+fix: |
+  Do not combine `cancel-in-progress: true` with deployment environment `wait-timer`
+  on the same workflow. Use `cancel-in-progress: false` (the default) for deploy
+  workflows — this queues runs so each commit eventually deploys in order.
+
+  If you want fast feedback for CI but reliable deployments for CD, split them into
+  separate workflow files with different concurrency strategies.
+fix_code:
+  - language: yaml
+    label: "Fix: disable cancel-in-progress for deploy workflow with wait-timer"
+    code: |
+      name: Deploy to Production
+      on:
+        push:
+          branches: [main]
+
+      concurrency:
+        group: deploy-production
+        cancel-in-progress: false  # Queue — never starve a deployment with wait-timer
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          environment: production   # Has wait-timer: 5 configured
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./deploy.sh
+
+  - language: yaml
+    label: "Split pipeline: CI cancels freely; deploy queues safely after CI"
+    code: |
+      # ci.yml — fast feedback, cancel stale runs is fine
+      name: CI
+      on:
+        push:
+          branches: [main]
+      concurrency:
+        group: ci-${{ github.ref }}
+        cancel-in-progress: true   # OK: no side effects
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+
+      ---
+      # deploy.yml — triggered after CI, environment has wait-timer
+      name: Deploy
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+          branches: [main]
+
+      concurrency:
+        group: deploy-production
+        cancel-in-progress: false   # Queue; every successful CI run gets deployed
+
+      jobs:
+        deploy:
+          if: ${{ github.event.workflow_run.conclusion == 'success' }}
+          runs-on: ubuntu-latest
+          environment: production   # wait-timer is safe — no cancel-in-progress racing it
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.workflow_run.head_sha }}
+            - run: ./deploy.sh
+prevention:
+  - "Never combine `cancel-in-progress: true` with a deployment environment `wait-timer` in the same workflow."
+  - "Use `cancel-in-progress: false` for any workflow that deploys to environments with protection rules."
+  - "Decouple CI (cancel-ok, fast) from CD (queued, reliable) into separate workflow files."
+  - "Monitor the Actions tab for a pattern of all deployments showing as CANCELLED — this is a sign of starvation."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/using-concurrency"
+    label: "GitHub Docs: Using concurrency in GitHub Actions"
+  - url: "https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment#wait-timer"
+    label: "GitHub Docs: Managing environments — wait timer"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run"
+    label: "workflow_run event — decouple CI and CD pipelines"

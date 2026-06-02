@@ -1,0 +1,160 @@
+id: concurrency-timing-013
+title: "Required Status Check Stuck in Pending When Workflow Skipped by Path or Branch Filter"
+category: concurrency-timing
+severity: warning
+tags:
+  - required-status-check
+  - path-filter
+  - branch-filter
+  - pending
+  - pull-request
+  - branch-protection
+  - paths
+  - blocked-pr
+patterns:
+  - regex: "Some checks haven't completed yet|Required status check.*pending"
+    flags: "i"
+  - regex: "Waiting for status:.*pending"
+    flags: "i"
+error_messages:
+  - "Some checks haven't completed yet"
+  - "Required status check is pending"
+  - "Waiting for status: CI / test (pending)"
+root_cause: |
+  GitHub Actions workflows that use `paths:`, `paths-ignore:`, `branches:`, or
+  `branches-ignore:` filters will NOT run — and will NOT report ANY status — for
+  commits that don't match the filter criteria.
+
+  When a required status check is configured in a branch protection rule and the
+  workflow providing that check is skipped by a filter:
+  - The check is NEVER created for that commit — it remains in "Pending" state indefinitely
+  - The PR is blocked from merging with "Some checks haven't completed yet"
+  - The check CANNOT be manually re-triggered without pushing a commit that matches the filter
+
+  Common scenario:
+  A repository has a `ci.yml` workflow with `paths: ['src/**', '*.ts']` and
+  `CI / test` configured as a required status check. A developer opens a PR that only
+  changes `README.md` or `.github/docs/`. The `CI / test` check never runs, shows as
+  "Pending" forever, and the PR is permanently blocked from merging without an admin
+  override or a dummy code commit to trigger the workflow.
+
+  This is explicitly documented behavior but frequently misunderstood:
+  - The workflow appears to work correctly for code-change PRs (the common case)
+  - The bug only surfaces on documentation-only, config-only, or administrative PRs
+  - Developers and reviewers see a pending check with no way to trigger it
+
+  Note: This is distinct from skipped-needs-cascade (job dependency skipping) — this
+  is specifically about the WORKFLOW TRIGGER filter preventing the run from ever starting,
+  so no job status is reported at all.
+
+  Source: GitHub Docs — Troubleshooting required status checks: "If a workflow is skipped
+  due to path filtering, branch filtering or a commit message, then checks associated
+  with that workflow will remain in a 'Pending' state. A pull request that requires those
+  checks to be successful will be blocked from merging."
+fix: |
+  Two main approaches:
+
+  1. **Always-succeeding bypass job** — remove path filters from the workflow trigger,
+     run the workflow for all PRs, use `dorny/paths-filter` or `tj-actions/changed-files`
+     to detect changes inside the workflow, and add a sentinel job that always produces a
+     status. Configure the required check to point at the sentinel job name.
+
+  2. **Split workflow** — keep the path-filtered workflow for actual CI work, and add a
+     separate always-running workflow that provides the required status check name
+     (succeeds immediately for non-code PRs, waits for CI for code PRs).
+fix_code:
+  - language: yaml
+    label: "Fix: always-running workflow with internal path detection and sentinel job"
+    code: |
+      name: CI
+      # No path filter — workflow always runs for all PRs
+      on:
+        pull_request:
+          branches: [main]
+
+      jobs:
+        changes:
+          runs-on: ubuntu-latest
+          outputs:
+            code: ${{ steps.filter.outputs.code }}
+          steps:
+            - uses: actions/checkout@v4
+            - uses: dorny/paths-filter@v3
+              id: filter
+              with:
+                filters: |
+                  code:
+                    - 'src/**'
+                    - '*.ts'
+                    - 'package*.json'
+
+        test:
+          needs: changes
+          if: needs.changes.outputs.code == 'true'
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm ci && npm test
+
+        # Branch protection required check: "CI / ci-gate" (not "CI / test")
+        # Always produces a status — green for docs PRs, waits for test on code PRs
+        ci-gate:
+          needs: [changes, test]
+          if: always()
+          runs-on: ubuntu-latest
+          steps:
+            - name: Confirm CI passed or code was not changed
+              run: |
+                CODE_CHANGED="${{ needs.changes.outputs.code }}"
+                TEST_RESULT="${{ needs.test.result }}"
+                if [[ "$CODE_CHANGED" == "false" ]]; then
+                  echo "✅ No code changes — CI gate passes automatically"
+                elif [[ "$TEST_RESULT" == "success" ]]; then
+                  echo "✅ Tests passed"
+                else
+                  echo "❌ Tests $TEST_RESULT"
+                  exit 1
+                fi
+
+  - language: yaml
+    label: "Alternative: run all steps always but skip expensive ones via filter"
+    code: |
+      name: CI
+      on:
+        pull_request:
+          branches: [main]
+      # No workflow-level path filter — status always reported
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - uses: dorny/paths-filter@v3
+              id: filter
+              with:
+                filters: |
+                  code: ['src/**', '*.ts', 'package*.json']
+
+            - name: Install dependencies
+              if: steps.filter.outputs.code == 'true'
+              run: npm ci
+
+            - name: Run tests
+              if: steps.filter.outputs.code == 'true'
+              run: npm test
+            # Job always completes with success — check is always reported
+prevention:
+  - "Never use workflow-level `paths:` or `branches:` filters as the sole trigger for a required status check."
+  - "Use `dorny/paths-filter` or `tj-actions/changed-files` INSIDE an always-running workflow instead of workflow-level path filters."
+  - "Name required status checks after jobs that always produce a status, even on non-code PRs."
+  - "Test branch protection rules by opening a documentation-only PR to verify all required checks complete."
+  - "Consider admin overrides as a last resort, not a workflow fix — the root cause will keep happening."
+docs:
+  - url: "https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/troubleshooting-required-status-checks"
+    label: "Troubleshooting required status checks (path filter skip documented)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#onpushpull_requestpull_request_targetpathspaths-ignore"
+    label: "Workflow syntax: paths and paths-ignore filters"
+  - url: "https://github.com/dorny/paths-filter"
+    label: "dorny/paths-filter — detect changed files inside workflow"
