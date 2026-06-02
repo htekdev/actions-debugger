@@ -1,0 +1,134 @@
+id: permissions-auth-018
+title: "GITHUB_TOKEN cannot modify check run status or conclusion after March 2025"
+category: permissions-auth
+severity: error
+tags:
+  - check-runs
+  - github-token
+  - checks-api
+  - permissions
+  - breaking-change
+patterns:
+  - regex: "Check run status and conclusions can only be updated internally by GitHub Actions"
+    flags: "i"
+  - regex: "check_run.*status.*conclusion.*updated internally"
+    flags: "i"
+  - regex: "Changes to check run status modification"
+    flags: "i"
+error_messages:
+  - "Error: Check run status and conclusions can only be updated internally by GitHub Actions. Please see https://github.blog/changelog/2025-02-12-notice-of-upcoming-deprecations-and-breaking-changes-for-github-actions/#changes-to-check-run-status-modification"
+  - "Check run status and conclusions can only be updated internally by GitHub Actions"
+root_cause: |
+  GitHub deprecated external modification of check run status and conclusion
+  fields on March 31, 2025. Prior to this change, workflows and third-party
+  actions (e.g., LouisBrunner/checks-action, custom Checks API calls) could
+  use the repository's GITHUB_TOKEN to call the REST API and update the status
+  (queued, in_progress, completed) or conclusion (success, failure, etc.) of
+  an existing check run that was originally created by GitHub Actions.
+
+  GitHub blocked this pattern to prevent confusion and race conditions that
+  could arise when external code overwrote the status of a check run that
+  GitHub Actions was still managing. Starting March 31, 2025, any attempt
+  to PATCH an existing Actions-created check run's status or conclusion via
+  GITHUB_TOKEN returns an error.
+
+  This affects:
+  - Actions that wrap the GitHub Checks API to create multi-step annotations
+    (e.g., LouisBrunner/checks-action)
+  - Custom workflows that read a check_run ID from a prior step and patch it
+  - External tooling that patches check run state using the built-in token
+  - Any pattern where one step creates a check run and a later step or job
+    tries to set it to "completed"
+
+  Check runs that were NOT created by GitHub Actions (created via a GitHub App
+  or OAuth token) are not affected and can still be updated by their creator.
+fix: |
+  Workflows that need to update check run status or conclusion must create
+  those check runs with a non-GITHUB_TOKEN credential so that the same
+  credential can also update them later.
+
+  Option 1 (GitHub App): Use actions/create-github-app-token to generate an
+  installation token and create check runs with that token. The same GitHub App
+  token can then update the check runs it created.
+
+  Option 2 (Remove update steps): If the check run is only being updated to
+  mark it "completed" at the end of a job, let GitHub Actions manage the
+  conclusion automatically. Remove the final PATCH step.
+
+  Option 3 (Migrate to annotations): Replace custom check run status tracking
+  with GitHub Actions step annotations (::notice::, ::warning::, ::error::).
+  These use the workflow's built-in UI and require no Checks API calls.
+fix_code:
+  - language: yaml
+    label: "Create and update check runs using a GitHub App installation token"
+    code: |
+      jobs:
+        annotate:
+          runs-on: ubuntu-latest
+          permissions:
+            # id-token:write needed if using OIDC-based App token
+            contents: read
+          steps:
+            - name: Generate GitHub App token
+              id: app-token
+              uses: actions/create-github-app-token@v2
+              with:
+                app-id: ${{ vars.CHECKS_APP_ID }}
+                private-key: ${{ secrets.CHECKS_APP_PRIVATE_KEY }}
+
+            - name: Create check run
+              id: create-check
+              uses: actions/github-script@v7
+              with:
+                github-token: ${{ steps.app-token.outputs.token }}
+                script: |
+                  const { data } = await github.rest.checks.create({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    name: 'My Custom Check',
+                    head_sha: context.sha,
+                    status: 'in_progress',
+                  });
+                  return data.id;
+
+            - name: Do work...
+              run: echo "running checks..."
+
+            - name: Update check run to completed
+              uses: actions/github-script@v7
+              with:
+                # Use the App token — NOT github.token — to update the check
+                github-token: ${{ steps.app-token.outputs.token }}
+                script: |
+                  await github.rest.checks.update({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    check_run_id: ${{ steps.create-check.outputs.result }},
+                    status: 'completed',
+                    conclusion: 'success',
+                  });
+  - language: yaml
+    label: "Use built-in step annotations instead of custom check runs"
+    code: |
+      - name: Emit warning annotation
+        run: echo "::warning file=src/main.js,line=42::Deprecated API usage detected"
+
+      - name: Emit error annotation (fails step)
+        run: echo "::error title=Lint Failed::3 lint violations found in src/"
+
+      # These annotations appear in the workflow summary and PR checks UI
+      # without any Checks API calls or external tokens
+prevention:
+  - "Never use GITHUB_TOKEN to PATCH the status or conclusion of an Actions-created check run"
+  - "Create custom check runs using a GitHub App installation token so the same credential owns them end-to-end"
+  - "Prefer built-in step annotations (::warning::, ::error::) over custom Checks API calls for simple annotation needs"
+  - "Audit third-party actions that wrap the Checks API (e.g., LouisBrunner/checks-action) for compatibility with the March 2025 change"
+docs:
+  - url: "https://github.blog/changelog/2025-02-12-notice-of-upcoming-deprecations-and-breaking-changes-for-github-actions/#changes-to-check-run-status-modification"
+    label: "GitHub Changelog — Changes to check run status modification (Feb 2025)"
+  - url: "https://docs.github.com/en/rest/checks/runs"
+    label: "GitHub REST API — Check Runs"
+  - url: "https://github.com/LouisBrunner/checks-action/issues/369"
+    label: "LouisBrunner/checks-action#369 — Error after March 2025 enforcement"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions#setting-a-warning-message"
+    label: "GitHub Docs — Workflow commands for annotations"

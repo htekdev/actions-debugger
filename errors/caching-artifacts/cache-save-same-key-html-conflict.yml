@@ -1,0 +1,109 @@
+id: caching-artifacts-020
+title: "actions/cache save fails with HTML error when identical key already exists for same ref"
+category: caching-artifacts
+severity: warning
+tags:
+  - cache
+  - cache-save
+  - 409-conflict
+  - pr-ref
+  - retry-loop
+  - key-collision
+patterns:
+  - regex: "Attempt \\d+ of \\d+ failed with error.*Unexpected token '<'"
+    flags: "i"
+  - regex: "cache.*already exists.*ref|key.*already.*saved.*ref"
+    flags: "i"
+  - regex: "Unexpected token '<'.*DOCTYPE|<!DOCTYPE.*cache"
+    flags: "im"
+error_messages:
+  - "Attempt 1 of 5 failed with error: Unexpected token '<', \"<!DOCTYPE ...\" is not valid JSON"
+  - "Failed to save: Unexpected token '<'"
+  - "Attempt 5 of 5 failed with error: Unexpected token '<'"
+root_cause: |
+  actions/cache v3 and v4 use the GitHub cache service to save cache entries
+  scoped to a key + ref combination. When a workflow run saves a cache entry
+  under a given key for refs/pull/N/merge, subsequent runs against the same
+  PR ref that produce the EXACT same cache key will attempt to save again.
+
+  The cache service rejects the duplicate write with an HTTP 409 response.
+  However, the response body is an HTML error page rather than a JSON error
+  object. The cache toolkit's retry logic does not recognize the HTML response
+  as a permanent, non-retryable conflict — it treats it as a transient network
+  error and retries up to 5 times with exponential backoff (~20-30 seconds
+  total wasted time before all attempts are exhausted).
+
+  The cache entry itself is not updated or overwritten (actions/cache v4 uses
+  immutable cache entries), but the 5-retry failure loop causes the post-job
+  cleanup step to report errors in the workflow log, adding noise and wasted
+  time to every successive commit pushed to a long-lived PR branch.
+
+  This is most visible in actions that use deterministic, content-addressed
+  cache keys (e.g., a Bun binary cache keyed on its checksum) where every
+  run produces the same key for the same PR.
+fix: |
+  Add a dynamic component to the cache key that changes between runs so that
+  consecutive runs on the same PR ref never attempt to save over an existing
+  entry. Using ${{ github.run_id }} or ${{ github.run_attempt }} as part of
+  the key ensures each run gets a unique save slot.
+
+  If you specifically want a stable cache that all runs on a PR share (only
+  save once), use restore-keys for lookup and add a save condition so the
+  save step only runs when a cache miss occurred:
+
+    if: steps.cache.outputs.cache-hit != 'true'
+
+  For large dependency caches, prefer restore-keys with a prefix approach so
+  partial hits are possible and saves only happen when the lockfile changes.
+fix_code:
+  - language: yaml
+    label: "Use restore-keys + conditional save to avoid same-key conflicts"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Cache Bun binary
+              id: bun-cache
+              uses: actions/cache@v4
+              with:
+                path: ~/.bun/install/cache
+                # Lock file hash in key + restore-keys for partial fallback
+                key: ${{ runner.os }}-bun-${{ hashFiles('bun.lockb') }}
+                restore-keys: |
+                  ${{ runner.os }}-bun-
+
+            # Only save if there was a cache miss — avoids HTML 409 on same PR
+            - name: Save Bun cache (miss only)
+              if: steps.bun-cache.outputs.cache-hit != 'true'
+              uses: actions/cache/save@v4
+              with:
+                path: ~/.bun/install/cache
+                key: ${{ steps.bun-cache.outputs.cache-primary-key }}
+  - language: yaml
+    label: "Include run_id in cache key to guarantee a unique save slot per run"
+    code: |
+      - uses: actions/cache@v4
+        with:
+          path: .build/
+          # run_id makes every run's save unique — no 409 conflicts
+          key: ${{ runner.os }}-build-${{ hashFiles('**/*.go') }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-build-${{ hashFiles('**/*.go') }}-
+            ${{ runner.os }}-build-
+prevention:
+  - "Use restore-keys for cache lookup and actions/cache/save with an if: cache-hit != 'true' guard to skip redundant saves"
+  - "Avoid fully deterministic cache keys that never change between runs on the same PR; add a per-run or per-lockfile component"
+  - "Treat 'Unexpected token <' in cache post-job as a 409 key-collision signal, not a network error"
+  - "Use actions/cache v4's separate save/restore actions for fine-grained control over when saves actually occur"
+docs:
+  - url: "https://github.com/actions/cache"
+    label: "actions/cache — GitHub Actions cache action documentation"
+  - url: "https://github.com/actions/cache/blob/main/tips-and-workarounds.md"
+    label: "actions/cache — Tips and workarounds (immutability, restore-keys)"
+  - url: "https://github.com/anthropics/claude-code-action/issues/1252"
+    label: "anthropics/claude-code-action#1252 — Cache save HTML 409 on same PR ref"
+  - url: "https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows#restrictions-for-accessing-a-cache"
+    label: "GitHub Docs — Cache restrictions and immutability"
