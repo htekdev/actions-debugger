@@ -1,0 +1,99 @@
+id: "runner-environment-023"
+title: "Self-hosted runner on deprecated version stops receiving jobs"
+category: "runner-environment"
+severity: "error"
+tags:
+  - "self-hosted"
+  - "runner"
+  - "deprecated"
+  - "version"
+  - "cannot-receive-messages"
+  - "maintenance"
+patterns:
+  - regex: "Runner version v\\d+\\.\\d+\\.\\d+ is deprecated and cannot receive messages"
+    flags: "i"
+  - regex: "WRITE ERROR.*runner.*deprecated"
+    flags: "i"
+error_messages:
+  - "Runner version v2.332.0 is deprecated and cannot receive messages."
+  - "WRITE ERROR: An error occured: Runner version v2.XXX.X is deprecated and cannot receive messages."
+root_cause: |
+  GitHub periodically deprecates older self-hosted runner versions. Once a runner version
+  is past its deprecation deadline, the runner agent can no longer communicate with the
+  GitHub Actions broker service.
+
+  The runner process stays alive, appears online in the GitHub UI (Settings → Actions →
+  Runners), and is listed as "Active" — but it can no longer receive job assignments.
+  Jobs queued for a runner group containing only deprecated-version runners will either
+  stay "Queued" indefinitely or time out without a clear error in the workflow UI.
+
+  This is a silent failure mode: the runner shows as online, no workflow error is
+  surfaced, but jobs never start. The deprecation schedule is published in the GitHub
+  Changelog and actions/runner releases but teams often miss it without automated
+  update pipelines.
+
+  As of 2026, GitHub requires runners to be within approximately the last 6 months of
+  releases. Related issues: actions/runner #4305, actions/runner #4442
+fix: |
+  Update the runner binary to a currently supported version.
+
+  For manually managed runners:
+  1. SSH to the runner host
+  2. Stop the runner service: ./svc.sh stop
+  3. Download the latest runner from https://github.com/actions/runner/releases/latest
+  4. Extract to the runner directory (configuration is preserved via .runner file)
+  5. Restart: ./svc.sh start
+
+  For ARC (Actions Runner Controller) or autoscaling solutions: bump the runner image
+  version tag in your HelmRelease or Deployment manifest and redeploy.
+fix_code:
+  - language: yaml
+    label: "Scheduled workflow to alert on outdated runner versions"
+    code: |
+      name: Check self-hosted runner versions
+      on:
+        schedule:
+          - cron: '0 9 * * 1'  # Weekly Monday 9 AM
+
+      jobs:
+        check-runners:
+          runs-on: ubuntu-latest  # GitHub-hosted runner for this diagnostic
+          steps:
+            - name: List runner versions via API
+              env:
+                GH_TOKEN: ${{ secrets.RUNNER_READ_TOKEN }}
+              run: |
+                echo "=== Org runners ==="
+                gh api /orgs/${{ github.repository_owner }}/actions/runners \
+                  --jq '.runners[] | "\(.name): v\(.version) (\(.status))"'
+
+            - name: Check latest available version
+              run: |
+                LATEST=$(curl -sf https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name)
+                echo "Latest runner version: $LATEST"
+                echo "Compare against your registered runners above"
+  - language: yaml
+    label: "ARC — bump runner version in HelmRelease"
+    code: |
+      # In your ARC HelmRelease or values.yaml
+      githubConfigUrl: "https://github.com/myorg"
+      template:
+        spec:
+          containers:
+            - name: runner
+              image: ghcr.io/actions/actions-runner:2.335.0  # Bump this regularly
+prevention:
+  - "Subscribe to the GitHub Changelog (https://github.blog/changelog/) or watch actions/runner releases for deprecation notices"
+  - "Use Actions Runner Controller (ARC) or an autoscaling solution to automate runner lifecycle management"
+  - "Schedule a weekly cron workflow that checks registered runner versions via the Runners API and alerts if any are outdated"
+  - "Pin runner version in IaC (Terraform, Ansible) and include a runner version bump in your monthly maintenance checklist"
+  - "Set up Dependabot or Renovate to auto-update runner image tags in Docker/ARC manifests"
+docs:
+  - url: "https://github.com/actions/runner/releases"
+    label: "actions/runner releases — version history and changelogs"
+  - url: "https://github.com/actions/runner/issues/4305"
+    label: "actions/runner #4305 — runner deprecated cannot receive messages"
+  - url: "https://github.com/actions/runner/issues/4442"
+    label: "actions/runner #4442 — version deprecation notice"
+  - url: "https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners"
+    label: "GitHub Docs — About self-hosted runners"
