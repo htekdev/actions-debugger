@@ -1,0 +1,84 @@
+id: "runner-environment-022"
+title: "actions/checkout set-safe-directory only runs in post step — container jobs get dubious ownership errors"
+category: "runner-environment"
+severity: "error"
+tags:
+  - "actions/checkout"
+  - "safe-directory"
+  - "container"
+  - "dubious-ownership"
+  - "CVE-2022-24765"
+  - "post-step"
+patterns:
+  - regex: "fatal: detected dubious ownership in repository"
+    flags: "i"
+  - regex: "safe\\.directory.*not.*owned"
+    flags: "i"
+error_messages:
+  - "fatal: detected dubious ownership in repository at '/github/workspace'"
+  - "hint: git config --global --add safe.directory /github/workspace"
+root_cause: |
+  The `actions/checkout` action configures `safe.directory` to allow git operations in
+  the workspace. However, this configuration only runs in the **post step** (cleanup
+  phase), not during the main execution step.
+
+  In container jobs, the workspace is mounted from the host and may be owned by a
+  different UID than the user running inside the container. Git's safe.directory
+  protection (introduced in Git 2.35.2 for CVE-2022-24765) blocks access when the
+  directory owner differs from the running user.
+
+  Because safe.directory is only written during the post step — after all workflow
+  steps have already run — any subsequent git operations in the job's main steps
+  fail with "fatal: detected dubious ownership". This includes third-party actions
+  that internally invoke git (reviewdog, gitops tools, semantic-release, etc.).
+
+  Reported upstream: https://github.com/actions/checkout/issues/2031
+fix: |
+  Add an explicit safe.directory configuration step immediately after `actions/checkout`
+  in any container job that performs git operations. This ensures the directory is
+  trusted before any subsequent steps run.
+fix_code:
+  - language: yaml
+    label: "Add safe.directory config step after checkout in container jobs"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          container: node:20-bookworm
+          steps:
+            - uses: actions/checkout@v4
+
+            # Workaround: post step safe.directory config doesn't help in container jobs
+            - name: Mark workspace as safe for git
+              run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+            - name: Run git-dependent steps
+              run: git log --oneline -5
+  - language: yaml
+    label: "Use wildcard to mark all directories safe in container workflows"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          container: python:3.12-slim
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Configure git safe directories
+              run: |
+                git config --global --add safe.directory '*'
+
+            - name: Lint with pre-commit
+              run: pre-commit run --all-files
+prevention:
+  - "Always add a safe.directory config step after checkout when using container jobs"
+  - "Audit third-party actions in container jobs — reviewdog, semantic-release, and gitops tools invoke git internally"
+  - "Consider running without a container and using docker run explicitly if git safety is complex to manage"
+  - "Track https://github.com/actions/checkout/issues/2031 for an official fix from the actions team"
+docs:
+  - url: "https://github.com/actions/checkout/issues/2031"
+    label: "actions/checkout #2031 — safe.directory only set in post step"
+  - url: "https://github.blog/2022-04-12-git-security-vulnerability-announced/"
+    label: "Git CVE-2022-24765 — safe.directory background"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-where-your-workflow-runs/running-jobs-in-a-container"
+    label: "GitHub Docs — Running jobs in a container"
