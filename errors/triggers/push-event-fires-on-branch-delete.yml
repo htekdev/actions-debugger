@@ -1,0 +1,129 @@
+id: triggers-015
+title: "on: push Fires When a Branch Is Deleted — Unguarded Workflows Fail"
+category: triggers
+severity: error
+tags:
+  - push
+  - branch-delete
+  - github.event.deleted
+  - ref-not-found
+  - workflow-trigger
+  - branch-cleanup
+patterns:
+  - regex: "on:\\s*push"
+    flags: "im"
+  - regex: "github\\.event\\.deleted"
+    flags: "i"
+  - regex: "fatal.*not.*a.*git repository|fatal.*couldn't find remote ref"
+    flags: "i"
+error_messages:
+  - "fatal: couldn't find remote ref refs/heads/my-feature-branch"
+  - "Error: The process '/usr/bin/git' failed with exit code 128"
+  - "fatal: not a git repository (or any of the parent directories): .git"
+  - "remote: Repository not found"
+root_cause: |
+  GitHub's `push` webhook fires on ALL ref write operations, including branch and tag
+  deletions. When a branch is deleted, a push event is emitted with:
+    - `github.event.deleted == true`
+    - `github.event.created == false`
+    - `github.ref` set to the deleted branch ref (e.g., `refs/heads/feature-xyz`)
+    - `github.event.after` set to `0000000000000000000000000000000000000000` (40 zeros)
+    - `github.sha` reverts to the default branch SHA
+
+  Workflows triggered by `on: push` that do not guard against deletion events can:
+  - Fail when `actions/checkout` tries to check out a branch that no longer exists
+  - Trigger deployment pipelines, test suites, or notification workflows unexpectedly
+  - Produce misleading failures that look like unrelated CI breakage
+
+  This is especially problematic in workflows that:
+  - Checkout a specific branch ref from `github.ref`
+  - Run clean-up scripts expecting the branch to exist
+  - Use `git describe` or `git log` on the tip of the deleted branch
+
+  GitHub documentation notes: "When you delete a branch, the SHA in the workflow run
+  (and its associated refs) reverts to the default branch of the repository."
+  Source: GitHub Docs — Events that trigger workflows (push event payload)
+  Source: GitHub Docs — Webhook events and payloads (`deleted` field on push payload)
+fix: |
+  Add an `if:` guard to any job or workflow step that should not run on branch deletions.
+  The `github.event.deleted` context field is `true` when the push event is a deletion.
+
+  For most push-triggered workflows, the intent is to react to new commits — guard with:
+    `if: github.event.deleted != true`
+
+  For tag deletion events, also check `github.event.ref_type` if you use the `delete`
+  event, or use `if: github.event.deleted != true && !startsWith(github.ref, 'refs/tags/')`.
+
+  Alternatively, use the `on: delete` event for branch/tag cleanup workflows instead of
+  listening for deletions via the push event.
+fix_code:
+  - language: yaml
+    label: "Guard push jobs from running on branch deletion"
+    code: |
+      on:
+        push:
+          branches:
+            - 'feature/**'
+            - 'fix/**'
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          # ✅ Skip the job entirely when the push is a branch deletion
+          if: github.event.deleted != true
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm ci && npm test
+
+  - language: yaml
+    label: "Per-step guard if you need some steps to run on deletion"
+    code: |
+      jobs:
+        process:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Checkout (skip on delete)
+              if: github.event.deleted != true
+              uses: actions/checkout@v4
+
+            - name: Run tests (skip on delete)
+              if: github.event.deleted != true
+              run: npm test
+
+            - name: Log branch deleted
+              if: github.event.deleted == true
+              run: echo "Branch ${{ github.ref_name }} was deleted"
+
+  - language: yaml
+    label: "Use on: delete event for cleanup workflows instead"
+    code: |
+      # Prefer the dedicated 'delete' event for branch/tag cleanup
+      on:
+        delete:
+          # Optionally filter to branches only (not tags)
+
+      jobs:
+        cleanup:
+          runs-on: ubuntu-latest
+          # github.event.ref is the deleted branch/tag name
+          # github.event.ref_type is 'branch' or 'tag'
+          if: github.event.ref_type == 'branch'
+          steps:
+            - name: Clean up preview environment
+              run: |
+                echo "Cleaning up for deleted branch: ${{ github.event.ref }}"
+                ./scripts/teardown-preview.sh "${{ github.event.ref }}"
+
+prevention:
+  - "Add `if: github.event.deleted != true` to all jobs in `on: push` workflows."
+  - "Use the `on: delete` event for branch/tag teardown workflows instead of catching deletions via push."
+  - "Check `github.event.after == '0000000000000000000000000000000000000000'` as an alternative deletion guard."
+  - "Avoid checking out `${{ github.ref }}` directly; use `actions/checkout` defaults which handle this gracefully."
+  - "Add branch filters under `on: push: branches:` to limit which branches trigger the workflow."
+docs:
+  - url: "https://docs.github.com/en/webhooks/webhook-events-and-payloads#push"
+    label: "GitHub Docs: push webhook event payload (deleted field)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#push"
+    label: "GitHub Docs: push event trigger"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#delete"
+    label: "GitHub Docs: delete event trigger"
