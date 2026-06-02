@@ -1,0 +1,127 @@
+id: silent-failures-019
+title: "GITHUB_ENV Multiline Values Silently Truncate Without Heredoc Delimiter Format"
+category: silent-failures
+severity: silent-failure
+tags:
+  - GITHUB_ENV
+  - environment-variable
+  - multiline
+  - heredoc
+  - truncation
+  - env-file
+patterns:
+  - regex: "GITHUB_ENV.*multiline|multiline.*GITHUB_ENV"
+    flags: "i"
+  - regex: "Invalid format '.*\\n'"
+    flags: "i"
+  - regex: "Error: Failed to parse environment file"
+    flags: "i"
+error_messages:
+  - "Error: Failed to parse environment file"
+  - "Invalid format 'MY_VAR=line1\nline2'"
+  - "Warning: Environment file exporting failed"
+root_cause: |
+  When setting an environment variable with `$GITHUB_ENV` that contains **newline
+  characters**, naïvely echoing the value produces an invalid environment file entry
+  that is silently truncated or causes a parse error.
+
+  The environment file format used by GitHub Actions expects single-line `KEY=VALUE`
+  entries. If a value contains a literal newline, the runner cannot parse it and
+  typically:
+  - Silently truncates the value at the first newline (the variable gets only the
+    first line)
+  - In strict runner versions: fails with "Error: Failed to parse environment file"
+
+  **Common incorrect pattern:**
+  ```yaml
+  run: echo "MY_CERT=${{ secrets.CERT }}" >> $GITHUB_ENV
+  # If CERT contains newlines, the env file entry is broken
+  ```
+
+  **Why it's a silent failure:**
+  - The step succeeds with exit code 0
+  - No obvious error message appears in the logs
+  - Downstream steps see a truncated, incomplete variable value
+  - Certificate/JSON/SSH key values are commonly multi-line and hit this silently
+
+  This is separate from the `$GITHUB_OUTPUT` multiline issue (which uses the same
+  heredoc syntax fix) — the root cause and pattern are identical but the environment
+  file (`GITHUB_ENV`) is a distinct file from the output file (`GITHUB_OUTPUT`).
+
+  Sources: GitHub Community #160171, GitHub Docs workflow commands
+fix: |
+  Use the **heredoc delimiter format** for multiline values in `$GITHUB_ENV`:
+
+  ```
+  KEY<<DELIMITER
+  value-line-1
+  value-line-2
+  DELIMITER
+  ```
+
+  The delimiter can be any string that does not appear in the value. `EOF` is the
+  conventional choice. The delimiter must appear on its own line both as the opening
+  marker and the closing marker.
+
+  This same pattern applies to `$GITHUB_OUTPUT` for multiline step outputs.
+fix_code:
+  - language: yaml
+    label: "Broken — newline in value breaks the env file silently"
+    code: |
+      # ❌ BROKEN: Secret or cert value with newlines truncates silently
+      - name: Set multiline env var
+        run: echo "MY_CERT=${{ secrets.TLS_CERT }}" >> $GITHUB_ENV
+        # Result: MY_CERT contains only the first line of the certificate
+  - language: yaml
+    label: "Fixed — heredoc delimiter format for multiline GITHUB_ENV values"
+    code: |
+      # ✅ FIXED: Use heredoc delimiter syntax
+      - name: Set multiline env var
+        run: |
+          echo "MY_CERT<<EOF" >> $GITHUB_ENV
+          echo "${{ secrets.TLS_CERT }}" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+  - language: yaml
+    label: "Fixed — multiline JSON body in GITHUB_ENV"
+    code: |
+      # ✅ FIXED: Multi-line JSON stored as env var using heredoc format
+      - name: Set JSON config variable
+        run: |
+          echo "APP_CONFIG<<EOF" >> $GITHUB_ENV
+          cat config/settings.json >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+  - language: yaml
+    label: "Fixed — same pattern applies to GITHUB_OUTPUT for multiline outputs"
+    code: |
+      # ✅ SAME PATTERN for step outputs (GITHUB_OUTPUT)
+      - name: Set multiline output
+        id: generate
+        run: |
+          echo "report<<EOF" >> $GITHUB_OUTPUT
+          cat test-results.txt >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+  - language: yaml
+    label: "Fixed — PowerShell equivalent for Windows runners"
+    code: |
+      # ✅ FIXED (Windows/PowerShell): Use Out-File -Append with heredoc-style writes
+      - name: Set multiline env var on Windows
+        shell: pwsh
+        run: |
+          @"
+          MY_CERT<<EOF
+          ${{ secrets.TLS_CERT }}
+          EOF
+          "@ | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+prevention:
+  - "Always use the `KEY<<DELIMITER ... DELIMITER` heredoc format for any env var value that may contain newlines (certs, JWTs, JSON, SSH keys)."
+  - "Never use a single `echo KEY=VALUE >> $GITHUB_ENV` for values sourced from secrets or file contents — they are likely to contain newlines."
+  - "The same heredoc pattern applies to `$GITHUB_OUTPUT` — treat them identically for multiline values."
+  - "Validate that downstream steps receive the full value: `run: echo \"MY_CERT=$MY_CERT\"` — a truncated cert will be obviously short."
+  - "Use `echo 'key<<EOF' >> $GITHUB_ENV` (single quotes around key<<EOF) to avoid accidental shell expansion of the delimiter line."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions#multiline-strings"
+    label: "GitHub Docs: Workflow commands — Multiline strings in environment files"
+  - url: "https://github.com/orgs/community/discussions/160171"
+    label: "GitHub Community #160171 — GITHUB_ENV multiline values"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions#setting-an-environment-variable"
+    label: "GitHub Docs: Setting an environment variable (GITHUB_ENV format)"
