@@ -1,0 +1,93 @@
+id: caching-artifacts-015
+title: "actions/cache Key Exceeds 512-Character Limit — Cache Action Fails"
+category: caching-artifacts
+severity: error
+tags:
+  - actions/cache
+  - cache-key
+  - key-length
+  - 512-char
+  - restore
+  - save
+patterns:
+  - regex: "Cache key is too long"
+    flags: "i"
+  - regex: "cache.*key.*exceed|key.*too long"
+    flags: "i"
+error_messages:
+  - "Cache key is too long"
+  - "Error: Cache key is too long (max: 512 characters)"
+root_cause: |
+  The `actions/cache` action enforces a maximum cache key length of **512 characters**.
+  When the `key:` or any `restore-keys:` entry exceeds this limit, the action fails
+  immediately with "Cache key is too long" — no cache is saved or restored.
+
+  This limit is hit most often when developers concatenate multiple dynamic values into
+  a single key without length management:
+  - Long branch names (`github.ref_name` on feature branches can be 60+ chars)
+  - Full commit SHAs (`github.sha` = 40 chars)
+  - `github.event_name` + `github.actor` + `github.run_id` (11+ chars) combined with a
+    long dependency hash
+  - `toJSON()` output of a context object embedded directly into the key
+  - Monorepo setups that include multiple file paths in a single hashFiles() call with
+    deeply nested directory structures
+
+  The 512-character limit applies per key entry, including each `restore-keys` line.
+  Keys that would cause the action to fail entirely, leaving the job without any cache.
+
+  Source: GitHub Docs — actions/cache usage limits
+fix: |
+  Shorten the cache key to stay under 512 characters. The primary strategies are:
+
+  1. **Use `hashFiles()` for dependency content** — hashing a lockfile produces a
+     consistent 64-character SHA256 output regardless of the file's contents.
+  2. **Remove redundant dynamic parts** — `github.run_id` is almost never appropriate
+     in a cache key (it changes every run, defeating cache sharing entirely).
+  3. **Truncate long branch names** — use `github.ref_name` only if needed, or hash it.
+  4. **Avoid embedding JSON strings** — never embed `toJSON()` outputs directly in keys.
+  5. **Use `restore-keys` for partial matching** instead of encoding multiple variants
+     into one long key.
+fix_code:
+  - language: yaml
+    label: "Broken — key too long from excessive concatenation"
+    code: |
+      # ❌ BROKEN: Key may exceed 512 chars with long branch names + run context
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-${{ github.workflow }}-${{ github.ref }}-${{ github.sha }}-${{ github.run_id }}-${{ hashFiles('**/package-lock.json', '**/yarn.lock', '**/pnpm-lock.yaml', 'packages/*/package-lock.json') }}
+  - language: yaml
+    label: "Fixed — concise key using OS + short context + lockfile hash"
+    code: |
+      # ✅ FIXED: OS prefix + workflow + lockfile hash — short and deterministic
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+  - language: yaml
+    label: "Fixed — long branch names: hash github.ref_name if needed"
+    code: |
+      # ✅ FIXED: When you need branch-scoped caches, hash the ref instead of embedding it
+      - name: Compute short ref hash
+        id: ref-hash
+        run: echo "value=$(echo '${{ github.ref }}' | sha256sum | cut -c1-16)" >> $GITHUB_OUTPUT
+
+      - uses: actions/cache@v4
+        with:
+          path: .build-cache
+          key: build-${{ runner.os }}-${{ steps.ref-hash.outputs.value }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            build-${{ runner.os }}-
+prevention:
+  - "Keep cache keys under 400 characters to leave comfortable headroom below the 512-char limit."
+  - "Never include `github.run_id` or `github.run_number` in cache keys — these values change every run and prevent cache hits entirely."
+  - "Prefer `hashFiles()` over embedding actual file content or long path lists into keys — the hash output is always 64 chars."
+  - "When branch-scoped caching is needed, hash `github.ref` to a short prefix rather than embedding the full ref string."
+  - "Test key length in a debug step: `run: echo \"Key length: $(echo -n '${{ KEY_EXPRESSION }}' | wc -c)\"`"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows#restrictions-for-accessing-a-cache"
+    label: "GitHub Docs: Cache restrictions and usage limits (512-char key limit)"
+  - url: "https://github.com/actions/cache#inputs"
+    label: "actions/cache inputs — key and restore-keys documentation"

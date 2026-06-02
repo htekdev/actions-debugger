@@ -1,0 +1,113 @@
+id: known-unsolved-015
+title: "Scheduled Workflows Only Run on the Default Branch — Cannot Target Arbitrary Branches"
+category: known-unsolved
+severity: limitation
+tags:
+  - schedule
+  - cron
+  - default-branch
+  - trigger
+  - branches-filter
+  - platform-limitation
+patterns:
+  - regex: "schedule.*branches|branches.*schedule"
+    flags: "i"
+  - regex: "cron.*not.*branch|branch.*cron.*ignored"
+    flags: "i"
+  - regex: "Unexpected value 'branches'"
+    flags: "i"
+error_messages:
+  - "You have an error in your yaml syntax on line X"
+  - "Unexpected value 'branches'"
+  - "The 'branches' filter is not supported under 'schedule'"
+root_cause: |
+  GitHub Actions schedule (cron) triggers **always run the workflow file from the
+  repository's default branch** (typically `main`). This is an intentional platform
+  security constraint.
+
+  There is no supported way to target a non-default branch with a `schedule:` trigger:
+  - Adding `branches:` under `schedule:` causes a YAML syntax error ("Unexpected value
+    'branches'") — it is not a valid key in that position.
+  - Placing the schedule workflow on a non-default branch does not cause it to run.
+  - The `github.ref` and `github.head_ref` values will always reflect the default branch
+    when triggered by a schedule event.
+
+  **Why GitHub enforces this:**
+  If scheduled workflows could target arbitrary branches, an attacker who pushes
+  malicious code to a feature branch could have it execute on a cron schedule with the
+  repository's full secrets — a significant supply-chain risk. By restricting cron runs
+  to the default branch, GitHub ensures only reviewed/merged code runs on schedule.
+
+  **Platform impact:**
+  - Cannot create separate nightly build schedules for multiple branches from one repo.
+  - Cannot run a scheduled integration test on a long-lived release branch without
+    special workarounds.
+  - Community has requested this capability since 2021 (community discussion #16107).
+
+  Sources: Stack Overflow Q/A, GitHub Community #16107, GitHub Docs
+fix: |
+  There is no direct fix — this is a platform constraint. Use these workarounds:
+
+  **Workaround 1 (Recommended): Check out the target branch in the scheduled workflow**
+  Keep the scheduled workflow on the default branch but have the job check out the
+  desired branch in its `actions/checkout` step:
+
+  **Workaround 2: Trigger via `workflow_dispatch` from an external scheduler**
+  Use the GitHub REST API or `gh workflow run` from a controlled external system
+  (another scheduled job, GitHub App, etc.) to trigger a `workflow_dispatch` event
+  targeting a specific `ref` (branch or tag).
+
+  **Workaround 3: `workflow_run` chaining**
+  Not a direct substitute, but a workflow triggered by `workflow_run` on a push to
+  the target branch can perform scheduled-like follow-up logic.
+
+  **For release branches:** Merge a scheduled workflow file into each release branch
+  as part of the branch maintenance process — each branch can independently schedule
+  its own cron.
+fix_code:
+  - language: yaml
+    label: "Broken — branches filter not valid under schedule, causes YAML error"
+    code: |
+      # ❌ BROKEN: 'branches' is not a valid key under schedule — YAML syntax error
+      on:
+        schedule:
+          - cron: '0 1 * * *'
+            branches:          # ← invalid key, causes: Unexpected value 'branches'
+              - release/v2
+  - language: yaml
+    label: "Workaround — check out target branch in the scheduled workflow step"
+    code: |
+      # ✅ WORKAROUND: workflow lives on default branch, checks out the desired ref
+      on:
+        schedule:
+          - cron: '0 1 * * *'   # runs from default branch (main)
+
+      jobs:
+        nightly-test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: 'release/v2'    # explicitly check out the target branch
+            # All subsequent steps operate on release/v2 code
+            - run: ./run-tests.sh
+  - language: yaml
+    label: "Workaround — trigger workflow_dispatch against a specific branch via gh CLI"
+    code: |
+      # ✅ WORKAROUND: External script that fires workflow_dispatch targeting a branch
+      # Run this from another scheduled job (e.g., a GitHub App or a cron runner)
+      gh workflow run nightly.yml \
+        --repo owner/repo \
+        --ref release/v2        # workflow_dispatch supports specifying a branch ref
+prevention:
+  - "Do not add `branches:` under `schedule:` — it is not a valid key and will cause YAML syntax errors."
+  - "Design scheduled workflows to check out the target branch explicitly via `actions/checkout` with the `ref:` input."
+  - "For complex multi-branch scheduling needs, consider using a GitHub App or external scheduler that fires `workflow_dispatch` events targeting specific refs."
+  - "Document this platform limitation in team wikis to prevent repeated attempts at adding `branches:` to schedule triggers."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#schedule"
+    label: "GitHub Docs: Events that trigger workflows — schedule"
+  - url: "https://github.com/orgs/community/discussions/16107"
+    label: "GitHub Community #16107 — Schedule trigger target branch request"
+  - url: "https://stackoverflow.com/questions/63612155/how-do-i-trigger-a-scheduled-action-on-a-specific-branch"
+    label: "Stack Overflow: How to trigger a scheduled action on a specific branch"

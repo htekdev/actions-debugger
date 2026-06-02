@@ -1,0 +1,92 @@
+id: runner-environment-041
+title: "actions/setup-go Go 1.23 Module Cache Restore Fails — Tar Extraction Error on Telemetry Files"
+category: runner-environment
+severity: error
+tags:
+  - actions/setup-go
+  - go
+  - go-1.23
+  - cache
+  - tar
+  - telemetry
+  - module-cache
+patterns:
+  - regex: "Cannot open: File exists"
+    flags: "i"
+  - regex: "tar.*failed with exit code 2|exit code 2.*tar"
+    flags: "i"
+  - regex: "Failed to restore.*usr/bin/tar.*failed"
+    flags: "i"
+  - regex: "golang\\.org/x/telemetry.*File exists"
+    flags: "i"
+error_messages:
+  - "/usr/bin/tar: ../../../go/pkg/mod/golang.org/x/telemetry/config@v0.31.0/config.json: Cannot open: File exists"
+  - "/usr/bin/tar: Exiting with failure status due to previous errors"
+  - "Warning: Failed to restore: \"/usr/bin/tar\" failed with error: The process '/usr/bin/tar' failed with exit code 2"
+  - "Cache is not found"
+root_cause: |
+  Go 1.23.0 introduced a telemetry subsystem that writes configuration files into the
+  module cache at `$GOPATH/pkg/mod/golang.org/x/telemetry/`. When `actions/setup-go`
+  attempts to restore a previously saved module cache, `tar` fails to extract these
+  telemetry files because they **already exist** on the runner filesystem from the
+  Go toolchain installation step.
+
+  The collision happens because:
+  1. `actions/setup-go` installs Go 1.23.0 (which creates telemetry files in the
+     module cache directory during toolchain initialization)
+  2. When restoring the cached module archive, `tar` attempts to write the same
+     telemetry files and hits "Cannot open: File exists" for each conflicting path
+  3. `tar` exits with code 2, causing the cache restore to report failure
+  4. The module cache falls back to a full fresh download — wasting CI minutes
+
+  This was a regression introduced in Go 1.23.0 and fixed in Go 1.23.1 by adjusting
+  how the telemetry module integrates with the module cache to avoid the path collision.
+
+  Source: actions/setup-go issue #506
+fix: |
+  **Upgrade to Go 1.23.1 or later** — the fix was shipped in the patch release.
+  Pin `go-version` to `>=1.23.1` in your `actions/setup-go` step.
+
+  If you must remain on 1.23.0 temporarily, the workaround is to delete the conflicting
+  telemetry directory before the cache restore runs, or to disable module cache caching
+  entirely for affected workflows until you can upgrade.
+fix_code:
+  - language: yaml
+    label: "Fixed — pin to Go 1.23.1+ to avoid the telemetry cache collision"
+    code: |
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.1'   # 1.23.0 has the tar collision bug; 1.23.1+ is fixed
+          cache: true
+  - language: yaml
+    label: "Fixed — use go-version-file to inherit version from go.mod"
+    code: |
+      # ✅ RECOMMENDED: source version from go.mod so the workflow stays in sync automatically
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod   # reads the version from the go directive in go.mod
+          cache: true
+          # Ensure go.mod specifies 'go 1.23.1' or later to avoid the cache bug
+  - language: yaml
+    label: "Workaround — clear telemetry before cache restore (Go 1.23.0 only)"
+    code: |
+      # Workaround if stuck on Go 1.23.0: pre-remove telemetry path before setup-go
+      - name: Clear stale telemetry module cache
+        run: rm -rf ~/go/pkg/mod/golang.org/x/telemetry || true
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.0'
+          cache: true
+prevention:
+  - "Pin `go-version` to patch releases (e.g., `1.23.1`) rather than minor versions (e.g., `1.23`) to avoid picking up newly released patch versions with regressions before they are fixed."
+  - "Use `go-version-file: go.mod` to keep CI and local development in sync — update go.mod to `go 1.23.1` or later."
+  - "Monitor `actions/setup-go` releases for patch notes when upgrading across Go minor versions."
+  - "If cache restore fails with tar errors, check if the error involves newly introduced toolchain files that collide with the restore path."
+docs:
+  - url: "https://github.com/actions/setup-go/issues/506"
+    label: "actions/setup-go issue #506 — Go 1.23 telemetry cache tar collision"
+  - url: "https://github.com/actions/setup-go"
+    label: "actions/setup-go repository"
+  - url: "https://go.dev/doc/devel/release#go1.23.minor"
+    label: "Go 1.23 release notes and minor releases"

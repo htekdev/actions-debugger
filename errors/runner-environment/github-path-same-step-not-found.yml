@@ -1,0 +1,114 @@
+id: runner-environment-040
+title: "GITHUB_PATH Updates Are Not Available in the Same Step That Writes Them"
+category: runner-environment
+severity: silent-failure
+tags:
+  - GITHUB_PATH
+  - GITHUB_ENV
+  - path
+  - environment-file
+  - command-not-found
+  - same-step
+patterns:
+  - regex: "command not found"
+    flags: "i"
+  - regex: "not recognized as.*cmdlet|not recognized as.*function"
+    flags: "i"
+  - regex: "GITHUB_PATH.*same step|same step.*GITHUB_PATH"
+    flags: "i"
+error_messages:
+  - "/bin/bash: line X: my-tool: command not found"
+  - "The term 'my-tool' is not recognized as the name of a cmdlet, function, script file, or executable program"
+root_cause: |
+  When you write a directory path to `$GITHUB_PATH` (or an environment variable to
+  `$GITHUB_ENV`), the change is **NOT available in the same `run:` step** that writes
+  the file. It only takes effect for **subsequent steps** in the same job.
+
+  The runner reads the environment files between steps — not mid-step. The typical
+  developer mistake is:
+
+  ```yaml
+  - name: Install and use tool
+    run: |
+      echo "$HOME/.local/bin" >> $GITHUB_PATH   # writes to GITHUB_PATH
+      my-tool --version                           # ❌ fails — PATH not updated yet
+  ```
+
+  The same applies to `$GITHUB_ENV` — variables written to the env file are not
+  accessible via `${{ env.VAR }}` or as shell variables in the same step.
+
+  Additionally, using `>` instead of `>>` to write to `$GITHUB_PATH` or `$GITHUB_ENV`
+  overwrites the entire file, wiping all previously set paths/variables and causing
+  unexpected "command not found" errors in later steps.
+
+  Sources: GitHub Community #80916, nektos/act issue #2637, GitHub Docs
+fix: |
+  Split the install/configure step from the step that uses the tool. Write to
+  `$GITHUB_PATH` or `$GITHUB_ENV` in one step, then use the tool/variable in a
+  subsequent step.
+
+  For the current step only, modify `$PATH` directly in the shell environment
+  (not via `$GITHUB_PATH`) if you need immediate access.
+
+  Always use `>>` (append) when writing to `$GITHUB_PATH` or `$GITHUB_ENV` — never
+  `>` (overwrite).
+fix_code:
+  - language: yaml
+    label: "Broken — tool used in same step as GITHUB_PATH write"
+    code: |
+      # ❌ BROKEN: my-tool not found because PATH not updated until next step
+      - name: Install and use tool
+        run: |
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          my-tool --version   # fails: command not found
+  - language: yaml
+    label: "Fixed — split into two steps"
+    code: |
+      # ✅ FIXED: separate steps so runner reads GITHUB_PATH between them
+      - name: Add tool to PATH
+        run: echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Use tool (PATH now includes ~/.local/bin)
+        run: my-tool --version
+  - language: yaml
+    label: "Fixed — same-step access via direct PATH export (no GITHUB_PATH)"
+    code: |
+      # ✅ ALTERNATIVE: Export PATH directly in the same step if splitting isn't possible
+      - name: Install and use tool in same step
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"   # takes effect immediately in this step
+          my-tool --version
+          # Also persist for later steps:
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+  - language: yaml
+    label: "Fixed — GITHUB_ENV: split the set and the use"
+    code: |
+      # ❌ BROKEN: Variable not available yet in same step
+      - run: |
+          echo "MY_VAR=hello" >> $GITHUB_ENV
+          echo "$MY_VAR"   # empty — not yet loaded
+
+      # ✅ FIXED: Use in a later step
+      - run: echo "MY_VAR=hello" >> $GITHUB_ENV
+      - run: echo "$MY_VAR"    # prints 'hello'
+  - language: yaml
+    label: "Warning — always append (>>) never overwrite (>)"
+    code: |
+      # ❌ BROKEN: Overwrites GITHUB_PATH, removing all previously set paths
+      echo "/new/path" > $GITHUB_PATH
+
+      # ✅ FIXED: Append to preserve existing entries
+      echo "/new/path" >> $GITHUB_PATH
+prevention:
+  - "Never use the result of `$GITHUB_PATH` or `$GITHUB_ENV` writes in the same `run:` step — they take effect in the next step."
+  - "Always use `>>` (append) not `>` (overwrite) when writing to `$GITHUB_PATH` or `$GITHUB_ENV`."
+  - "If you need a tool available in the same step, export `PATH` directly in the shell command: `export PATH=\"/dir:$PATH\"` before calling the tool."
+  - "On Windows (PowerShell), use `Add-Content` or `Out-File -Append` — do not use `Set-Content` which overwrites the file."
+  - "Check the GitHub Actions docs section on 'environment files' to understand the step boundary at which env files are read."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions#adding-a-system-path"
+    label: "GitHub Docs: Workflow commands — Adding a system path (GITHUB_PATH)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions#setting-an-environment-variable"
+    label: "GitHub Docs: Workflow commands — Setting an environment variable (GITHUB_ENV)"
+  - url: "https://github.com/orgs/community/discussions/80916"
+    label: "GitHub Community #80916 — GITHUB_PATH not available same step"
