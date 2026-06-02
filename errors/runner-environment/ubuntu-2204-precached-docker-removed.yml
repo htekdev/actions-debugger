@@ -1,0 +1,110 @@
+id: runner-environment-035
+title: "ubuntu-22.04 Pre-Cached Docker Images Removed — Cold Pulls Now Required"
+category: runner-environment
+severity: warning
+tags:
+  - ubuntu
+  - docker
+  - pre-cached
+  - runner-image
+  - pull-rate
+  - performance
+patterns:
+  - regex: "Unable to find image '.*' locally"
+    flags: "i"
+  - regex: "Pulling from (?:library/)?(?:node|python|postgres|redis|mysql|nginx|ubuntu|alpine).*\nDigest:"
+    flags: "im"
+  - regex: "docker: Error response from daemon.*manifest.*not found"
+    flags: "i"
+error_messages:
+  - "Unable to find image 'node:lts-alpine' locally"
+  - "Unable to find image 'postgres:15' locally"
+  - "Unable to find image 'redis:7-alpine' locally"
+  - "Pulling from library/node"
+  - "Pulling from library/postgres"
+root_cause: |
+  Starting January 12, 2026, GitHub removed all pre-cached Docker images from the
+  ubuntu-22.04 runner image to address disk space limits. Previously, commonly used
+  Docker images (node, postgres, redis, mysql, python, nginx, alpine, etc.) were
+  pre-pulled into the runner's local Docker image cache, so `docker pull` or
+  `docker run` on those images started immediately without a network pull.
+
+  After the change, ALL Docker images must be pulled from the registry at runtime.
+  This has two main effects:
+
+  1. **Longer job times**: Cold pulls for large images (node, python, postgres) add
+     30-120+ seconds per job depending on image size and registry speed.
+
+  2. **DockerHub rate limit exposure**: Workflows that previously never hit the
+     DockerHub anonymous pull rate limit (100 pulls/6h per IP) may now exceed it
+     once caching is removed — especially on parallel matrix jobs all pulling the
+     same image from the same runner subnet IP.
+
+  The change only affects ubuntu-22.04. Ubuntu 24.04 and other images were not
+  pre-caching Docker images in the same way.
+
+  Source: actions/runner-images#13472
+fix: |
+  **Option 1 — Authenticate to DockerHub** to raise the rate limit to 200 pulls/6h
+  (free account) or unlimited (Pro/Team).
+
+  **Option 2 — Use GitHub Container Registry (ghcr.io)** for your own images —
+  these never count against DockerHub rate limits and pull faster from GitHub runners.
+
+  **Option 3 — Upgrade to ubuntu-24.04** if the workflow is not tied to ubuntu-22.04
+  specific packages. The 24.04 image has current tooling and better long-term support.
+
+  **Option 4 — Add a docker/login-action step** before any Docker operations to
+  authenticate even with a free DockerHub account, which 2x the anonymous rate limit.
+fix_code:
+  - language: yaml
+    label: "Authenticate to DockerHub to avoid rate limits on ubuntu-22.04"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-22.04
+          steps:
+            - name: Log in to DockerHub
+              uses: docker/login-action@v3
+              with:
+                username: ${{ secrets.DOCKERHUB_USERNAME }}
+                password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+            - name: Run tests with Postgres
+              run: |
+                docker run --rm -d -p 5432:5432 \
+                  -e POSTGRES_PASSWORD=test \
+                  postgres:15-alpine
+  - language: yaml
+    label: "Use GitHub Container Registry instead of DockerHub"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-22.04
+          permissions:
+            packages: read
+          steps:
+            - name: Log in to GHCR
+              uses: docker/login-action@v3
+              with:
+                registry: ghcr.io
+                username: ${{ github.actor }}
+                password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Run service container from GHCR
+              run: docker run --rm ghcr.io/myorg/my-image:latest
+prevention:
+  - "Authenticate to DockerHub in all workflows that pull images on ubuntu-22.04 runners."
+  - "Consider migrating ubuntu-22.04 workflows to ubuntu-24.04 — it's the current default and avoids this issue."
+  - "Prefer GitHub Container Registry (ghcr.io) for your own images to eliminate DockerHub rate limits entirely."
+  - "Use `docker/login-action` as a standard first step in any workflow that involves Docker image pulls."
+  - "Monitor job durations after runner image updates — unexpected slowdowns often signal a caching change."
+docs:
+  - url: "https://github.com/actions/runner-images/issues/13472"
+    label: "runner-images#13472 — ubuntu-22.04 pre-cached Docker images removal announcement"
+  - url: "https://github.com/actions/runner-images/issues/1445"
+    label: "runner-images#1445 — DockerHub pull rate limit discussion"
+  - url: "https://docs.docker.com/docker-hub/download-rate-limit/"
+    label: "DockerHub pull rate limits documentation"
+  - url: "https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry"
+    label: "Working with GitHub Container Registry (ghcr.io)"

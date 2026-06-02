@@ -1,0 +1,112 @@
+id: runner-environment-036
+title: "Windows MSVC LTCG Linker Fails When Jobs in Same Run Receive Different Image Versions"
+category: runner-environment
+severity: error
+tags:
+  - windows
+  - msvc
+  - ltcg
+  - linker
+  - runner-image
+  - build
+  - vs2026
+patterns:
+  - regex: "C1900.*Il mismatch between 'P1' version.*and 'P2' version"
+    flags: "i"
+  - regex: "LNK1257.*code generation failed"
+    flags: "i"
+  - regex: "LNK2001.*unresolved external symbol __std_"
+    flags: "i"
+  - regex: "fatal error C1900"
+    flags: "i"
+error_messages:
+  - "EXEC : fatal error C1900: Il mismatch between 'P1' version '20251208' and 'P2' version '20250730'"
+  - "LINK : fatal error LNK1257: code generation failed"
+  - "skia.lib(...) : error LNK2001: unresolved external symbol __std_minmax_element_f_"
+  - "skia.lib(...) : error LNK2001: unresolved external symbol __std_max_element_2u"
+root_cause: |
+  GitHub Actions does not guarantee that all jobs within a single workflow run receive
+  the same concrete runner image version. When a runner image is being rolled out
+  (e.g., during a VS 2026 update or patch cycle), some jobs may be assigned to runners
+  with image version 20260510.103.1 while others receive 20260518.113.1 — even for
+  jobs with the same `runs-on: windows-2025-vs2026` label.
+
+  This becomes a hard build failure for workflows that use MSVC Link-Time Code
+  Generation (LTCG / /GL):
+  - Job A (build) compiles .obj and .lib files with /GL on image version X
+    → MSVC compiler emits Intermediate Language (IL) artifacts stamped with version X.
+  - Job B (link) downloads those artifacts and attempts to link them using /LTCG on
+    image version Y (a different MSVC toolset patch version).
+  - MSVC detects the IL version mismatch (C1900) and aborts: the IL produced by
+    one toolset cannot be consumed by a different toolset version.
+
+  The same failure can occur for any build pipeline that:
+  - Splits compilation and linking across separate jobs
+  - Uses artifact upload/download to pass compiled objects between jobs
+  - Relies on LTCG, MSVC STL internals, or other IL-sensitive optimizations
+
+  This is a known limitation of the GitHub Actions runner assignment model — image
+  rollouts are gradual across the runner pool, and job assignments are not pinned
+  to a specific image version within a run.
+
+  Source: actions/runner-images#14140
+fix: |
+  **Option 1 — Combine compile and link in a single job** so all MSVC operations
+  run on the same runner image. This eliminates the cross-image artifact transfer.
+
+  **Option 2 — Disable LTCG for CI builds** (/GL is a release optimization; most
+  CI builds only need it for final release binaries, not PRs or branch builds).
+
+  **Option 3 — Add MSVC toolset version check** in the link job to detect mismatches
+  before the link fails, and fail fast with a clear diagnostic message.
+
+  **Option 4 — Use a self-hosted runner** with a pinned image version for builds
+  that require LTCG across jobs.
+fix_code:
+  - language: yaml
+    label: "Combine compile and link in one job to avoid image mismatch"
+    code: |
+      jobs:
+        build-and-link:
+          runs-on: windows-2025-vs2026
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Configure CMake
+              run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+            # Compile AND link in the same job — same image version guaranteed
+            - name: Build (compile + link)
+              run: cmake --build build --config Release
+  - language: yaml
+    label: "Disable LTCG on CI builds, enable only for release"
+    code: |
+      jobs:
+        build:
+          runs-on: windows-2025-vs2026
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Build without LTCG (CI)
+              # Pass -DNO_LTCG=1 or equivalent CMake flag to disable /GL and /LTCG
+              # LTCG is only enabled in the separate release workflow
+              run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_LTCG=OFF
+              env:
+                # Alternatively: override CFLAGS/CXXFLAGS directly
+                CFLAGS: /O2     # Optimize without /GL
+                CXXFLAGS: /O2
+prevention:
+  - "Never split MSVC compilation and LTCG linking across separate jobs that upload/download artifacts."
+  - "Disable /GL (LTCG) in CI builds — reserve it for final release artifact builds on a single job."
+  - "Monitor runner image rollout announcements; if a new Windows image version is being deployed, LTCG cross-job builds are at risk during the rollout window."
+  - "Add a MSVC version check step at the start of link jobs to emit the toolset version to logs for post-failure diagnosis."
+  - "Use self-hosted runners with pinned image versions for release builds that require LTCG across jobs."
+docs:
+  - url: "https://github.com/actions/runner-images/issues/14140"
+    label: "runner-images#14140 — MSVC LTCG linker failure from mixed image versions in same run"
+  - url: "https://learn.microsoft.com/en-us/cpp/build/reference/gl-whole-program-optimization"
+    label: "MSVC /GL (Whole Program Optimization) documentation"
+  - url: "https://learn.microsoft.com/en-us/cpp/build/reference/ltcg-link-time-code-generation"
+    label: "MSVC /LTCG (Link-Time Code Generation) documentation"
+  - url: "https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners"
+    label: "About GitHub-hosted runners"
