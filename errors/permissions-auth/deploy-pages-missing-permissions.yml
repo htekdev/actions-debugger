@@ -1,0 +1,144 @@
+id: permissions-auth-009
+title: "actions/deploy-pages Fails 403 — Missing pages: write or id-token: write Permissions"
+category: permissions-auth
+severity: error
+tags:
+  - deploy-pages
+  - pages
+  - permissions
+  - id-token
+  - oidc
+  - github-token
+  - 403
+patterns:
+  - regex: "Failed to create deployment.*status: 403.*pages: write"
+    flags: "i"
+  - regex: "Resource not accessible by integration"
+    flags: "i"
+  - regex: "Fetching artifact metadata failed.*Resource not accessible by integration"
+    flags: "i"
+  - regex: "Error: Error: Failed to create deployment \\(status: 403\\)"
+    flags: "i"
+error_messages:
+  - "Error: Fetching artifact metadata failed. Is githubstatus.com reporting issues with API requests, Pages or Actions? Please re-run the deployment at a later time."
+  - "Error: HttpError: Resource not accessible by integration"
+  - "Error: Error: Failed to create deployment (status: 403) with build version abc123. Ensure GITHUB_TOKEN has permission \"pages: write\"."
+  - "Creating Pages deployment failed"
+root_cause: |
+  `actions/deploy-pages` uses the GitHub Pages REST API, which requires an OIDC-issued
+  JWT token for authentication. This imposes three distinct permissions that must all be
+  present on the **deploy job** (not the build job):
+
+  1. `pages: write` — allows the GITHUB_TOKEN to create and update GitHub Pages deployments.
+  2. `id-token: write` — allows the runner to request an OIDC JWT from GitHub's token
+     endpoint. Without this, `deploy-pages` cannot obtain the token used to authenticate
+     the Pages API call, resulting in the misleading "Resource not accessible by integration"
+     HTTP 403 error.
+  3. `contents: read` — required to read the uploaded artifact. Often already set by
+     inheritance but must be explicit when a workflow-level `permissions:` block restricts
+     all tokens to read-only.
+
+  **Why this is confusing:**
+  - The error message says "Resource not accessible by integration" which looks like a generic
+    API permission problem, not a missing `id-token` scope.
+  - The `pages: write` permission alone is insufficient — `id-token: write` is equally
+    required and its absence produces the exact same error.
+  - Permissions set at the **workflow level** do not automatically apply to jobs that override
+    them. The deploy job must declare its own `permissions:` block.
+  - The artifact upload (via `actions/upload-pages-artifact`) happens in a SEPARATE job from
+    the deploy — permissions for upload and deploy must be set independently.
+
+  **Source:** Confirmed in `actions/deploy-pages` issues #285, #286 (Dec 2023) — over 16
+  reactions and widespread community impact.
+fix: |
+  Add all three required permissions to the deploy job. The build job that runs
+  `upload-pages-artifact` does not need these permissions, but the deploy job does.
+
+  Also verify that GitHub Pages is enabled for the repository under
+  Settings → Pages → Source → "GitHub Actions".
+fix_code:
+  - language: yaml
+    label: "Correct two-job Pages deployment workflow with required permissions"
+    code: |
+      name: Deploy GitHub Pages
+
+      on:
+        push:
+          branches: [main]
+
+      # Deny all permissions at workflow level; grant explicitly per job
+      permissions:
+        contents: read
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Build site
+              run: npm run build   # outputs to ./dist
+
+            - name: Upload Pages artifact
+              uses: actions/upload-pages-artifact@v3
+              with:
+                path: ./dist
+
+        deploy:
+          needs: build
+          runs-on: ubuntu-latest
+          permissions:
+            pages: write        # ← Required: create/update Pages deployment
+            id-token: write     # ← Required: obtain OIDC JWT for Pages API auth
+            contents: read      # ← Required: read the uploaded artifact
+          environment:
+            name: github-pages
+            url: ${{ steps.deployment.outputs.page_url }}
+          steps:
+            - name: Deploy to GitHub Pages
+              id: deployment
+              uses: actions/deploy-pages@v4
+  - language: yaml
+    label: "Single-job variant — all permissions in one job"
+    code: |
+      name: Deploy Pages (single job)
+
+      on:
+        push:
+          branches: [main]
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          permissions:
+            pages: write
+            id-token: write
+            contents: read
+          environment:
+            name: github-pages
+            url: ${{ steps.deployment.outputs.page_url }}
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build
+              run: npm run build
+            - uses: actions/upload-pages-artifact@v3
+              with:
+                path: ./dist
+            - id: deployment
+              uses: actions/deploy-pages@v4
+prevention:
+  - "Always set `pages: write`, `id-token: write`, and `contents: read` on the deploy job — not the build job and not only at the workflow level."
+  - "Confirm GitHub Pages is enabled under repository Settings → Pages → Source → 'GitHub Actions' before running the workflow."
+  - "When using a workflow-level `permissions:` block that restricts defaults, remember job-level permissions do not inherit write scopes — they must be re-declared."
+  - "The `environment: github-pages` block is required for the Pages API to create a deployment — do not omit it."
+docs:
+  - url: "https://docs.github.com/en/pages/getting-started-with-github-pages/configuring-a-publishing-source-for-your-github-pages-site#publishing-with-a-custom-github-actions-workflow"
+    label: "GitHub Docs: Publishing GitHub Pages with Actions"
+  - url: "https://github.com/actions/deploy-pages"
+    label: "actions/deploy-pages — official action repository"
+  - url: "https://github.com/actions/deploy-pages/issues/285"
+    label: "actions/deploy-pages #285: Failing to fetch artifact metadata since 4.0.0"
+  - url: "https://github.com/actions/deploy-pages/issues/286"
+    label: "actions/deploy-pages #286: Bump to V4 broke the deploy step"
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect"
+    label: "GitHub Docs: Security hardening with OpenID Connect"
