@@ -1,0 +1,96 @@
+id: silent-failures-009
+title: "hashFiles() Returns Empty String When No Files Match — Silent Cache Key Collision"
+category: silent-failures
+severity: silent-failure
+tags:
+  - cache
+  - hashFiles
+  - cache-key
+  - collision
+  - glob
+  - silent-failure
+patterns:
+  - regex: "key: [A-Za-z0-9_-]+-$"
+    flags: "m"
+  - regex: "Cache restored from key: [A-Za-z0-9_-]+(?!-[0-9a-f]{64})"
+    flags: "i"
+error_messages:
+  - "Cache restored from key: Linux-node-"
+  - "Cache restored from key: Linux-pip-"
+  - "No error shown — workflow succeeds but wrong cache is restored"
+root_cause: |
+  The `hashFiles()` expression function returns an empty string (not an error)
+  when the supplied glob pattern matches no files in the workspace. This silently
+  truncates the cache key, turning a key like:
+
+    ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+
+  into:
+
+    Linux-node-
+
+  when no package-lock.json exists. This short, predictable key collides across
+  branches and runs, causing stale or wrong cache content to be restored without
+  any warning. The workflow log shows the cache as restored successfully.
+
+  Documented in actions/runner issue #894. Commonly triggered by:
+  - Lockfile not yet committed (new project setup)
+  - Wrong glob path (e.g., `**/package-lock.json` but lockfile is at root)
+  - Wrong working directory at cache step execution time
+  - Matrix jobs where not all matrix values have a matching lockfile
+fix: |
+  Add a fallback value to the hashFiles() expression using the `||` operator so
+  the key is always deterministic even when no files match:
+
+    key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') || 'no-lockfile' }}
+
+  Also verify that the glob actually matches the file by running
+  `find . -name "package-lock.json"` in a debug step before the cache step.
+
+  For matrix workflows, include the matrix value in the key to prevent
+  cross-matrix collisions even when hash is empty:
+
+    key: ${{ runner.os }}-node-${{ matrix.node-version }}-${{ hashFiles('**/package-lock.json') || 'no-lockfile' }}
+fix_code:
+  - language: yaml
+    label: "WRONG — hashFiles with no fallback (silently short key on miss)"
+    code: |
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          # ❌ If no package-lock.json found, key becomes "Linux-node-"
+          # All runs share the same truncated key → wrong cache restored silently
+  - language: yaml
+    label: "RIGHT — hashFiles with explicit fallback"
+    code: |
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') || 'no-lockfile' }}
+          # ✅ If no lockfile, key becomes "Linux-node-no-lockfile" — deterministic and unique
+          restore-keys: |
+            ${{ runner.os }}-node-
+  - language: yaml
+    label: "DEBUG — verify glob matches before caching"
+    code: |
+      - name: Debug — check lockfile exists
+        run: find . -name "package-lock.json" | head -5
+        # If empty output: fix the glob or ensure lockfile is committed
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') || 'no-lockfile' }}
+prevention:
+  - "Always provide a `|| 'fallback-value'` after any hashFiles() call to prevent empty-string cache key truncation."
+  - "Test your hashFiles() glob locally: run `find . -name 'your-lockfile'` from the repo root to confirm it matches."
+  - "Include stable discriminators (runner.os, matrix values, Node version) in cache keys to reduce collision risk."
+  - "Review restored cache key in workflow logs — a key ending in just a short prefix without a 64-char hash is a sign of an empty hashFiles()."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#hashfiles"
+    label: "hashFiles() function documentation"
+  - url: "https://github.com/actions/runner/issues/894"
+    label: "actions/runner #894 — hashFiles returns empty string instead of hash"
+  - url: "https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows"
+    label: "Caching dependencies to speed up workflows"

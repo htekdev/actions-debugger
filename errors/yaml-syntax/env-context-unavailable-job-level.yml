@@ -1,0 +1,109 @@
+id: yaml-syntax-014
+title: "env Context Not Available at Job-Level if or Reusable Workflow Positions"
+category: yaml-syntax
+severity: error
+tags:
+  - env
+  - context
+  - job-if
+  - reusable-workflow
+  - expression
+  - context-availability
+patterns:
+  - regex: "Unrecognized named-value: 'env'"
+    flags: "i"
+  - regex: "The workflow is not valid.*Unrecognized named-value: 'env'"
+    flags: "i"
+  - regex: "Located at position \\d+ within expression.*env\\."
+    flags: "i"
+error_messages:
+  - "The workflow is not valid. .github/workflows/<workflow>.yml (Line: X, Col: Y): Unrecognized named-value: 'env'. Located at position Z within expression: <expression>"
+  - "Unrecognized named-value: 'env'. Located at position 1 within expression"
+root_cause: |
+  GitHub Actions evaluates job-level expressions (jobs.<job_id>.if, certain
+  jobs.<job_id>.with: inputs for reusable workflows) before any steps run and
+  before step-level env values are available. Because the `env` context is
+  only populated at step execution time, using `env.MY_VAR` inside a job-level
+  `if:` condition or inside a reusable workflow's `jobs:` block triggers a
+  validation error at parse time rather than a runtime failure.
+
+  This affects:
+  - `jobs.<job_id>.if: ${{ env.MY_VAR == 'foo' }}`
+  - `jobs.<job_id>.with:` fields referencing `env.*` in a reusable workflow call
+  - Any top-level workflow expression that attempts to read `env` context
+
+  Documented in actions/runner issues #1189, #1661, and #2372.
+fix: |
+  Replace env context references in job-level positions with contexts that are
+  available at job evaluation time:
+  - Use `vars.*` (repository/environment variables) for static configuration values
+  - Use `github.*` context for event-driven values
+  - Use `inputs.*` for values passed into reusable workflows
+  - Use job outputs (`needs.<job_id>.outputs.<name>`) to pass dynamic values
+    computed in earlier steps to downstream job `if:` conditions
+
+  If the value is truly dynamic and set in a previous step, emit it as a step
+  output → job output → needs output chain so downstream jobs can reference it.
+fix_code:
+  - language: yaml
+    label: "WRONG — env context in job-level if (fails validation)"
+    code: |
+      jobs:
+        deploy:
+          if: ${{ env.DEPLOY_ENV == 'production' }}  # ❌ env not available here
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying"
+  - language: yaml
+    label: "RIGHT — use vars context or job outputs instead"
+    code: |
+      # Option 1: use vars (repository/environment variables) for static config
+      jobs:
+        deploy:
+          if: ${{ vars.DEPLOY_ENV == 'production' }}  # ✅ vars available at job level
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying"
+
+      # Option 2: compute in a preceding job, emit as output
+      jobs:
+        compute-env:
+          runs-on: ubuntu-latest
+          outputs:
+            deploy_env: ${{ steps.set-env.outputs.deploy_env }}
+          steps:
+            - id: set-env
+              run: echo "deploy_env=production" >> $GITHUB_OUTPUT
+
+        deploy:
+          needs: compute-env
+          if: ${{ needs.compute-env.outputs.deploy_env == 'production' }}
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying"
+  - language: yaml
+    label: "RIGHT — reusable workflow: pass value via inputs not env"
+    code: |
+      # Caller workflow
+      jobs:
+        call-deploy:
+          uses: ./.github/workflows/deploy.yml
+          with:
+            environment: production  # ✅ pass via inputs, not env
+          secrets: inherit
+prevention:
+  - "Consult the GitHub docs context availability table before writing expressions — not all contexts are available at every YAML key position."
+  - "For job-level if conditions, use `vars.*`, `github.*`, or `needs.<job>.outputs.*` — never `env.*`."
+  - "For reusable workflow inputs, pass values explicitly through `with:` inputs rather than relying on caller env context."
+  - "Use `vars` (repository/environment variables) as a replacement for env-based feature flags that need to be available at job evaluation time."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#context-availability"
+    label: "Context availability — which contexts are available at each YAML key"
+  - url: "https://github.com/actions/runner/issues/1189"
+    label: "actions/runner #1189 — Unrecognized named-value: 'env' for job conditional"
+  - url: "https://github.com/actions/runner/issues/1661"
+    label: "actions/runner #1661 — env unrecognised in job-level if when calling reusable workflow"
+  - url: "https://github.com/actions/runner/issues/2372"
+    label: "actions/runner #2372 — Unrecognized named-value: 'env' in reusable workflow jobs"
+  - url: "https://stackoverflow.com/questions/76471787/why-is-env-context-not-available-in-github-action-job-level-if-statement"
+    label: "Stack Overflow — Why is env context not available in job level if statement?"
