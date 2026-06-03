@@ -1,0 +1,103 @@
+id: silent-failures-044
+title: 'upload-artifact path patterns resolved from workspace root — working-directory setting ignored'
+category: silent-failures
+severity: silent-failure
+tags:
+  - upload-artifact
+  - working-directory
+  - path
+  - glob
+  - artifacts
+  - workspace
+patterns:
+  - regex: 'No files were found with the provided path'
+    flags: 'i'
+  - regex: 'Warning: No files were found with the provided path'
+    flags: 'i'
+  - regex: 'artifact.*no files.*found|no files.*artifact'
+    flags: 'i'
+error_messages:
+  - "Error: No files were found with the provided path: dist/build.zip. No artifacts will be uploaded."
+  - "Warning: No files were found with the provided path: *.tar.gz. No artifacts will be uploaded."
+  - "No files were found with the provided path: output/*.zip"
+root_cause: |
+  The path: input in actions/upload-artifact (all versions) is always resolved
+  relative to $GITHUB_WORKSPACE (the repository root), regardless of any
+  working-directory: setting on the step or enclosing job.
+
+  Developers who set working-directory: dist at the job level or on the step
+  and then specify path: *.js or path: build.zip expect the glob to be evaluated
+  from within dist/. Instead, the action evaluates it from workspace root, finds
+  no matching files, and either warns and uploads nothing (silent-failure) or
+  fails the step entirely depending on if-no-files-found setting.
+
+  The working-directory: context is respected only by run: shell steps for
+  command execution. It is not propagated to uses: action inputs — actions
+  receive path inputs as raw strings and resolve them internally from GITHUB_WORKSPACE.
+
+  The same behavior applies to actions/download-artifact path: inputs and to
+  other actions that accept file path parameters (e.g., docker/build-push-action
+  context: and file: inputs also require workspace-relative paths).
+fix: |
+  Prefix all path: patterns with the subdirectory path relative to GITHUB_WORKSPACE.
+
+  Instead of:
+    working-directory: dist
+    path: build.zip
+
+  Use:
+    path: dist/build.zip
+
+  Or to upload an entire directory tree:
+    path: dist/
+
+  Set if-no-files-found: error to convert the silent warning into a visible
+  failure so path mistakes are caught immediately rather than silently producing
+  empty or missing artifacts downstream.
+fix_code:
+  - language: yaml
+    label: 'Use workspace-relative path instead of relying on working-directory'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Build
+              working-directory: dist    # only affects this run: step
+              run: npm run build
+
+            # WRONG: path: build.zip searches workspace root, not dist/
+            # - uses: actions/upload-artifact@v4
+            #   with:
+            #     name: release
+            #     path: build.zip
+
+            # CORRECT: include the subdirectory in the path
+            - uses: actions/upload-artifact@v4
+              with:
+                name: release
+                path: dist/build.zip    # relative to GITHUB_WORKSPACE
+                if-no-files-found: error
+  - language: yaml
+    label: 'Upload all files from a subdirectory and fail fast on missing files'
+    code: |
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-files
+          path: dist/               # uploads entire dist/ directory tree
+          if-no-files-found: error  # fail fast instead of silent warning
+prevention:
+  - 'Always write path: patterns in upload-artifact relative to GITHUB_WORKSPACE (repository root), not working-directory'
+  - 'Set if-no-files-found: error on every upload-artifact step to catch path mistakes immediately'
+  - 'Verify artifact contents in the Actions UI after the first run to confirm the correct files were captured'
+  - 'Remember that working-directory: only affects run: shell steps — uses: action inputs are always workspace-relative'
+  - 'Use ${{ github.workspace }} to build absolute paths when the relative path is ambiguous'
+docs:
+  - url: 'https://github.com/actions/upload-artifact#inputs'
+    label: 'actions/upload-artifact inputs — path field documentation'
+  - url: 'https://github.com/actions/upload-artifact/issues/232'
+    label: 'upload-artifact#232: path is resolved relative to workspace root, not working-directory (community report)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/store-information-in-variables#default-environment-variables'
+    label: 'GITHUB_WORKSPACE default environment variable — GitHub Docs'

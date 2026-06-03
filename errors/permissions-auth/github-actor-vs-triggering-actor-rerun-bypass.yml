@@ -1,0 +1,111 @@
+id: permissions-auth-033
+title: 'github.actor frozen at original trigger time — github.triggering_actor differs on re-run, breaking actor-based access checks'
+category: permissions-auth
+severity: silent-failure
+tags:
+  - github.actor
+  - github.triggering_actor
+  - re-run
+  - access-control
+  - if-condition
+  - silent-failure
+  - permissions
+patterns:
+  - regex: 'github\.triggering_actor|triggering_actor'
+    flags: 'i'
+  - regex: 'Skipping.*actor.*not.*allowed|actor.*not in.*allowlist'
+    flags: 'i'
+  - regex: 'Access denied.*github\.actor'
+    flags: 'i'
+error_messages:
+  - "Skipping deployment: actor 'original-bot' is not in the deployers allowlist"
+  - "Access denied: github.actor does not match the expected release account"
+root_cause: |
+  GitHub Actions provides two separate context properties for workflow actor identity:
+
+  github.actor           — the user or app that ORIGINALLY triggered the workflow run
+  github.triggering_actor — the user or app that triggered the CURRENT run attempt
+                            (reflects re-runs and re-trigger operations)
+
+  These values are identical for the first run of a workflow. They diverge when
+  the workflow is re-triggered via the "Re-run jobs" button, "Re-run failed jobs",
+  or the REST API re-run endpoint. In that case, github.actor still holds the
+  original requester's login while github.triggering_actor holds the person or
+  app that clicked re-run.
+
+  Two classes of silent failure result:
+
+  1. Security bypass: A workflow guards a deployment with
+     if: github.actor == 'deploy-bot'. A human clicks "Re-run" — github.actor
+     still shows 'deploy-bot' (original requester), so the guard passes and the
+     human inadvertently triggers a privileged deployment step.
+
+  2. Unintended block: A workflow allows deployments only for a specific release
+     manager by checking github.actor. A second authorized team member re-runs
+     the workflow — github.actor shows the original requester (someone else),
+     so the guard incorrectly blocks the re-run.
+
+  In both cases there is no error message indicating the actor mismatch — the
+  guard silently passes or silently blocks based on stale identity data.
+fix: |
+  For access control checks that should apply to WHO IS CURRENTLY RUNNING the
+  workflow (including re-runs), replace github.actor with github.triggering_actor.
+
+  For checks that must enforce the original requester (e.g., "only the PR author
+  can trigger this check"), use github.actor explicitly and document the intent.
+
+  For high-security deployment gates, use GitHub Environment protection rules
+  with required reviewers. Environment protection is enforced by GitHub platform
+  security rather than YAML if: conditions and cannot be bypassed by re-runs.
+fix_code:
+  - language: yaml
+    label: 'Use triggering_actor for re-run-aware access control'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            # WRONG: github.actor is frozen at original trigger time
+            # github.actor still shows 'deploy-bot' even when a human re-runs
+            # - name: Gate check
+            #   if: github.actor != 'deploy-bot'
+            #   run: exit 1
+
+            # CORRECT: github.triggering_actor reflects who actually ran this attempt
+            - name: Gate check
+              if: github.triggering_actor != 'deploy-bot'
+              run: |
+                echo "::error::Deploy must be triggered by deploy-bot, got ${{ github.triggering_actor }}"
+                exit 1
+
+            - name: Deploy
+              run: ./deploy.sh
+  - language: yaml
+    label: 'Use environment protection rules for production deployments (preferred)'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          environment: production    # required reviewers enforced at platform level
+          steps:
+            - name: Deploy
+              env:
+                ACTOR: ${{ github.actor }}
+                TRIGGERED_BY: ${{ github.triggering_actor }}
+              run: |
+                echo "Original trigger: $ACTOR"
+                echo "This run triggered by: $TRIGGERED_BY"
+                ./deploy.sh
+prevention:
+  - 'Use github.triggering_actor (not github.actor) when the intent is to check who triggered the current run attempt'
+  - 'Prefer GitHub Environment protection rules and required reviewers over actor-based if: conditions for deployment gates'
+  - 'Document in each workflow whether actor checks use github.actor (original) or github.triggering_actor (current)'
+  - 'Test actor-based gates by having a second authorized user re-run the workflow to verify the check fires as expected'
+  - 'Never use github.actor alone for security-sensitive production deployment gates — it is not re-run-aware'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context'
+    label: 'github context — github.actor vs github.triggering_actor properties'
+  - url: 'https://github.blog/changelog/2022-08-09-github-actions-re-run-workflows-and-jobs/'
+    label: 'GitHub Changelog 2022-08-09: Re-run workflows and jobs — introducing triggering_actor'
+  - url: 'https://github.com/orgs/community/discussions/27154'
+    label: 'GitHub Community: github.actor vs github.triggering_actor for re-run access control'

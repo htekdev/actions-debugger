@@ -1,0 +1,97 @@
+id: yaml-syntax-034
+title: 'runs-on label array requires ALL labels to match (AND logic) — job queues indefinitely when no runner qualifies'
+category: yaml-syntax
+severity: error
+tags:
+  - runs-on
+  - self-hosted
+  - labels
+  - runner-matching
+  - AND-logic
+  - job-queue
+  - infinite-wait
+patterns:
+  - regex: 'Waiting for a runner to pick up this job'
+    flags: 'i'
+  - regex: 'Could not find any available self-hosted runner that matches the required labels'
+    flags: 'i'
+  - regex: 'No hosted runner matching the labels.*was found'
+    flags: 'i'
+error_messages:
+  - "Waiting for a runner to pick up this job"
+  - "Could not find any available self-hosted runner that matches the required labels: self-hosted, linux, arm64, fast-ssd"
+  - "No hosted runner matching the labels ['self-hosted', 'linux', 'gpu'] was found"
+root_cause: |
+  When runs-on: specifies an array of labels, GitHub requires a runner to have
+  ALL of the listed labels simultaneously (AND logic, not OR). A runner registered
+  with labels [self-hosted, linux, x64] will NOT match
+  runs-on: [self-hosted, linux, arm64] because it is missing the arm64 label,
+  even though it has two of the three required labels.
+
+  Common causes of permanent queueing:
+  - Combining labels from different runner types in one runs-on: array, expecting
+    any runner matching any label to pick up the job
+  - A typo in one label (e.g., "arm64" vs "aarch64") making the full set unmatchable
+  - Adding a new label requirement without ensuring at least one runner carries it
+  - Using a label that was renamed on the runner registration but not updated in workflows
+  - Combining GitHub-hosted runner identifiers with self-hosted labels
+    (e.g., [ubuntu-latest, self-hosted]) — GitHub-hosted runners do not carry
+    the self-hosted label, so this combination never matches any runner
+
+  The job queues indefinitely with "Waiting for a runner to pick up this job" and
+  never times out automatically unless job timeout-minutes or org-level timeout
+  limits are configured. The error message lists all required labels but does not
+  indicate which specific label is unmatched.
+fix: |
+  Ensure at least one registered runner has EVERY label in the runs-on: array.
+  Check Settings > Actions > Runners to verify exact label sets on each runner.
+
+  For different runner types (e.g., x64 vs ARM), use separate jobs rather than
+  a single job with an impossible label combination. For OR semantics across
+  runner types, use a matrix strategy.
+
+  For GitHub-hosted runners, use a single label string (ubuntu-latest,
+  windows-latest, macos-latest) not an array.
+fix_code:
+  - language: yaml
+    label: 'Use only labels that ALL exist on at least one registered runner'
+    code: |
+      jobs:
+        # WRONG: no single runner has both fast-ssd AND arm64 labels
+        # build:
+        #   runs-on: [self-hosted, linux, arm64, fast-ssd]
+
+        # CORRECT: use only labels that exist together on one runner
+        build:
+          runs-on: [self-hosted, linux, arm64]   # matches a runner with all three
+
+        # CORRECT for GitHub-hosted: single string label
+        test:
+          runs-on: ubuntu-latest
+  - language: yaml
+    label: 'Use matrix to target multiple runner types (OR semantics)'
+    code: |
+      jobs:
+        test:
+          strategy:
+            matrix:
+              runner:
+                - ubuntu-latest
+                - [self-hosted, linux, arm64]
+          runs-on: ${{ matrix.runner }}
+          steps:
+            - uses: actions/checkout@v4
+            - run: make test
+prevention:
+  - 'Treat runs-on: arrays as requiring ALL labels on one runner simultaneously — never use them as OR matching'
+  - 'Keep self-hosted runner label sets minimal (2-3 labels) to reduce the risk of unmatched combinations'
+  - 'Audit all workflow runs-on: references when renaming or removing runner labels — old labels cause indefinite queueing'
+  - 'Verify exact label sets in GitHub Settings > Actions > Runners before writing runs-on: arrays'
+  - 'Set a job-level timeout-minutes to prevent stuck jobs from blocking runners indefinitely'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-where-your-workflow-runs/choosing-the-runner-for-a-job#choosing-self-hosted-runners'
+    label: 'Choosing self-hosted runners — label matching behavior (AND semantics)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/using-labels-with-self-hosted-runners'
+    label: 'Using labels with self-hosted runners'
+  - url: 'https://github.com/orgs/community/discussions/25033'
+    label: 'GitHub Community: Self-hosted runner label AND matching — job queues indefinitely'
