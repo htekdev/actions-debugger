@@ -1,0 +1,96 @@
+id: permissions-auth-036
+title: 'GITHUB_TOKEN cannot push commits to branches protected by "Require signed commits" — token identity cannot sign'
+category: permissions-auth
+severity: error
+tags:
+  - github-token
+  - signed-commits
+  - branch-protection
+  - gpg
+  - push
+  - protected-branch
+patterns:
+  - regex: 'GH006.*Protected branch.*signed|Commits must have verified signatures'
+    flags: 'i'
+  - regex: 'Changes must be signed|protected branch.*signed.*commits'
+    flags: 'i'
+error_messages:
+  - 'remote: error: GH006: Protected branch update failed for refs/heads/main.'
+  - 'remote: error: Commits must have verified signatures.'
+  - 'remote: error: Changes must be signed.'
+root_cause: |
+  GitHub's "Require signed commits" branch protection rule requires every pushed commit
+  to carry a verified GPG or SSH signature. The GITHUB_TOKEN is a short-lived bearer token
+  scoped to a workflow run — it has no associated GPG or SSH signing key and cannot produce
+  verified commit signatures.
+
+  This means any workflow that creates commits and pushes them using GITHUB_TOKEN will fail
+  on branches protected by "Require signed commits", regardless of the token's permission
+  level. Having contents: write permission is necessary but not sufficient: the signature
+  requirement is enforced by a separate push hook after permission checks pass.
+
+  Common workflow patterns that hit this:
+  - Auto-commit actions (stefanzweifel/auto-commit-action, EndBug/add-and-commit) that
+    commit generated files (changelogs, coverage badges, built assets) back to main
+  - Release workflows that bump version numbers in committed files before tagging
+  - Automated dependency update workflows that commit lockfile changes
+  - Documentation generation workflows that commit generated API docs or OpenAPI specs
+
+  The GH006 error appears in the push step's output but the job may not fail loudly if
+  the step's exit code is not checked carefully. In some auto-commit actions, the failure
+  surfaces as an unexpected empty push with no error surfaced to the workflow summary.
+fix: |
+  Option 1 — Create a pull request instead of direct push (recommended): Use
+  peter-evans/create-pull-request or similar to push the auto-generated commit to a
+  feature branch, then open a PR. Feature branches are not subject to the main branch's
+  "Require signed commits" protection.
+
+  Option 2 — GitHub App with bypass: Create a GitHub App and add it to the branch
+  protection "Allow specific actors to bypass required pull request reviews and required
+  status checks" bypass list. Generate tokens for the App in the workflow and push with
+  the App token. The App's bot commits can bypass the signed-commits requirement if
+  explicitly listed as a bypass actor.
+
+  Option 3 — Signed commits via GitHub App SSH key: Configure a GitHub App with an
+  SSH signing key. Use the App installation token and the App's SSH key for commit
+  signing via GIT_COMMITTER_EMAIL and gpg.format = ssh configuration.
+
+  The GITHUB_TOKEN itself cannot be configured for commit signing — this is a platform
+  limitation with no in-token workaround.
+fix_code:
+  - language: yaml
+    label: 'Create a pull request instead of pushing directly — avoids signed commits requirement on main'
+    code: |
+      jobs:
+        update-generated:
+          runs-on: ubuntu-latest
+          permissions:
+            contents: write
+            pull-requests: write
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Regenerate files
+              run: make generate
+
+            - name: Create pull request for generated output
+              uses: peter-evans/create-pull-request@v7
+              with:
+                commit-message: 'chore: regenerate auto-generated files'
+                branch: automated/regenerate-output
+                title: 'chore: automated file regeneration'
+                body: 'Automated regeneration triggered by CI. Merge after review.'
+                # Commit targets the feature branch, not main — signed-commits rule on
+                # main does not apply to the automated/ branch
+prevention:
+  - 'Before enabling "Require signed commits" on a branch, audit all workflows that push commits using GITHUB_TOKEN to that branch'
+  - 'Use the create-pull-request pattern for auto-generated commits rather than pushing directly to protected branches'
+  - 'Document in workflow files that GITHUB_TOKEN cannot push to branches with signed-commits protection'
+  - 'If a GitHub App bypass is used, rotate the App private key regularly and scope permissions to the minimum required'
+docs:
+  - url: 'https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-signed-commits'
+    label: 'GitHub Docs: Require signed commits branch protection'
+  - url: 'https://docs.github.com/en/authentication/managing-commit-signature-verification/about-commit-signature-verification'
+    label: 'GitHub Docs: About commit signature verification'
+  - url: 'https://github.com/orgs/community/discussions/13836'
+    label: 'GitHub Community #13836: GITHUB_TOKEN cannot push to branch requiring signed commits'
