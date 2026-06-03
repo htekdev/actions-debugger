@@ -1,0 +1,80 @@
+id: 'caching-artifacts-027'
+title: 'restore-keys fallback matches cross-OS or cross-architecture cache, restoring incompatible binaries'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - cache
+  - restore-keys
+  - cross-platform
+  - architecture
+  - arm64
+  - runner-os
+patterns:
+  - regex: 'restore-keys:'
+    flags: 'i'
+error_messages:
+  - 'Cache restored from key'
+  - 'Exec format error'
+  - 'cannot execute binary file: Exec format error'
+root_cause: |
+  restore-keys performs prefix matching against ALL cached entries in the repository,
+  regardless of operating system or CPU architecture. When a restore-keys prefix is
+  shorter than the primary cache key and omits runner.os or runner.arch, a cache
+  saved on one platform can be silently restored on a different one.
+
+  Example: primary key Linux-x64-node-abc123, restore-keys Linux-node- will match
+  a Linux ARM64 cache saved as Linux-arm64-node-xyz789. The ARM64 node_modules
+  contains native addon binaries (esbuild, sqlite3, etc.) compiled for ARM64; when
+  restored on an x64 runner, they fail at runtime with "Exec format error."
+
+  This became a widespread issue after GitHub introduced macOS ARM64 (M1/M2) runners
+  in 2023 and Linux ARM64 runners in 2024. Teams adding new runner architectures
+  to existing matrix builds often expose this silently.
+
+  The cache-hit output evaluates to 'true' even for cross-architecture restores,
+  providing no indication that the restored content may be incompatible.
+fix: |
+  Always include runner.os AND runner.arch in every level of restore-keys, mirroring
+  whatever isolation is present in the primary cache key. No restore-keys prefix should
+  ever be shorter than the architecture scope of the primary key.
+fix_code:
+  - language: yaml
+    label: 'Include runner.os and runner.arch in all restore-keys levels'
+    code: |
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          # Primary key includes full OS and architecture isolation
+          key: ${{ runner.os }}-${{ runner.arch }}-node-${{ hashFiles('**/package-lock.json') }}
+          # Every fallback level maintains OS plus architecture isolation
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-node-
+            ${{ runner.os }}-${{ runner.arch }}-
+  - language: yaml
+    label: 'Matrix build with per-arch cache keys'
+    code: |
+      strategy:
+        matrix:
+          os: [ubuntu-latest, macos-latest, windows-latest]
+          arch: [x64, arm64]
+      steps:
+        - uses: actions/cache@v4
+          with:
+            path: |
+              ~/.cargo/registry
+              target/
+            key: ${{ matrix.os }}-${{ matrix.arch }}-rust-${{ hashFiles('**/Cargo.lock') }}
+            restore-keys: |
+              ${{ matrix.os }}-${{ matrix.arch }}-rust-
+prevention:
+  - 'Always include runner.os AND runner.arch in every level of restore-keys'
+  - 'Audit cache configurations when adding new runner OS or arch combinations to matrix builds'
+  - 'Add a verification step after cache restore to confirm a native binary executes correctly'
+  - 'When migrating from x64-only to multi-arch, update all restore-keys at the same time'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows#matching-a-cache-key'
+    label: 'GitHub Docs: Matching a cache key'
+  - url: 'https://github.com/actions/cache#inputs'
+    label: 'actions/cache README: restore-keys input'
+  - url: 'https://github.com/actions/cache/issues/1660'
+    label: 'actions/cache#1660: restore-keys cross-architecture match'

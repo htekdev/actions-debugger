@@ -1,0 +1,72 @@
+id: 'concurrency-timing-024'
+title: 'timeout-minutes applies to job execution only, not queue wait time — jobs can wait indefinitely'
+category: concurrency-timing
+severity: warning
+tags:
+  - timeout
+  - queue
+  - self-hosted
+  - runner
+  - wait-time
+patterns:
+  - regex: 'timeout-minutes:\s*\d+'
+    flags: 'i'
+error_messages:
+  - 'The job running on runner has exceeded the maximum execution time of'
+  - 'The operation was canceled.'
+root_cause: |
+  timeout-minutes only counts elapsed time from when a job actually begins executing on
+  a runner — not from when it enters the queue. A job waiting for an available runner
+  slot (including jobs waiting in a concurrency group queue) can sit pending for hours
+  or indefinitely without any timeout being applied.
+
+  This is particularly impactful with:
+  - Self-hosted runners under heavy load with limited runner capacity
+  - Concurrency groups with cancel-in-progress: false that accumulate queued jobs
+  - Repository-level runner quotas on GitHub-hosted runners during peak usage
+
+  Developers are often surprised that a job with timeout-minutes: 30 waited 4+ hours
+  before starting, then proceeded to run for its full 30-minute budget.
+fix: |
+  There is no native queue-timeout setting in GitHub Actions. Recommended workarounds:
+
+  1. Set cancel-in-progress: true in concurrency groups to drop stale queued jobs
+     when newer commits arrive, preventing queue accumulation.
+  2. Monitor queue depth using the GitHub REST API /repos/{owner}/{repo}/actions/runs
+     and set up external alerting for runs stuck in 'queued' status too long.
+  3. Ensure adequate self-hosted runner pool capacity relative to expected parallelism.
+  4. Use github-hosted runners for time-sensitive jobs to avoid self-hosted queue depth issues.
+fix_code:
+  - language: yaml
+    label: 'Prevent queue accumulation with cancel-in-progress'
+    code: |
+      jobs:
+        build:
+          runs-on: self-hosted
+          timeout-minutes: 30  # Only counts execution time, NOT queue wait time
+          concurrency:
+            group: ${{ github.workflow }}-${{ github.ref }}
+            cancel-in-progress: true  # Drop stale queued jobs on new push
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./build.sh
+  - language: yaml
+    label: 'External queue monitoring via API'
+    code: |
+      # Monitor for stuck queued runs via GitHub API
+      # GET /repos/{owner}/{repo}/actions/runs?status=queued
+      # Alert if any run has been queued for more than N minutes
+      # (implement in a separate monitoring workflow or external system)
+prevention:
+  - 'Do not assume timeout-minutes prevents jobs from waiting indefinitely in the runner queue'
+  - 'Use cancel-in-progress: true for CI workflows to prevent queue accumulation'
+  - 'Size self-hosted runner pools to handle expected peak concurrency'
+  - 'Monitor workflow run queue depth separately via the GitHub REST API'
+  - 'Document queue wait behavior in team CI runbooks so on-call engineers know what to expect'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idtimeout-minutes'
+    label: 'GitHub Docs: timeout-minutes'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency'
+    label: 'GitHub Docs: Using concurrency'
+  - url: 'https://docs.github.com/en/rest/actions/workflow-runs'
+    label: 'GitHub REST API: Workflow runs'

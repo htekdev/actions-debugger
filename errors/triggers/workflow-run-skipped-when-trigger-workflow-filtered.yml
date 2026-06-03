@@ -1,0 +1,88 @@
+id: 'triggers-026'
+title: 'workflow_run does not fire when triggering workflow is skipped by paths or branches filter'
+category: triggers
+severity: silent-failure
+tags:
+  - workflow-run
+  - skipped
+  - paths-filter
+  - branches-filter
+  - trigger-chain
+patterns:
+  - regex: 'workflow_run'
+    flags: 'i'
+  - regex: 'types:\s*\[.*completed.*\]'
+    flags: 'i'
+error_messages:
+  - 'This run was triggered by a workflow_run event but the parent workflow was not found'
+root_cause: |
+  When a workflow is skipped because its on.push.paths or on.push.branches filter does not
+  match the pushed commit, GitHub does not create a workflow run record and therefore does
+  not emit a workflow_run completion event. A downstream workflow that listens for
+  on.workflow_run: [UpstreamWorkflow] with types: [completed] silently never fires.
+
+  This breaks fan-out CI/CD architectures where a primary workflow is gated by path/branch
+  filters, and secondary workflows (deploy, notify, publish) depend on its completion.
+  When the paths filter causes the primary workflow to be skipped entirely, the downstream
+  chain is dropped with no error message.
+
+  The issue affects both on.push.paths and on.push.branches filters. It does not affect
+  workflows that run but exit early via an if: condition on a job — only skipped runs
+  (which never appear in the GitHub Actions run list) cause the downstream gap.
+fix: |
+  Replace trigger-level on.push.paths filtering with in-workflow job-level path detection
+  using an action like dorny/paths-filter. This ensures the upstream workflow always
+  creates a run (triggering the workflow_run event), while individual jobs are skipped
+  when paths do not match.
+fix_code:
+  - language: yaml
+    label: 'Replace trigger-level paths filter with in-workflow detection'
+    code: |
+      # upstream.yml
+      # BAD: on.push.paths silently skips the run — workflow_run downstream never fires
+      # on:
+      #   push:
+      #     paths: ['src/**']
+
+      # GOOD: Always run, detect paths inside the workflow
+      on: [push]
+
+      jobs:
+        detect-changes:
+          runs-on: ubuntu-latest
+          outputs:
+            src-changed: ${{ steps.filter.outputs.src }}
+          steps:
+            - uses: actions/checkout@v4
+            - uses: dorny/paths-filter@v3
+              id: filter
+              with:
+                filters: |
+                  src:
+                    - 'src/**'
+
+        build:
+          needs: detect-changes
+          if: ${{ needs.detect-changes.outputs.src-changed == 'true' }}
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./build.sh
+
+      # downstream.yml — now reliably fires on every push
+      # on:
+      #   workflow_run:
+      #     workflows: ['Upstream CI']
+      #     types: [completed]
+prevention:
+  - 'Do not combine on.push.paths/branches filters with workflow_run downstream dependencies'
+  - 'Use dorny/paths-filter or tj-actions/changed-files inside always-running workflows instead'
+  - 'Test the full trigger chain end-to-end by pushing commits that both match and do not match the filter'
+  - 'Document the skipped-runs gap in team CI docs for anyone building workflow_run chains'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run'
+    label: 'GitHub Docs: workflow_run — triggering workflow must run on default branch'
+  - url: 'https://github.com/dorny/paths-filter'
+    label: 'dorny/paths-filter — job-level path filtering'
+  - url: 'https://github.com/orgs/community/discussions/23710'
+    label: 'GitHub Community: workflow_run not triggered when upstream workflow is skipped'
