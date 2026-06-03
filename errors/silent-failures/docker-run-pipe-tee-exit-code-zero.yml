@@ -1,0 +1,99 @@
+id: silent-failures-026
+title: "Docker Run Exit Code Masked When Output Is Piped to tee"
+category: silent-failures
+severity: silent-failure
+tags:
+  - docker
+  - exit-code
+  - pipe
+  - tee
+  - bash
+  - pipefail
+patterns:
+  - regex: "docker run.*\\|.*tee"
+    flags: "i"
+  - regex: "PIPESTATUS|pipefail"
+    flags: "i"
+error_messages:
+  - "Pipe status: 0"
+  - "Exit status: 0"
+  - "The command succeeded."
+root_cause: |
+  When a `docker run` command is piped to `tee` for dual-output (file + console),
+  the shell's `$?` variable captures the exit code of the *last command in the
+  pipeline* — which is `tee`. Since `tee` always exits 0 (unless it cannot write
+  to the output file), the workflow step always reports success even when the
+  container process exits with a non-zero code.
+
+  Example:
+    docker run myimage pytest tests/ 2>&1 | tee output.txt
+    echo $?  # Always 0 — tee's exit code, not docker's
+
+  GitHub Actions enables `set -e` and `set -o pipefail` by default for bash steps,
+  but `pipefail` only propagates failures if the pipeline command itself fails.
+  When the output of `docker run` is piped, the runner still sees `tee`'s exit code
+  as the step's result.
+
+  `${PIPESTATUS[0]}` is the bash array of exit codes for each pipeline segment, but
+  it must be captured *immediately* after the pipeline — it is overwritten by the
+  next command.
+
+  Sources: stackoverflow.com/questions/79075923
+fix: |
+  Option 1 (Recommended): Capture the docker exit code via PIPESTATUS immediately
+  after the pipeline, before running any other command.
+
+  Option 2: Run docker without piping, capturing output to a variable first, then
+  echo it and write to file. This avoids the PIPESTATUS problem entirely.
+
+  Option 3: Enable `set -o pipefail` in the step shell (note: GitHub Actions bash
+  steps do NOT enable pipefail by default despite documentation implying otherwise —
+  test explicitly).
+fix_code:
+  - language: yaml
+    label: "Capture docker exit code via PIPESTATUS[0]"
+    code: |
+      - name: Run tests in Docker
+        run: |
+          docker run myimage pytest tests/ 2>&1 | tee output.txt
+          DOCKER_EXIT=${PIPESTATUS[0]}
+          # PIPESTATUS must be captured immediately after the pipeline
+          echo "Docker exit code: $DOCKER_EXIT"
+          if [ "$DOCKER_EXIT" -ne 0 ]; then
+            echo "Tests failed inside container."
+            exit "$DOCKER_EXIT"
+          fi
+  - language: yaml
+    label: "Avoid piping: capture output in variable, then write and echo"
+    code: |
+      - name: Run tests in Docker
+        run: |
+          # Capture output without piping — preserves $? correctly
+          docker_output=$(docker run myimage pytest tests/ 2>&1)
+          DOCKER_EXIT=$?
+          echo "$docker_output"          # Show in Actions log
+          echo "$docker_output" > output.txt  # Also write to file
+          if [ "$DOCKER_EXIT" -ne 0 ]; then
+            echo "Tests failed (exit $DOCKER_EXIT)"
+            exit "$DOCKER_EXIT"
+          fi
+  - language: yaml
+    label: "Use process substitution to write to file without a pipeline"
+    code: |
+      - name: Run tests in Docker
+        run: |
+          # tee via process substitution — preserves docker's exit code
+          docker run myimage pytest tests/ 2>&1 > >(tee output.txt)
+          # $? is now docker's exit code, not tee's
+prevention:
+  - "Never check $? after a piped command to determine success — always use ${PIPESTATUS[0]} or avoid piping."
+  - "Add an explicit exit-code check after any docker run step, especially when the step uses | tee or redirections."
+  - "Consider adding `set -o pipefail` at the top of multi-command run steps to catch pipeline failures automatically."
+  - "Test workflows with a deliberately failing container command to confirm the step actually fails as expected."
+docs:
+  - url: "https://www.gnu.org/software/bash/manual/bash.html#index-PIPESTATUS"
+    label: "Bash manual — PIPESTATUS"
+  - url: "https://stackoverflow.com/questions/79075923/how-can-i-get-the-error-codes-in-github-actions-shell-when-a-docker-run-command"
+    label: "SO: Get error codes in github-actions shell when docker run command fails while piping output"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions"
+    label: "GitHub Actions workflow commands"
