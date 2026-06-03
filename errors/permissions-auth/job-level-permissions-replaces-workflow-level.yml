@@ -1,0 +1,123 @@
+id: permissions-auth-034
+title: 'Job-level permissions: block replaces workflow-level permissions — undeclared scopes are silently removed'
+category: permissions-auth
+severity: silent-failure
+tags:
+  - permissions
+  - GITHUB_TOKEN
+  - job-level
+  - workflow-level
+  - 403
+patterns:
+  - regex: 'Resource not accessible by integration'
+    flags: 'i'
+  - regex: 'HttpError.*403'
+    flags: 'i'
+error_messages:
+  - 'Resource not accessible by integration'
+  - 'HttpError: Resource not accessible by integration'
+  - '403 Forbidden'
+root_cause: |
+  The permissions: block in GitHub Actions is a REPLACEMENT at the scope where
+  it is applied — it does NOT inherit or merge with permissions defined at a
+  parent scope.
+
+  Example: if a workflow defines top-level permissions:
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+
+  And a job within that workflow also defines permissions:
+    permissions:
+      deployments: write
+
+  Then that job's GITHUB_TOKEN has ONLY deployments: write. The
+  contents: write, issues: write, and pull-requests: write scopes are
+  completely dropped for that job.
+
+  Developers expect job-level permissions to be ADDITIVE (adding new
+  permissions on top of the workflow-level set). The actual behavior is the
+  opposite: job-level permissions creates an entirely new permission set for
+  that job, discarding all workflow-level grants not re-declared.
+
+  The failure is silent — no warning is emitted about the permission reduction.
+  Steps produce 403 or "Resource not accessible by integration" only when
+  they actually attempt to use the silently-removed permission.
+fix: |
+  When using a job-level permissions: block, re-declare ALL permissions
+  that the job needs — not just the new ones you want to add.
+
+  Alternatively, if all jobs in the workflow need the same permission set,
+  set permissions only at the workflow level and omit job-level overrides.
+
+  Best practice: prefer job-level permissions over workflow-level for the
+  principle of least privilege — each job explicitly declares only what it
+  needs, with no inheritance confusion.
+fix_code:
+  - language: yaml
+    label: 'Wrong: job-level block silently drops workflow-level grants'
+    code: |
+      # Workflow level
+      permissions:
+        contents: write
+        issues: write
+
+      jobs:
+        deploy:
+          permissions:
+            deployments: write   # This REPLACES the above — contents and issues are now GONE
+          steps:
+            - name: Comment on issue
+              uses: actions/github-script@v7
+              with:
+                script: |
+                  # This will 403 — issues: write was silently removed
+                  await github.rest.issues.createComment({ issue_number: 1, body: 'deployed' })
+  - language: yaml
+    label: 'Correct: re-declare all needed permissions at job level'
+    code: |
+      # No workflow-level permissions block needed when using job-level
+
+      jobs:
+        deploy:
+          permissions:
+            contents: write      # Re-declared (was at workflow level)
+            issues: write        # Re-declared (was at workflow level)
+            deployments: write   # New permission added
+          steps:
+            - name: Comment on issue
+              uses: actions/github-script@v7
+              with:
+                script: |
+                  await github.rest.issues.createComment({ issue_number: 1, body: 'deployed' })
+  - language: yaml
+    label: 'Minimal job permissions — each job declares only what it needs'
+    code: |
+      # No workflow-level permissions block — all scoped to jobs
+
+      jobs:
+        test:
+          permissions:
+            checks: write
+            contents: read
+          steps:
+            - uses: actions/checkout@v4
+
+        deploy:
+          permissions:
+            contents: read
+            deployments: write
+            id-token: write
+          steps:
+            - run: echo "deploying"
+prevention:
+  - 'When adding a job-level permissions block, start by listing every permission the job needs from scratch'
+  - 'Do not assume any permissions flow down from the workflow level when a job block is present'
+  - 'Prefer defining all permissions at the job level (not workflow level) to make the permission set explicit'
+  - 'The GitHub Docs explicitly state: permissions at the job level override the workflow-level setting'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/controlling-permissions-for-github_token'
+    label: 'GitHub Docs — Controlling permissions for GITHUB_TOKEN'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idpermissions'
+    label: 'GitHub Docs — jobs.<job_id>.permissions syntax'

@@ -1,0 +1,99 @@
+id: silent-failures-048
+title: 'Composite action outputs not propagated — outputs: declaration required in action.yml'
+category: silent-failures
+severity: silent-failure
+tags:
+  - composite
+  - outputs
+  - action.yml
+  - step-outputs
+  - empty-string
+patterns:
+  - regex: 'steps\.\w+\.outputs\.'
+    flags: 'i'
+error_messages: []
+root_cause: |
+  In composite actions, step outputs from internal steps are NOT automatically
+  visible to the action's callers. The composite action's action.yml must
+  declare an outputs: block that explicitly maps each output name to a value
+  expression referencing an internal step's output:
+
+    outputs:
+      my-result:
+        description: "The result"
+        value: ${{ steps.build.outputs.result }}
+
+  Without this declaration, ${{ steps.my-action.outputs.my-result }} in the
+  calling workflow evaluates to empty string with no error or warning.
+
+  This is different from regular workflow jobs, where step outputs are
+  accessible within the same job via steps.<id>.outputs.<name> without any
+  explicit mapping. Composite actions require explicit wiring because the
+  action boundary creates an isolation layer — internal step IDs are not
+  exposed to callers.
+
+  Common mistake pattern: developer tests the composite action, sees that
+  internal steps set outputs correctly, but the caller always receives "".
+  The action.yml outputs: block is missing or references a wrong step id.
+fix: |
+  1. Open the composite action's action.yml file.
+  2. Add an outputs: block (after the inputs: block if present).
+  3. For each output you need to expose, add an entry with:
+       value: ${{ steps.<internal-step-id>.outputs.<output-name> }}
+  4. Ensure the referenced internal step has a matching id: field.
+  5. Ensure the internal step writes outputs via GITHUB_OUTPUT:
+       echo "result=value" >> $GITHUB_OUTPUT
+fix_code:
+  - language: yaml
+    label: 'action.yml — declare outputs with value expressions'
+    code: |
+      # .github/actions/my-build/action.yml
+      name: 'My Build Action'
+      description: 'Builds the project and returns the version'
+
+      outputs:
+        build-version:
+          description: 'The version that was built'
+          value: ${{ steps.get-version.outputs.version }}
+        artifact-path:
+          description: 'Path to the built artifact'
+          value: ${{ steps.build.outputs.artifact }}
+
+      runs:
+        using: composite
+        steps:
+          - id: get-version
+            shell: bash
+            run: echo "version=$(cat version.txt)" >> $GITHUB_OUTPUT
+
+          - id: build
+            shell: bash
+            run: |
+              make build
+              echo "artifact=dist/app.tar.gz" >> $GITHUB_OUTPUT
+  - language: yaml
+    label: 'Calling workflow — accessing composite action outputs'
+    code: |
+      jobs:
+        release:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - id: build
+              uses: ./.github/actions/my-build
+
+            - name: Use outputs
+              run: |
+                echo "Version: ${{ steps.build.outputs.build-version }}"
+                echo "Artifact: ${{ steps.build.outputs.artifact-path }}"
+prevention:
+  - 'Every composite action output must have a corresponding entry in the outputs: block of action.yml'
+  - 'Internal steps must have an id: field for the outputs value: expression to reference'
+  - 'The step id in the value: expression must exactly match the internal step id: value'
+  - 'Add a debug step in the action to print $GITHUB_OUTPUT contents when troubleshooting'
+docs:
+  - url: 'https://docs.github.com/en/actions/sharing-automations/creating-actions/metadata-syntax-for-github-actions#outputs-for-composite-actions'
+    label: 'GitHub Docs — Outputs for composite actions'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/passing-information-between-jobs'
+    label: 'GitHub Docs — Passing information between jobs'
