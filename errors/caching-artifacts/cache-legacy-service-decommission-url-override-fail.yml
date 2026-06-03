@@ -1,0 +1,120 @@
+id: caching-artifacts-031
+title: 'Cache failures from manually-overridden ACTIONS_CACHE_URL after legacy service decommission (April 2025)'
+category: caching-artifacts
+severity: error
+tags:
+  - cache
+  - legacy-service
+  - ACTIONS_CACHE_URL
+  - service-migration
+  - brownout
+  - self-hosted
+patterns:
+  - regex: 'ACTIONS_CACHE_URL.*403|ACTIONS_CACHE_URL.*503|ACTIONS_CACHE_URL.*Connection refused'
+    flags: 'i'
+  - regex: 'Cache service responded with (403|503|5\d\d)'
+    flags: 'i'
+  - regex: 'Failed to restore cache entry\. Exiting\.\.\.'
+    flags: 'i'
+  - regex: 'Unable to reserve cache with key.*ACTIONS_CACHE_URL'
+    flags: 'i'
+error_messages:
+  - "Cache service responded with 503"
+  - "Cache service responded with 403"
+  - "Failed to restore cache entry. Exiting..."
+  - "Unable to reserve cache with key"
+  - "Error: ECONNREFUSED connecting to ACTIONS_CACHE_URL"
+root_cause: |
+  GitHub migrated all customers to a new cache service backend in early 2025
+  and decommissioned the legacy service on April 15, 2025. Prior to decommission,
+  brownout windows were scheduled on April 1 and April 8 (each 4-8 hours).
+
+  Workflows that explicitly override ACTIONS_CACHE_URL, ACTIONS_RESULTS_URL, or
+  ACTIONS_RUNTIME_URL continue routing requests to the decommissioned endpoint,
+  causing 403 or 503 responses. The cache action reports "Failed to restore cache
+  entry" or "Unable to reserve cache" and either skips caching silently or fails
+  the step (depending on fail-on-cache-miss settings).
+
+  Common sources of stale overrides:
+  - Third-party self-hosted runner software (ARC add-ons, Buildkite agents, etc.)
+    that inject a corporate cache proxy URL into the runner environment
+  - Composite actions or reusable workflows with hardcoded env var overrides
+    copied from pre-migration documentation
+  - Container images with ENV ACTIONS_CACHE_URL set in their Dockerfile,
+    inherited by container jobs and overriding the runner-injected value
+  - Enterprise self-hosted runner configurations in on-premises GitHub instances
+    that still point to a proxy configured for the old cache service API
+
+  The runner agent always injects the correct new-service values at job startup.
+  Any explicit override — even one set a millisecond earlier — takes precedence
+  and silently routes to the wrong endpoint.
+fix: |
+  Remove all explicit overrides of ACTIONS_CACHE_URL, ACTIONS_RESULTS_URL, and
+  ACTIONS_RUNTIME_URL from:
+  - Workflow env: blocks (top-level, job-level, and step-level)
+  - Composite action env blocks
+  - Reusable workflow env blocks
+  - Container image Dockerfiles (ENV directives)
+  - Self-hosted runner startup scripts and systemd unit files
+  - ARC runner controller configuration and any environment-injection middleware
+
+  Let the runner agent inject the correct values automatically at job startup.
+  These values are ephemeral per-job tokens — they cannot be cached or pre-set
+  and must come from the runner agent.
+
+  For self-hosted setups using a corporate cache proxy, update the proxy
+  to forward requests to the new service endpoint format, or decommission the
+  proxy if it is no longer required.
+fix_code:
+  - language: yaml
+    label: 'Remove ACTIONS_CACHE_URL override from workflow — let runner inject correct value'
+    code: |
+      # WRONG: overriding cache service URL causes failures after April 2025
+      # env:
+      #   ACTIONS_CACHE_URL: https://my-corp-proxy.example.com/_apis/artifactcache/
+      #   ACTIONS_RESULTS_URL: https://my-corp-proxy.example.com/_apis/
+      #   ACTIONS_RUNTIME_URL: https://my-corp-proxy.example.com/
+
+      # CORRECT: remove all overrides, let the runner inject the values
+      jobs:
+        build:
+          runs-on: [self-hosted, linux]
+          steps:
+            - uses: actions/checkout@v4
+            - name: Cache dependencies
+              uses: actions/cache@v4
+              with:
+                path: ~/.npm
+                key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+            - name: Install
+              run: npm ci
+  - language: yaml
+    label: 'Audit container images for hardcoded ACTIONS_CACHE_URL'
+    code: |
+      # In your Dockerfile — remove any hardcoded cache service URL
+      # FROM ubuntu:22.04
+      # ENV ACTIONS_CACHE_URL=https://...  ← REMOVE: causes failures after April 2025
+
+      # In your workflow — do not set cache URL env vars in container definitions
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          container:
+            image: myimage:latest
+            # Do not add env overrides for ACTIONS_CACHE_URL here
+          steps:
+            - uses: actions/cache@v4
+              with:
+                path: ~/.cache/pip
+                key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+prevention:
+  - 'Never hardcode ACTIONS_CACHE_URL, ACTIONS_RESULTS_URL, or ACTIONS_RUNTIME_URL in workflows, container images, or runner configs'
+  - 'Audit third-party composite actions and runner middleware for injected cache URL overrides after any GitHub cache service migration'
+  - 'Subscribe to the GitHub Changelog (github.blog/changelog) to receive advance notice of cache service migrations and brownout schedules'
+  - 'Upgrade to actions/cache@v4 or later — the v4 client was updated to use the new service API and is the supported path forward'
+  - 'Add a pre-flight check step on self-hosted runners that logs the injected ACTIONS_CACHE_URL to detect unexpected overrides'
+docs:
+  - url: 'https://github.blog/changelog/2025-03-20-notification-of-upcoming-breaking-changes-in-github-actions/'
+    label: 'GitHub Changelog: Upcoming breaking changes — legacy cache service decommission (March 2025)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows'
+    label: 'Caching dependencies to speed up workflows — actions/cache@v4'

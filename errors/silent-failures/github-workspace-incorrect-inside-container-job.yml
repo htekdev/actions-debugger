@@ -1,0 +1,123 @@
+id: silent-failures-043
+title: 'github.workspace and runner.workspace return host paths, not container paths, inside container jobs'
+category: silent-failures
+severity: silent-failure
+tags:
+  - container-jobs
+  - github-context
+  - workspace
+  - path-mismatch
+  - expressions
+  - silent
+patterns:
+  - regex: '\$\{\{\s*github\.workspace\s*\}\}.*container|\$\{\{\s*runner\.workspace\s*\}\}.*container'
+    flags: 'i'
+  - regex: '/home/runner/work/[^/]+/[^/]+.*no such file|not found.*home/runner/work'
+    flags: 'i'
+error_messages: []
+root_cause: |
+  Inside container jobs, `${{ github.workspace }}` and `${{ runner.workspace }}`
+  resolve to the HOST-side path (e.g., /home/runner/work/repo/repo), not the
+  path that the container actually sees at runtime (e.g., /github/workspace or
+  /__w/repo/repo depending on the runner type).
+
+  The container mounts the workspace at a different path than the host. Any
+  expression using these context values to construct file paths, Docker build
+  contexts, artifact paths, or shell script arguments will silently resolve to
+  the wrong location inside the container — either a non-existent path or an
+  unexpected host directory leaked into the container mount namespace.
+
+  By contrast, the GITHUB_WORKSPACE and RUNNER_WORKSPACE environment variables
+  ARE injected with the correct container-visible paths. Only the expression
+  context values (${{ github.workspace }}) are wrong. This inconsistency is the
+  core trap: developers expect context and env var to be equivalent, but inside
+  containers they diverge.
+
+  No error is raised — wrong paths are silently accepted by shells and tools,
+  causing subtly incorrect behavior: files not found, wrong directory used for
+  builds, artifacts uploaded from wrong paths, or test results pointing to
+  non-existent locations.
+
+  Tracked in runner#2058 (81 reactions, 13 confused reactions) as a known bug
+  with no built-in fix as of 2026.
+fix: |
+  Use the GITHUB_WORKSPACE environment variable instead of the
+  ${{ github.workspace }} expression inside container job steps. The env var
+  is injected by the runner with the correct container-visible path.
+
+  Similarly, use RUNNER_WORKSPACE instead of ${{ runner.workspace }}.
+
+  For Docker build contexts and tool paths that require absolute paths, use
+  the container-visible path directly:
+  - GitHub-hosted runners: /github/workspace
+  - ARC/self-hosted: /__w/<repo-name>/<repo-name> (verify with pwd in first step)
+
+  Alternatively, use relative paths (.) wherever possible to avoid the
+  host/container path discrepancy entirely.
+fix_code:
+  - language: yaml
+    label: 'Use GITHUB_WORKSPACE env var instead of ${{ github.workspace }} inside container steps'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          container:
+            image: myapp-builder:latest
+          steps:
+            - uses: actions/checkout@v4
+
+            # WRONG: returns host path, not the container-visible mount path
+            # - name: Build
+            #   run: cd "${{ github.workspace }}" && make build
+
+            # CORRECT: GITHUB_WORKSPACE is set to the container-visible path
+            - name: Build
+              run: |
+                echo "Container workspace: $GITHUB_WORKSPACE"
+                cd "$GITHUB_WORKSPACE" && make build
+  - language: yaml
+    label: 'Use relative paths for Docker build context inside container jobs'
+    code: |
+      jobs:
+        docker-in-docker:
+          runs-on: ubuntu-latest
+          container:
+            image: docker:24
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build image
+              run: |
+                # Use . (current dir) not ${{ github.workspace }} for build context
+                docker build -t myimage:latest .
+
+                # If absolute path needed, use the env var:
+                docker build -t myimage:latest "$GITHUB_WORKSPACE"
+  - language: yaml
+    label: 'Debug step to reveal the actual container workspace path'
+    code: |
+      jobs:
+        debug:
+          runs-on: ubuntu-latest
+          container:
+            image: ubuntu:22.04
+          steps:
+            - name: Show path discrepancy
+              run: |
+                echo "Host path via context (WRONG inside container):"
+                echo "  github.workspace = ${{ github.workspace }}"
+                echo ""
+                echo "Container-visible path via env var (CORRECT):"
+                echo "  GITHUB_WORKSPACE = $GITHUB_WORKSPACE"
+                echo ""
+                echo "Actual current directory: $(pwd)"
+prevention:
+  - 'Never use ${{ github.workspace }} or ${{ runner.workspace }} expressions inside container job steps — they return host paths'
+  - 'Use the GITHUB_WORKSPACE and RUNNER_WORKSPACE environment variables for all path references inside containers'
+  - 'Use relative paths wherever possible in container steps to avoid the host/container path mismatch entirely'
+  - 'Add a debug step printing both the context value and the env var when authoring new container workflows'
+  - 'Test container-based workflows locally with nektos/act to surface path resolution issues before CI'
+docs:
+  - url: 'https://github.com/actions/runner/issues/2058'
+    label: 'runner#2058: github.workspace and runner.workspace are incorrect inside container jobs (81 reactions)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-where-your-workflow-runs/running-jobs-in-a-container'
+    label: 'Running jobs in a container — environment variables and context values'

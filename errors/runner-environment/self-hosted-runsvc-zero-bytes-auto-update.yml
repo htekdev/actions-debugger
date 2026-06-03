@@ -1,0 +1,112 @@
+id: runner-environment-096
+title: 'Self-hosted runner runsvc.sh corrupted to 0 bytes after auto-update'
+category: runner-environment
+severity: error
+tags:
+  - self-hosted
+  - auto-update
+  - runsvc
+  - systemd
+  - service-restart
+patterns:
+  - regex: 'runsvc\.sh.*0 bytes|0 bytes.*runsvc\.sh'
+    flags: 'i'
+  - regex: 'code=exited.*status=203/EXEC|status=203/EXEC'
+    flags: 'i'
+  - regex: 'Failed to start GitHub Actions Runner'
+    flags: 'i'
+  - regex: 'bin/runsvc\.sh.*Syntax error.*end of file'
+    flags: 'i'
+error_messages:
+  - "(code=exited, status=203/EXEC)"
+  - "Failed to start GitHub Actions Runner (svc.sh)"
+  - "bin/runsvc.sh: 1: Syntax error: Unexpected end of file"
+  - "bin.2.334.0/runsvc.sh: 0 bytes"
+root_cause: |
+  When a self-hosted runner auto-updates from v2.328.0 to v2.334.0 (and some
+  adjacent version pairs), a race condition in the update file-extraction process
+  sometimes writes the new bin.{version}/runsvc.sh as 0 bytes instead of the
+  correct shell script content.
+
+  The currently-running listener operates from in-memory state and continues
+  accepting and completing jobs normally — so the runner appears healthy in
+  the GitHub Actions UI and the corruption is not immediately visible. The
+  bin/runsvc.sh symlink quietly points to the corrupted 0-byte file.
+
+  On the next service restart (host reboot, manual systemctl restart, OOM kill,
+  scheduled maintenance window), systemd attempts to execute the 0-byte runsvc.sh,
+  receives Status=203/EXEC (exec format error because the file is empty), and the
+  runner fails to start entirely — dropping all pending and future jobs.
+
+  The failure is especially hard to diagnose because the runner appears fully
+  online right up to the restart event. Runners in pools that restart infrequently
+  may run corrupted for days before the symptom appears.
+fix: |
+  Immediate recovery:
+  1. Check if runsvc.sh is 0 bytes:
+       ls -lh /path/to/runner/bin/runsvc.sh
+  2. If 0 bytes, stop the service and re-download the runner package at the
+     same version, or manually copy runsvc.sh from a known-good runner
+     installation of the same version.
+  3. Restart the service and confirm it comes up cleanly before re-enabling
+     job acceptance.
+
+  Preventive measures:
+  - Disable auto-update (--no-auto-update flag during registration) and manage
+    runner version upgrades manually during maintenance windows.
+  - Add a startup health check (see fix_code) that verifies runsvc.sh is
+    non-zero before the service is considered ready.
+  - For ephemeral runners, use container restart policies that detect the
+    0-byte condition and re-register a fresh runner instead of recycling
+    a corrupted one.
+fix_code:
+  - language: yaml
+    label: 'Detect corrupted runsvc.sh in a pre-job health check step'
+    code: |
+      jobs:
+        preflight:
+          runs-on: [self-hosted, linux]
+          steps:
+            - name: Verify runner service script integrity
+              shell: bash
+              run: |
+                RUNNER_SVC="$(dirname "$(realpath "$0")")/../bin/runsvc.sh"
+                if [ ! -s "$RUNNER_SVC" ]; then
+                  echo "::error::runsvc.sh is 0 bytes — runner update corrupted the service script. Re-register this runner."
+                  exit 1
+                fi
+                echo "runsvc.sh OK ($(wc -c < "$RUNNER_SVC") bytes)"
+  - language: yaml
+    label: 'Pin runner version and disable auto-update via ARC RunnerSet spec'
+    code: |
+      # actions-runner-controller RunnerSet — pin version, disable auto-update
+      apiVersion: actions.github.com/v1alpha1
+      kind: RunnerSet
+      metadata:
+        name: my-runners
+      spec:
+        githubConfigUrl: https://github.com/my-org/my-repo
+        githubConfigSecret: controller-manager
+        minRunners: 2
+        maxRunners: 10
+        template:
+          spec:
+            containers:
+              - name: runner
+                image: ghcr.io/actions/actions-runner:2.334.0   # pin version
+                env:
+                  - name: DISABLE_RUNNER_UPDATE
+                    value: '1'
+prevention:
+  - 'Pin runner version with --no-auto-update and upgrade manually during maintenance windows'
+  - 'Monitor runner systemd units with alerting on failed states before jobs queue up'
+  - 'Use ephemeral runners (--ephemeral flag) so each job gets a freshly registered runner, avoiding accumulated update corruption'
+  - 'After any auto-update event, verify that bin/runsvc.sh is non-zero before accepting production jobs'
+  - 'Run a nightly canary workflow that exercises a restart-then-run cycle on self-hosted pools'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4421'
+    label: 'runner#4421: runsvc.sh sometimes 0 bytes after auto-update from 2.328.0 to 2.334.0 (May 2026)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/autoscaling-with-self-hosted-runners'
+    label: 'Autoscaling with self-hosted runners — runner lifecycle management'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners#self-hosted-runner-version-updates'
+    label: 'Self-hosted runner version updates'
