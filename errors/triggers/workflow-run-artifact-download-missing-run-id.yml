@@ -1,0 +1,106 @@
+id: triggers-018
+title: "workflow_run: download-artifact finds no artifacts without explicit run-id"
+category: triggers
+severity: silent-failure
+tags:
+  - workflow_run
+  - download-artifact
+  - run-id
+  - cross-workflow
+  - artifact
+patterns:
+  - regex: "No artifacts found"
+    flags: "i"
+  - regex: "Unable to find any artifacts for the associated workflow"
+    flags: "i"
+  - regex: "No artifacts were found with the provided run ID"
+    flags: "i"
+error_messages:
+  - "No artifacts found"
+  - "Unable to find any artifacts for the associated workflow run"
+  - "Warning: No artifacts were found with the provided run ID."
+  - "Error: Unable to find any artifacts for the associated workflow run"
+root_cause: |
+  When a workflow is triggered by the `workflow_run` event, it runs in the context of
+  **its own** workflow run — not the triggering workflow run. If `actions/download-artifact`
+  is called without specifying `run-id`, it defaults to `${{ github.run_id }}` which is the
+  ID of the triggered (consumer) workflow — not the upstream workflow that produced the
+  artifacts.
+
+  Since the consumer workflow produces no artifacts itself, `download-artifact` finds nothing.
+  This is a silent failure in some versions: the step exits without error but no files are
+  downloaded, causing subsequent steps that depend on the artifact to fail with confusing errors.
+
+  The artifact was uploaded in the triggering workflow's run. To download it, you must
+  explicitly reference `github.event.workflow_run.id` (the upstream run's ID).
+fix: |
+  Add `run-id: ${{ github.event.workflow_run.id }}` to the `actions/download-artifact`
+  step. This tells the action to download from the triggering workflow run rather than
+  the current workflow run.
+
+  Also ensure the token has `actions: read` permission to download artifacts from other runs.
+fix_code:
+  - language: yaml
+    label: "Wrong: download-artifact defaults to current run (finds nothing in workflow_run)"
+    code: |
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+      
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/download-artifact@v4
+              with:
+                name: build-output  # ❌ Defaults to github.run_id (this run, has no artifacts)
+  - language: yaml
+    label: "Fix: explicitly reference the triggering run's ID"
+    code: |
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+      
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          permissions:
+            actions: read  # Required to download artifacts from other workflow runs
+          steps:
+            - uses: actions/download-artifact@v4
+              with:
+                name: build-output
+                run-id: ${{ github.event.workflow_run.id }}  # ✅ The upstream run's ID
+  - language: yaml
+    label: "Guard: only run if triggering workflow succeeded"
+    code: |
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+      
+      jobs:
+        deploy:
+          if: github.event.workflow_run.conclusion == 'success'  # ✅ Don't deploy on failure
+          runs-on: ubuntu-latest
+          permissions:
+            actions: read
+          steps:
+            - uses: actions/download-artifact@v4
+              with:
+                name: build-output
+                run-id: ${{ github.event.workflow_run.id }}
+prevention:
+  - "Always specify `run-id: ${{ github.event.workflow_run.id }}` when downloading artifacts in a `workflow_run`-triggered workflow"
+  - "Add `permissions: actions: read` to any job that downloads artifacts from a different workflow run"
+  - "Guard the job with `if: github.event.workflow_run.conclusion == 'success'` to skip on upstream failures"
+  - "Use `github.event.workflow_run.id` (not `github.run_id`) — they are different: the former is the upstream run, the latter is the current consumer run"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run"
+    label: "Events that trigger workflows — workflow_run"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-and-sharing-data-from-a-workflow#downloading-artifacts-from-a-different-workflow-run"
+    label: "Downloading artifacts from a different workflow run"
+  - url: "https://github.com/actions/download-artifact"
+    label: "actions/download-artifact README"

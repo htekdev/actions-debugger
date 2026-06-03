@@ -1,0 +1,102 @@
+id: yaml-syntax-023
+title: "Reusable workflow: env context rejected in `jobs.<job_id>.with` inputs"
+category: yaml-syntax
+severity: error
+tags:
+  - reusable-workflow
+  - env-context
+  - with-inputs
+  - workflow_call
+  - variable-scoping
+patterns:
+  - regex: "Unrecognized named-value: 'env'"
+    flags: "i"
+  - regex: "Context access might be invalid: env"
+    flags: "i"
+  - regex: "The env context is not available"
+    flags: "i"
+error_messages:
+  - "Unrecognized named-value: 'env'. Located at position 1 within expression: env.MY_VAR"
+  - "Context access might be invalid: env"
+  - "The env context is not available to reusable workflow inputs"
+root_cause: |
+  When calling a reusable workflow using `jobs.<job_id>.uses`, the `env` context is not
+  available inside the `with:` block. Only the following contexts are permitted at that
+  evaluation point: `github`, `inputs`, `needs`, `strategy`, and `matrix`.
+
+  This is a platform-level restriction. The `env` context is resolved during job execution
+  on the runner, but reusable workflow `with:` inputs are evaluated at workflow dispatch time
+  (before a runner is allocated), so `env` values are simply unavailable.
+
+  Top-level `env:` blocks defined in the caller workflow cannot be referenced inside
+  `jobs.<job_id>.with` — using `${{ env.MY_VAR }}` there produces a syntax validation
+  error that prevents the workflow from running at all.
+fix: |
+  Replace `${{ env.MY_VAR }}` in reusable workflow `with:` inputs with one of:
+
+  1. `${{ vars.MY_VAR }}` — repository or organization variable (preferred for non-secret
+     configuration values that are reused across workflows)
+  2. Hardcoded literal value directly in `with:`
+  3. An intermediate job that exposes the value as a job output, then reference it via
+     `${{ needs.prepare.outputs.my_var }}`
+fix_code:
+  - language: yaml
+    label: "Wrong: env context in reusable workflow with inputs"
+    code: |
+      env:
+        DEPLOY_ENV: "production"
+      
+      jobs:
+        deploy:
+          uses: org/repo/.github/workflows/deploy.yml@main
+          with:
+            environment: ${{ env.DEPLOY_ENV }}   # ❌ Error: env context not available
+  - language: yaml
+    label: "Fix option 1: use vars context (repository/org variable)"
+    code: |
+      jobs:
+        deploy:
+          uses: org/repo/.github/workflows/deploy.yml@main
+          with:
+            environment: ${{ vars.DEPLOY_ENV }}  # ✅ vars context works in with:
+  - language: yaml
+    label: "Fix option 2: propagate via intermediate job output"
+    code: |
+      env:
+        DEPLOY_ENV: "production"
+      
+      jobs:
+        prepare:
+          runs-on: ubuntu-latest
+          outputs:
+            deploy_env: ${{ steps.set-env.outputs.value }}
+          steps:
+            - id: set-env
+              run: echo "value=$DEPLOY_ENV" >> "$GITHUB_OUTPUT"
+        
+        deploy:
+          needs: prepare
+          uses: org/repo/.github/workflows/deploy.yml@main
+          with:
+            environment: ${{ needs.prepare.outputs.deploy_env }}  # ✅
+  - language: yaml
+    label: "Fix option 3: hardcode the value directly"
+    code: |
+      jobs:
+        deploy:
+          uses: org/repo/.github/workflows/deploy.yml@main
+          with:
+            environment: "production"  # ✅ Literal values always work
+prevention:
+  - "Store workflow-wide configuration values in repository or organization variables (`vars` context) so they are available in reusable workflow `with:` blocks"
+  - "Only `github`, `inputs`, `needs`, `strategy`, and `matrix` contexts are available in `jobs.<job_id>.with` — never `env`, `secrets`, or `steps`"
+  - "If a value must be computed at runtime, use an intermediate job with `outputs:` and reference via `needs.<job_id>.outputs.<key>`"
+docs:
+  - url: "https://docs.github.com/en/actions/sharing-automations/reusing-workflows#limitations"
+    label: "Reusing workflows — Limitations"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#context-availability"
+    label: "GitHub Actions context availability by workflow key"
+  - url: "https://github.com/actions/runner/issues/1413"
+    label: "actions/runner#1413: env not available in reusable workflow with inputs (known limitation)"
+  - url: "https://github.com/actions/toolkit/issues/931"
+    label: "actions/toolkit#931: Variable scoping across reusable workflows (58 reactions)"
