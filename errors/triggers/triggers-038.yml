@@ -1,0 +1,126 @@
+id: triggers-038
+title: 'workflow_run.conclusion is null when the upstream run was cancelled before any job started — if: checks silently skip'
+category: triggers
+severity: silent-failure
+tags:
+  - workflow-run
+  - conclusion
+  - cancelled
+  - null-conclusion
+  - if-condition
+  - cross-workflow
+patterns:
+  - regex: 'github\.event\.workflow_run\.conclusion\s*==\s*[''"]success[''"]'
+    flags: 'i'
+  - regex: 'github\.event\.workflow_run\.conclusion\s*==\s*[''"]failure[''"]'
+    flags: 'i'
+error_messages:
+  - "(No error — triggered workflow runs but all jobs/steps with if: github.event.workflow_run.conclusion == 'success' silently skip)"
+root_cause: |
+  When a downstream workflow uses on: workflow_run (types: [completed]), it fires
+  whenever an upstream workflow run reaches a terminal state. The
+  github.event.workflow_run.conclusion field is expected to reflect the outcome of
+  that upstream run.
+
+  However, if the upstream run was cancelled before any job started — for example,
+  due to a concurrent push triggering cancel-in-progress on the queued run, or a
+  manual UI cancellation before the run left the queue — the conclusion field is
+  null, not "cancelled".
+
+  GitHub's API returns: { "conclusion": null, "status": "cancelled" } for runs
+  cancelled while still queued. This is documented behavior: conclusion is only set
+  when at least one job has run to completion.
+
+  The effect on downstream conditional logic:
+    if: github.event.workflow_run.conclusion == 'success'    → false (null != string)
+    if: github.event.workflow_run.conclusion == 'failure'    → false
+    if: github.event.workflow_run.conclusion == 'cancelled'  → also false (null != string)
+    if: github.event.workflow_run.conclusion != 'success'    → TRUE (null != string)
+
+  The downstream workflow's workflow_run completed event fires and the workflow
+  starts, but every job with a success/failure/cancelled equality check is silently
+  skipped. A CD pipeline gated on CI success may appear to trigger but produce no
+  deployment with no error surfaced to the developer.
+
+  This can also silently allow deployment jobs protected by
+  conclusion != 'failure' to run when the upstream was an early cancellation.
+fix: |
+  Treat workflow_run.conclusion as nullable. Always verify it is not null before
+  comparing to an expected value:
+
+  Option A — Explicit null check (most readable):
+    if: github.event.workflow_run.conclusion != null && github.event.workflow_run.conclusion == 'success'
+
+  Option B — contains() with fromJSON allowlist (handles null gracefully; null is
+  not in the list, so the condition evaluates false without error):
+    if: contains(fromJSON('["success"]'), github.event.workflow_run.conclusion)
+
+  Option C — Guard step that fails fast and visibly when conclusion is unexpected,
+  so silent skips become explicit failures:
+    - run: |
+        if [ "$CONCLUSION" != "success" ]; then
+          echo "Upstream conclusion was: $CONCLUSION"
+          exit 1
+        fi
+      env:
+        CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+fix_code:
+  - language: yaml
+    label: 'Use contains() with fromJSON to handle null conclusion safely'
+    code: |
+      on:
+        workflow_run:
+          workflows: ['CI']
+          types: [completed]
+
+      jobs:
+        deploy:
+          # contains() returns false when conclusion is null — no null-equality error
+          if: |
+            contains(fromJSON('["success"]'), github.event.workflow_run.conclusion) &&
+            github.event.workflow_run.head_branch == 'main'
+          runs-on: ubuntu-latest
+          steps:
+            - name: Deploy
+              run: echo "Deploying after confirmed CI success"
+
+  - language: yaml
+    label: 'Guard step that fails visibly on null or unexpected conclusion'
+    code: |
+      on:
+        workflow_run:
+          workflows: ['CI']
+          types: [completed]
+
+      jobs:
+        verify-conclusion:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Check upstream conclusion
+              env:
+                CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+              run: |
+                echo "Upstream workflow conclusion: $CONCLUSION"
+                if [ "$CONCLUSION" != "success" ]; then
+                  echo "Expected 'success', got '$CONCLUSION' (possibly null if cancelled before job start)"
+                  exit 1
+                fi
+
+        deploy:
+          needs: verify-conclusion
+          runs-on: ubuntu-latest
+          steps:
+            - name: Deploy
+              run: echo "Deploying"
+prevention:
+  - 'Always treat workflow_run.conclusion as nullable — a run cancelled while queued has conclusion: null, not "cancelled"'
+  - 'Use contains(fromJSON(...), github.event.workflow_run.conclusion) instead of == equality — contains() handles null safely'
+  - 'Add a guard step that prints the actual conclusion value to make silent skips visible during debugging'
+  - 'Prefer repository_dispatch for cross-workflow chaining when you need explicit control over the payload and conclusion semantics'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run'
+    label: 'GitHub Docs: workflow_run event — conclusion field behavior'
+  - url: 'https://docs.github.com/en/rest/actions/workflow-runs?apiVersion=2022-11-28#get-a-workflow-run'
+    label: 'GitHub REST API: Workflow run — conclusion is nullable'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#github-context'
+    label: 'GitHub Docs: github.event.workflow_run context properties'
