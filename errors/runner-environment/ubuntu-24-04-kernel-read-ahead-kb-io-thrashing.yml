@@ -1,0 +1,94 @@
+id: runner-environment-076
+title: "Ubuntu 24.04 Kernel read_ahead_kb Regression Causes I/O Thrashing and Workflow Hangs"
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-24.04
+  - kernel
+  - io-thrashing
+  - memory
+  - docker
+  - read-ahead
+  - performance
+patterns:
+  - regex: 'The hosted runner lost communication with the server'
+    flags: "i"
+  - regex: 'Free memory is lower than 5%|Currently used: 9[0-9]\.[0-9]+%'
+    flags: "i"
+  - regex: 'Out of memory, malloc failed|fatal: the remote end hung up unexpectedly'
+    flags: "i"
+error_messages:
+  - "The hosted runner lost communication with the server. Anything in your workflow that terminates the runner process, starves it for CPU/Memory, or blocks its network access can cause this error."
+  - "##[warning]Free memory is lower than 5%; Currently used: 95.55%"
+  - "fatal: Out of memory, malloc failed (tried to allocate 217 bytes)"
+  - "fatal: the remote end hung up unexpectedly"
+root_cause: |
+  Starting with kernel 6.14.0-1017-azure (shipped in ubuntu-24.04 image 20260224.36.1
+  and continuing with 6.17.0-1008-azure in 20260302.42.1 through current), the default
+  read_ahead_kb block device value was changed from 128 KB to 4096 KB. This causes
+  the Linux page cache to speculatively read 32x more data from disk for each I/O
+  operation, flooding available RAM with unused prefetched data.
+
+  The effect is severe for workloads with large files accessed non-sequentially
+  (many build systems, compilation), Docker-in-Docker setups, database integration
+  tests (Postgres, MySQL, Redis) under I/O load, and large repository operations.
+
+  The page cache exhaustion triggers OOM conditions, process starvation, and eventually
+  causes the Actions runner process to lose connectivity to the GitHub Actions broker,
+  manifesting as "The hosted runner lost communication with the server."
+
+  GitHub confirmed this is a kernel-level change they do not control and cannot roll
+  back. The fix must be applied in the workflow. Independently documented by the
+  RavenDB team for the same Azure kernel change.
+fix: |
+  Add a step at the beginning of the job to reset read_ahead_kb to 128 KB (the
+  safe pre-regression value). This must run before any I/O-intensive steps.
+  The step requires sudo access, which is available on all GitHub-hosted runners.
+fix_code:
+  - language: yaml
+    label: "Reset read_ahead_kb before I/O-intensive steps (kernel regression workaround)"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-24.04
+          steps:
+            - name: Reset block device read-ahead (kernel regression workaround for runner-images#13770)
+              run: |
+                for dev in /sys/block/sd*/queue/read_ahead_kb; do
+                  echo 128 | sudo tee "$dev" > /dev/null
+                done
+                echo "read_ahead_kb reset to 128 on all block devices"
+
+            - uses: actions/checkout@v4
+            - name: Build
+              run: make
+  - language: yaml
+    label: "Diagnose memory pressure before applying the workaround"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-24.04
+          steps:
+            - name: Show current read_ahead_kb and available memory
+              run: |
+                cat /sys/block/sda/queue/read_ahead_kb || true
+                free -h
+
+            - name: Reset read_ahead_kb to safe value
+              run: |
+                for dev in /sys/block/sd*/queue/read_ahead_kb; do
+                  echo 128 | sudo tee "$dev" > /dev/null
+                done
+                cat /sys/block/sda/queue/read_ahead_kb
+prevention:
+  - "Always reset read_ahead_kb to 128 on ubuntu-24.04 runners for workflows with Docker containers or database integration tests."
+  - "Use ubuntu-22.04 as a temporary mitigation — kernel 6.8.0 is unaffected by this regression."
+  - "Add memory diagnostics (free -h) before heavy build steps to catch exhaustion early."
+  - "Monitor actions/runner-images#13770 for a permanent kernel fix from Canonical and GitHub."
+docs:
+  - url: "https://github.com/actions/runner-images/issues/13770"
+    label: "runner-images#13770: ubuntu-latest builds hanging in 20260302.42.1 runner image (kernel regression)"
+  - url: "https://github.com/ravendb/ravendb/discussions/22410"
+    label: "RavenDB: Azure kernel read_ahead_kb change causing I/O thrashing"
+  - url: "https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners/about-github-hosted-runners"
+    label: "GitHub Docs: GitHub-hosted runner hardware resources"
