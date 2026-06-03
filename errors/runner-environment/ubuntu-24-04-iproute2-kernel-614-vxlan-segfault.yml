@@ -1,0 +1,102 @@
+id: 'runner-environment-087'
+title: '`ip -d link show` segfaults (exit 139 / SIGSEGV) on VXLAN interfaces on ubuntu-24.04 after kernel 6.14 upgrade'
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-24-04
+  - networking
+  - vxlan
+  - iproute2
+  - kernel
+  - segfault
+  - regression
+  - container-networking
+patterns:
+  - regex: 'Segmentation fault.*ip.*link'
+    flags: 'i'
+  - regex: 'ip -d link show.*exit.*139'
+    flags: 'i'
+  - regex: 'ip\s+-d\s+link\s+show'
+    flags: 'i'
+error_messages:
+  - 'Segmentation fault (core dumped)'
+  - 'Process completed with exit code 139.'
+  - 'ip: Segmentation fault'
+root_cause: |
+  On ubuntu-24.04 runner image 20260209.23 and later, the kernel was upgraded to
+  6.14.0-1017-azure while the iproute2 package remained at version 6.1.0-1ubuntu6.2.
+
+  Linux kernel 6.14 introduced a new VXLAN netlink attribute (IFLA_VXLAN_FAN_MAP) in
+  the rtnetlink interface. When iproute2 6.1 receives a netlink response containing this
+  unrecognized attribute and parses it with the -d (details) flag, it dereferences an
+  unexpected attribute structure, triggering a SIGSEGV.
+
+  The crash occurs specifically when:
+  1. A VXLAN network interface exists on the runner (e.g., created with `ip link add ... type vxlan`)
+  2. `ip -d link show dev <vxlan-interface>` is executed to inspect its details
+
+  Without the -d flag, `ip link show` succeeds. The regression was confirmed by comparing:
+  - Working image: 20260201.15.1 (kernel 6.11.0-1018-azure, iproute2 6.1.0-1ubuntu6.2)
+  - Broken image:  20260209.23.1 (kernel 6.14.0-1017-azure, iproute2 6.1.0-1ubuntu6.2)
+
+  Affected workflows: any CI that creates VXLAN interfaces for network simulation, overlay
+  networking tests, or Kubernetes-in-CI scenarios (e.g., containerlab, kind with custom
+  network topologies, network protocol testing).
+
+  Tracked in actions/runner-images#13669 (February 2026, open).
+fix: |
+  Option 1: Upgrade iproute2 to a version compatible with kernel 6.14 at the start of
+  the job. Install a newer iproute2 from a backport PPA or compile from source.
+
+  Option 2: Avoid the -d flag when only basic VXLAN interface information is needed.
+  `ip link show dev <vxlan-interface>` (without -d) does not trigger the crash.
+
+  Option 3: Pin to ubuntu-22.04, which uses an older kernel/iproute2 combination that
+  does not exhibit this issue.
+
+  Option 4: Parse VXLAN interface details via /sys/class/net/ sysfs entries instead of
+  relying on `ip -d link show`.
+fix_code:
+  - language: yaml
+    label: 'Upgrade iproute2 before creating VXLAN interfaces to avoid segfault'
+    code: |
+      jobs:
+        network-test:
+          runs-on: ubuntu-24.04
+          steps:
+            - name: Upgrade iproute2 to kernel-6.14-compatible version
+              run: |
+                sudo apt-get update -qq
+                sudo apt-get install -y --only-upgrade iproute2
+                ip -V    # Verify new version
+
+            - name: Create and inspect VXLAN interface
+              run: |
+                sudo ip link add vxlan-test type vxlan id 100 \
+                  local 10.0.0.1 remote 10.0.0.2 dev eth0 dstport 4789
+                ip -d link show dev vxlan-test   # Safe with upgraded iproute2
+
+  - language: yaml
+    label: 'Avoid -d flag as workaround on ubuntu-24.04 without iproute2 upgrade'
+    code: |
+      jobs:
+        network-test:
+          runs-on: ubuntu-24.04
+          steps:
+            - name: Create VXLAN interface
+              run: |
+                sudo ip link add vxlan-test type vxlan id 100 dstport 4789
+                # Use ip link show WITHOUT -d flag to avoid SIGSEGV on kernel 6.14
+                ip link show dev vxlan-test
+                # VXLAN-specific attributes via sysfs instead of iproute2 -d output:
+                cat /sys/class/net/vxlan-test/carrier || true
+prevention:
+  - 'Add an iproute2 upgrade step when workflows inspect VXLAN or other advanced interface types with `ip -d link show`'
+  - 'Watch actions/runner-images#13669 for a fix that aligns iproute2 with the kernel 6.14 netlink attributes'
+  - 'Test network-intensive CI on both ubuntu-22.04 and ubuntu-24.04 to detect kernel/iproute2 mismatch regressions'
+  - 'Consider ubuntu-22.04 for VXLAN-dependent workflows until the iproute2 package is updated on ubuntu-24.04 images'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/13669'
+    label: 'actions/runner-images#13669: ip -d link show segfaults on vxlan interfaces — iproute2/kernel 6.14 mismatch'
+  - url: 'https://manpages.ubuntu.com/manpages/noble/man8/ip-link.8.html'
+    label: 'Ubuntu ip-link manpage: ip link show options'
