@@ -1,0 +1,114 @@
+id: 'runner-environment-086'
+title: 'macOS 15 arm64 Homebrew `rustup-init` rejects `+stable` toolchain specifier and subcommands — Rust builds fail with ~50% probability'
+category: runner-environment
+severity: error
+tags:
+  - macos
+  - arm64
+  - homebrew
+  - rust
+  - rustup
+  - maturin
+  - napi-rs
+  - image-regression
+patterns:
+  - regex: 'error: unexpected argument .+stable. found'
+    flags: 'i'
+  - regex: 'error: unexpected argument .metadata. found'
+    flags: 'i'
+  - regex: 'Usage: rustup-init\[EXE\] \[OPTIONS\]'
+    flags: 'i'
+  - regex: 'macos-15-arm64.*20260511'
+    flags: 'i'
+error_messages:
+  - "Error: error: error: unexpected argument '+stable' found"
+  - "error: error: unexpected argument 'metadata' found"
+  - "Usage: rustup-init[EXE] [OPTIONS]"
+  - "info: self-update is disabled for this build of rustup"
+  - "Could not parse the Cargo.toml: Error: Command failed: cargo metadata"
+root_cause: |
+  The macos-15-arm64 runner image version 20260511.0048 ships a broken Homebrew rustup
+  formula at /opt/homebrew/bin/rustup (version 1.29.0) whose bundled rustup-init binary
+  rejects standard argv that the outer rustup CLI forwards internally.
+
+  When rustup receives a command like `rustup component add llvm-tools-preview` or when
+  cargo shims invoke `cargo metadata`, the outer rustup binary calls rustup-init with
+  forwarded arguments (+stable, metadata, etc.). On this image version, rustup-init
+  treats these as unknown positional arguments and immediately exits with an error.
+
+  The failure is intermittent because GitHub's runner scheduler assigns jobs to different
+  image versions: 20260511.0048 (broken) and 20260427.0018 (working). A single workflow
+  run with multiple matrix entries can produce a mix of passing and failing jobs depending
+  on which image version each job lands on. Reruns do not reliably fix the issue because
+  rerun jobs may again be scheduled on the broken image version.
+
+  Affected downstream tools (all work on 20260427.0018, all fail on 20260511.0048):
+  - PyO3/maturin-action@v1 — calls `rustup component add llvm-tools-preview`
+  - @napi-rs/cli — calls `cargo metadata --format-version 1`
+  - Any workflow that calls `rustup component add` with a toolchain specifier
+  - Any Rust build that uses the Homebrew rustup shim for internal rustup-init calls
+
+  Tracked in actions/runner-images#14097 (May 2026, open).
+fix: |
+  Option 1 (recommended): Install rustup from the upstream installer (sh.rustup.rs)
+  before any Rust build steps. This replaces the broken Homebrew binary at
+  /opt/homebrew/bin/rustup with the upstream version and resolves the argv issue.
+
+  Option 2: Pin the runner to macos-15-arm64 explicitly and avoid the image lottery.
+  Note: this only temporarily avoids the issue; broken images will eventually be the
+  only version served.
+
+  Option 3: Use the dtolnay/rust-toolchain action before any Rust operations to
+  install or update rustup via the upstream installer, bypassing the Homebrew version.
+fix_code:
+  - language: yaml
+    label: 'Replace Homebrew rustup with upstream installer before Rust build steps'
+    code: |
+      jobs:
+        build:
+          runs-on: macos-latest   # or macos-15-arm64
+          steps:
+            - uses: actions/checkout@v6
+
+            - name: Replace Homebrew rustup with upstream installer
+              run: |
+                # Remove Homebrew rustup to avoid the broken rustup-init binary
+                brew uninstall rustup-init rustup 2>/dev/null || true
+                # Install from upstream — stable, no Homebrew dependency
+                curl https://sh.rustup.rs -sSf | sh -s -- -y --no-modify-path
+                echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+            - name: Install Rust target
+              run: rustup target add aarch64-apple-darwin
+
+            - uses: PyO3/maturin-action@v1
+              with:
+                target: aarch64-apple-darwin
+  - language: yaml
+    label: 'Use dtolnay/rust-toolchain to install a clean rustup before builds'
+    code: |
+      jobs:
+        build:
+          runs-on: macos-latest
+          steps:
+            - uses: actions/checkout@v6
+
+            - name: Install Rust toolchain (upstream, not Homebrew)
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                components: llvm-tools-preview
+
+            - name: Build
+              run: cargo build --release
+prevention:
+  - 'Prefer dtolnay/rust-toolchain or rustup-toolchain-install-master for cross-platform Rust toolchain management rather than relying on the pre-installed Homebrew rustup'
+  - 'Test macOS ARM64 jobs on both arm64 and x86-via-Rosetta matrix entries to detect image-lottery regressions early'
+  - 'Watch actions/runner-images#14097 for the fix and the image version that resolves the broken rustup-init'
+  - 'Avoid using the Homebrew rustup binary directly; upstream rustup at ~/.cargo/bin/rustup is more stable across image updates'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14097'
+    label: 'actions/runner-images#14097: macos-15-arm64/20260511.0048 ships broken Homebrew rustup-init (May 2026)'
+  - url: 'https://rustup.rs/'
+    label: 'rustup.rs: Official upstream rustup installer'
+  - url: 'https://github.com/PyO3/maturin-action'
+    label: 'PyO3/maturin-action: Affected action that calls rustup component add'
