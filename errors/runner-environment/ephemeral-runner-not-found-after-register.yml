@@ -1,0 +1,115 @@
+id: runner-environment-090
+title: 'Ephemeral Self-Hosted Runner Fails Immediately With "An error occurred: Runner not found"'
+category: runner-environment
+severity: error
+tags:
+  - self-hosted
+  - ephemeral
+  - runner-not-found
+  - registration
+  - broker
+  - jit
+patterns:
+  - regex: 'An error occurred: Runner not found'
+    flags: 'i'
+  - regex: 'RunnerNotFoundException'
+    flags: 'i'
+error_messages:
+  - 'An error occurred: Runner not found'
+  - 'GitHub.Actions.RunService.WebApi.RunnerNotFoundException'
+  - 'Listening for Jobs'
+root_cause: |
+  GitHub's broker endpoint returns RunnerNotFoundException immediately after
+  a successful registration and connection for ephemeral self-hosted runners
+  configured with replace mode. The runner completes registration ("Successfully
+  replaced the runner"), establishes connection ("Runner connection is good"),
+  starts listening for jobs, then receives a RunnerNotFoundException from the
+  broker HTTP client within seconds.
+
+  The error originates in BrokerHttpClient.cs where the broker API returns a
+  404/RunnerNotFoundException for the registered runner slot. This can occur
+  when the broker has stale slot state from the previous ephemeral runner
+  iteration that collides with the newly registered runner identity during the
+  brief window between registration and first poll.
+
+  The runner has no graceful retry handling for this condition — it exits with
+  status 1, causing systemd to restart it repeatedly, rapidly exhausting GitHub
+  App installation tokens through frequent re-registration cycles.
+
+  Affects all architectures (x86_64, aarch64, s390x) on various runner versions.
+  Spikes during periods of elevated load on GitHub broker infrastructure.
+  Source: actions/runner#3857 (116 reactions, open May 2025).
+fix: |
+  1. Switch from replace-mode ephemeral runners to JIT (Just-In-Time) runner
+     tokens. JIT runners receive a pre-assigned job ID and avoid the broker
+     slot replacement race entirely.
+  2. Update the runner to the latest version (v2.334.0+) which improves retry
+     behavior around transient broker errors.
+  3. Add restart delay in the systemd service unit to prevent token exhaustion
+     on rapid restart loops:
+       RestartSec=30
+       StartLimitIntervalSec=300
+       StartLimitBurst=5
+  4. Monitor runner diagnostic logs in _diag/Runner_*.log for the
+     RunnerNotFoundException pattern to distinguish broker errors from
+     configuration issues.
+fix_code:
+  - language: yaml
+    label: 'Systemd service unit with restart throttle to prevent token exhaustion'
+    code: |
+      # /etc/systemd/system/actions-runner.service
+      [Unit]
+      Description=GitHub Actions Self-Hosted Runner
+      After=network-online.target
+
+      [Service]
+      ExecStart=/home/runner/actions-runner/run.sh
+      Restart=on-failure
+      RestartSec=30
+      StartLimitIntervalSec=300
+      StartLimitBurst=5
+      User=runner
+
+      [Install]
+      WantedBy=multi-user.target
+  - language: yaml
+    label: 'Workflow using JIT runner token to avoid broker slot collision'
+    code: |
+      jobs:
+        provision-runner:
+          runs-on: ubuntu-latest
+          outputs:
+            runner-token: ${{ steps.jit.outputs.encoded_jit_config }}
+          steps:
+            - name: Generate JIT runner token
+              id: jit
+              uses: actions/github-script@v7
+              with:
+                script: |
+                  const { data } = await github.rest.actions.generateRunnerJitconfigForRepo({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    name: 'ephemeral-jit-runner',
+                    runner_group_id: 1,
+                    labels: ['self-hosted', 'ephemeral', 'linux']
+                  });
+                  core.setOutput('encoded_jit_config', data.encoded_jit_config);
+
+        build:
+          needs: provision-runner
+          runs-on: [self-hosted, ephemeral, linux]
+          steps:
+            - uses: actions/checkout@v4
+prevention:
+  - 'Use JIT runner tokens instead of replace-mode registration to eliminate broker slot race'
+  - 'Set systemd RestartSec to at least 30 seconds to avoid GitHub App token exhaustion'
+  - 'Monitor _diag/Runner_*.log for RunnerNotFoundException patterns and alert on restart frequency'
+  - 'Keep runner version current — broker compatibility fixes are regularly backported'
+  - 'Consider Kubernetes ARC ephemeral runners where pod lifecycle handles registration cleanly'
+docs:
+  - url: 'https://github.com/actions/runner/issues/3857'
+    label: 'actions/runner #3857: An error occurred: Runner not found (116 reactions, open May 2025)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/autoscaling-with-self-hosted-runners#using-just-in-time-runners'
+    label: 'GitHub Docs: Just-in-time runners (JIT)'
+  - url: 'https://docs.github.com/en/rest/actions/self-hosted-runners#create-configuration-for-a-just-in-time-runner-for-a-repository'
+    label: 'GitHub REST API: Generate JIT runner config'
