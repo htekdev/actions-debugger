@@ -1,0 +1,92 @@
+id: known-unsolved-019
+title: "No built-in automatic retry for individual failed jobs — only full workflow re-run or manual step"
+category: known-unsolved
+severity: limitation
+tags:
+  - retry
+  - flaky
+  - job
+  - re-run
+  - known-limitation
+  - matrix
+patterns:
+  - regex: "retry|re-run|rerun|flaky"
+    flags: "i"
+error_messages:
+  - "There is no native retry: N option for jobs in GitHub Actions"
+root_cause: |
+  GitHub Actions provides no built-in retry: count field at the job level. When a
+  job fails due to a flaky test, a transient network error, or an intermittent
+  service dependency, the only native options are: (1) manually re-run the failed
+  job via the UI or API, (2) re-run the entire workflow, or (3) add shell-level
+  retry loops inside run steps. There is no declarative way to say "retry this job
+  up to N times automatically before marking it as failed." This is a long-standing
+  platform limitation tracked in multiple GitHub Community discussions. The
+  workflow-level timeout-minutes and job-level timeout-minutes exist, but neither
+  provides automatic retry semantics. For matrix jobs, a single flaky matrix entry
+  failing causes the whole matrix (or the workflow, with default fail-fast:true) to
+  fail with no automatic per-matrix-slot retry.
+fix: |
+  Workarounds depend on the scope of flakiness. For step-level flakiness, use a
+  shell retry loop or the nick-fields/retry third-party action. For job-level
+  flakiness in CI, consider using the GitHub REST API with a calling orchestrator
+  workflow that re-dispatches on failure. For matrix flakiness, capture failed
+  matrix entries and dispatch a targeted follow-up workflow run. Manual re-run via
+  gh run rerun --failed is the simplest workaround for human-in-the-loop flows.
+fix_code:
+  - language: yaml
+    label: "Workaround — shell-level retry loop inside a run step"
+    code: |
+      steps:
+        - name: Flaky network step with retry
+          run: |
+            for i in 1 2 3; do
+              curl -sf https://api.example.com/deploy && break
+              echo "Attempt $i failed, retrying in 10s..."
+              sleep 10
+            done
+  - language: yaml
+    label: "Workaround — nick-fields/retry action for step-level retry"
+    code: |
+      steps:
+        - name: Retry flaky step
+          uses: nick-fields/retry@v3
+          with:
+            timeout_minutes: 10
+            max_attempts: 3
+            command: npm test
+  - language: yaml
+    label: "Workaround — re-run only failed jobs via gh CLI after workflow completes"
+    code: |
+      # In a post-pipeline script or calling workflow:
+      # gh run rerun <RUN_ID> --failed  re-runs only the jobs that failed
+      # Automate this with an on.workflow_run trigger checking conclusion == 'failure'
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+
+      jobs:
+        auto-retry:
+          if: github.event.workflow_run.conclusion == 'failure'
+          runs-on: ubuntu-latest
+          steps:
+            - name: Re-run failed jobs once
+              env:
+                GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                gh run rerun ${{ github.event.workflow_run.id }} --failed --repo ${{ github.repository }}
+prevention:
+  - "Design tests and deployment steps to be idempotent so manual re-runs are safe"
+  - "Use step-level retry wrappers (shell loops or nick-fields/retry) for known-flaky external calls"
+  - "Separate flaky integration tests into their own workflow so re-runs are scoped and cheaper"
+  - "Track flakiness metrics; persistent flakiness signals a real bug, not just a retry need"
+docs:
+  - url: "https://github.com/orgs/community/discussions/26186"
+    label: "GitHub Community — native job retry support request"
+  - url: "https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-workflow-runs/re-running-workflows-and-jobs"
+    label: "Re-running workflows and jobs — GitHub Actions"
+  - url: "https://github.com/nick-fields/retry"
+    label: "nick-fields/retry — step-level retry action (third-party workaround)"
+  - url: "https://cli.github.com/manual/gh_run_rerun"
+    label: "gh run rerun — GitHub CLI reference"
