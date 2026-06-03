@@ -1,0 +1,109 @@
+id: runner-environment-079
+title: "PowerShell 7.6 on Runners Ships .NET 10 Runtime — HttpWebRequest and WebClient Throw NotSupportedException"
+category: runner-environment
+severity: error
+tags:
+  - powershell
+  - powershell-76
+  - dotnet-10
+  - dotnet-8
+  - runner-images
+  - breaking-change
+  - httpclient
+  - webclient
+patterns:
+  - regex: 'NotSupportedException.*HttpWebRequest|WebClient.*NotSupportedException'
+    flags: "i"
+  - regex: 'ServicePointManager.*SecurityProtocol.*not supported|The method or operation is not implemented'
+    flags: "i"
+  - regex: 'MissingMethodException.*ServicePointManager|System\.Net\.WebException.*NotSupported'
+    flags: "i"
+  - regex: 'WildcardPattern\.Escape.*backtick|Join-Path.*ChildPath.*string\[\]'
+    flags: "i"
+error_messages:
+  - "System.NotSupportedException: WebClient has been removed from .NET"
+  - "System.NotSupportedException: HttpWebRequest is not supported on this platform"
+  - "System.MissingMethodException: Method not found: 'Void System.Net.ServicePointManager.set_SecurityProtocol'"
+root_cause: |
+  PowerShell 7.4 was built on .NET 8. PowerShell 7.6 is built on .NET 10.
+  Beginning June 8-15, 2026, all GitHub-hosted runner images upgraded from PS 7.4
+  to PS 7.6 LTS (runner-images#14150). This introduces several .NET 10 breaking changes:
+
+  1. HttpWebRequest and WebClient have been fully removed in .NET 10.
+     Any PowerShell script that uses New-Object System.Net.WebClient or
+     [System.Net.HttpWebRequest]::Create() now throws NotSupportedException.
+     Both classes were deprecated in .NET 5 and are gone in .NET 10.
+
+  2. ServicePointManager.SecurityProtocol setter is not supported in .NET 10.
+     Workflows that manually set TLS protocol versions with
+     [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+     now throw MissingMethodException. .NET 10 negotiates TLS automatically.
+
+  3. WildcardPattern.Escape now correctly escapes lone backtick characters (PS #25211).
+     Scripts that relied on the previous (incorrect) unescaped behavior may match
+     different patterns than expected.
+
+  4. Join-Path -ChildPath parameter changed from string to string[]. Code that relied
+     on positional argument behavior for this parameter may bind differently.
+
+  This is distinct from the ThreadJob module rename (runner-environment-075 entry).
+  These are .NET runtime-level breaking changes, not module renames.
+fix: |
+  Replace HttpWebRequest / WebClient with Invoke-RestMethod or Invoke-WebRequest,
+  which are the PowerShell-native HTTP clients backed by HttpClient (supported in all
+  .NET versions). Remove ServicePointManager.SecurityProtocol assignments entirely;
+  .NET 10 negotiates TLS 1.2/1.3 automatically and no longer accepts manual overrides.
+fix_code:
+  - language: yaml
+    label: "Replace WebClient (removed in .NET 10) with Invoke-WebRequest"
+    code: |
+      steps:
+        - name: Download file
+          shell: pwsh
+          run: |
+            # BEFORE (.NET 10 throws NotSupportedException):
+            # $wc = New-Object System.Net.WebClient
+            # $wc.DownloadFile($env:URL, $env:DEST)
+
+            # AFTER — use Invoke-WebRequest (works across .NET 6/8/10)
+            Invoke-WebRequest -Uri $env:ARTIFACT_URL -OutFile $env:DEST_PATH -UseBasicParsing
+          env:
+            ARTIFACT_URL: 'https://example.com/artifact.zip'
+            DEST_PATH: 'artifact.zip'
+  - language: yaml
+    label: "Remove ServicePointManager.SecurityProtocol (not needed in .NET 10)"
+    code: |
+      steps:
+        - name: Call API
+          shell: pwsh
+          run: |
+            # BEFORE (.NET 10 throws MissingMethodException):
+            # [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+
+            # AFTER — .NET 10 negotiates TLS 1.3/1.2 automatically, no manual override needed
+            $response = Invoke-RestMethod -Uri 'https://api.example.com/data' -Method Get
+            $response | ConvertTo-Json
+  - language: yaml
+    label: "Check PowerShell version in workflow to detect the upgrade"
+    code: |
+      steps:
+        - name: Verify PowerShell version and .NET runtime
+          shell: pwsh
+          run: |
+            $PSVersionTable
+            [System.Environment]::Version
+prevention:
+  - "Audit all PowerShell scripts in workflows for WebClient and HttpWebRequest usage before the June 8-15 image rollout."
+  - "Replace New-Object System.Net.WebClient with Invoke-WebRequest or Invoke-RestMethod throughout."
+  - "Remove all [System.Net.ServicePointManager]::SecurityProtocol assignments — they are no-ops at best in .NET 10."
+  - "Test workflows locally with PowerShell 7.6 (winget install Microsoft.PowerShell) before the image rollout completes."
+  - "The ThreadJob module rename is a separate issue — see runner-environment-075 entry for that breaking change."
+docs:
+  - url: "https://github.com/actions/runner-images/issues/14150"
+    label: "runner-images#14150: PowerShell will be updated from 7.4 to 7.6 LTS on all runner images"
+  - url: "https://learn.microsoft.com/en-us/powershell/scripting/whats-new/what-s-new-in-powershell-76"
+    label: "Microsoft Docs: What's new in PowerShell 7.6"
+  - url: "https://learn.microsoft.com/en-us/dotnet/core/whats-new/dotnet-10/overview"
+    label: "Microsoft Docs: Breaking changes in .NET 10"
+  - url: "https://github.com/PowerShell/PowerShell/releases/tag/v7.6.0"
+    label: "PowerShell 7.6.0 Release Notes"
