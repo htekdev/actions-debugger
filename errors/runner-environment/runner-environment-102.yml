@@ -1,0 +1,89 @@
+id: runner-environment-102
+title: "macOS 14+ xcrun altool removed — notarization workflows fail with 'unable to find utility'"
+category: runner-environment
+severity: error
+tags:
+  - macos
+  - xcode
+  - notarization
+  - altool
+  - notarytool
+  - codesign
+  - migration
+patterns:
+  - regex: 'xcrun: error: unable to find utility .altool.'
+    flags: "i"
+  - regex: 'altool.*has been deprecated and is no longer supported|unable to find utility .altool.'
+    flags: "i"
+error_messages:
+  - "xcrun: error: unable to find utility \"altool\", not a developer tool or in PATH"
+  - "altool has been deprecated and is no longer supported"
+root_cause: |
+  xcrun altool was Apple's original notarization CLI tool. Apple deprecated it in
+  Xcode 13 (WWDC 2021) and removed it entirely in Xcode 15 (September 2023).
+  GitHub's macOS 14, macOS 15, and macOS 26 runners ship Xcode 15 or later, so
+  altool is not present on these runners.
+
+  Workflows that use any of the following commands fail immediately on macos-14+:
+    xcrun altool --notarize-app ...
+    xcrun altool --notarization-info ...
+    xcrun altool --staple-archive ...
+    xcrun altool --notarization-history ...
+
+  This is a runner image migration break: workflows working on macos-12 or macos-13
+  (Xcode 14) silently stop working when the runner label switches to macos-14 or
+  macos-latest, which ships Xcode 15+. The failure is loud (non-zero exit from
+  xcrun) but easy to miss if teams assume the mac runner version did not change.
+fix: |
+  Migrate to xcrun notarytool, the replacement for altool since Xcode 13. Notarytool
+  accepts the same Apple ID + app-specific password credentials or the more secure
+  App Store Connect API key (recommended for CI — avoids 2FA issues). Submissions
+  complete synchronously with --wait, replacing the polling loop previously required
+  by altool.
+fix_code:
+  - language: yaml
+    label: "Migrate from altool to notarytool (Apple ID auth)"
+    code: |
+      - name: Notarize app
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          xcrun notarytool submit MyApp.zip \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$TEAM_ID" \
+            --wait
+
+      - name: Staple notarization ticket
+        run: xcrun stapler staple MyApp.app
+  - language: yaml
+    label: "Preferred: App Store Connect API key auth (no 2FA issues)"
+    code: |
+      - name: Notarize with App Store Connect API key
+        env:
+          API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+          API_KEY_ISSUER: ${{ secrets.AC_API_KEY_ISSUER }}
+          API_KEY_PATH: /tmp/AuthKey.p8
+        run: |
+          printf '%s' "${{ secrets.AC_API_KEY }}" > "$API_KEY_PATH"
+          xcrun notarytool submit MyApp.zip \
+            --key "$API_KEY_PATH" \
+            --key-id "$API_KEY_ID" \
+            --issuer "$API_KEY_ISSUER" \
+            --wait
+prevention:
+  - "Migrate all xcrun altool commands to xcrun notarytool — altool is gone on any Xcode 15+ runner"
+  - "Prefer App Store Connect API key authentication in CI — avoids 2FA prompts and app-specific password rotation"
+  - "Search workflow files for altool before updating the macos runner label from macos-13 to macos-14 or macos-latest"
+  - "Test notarization on macos-14 alongside macos-13 before fully retiring the older runner label"
+docs:
+  - url: "https://developer.apple.com/documentation/notaryapi"
+    label: "Apple: Notary API (notarytool)"
+  - url: "https://developer.apple.com/news/releases/xcode-15-release-notes/"
+    label: "Xcode 15 Release Notes — altool removal"
+  - url: "https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution/customizing-the-notarization-workflow"
+    label: "Apple: Customizing the notarization workflow"
+  - url: "https://github.com/actions/runner-images/discussions/7505"
+    label: "runner-images: macOS 14 Xcode 15 notarization migration"
