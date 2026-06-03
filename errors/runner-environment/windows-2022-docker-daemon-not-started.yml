@@ -1,0 +1,108 @@
+id: runner-environment-069
+title: "Windows 2022 Runner Docker Engine Named Pipe Not Found on Start"
+category: runner-environment
+severity: error
+tags:
+  - windows
+  - docker
+  - runner-image
+  - intermittent
+  - named-pipe
+patterns:
+  - regex: "failed to connect to the docker API at npipe:////\\.?/pipe/docker_engine"
+    flags: "i"
+  - regex: "open //\\.?/pipe/docker_engine.*The system cannot find the file specified"
+    flags: "i"
+  - regex: "error during connect.*pipe/docker_engine.*daemon running"
+    flags: "i"
+  - regex: "Docker Engine.*Stopped|docker.*service.*not running"
+    flags: "i"
+error_messages:
+  - "failed to connect to the docker API at npipe:////./pipe/docker_engine; check if the path is correct and if the daemon is running: open //./pipe/docker_engine: The system cannot find the file specified."
+  - "error during connect: Get \"http://%2F%2F.%2Fpipe%2Fdocker_engine/v1.45/info\": open //./pipe/docker_engine: The system cannot find the file specified."
+root_cause: |
+  On GitHub-hosted `windows-2022` runners, the Docker Engine service occasionally
+  fails to start before the workflow job begins. The Docker Engine runs as a Windows
+  service (`docker`) and the runner sometimes starts executing job steps before the
+  service has fully initialized and opened its named pipe at `//./pipe/docker_engine`.
+
+  This is an intermittent race condition between the runner agent startup and the
+  Docker Engine service startup sequence. The issue was reported in February 2026
+  (runner-images#13729) and confirmed to affect `windows-2022` at ~50% frequency
+  for some users. The `windows-2025` image is less affected.
+
+  The Docker Engine service shows `Status: Stopped` when queried immediately after
+  the runner starts. Manually starting the service (via `Start-Service docker`)
+  resolves the issue for that run. Job reruns also frequently succeed because they
+  land on a fresh host with Docker already running.
+fix: |
+  Add a step early in your job to verify Docker is running and start it if not:
+
+  ```yaml
+  - name: Ensure Docker Engine is running
+    shell: pwsh
+    run: |
+      $service = Get-Service -Name docker -ErrorAction SilentlyContinue
+      if ($service.Status -ne 'Running') {
+        Start-Service docker
+        $timeout = 60
+        $elapsed = 0
+        while ((Get-Service docker).Status -ne 'Running' -and $elapsed -lt $timeout) {
+          Start-Sleep -Seconds 2
+          $elapsed += 2
+        }
+      }
+      docker info
+  ```
+
+  If the issue is sporadic, a simpler retry on job failure may suffice. You can
+  also switch to `windows-2025` which has a lower incidence of this race condition.
+fix_code:
+  - language: yaml
+    label: "Guard step — ensure Docker service is running before use"
+    code: |
+      jobs:
+        build:
+          runs-on: windows-2022
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Ensure Docker Engine is running
+              shell: pwsh
+              run: |
+                $svc = Get-Service docker -ErrorAction SilentlyContinue
+                if ($null -eq $svc -or $svc.Status -ne 'Running') {
+                  Write-Host "Docker service not running — starting..."
+                  Start-Service docker
+                  $deadline = (Get-Date).AddSeconds(60)
+                  while ((Get-Service docker).Status -ne 'Running') {
+                    if ((Get-Date) -gt $deadline) { throw "Docker failed to start in 60s" }
+                    Start-Sleep -Seconds 2
+                  }
+                  Write-Host "Docker service started."
+                }
+                docker info
+
+            - name: Build Docker image
+              run: docker build -t myimage .
+  - language: yaml
+    label: "Alternative — switch to windows-2025 (less affected)"
+    code: |
+      jobs:
+        build:
+          # windows-2025 has a lower frequency of this race condition
+          runs-on: windows-2025
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build Docker image
+              run: docker build -t myimage .
+prevention:
+  - "Add a Docker health-check step before any `docker` commands on Windows runners."
+  - "Consider using `windows-2025` which has fewer reports of this race condition."
+  - "Enable job reruns — this race condition is intermittent and reruns usually succeed."
+  - "Subscribe to runner-images announcements; GitHub is tracking this as a runner startup issue."
+docs:
+  - url: "https://github.com/actions/runner-images/issues/13729"
+    label: "GitHub Issue: windows-2022 docker not available when runner starts"
+  - url: "https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners#supported-runners-and-hardware-resources"
+    label: "About GitHub-hosted runners"
