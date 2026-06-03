@@ -1,0 +1,121 @@
+id: 'silent-failures-037'
+title: '`github.event.head_commit` is null on `pull_request` and `workflow_dispatch` events — commit message access silently fails'
+category: silent-failures
+severity: silent-failure
+tags:
+  - head-commit
+  - commit-message
+  - pull-request
+  - workflow-dispatch
+  - event-payload
+  - null-context
+  - silent-skip
+patterns:
+  - regex: 'github\.event\.head_commit\.(?:message|author|id|timestamp)'
+    flags: 'i'
+  - regex: 'github\.event\.head_commit\s+is\s+null'
+    flags: 'i'
+error_messages:
+  - "Error: Unhandled error: TypeError: Cannot read properties of null (reading 'message')"
+  - "Expression evaluation failed: github.event.head_commit is null"
+  - "Step was skipped because the condition was false: contains(github.event.head_commit.message, '[skip ci]')"
+root_cause: |
+  `github.event.head_commit` is only populated on `push` events. It is `null` (not an
+  empty object) on all other event types, including:
+  - `pull_request` and `pull_request_target`
+  - `workflow_dispatch`
+  - `workflow_call`
+  - `schedule`
+  - `release`
+  - `repository_dispatch`
+
+  This causes several silent failure patterns:
+  1. **Silent [skip ci] bypass**: A common pattern is
+     `if: "!contains(github.event.head_commit.message, '[skip ci]')"`.
+     On a `pull_request` event, `github.event.head_commit` is null, so the expression
+     evaluates as `!contains(null, '[skip ci]')` → `!false` → `true`. Every PR run
+     executes unconditionally, ignoring any [skip ci] intent.
+  2. **Runtime crash in scripts**: GitHub Script or shell steps that access
+     `${{ github.event.head_commit.message }}` on PR events receive an empty string
+     silently, or throw a TypeError if accessed via JavaScript.
+  3. **Commit metadata loss in multi-event workflows**: Workflows triggered by both
+     `push` and `pull_request` may use `head_commit` data in notifications or logs;
+     the PR trigger silently produces empty/null values for all commit fields.
+
+  This is documented in Stack Overflow question #63441440 (Score: 95, 100,000+ views).
+fix: |
+  Use a multi-event compatible approach to access commit messages:
+  - For `pull_request`: use `github.event.pull_request.head.sha` and fetch the commit
+    via the API, or use `github-script` with `octokit.rest.repos.getCommit()`
+  - For `push`: `github.event.head_commit.message` works directly
+  - For a robust cross-event solution: use `actions/checkout` with fetch-depth and
+    run `git log -1 --format=%s` in a shell step — this works regardless of event type
+  - For [skip ci] detection: use the `github.event.commits` array (available on `push`)
+    or check PR body/title instead of commit message for multi-event workflows
+fix_code:
+  - language: yaml
+    label: 'Guard head_commit access with event_name check'
+    code: |
+      steps:
+        - name: Get commit message (push events only)
+          if: github.event_name == 'push'
+          run: echo "Commit: ${{ github.event.head_commit.message }}"
+
+        - name: Get HEAD commit message (all events via shell)
+          run: |
+            MSG=$(git log -1 --format='%s')
+            echo "Commit: $MSG"
+  - language: yaml
+    label: 'Cross-event [skip ci] detection using shell git log'
+    code: |
+      jobs:
+        check-skip:
+          runs-on: ubuntu-latest
+          outputs:
+            skip: ${{ steps.skip-check.outputs.skip }}
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                fetch-depth: 2
+            - id: skip-check
+              run: |
+                MSG=$(git log -1 --format='%s')
+                if echo "$MSG" | grep -q '\[skip ci\]'; then
+                  echo "skip=true" >> "$GITHUB_OUTPUT"
+                else
+                  echo "skip=false" >> "$GITHUB_OUTPUT"
+                fi
+
+        build:
+          needs: check-skip
+          if: needs.check-skip.outputs.skip != 'true'
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Building"
+  - language: yaml
+    label: 'Fetch commit message via API for pull_request events'
+    code: |
+      steps:
+        - name: Get PR head commit message
+          if: github.event_name == 'pull_request'
+          uses: actions/github-script@v7
+          with:
+            script: |
+              const { data } = await github.rest.repos.getCommit({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: context.payload.pull_request.head.sha
+              });
+              console.log('Commit message:', data.commit.message);
+prevention:
+  - 'Always guard `github.event.head_commit` access with `if: github.event_name == ''push''`'
+  - 'For multi-event workflows needing commit messages, use `git log -1 --format=%s` after checkout rather than the event context'
+  - 'Do not use `github.event.head_commit.message` for [skip ci] detection — it silently fails on PRs and dispatches'
+  - 'Add `run: echo "${{ toJSON(github.event) }}"` to debug which event fields are available for each trigger'
+docs:
+  - url: 'https://docs.github.com/en/webhooks/webhook-events-and-payloads#push'
+    label: 'GitHub Docs: push event payload — head_commit field'
+  - url: 'https://docs.github.com/en/webhooks/webhook-events-and-payloads#pull_request'
+    label: 'GitHub Docs: pull_request event payload (no head_commit field)'
+  - url: 'https://stackoverflow.com/questions/63441440/get-github-commit-message-in-pull-request-actions'
+    label: 'Stack Overflow #63441440 (95 votes, 100K views): Get GitHub commit message in pull request Actions'
