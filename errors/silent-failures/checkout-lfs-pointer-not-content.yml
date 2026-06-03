@@ -1,0 +1,105 @@
+id: silent-failures-033
+title: "actions/checkout lfs: true Leaves LFS Pointer Metadata Instead of Actual File Content"
+category: silent-failures
+severity: silent-failure
+tags:
+  - checkout
+  - git-lfs
+  - lfs
+  - pointer-file
+  - large-file-storage
+  - self-hosted
+patterns:
+  - regex: "version https://git-lfs\\.github\\.com/spec/v1"
+    flags: "i"
+  - regex: "oid\\s+sha256:[0-9a-f]{64}"
+    flags: "i"
+  - regex: "lfs:\\s*true"
+    flags: "i"
+error_messages:
+  - "version https://git-lfs.github.com/spec/v1"
+  - "oid sha256:f23e4c2b1244bc93085dbccf17c447e54..."
+  - "size 58951008"
+root_cause: |
+  When actions/checkout runs with lfs: true, it configures LFS credentials and
+  attempts to download actual file content for LFS-tracked files. However, the
+  step can exit 0 (success) while leaving LFS pointer metadata files on disk
+  instead of the actual binary or text content.
+
+  This happens silently in several situations:
+
+  - Self-hosted runners without git-lfs installed: the LFS fetch is skipped
+    because the binary is not present. No error is emitted.
+  - LFS bandwidth quota exhausted: GitHub's LFS bandwidth limit (1 GB/month
+    free tier) is silently hit; pointer files remain without a clear warning.
+  - Private cross-repo LFS: checking out a different repository with lfs: true
+    using a token may fail LFS authentication without surfacing an error.
+  - Fork pull requests: LFS objects contributed from fork branches may not be
+    accessible to the base repository workflow.
+
+  The result: downstream tools receive a text file starting with
+  "version https://git-lfs.github.com/spec/v1" instead of actual content,
+  causing opaque failures in build tools, image processors, or test suites.
+fix: |
+  Add an explicit LFS fetch step after checkout. On GitHub-hosted runners,
+  lfs: true is generally sufficient if LFS is configured on the repository.
+  For self-hosted runners, ensure git-lfs is installed before the checkout
+  step runs:
+  - Ubuntu/Debian: sudo apt-get install git-lfs
+  - macOS: brew install git-lfs
+  - Windows: winget install GitHub.GitLFS
+
+  After installation, run the LFS initialization command (git lfs install)
+  once per runner to configure the global LFS hooks.
+
+  To detect unfetched pointer files, add a validation step that checks for
+  the LFS pointer header string in files that should contain real content.
+fix_code:
+  - language: yaml
+    label: "Self-hosted runner — install git-lfs before checkout"
+    code: |
+      steps:
+        - name: Ensure git-lfs is installed
+          run: |
+            sudo apt-get update -qq
+            sudo apt-get install -y git-lfs
+          shell: bash
+
+        - uses: actions/checkout@v4
+          with:
+            lfs: true
+
+        - name: Verify LFS content downloaded
+          run: |
+            if grep -rl "version https://git-lfs.github.com/spec/v1" . \
+               --include="*.bin" --include="*.png" --include="*.zip" 2>/dev/null | head -1 | grep -q .; then
+              echo "ERROR: LFS pointer files found — actual content was not downloaded"
+              exit 1
+            fi
+            echo "LFS check passed — no pointer files found"
+          shell: bash
+
+  - language: yaml
+    label: "GitHub-hosted runner — explicit lfs: true with verification"
+    code: |
+      steps:
+        - uses: actions/checkout@v4
+          with:
+            lfs: true
+            # lfs: true is usually sufficient on GitHub-hosted runners
+            # if LFS quota is not exhausted
+prevention:
+  - "Verify git-lfs is installed on all self-hosted runners before running checkout workflows."
+  - "Monitor GitHub LFS bandwidth usage in repository Settings > Billing to avoid silent quota exhaustion."
+  - "Add a post-checkout verification step that confirms LFS-tracked files contain real content, not pointer metadata."
+  - "For fork PRs from external contributors, be aware that LFS objects may not be accessible — consider disabling LFS-dependent tests for fork builds."
+  - "Use GitHub-hosted runners for LFS-heavy workflows to avoid manual git-lfs installation and configuration."
+docs:
+  - url: "https://stackoverflow.com/questions/61463578/github-actions-actions-checkoutv2-lfs-true-flag-not-converting-pointers-to-actual-files"
+    label: "Stack Overflow: actions/checkout lfs:true not converting pointers to actual files (Score: 48, 21K views)"
+  - url: "https://github.com/actions/checkout#usage"
+    label: "actions/checkout: lfs input documentation"
+  - url: "https://docs.github.com/en/repositories/working-with-files/managing-large-files/about-git-large-file-storage"
+    label: "GitHub Docs: About Git Large File Storage"
+  - url: "https://docs.github.com/en/billing/managing-billing-for-your-products/managing-billing-for-git-large-file-storage/about-billing-for-git-large-file-storage"
+    label: "GitHub Docs: About billing for Git LFS"
