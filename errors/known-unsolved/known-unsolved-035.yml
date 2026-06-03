@@ -1,0 +1,97 @@
+id: known-unsolved-035
+title: "workflow_run trigger only fires for same-repo workflows — cross-repo chaining not supported"
+category: known-unsolved
+severity: limitation
+tags:
+  - workflow_run
+  - cross-repo
+  - triggers
+  - repository-dispatch
+  - known-limitation
+  - event-chaining
+patterns:
+  - regex: 'workflow_run.*never.*trigger|on.*workflow_run.*different.*repo'
+    flags: "i"
+  - regex: 'cross.repo.*workflow.run|workflow_run.*external.*repo'
+    flags: "i"
+error_messages:
+  - "workflow_run trigger does not fire for workflows in a different repository"
+root_cause: |
+  The on: workflow_run trigger only listens to workflow completion events in the same
+  repository. It cannot subscribe to events from workflows in external repositories,
+  even within the same organization or enterprise. Teams building cross-repository
+  CI/CD chains (e.g., "when repo-A build finishes, trigger repo-B deploy") discover
+  that the downstream workflow simply never starts — there is no error, just silence.
+
+  This is a platform design decision: workflow_run was built for intra-repo fan-out
+  (e.g., running security scans after CI passes) and not for cross-repo event routing.
+
+  Common scenarios where this limitation is hit:
+  - Platform team repo triggering deploy workflows in service repos
+  - Shared library repo signaling consumers after a release
+  - Monorepo-to-polyrepo migration preserving CI event chains
+  - Organization-wide rollout pipelines spanning multiple repositories
+fix: |
+  Use repository_dispatch for cross-repo event chaining. The upstream workflow sends
+  a POST to the GitHub REST API to create a repository_dispatch event in the downstream
+  repo. The downstream workflow listens on on: repository_dispatch: types: [...].
+
+  This requires a PAT (classic) with repo scope, or a GitHub App token with contents:
+  write or actions: write on the downstream repository. The peter-evans/repository-dispatch
+  action is the most widely used wrapper.
+fix_code:
+  - language: yaml
+    label: "Upstream (repo-A): dispatch event to repo-B on workflow completion"
+    code: |
+      # .github/workflows/build.yml in repo-A
+      on:
+        push:
+          branches: [main]
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Build
+              run: make build
+
+            - name: Trigger deployment in repo-B
+              uses: peter-evans/repository-dispatch@v3
+              with:
+                token: ${{ secrets.CROSS_REPO_PAT }}
+                repository: my-org/repo-B
+                event-type: repo-a-build-complete
+                client-payload: >-
+                  {"sha": "${{ github.sha }}", "ref": "${{ github.ref }}",
+                   "run_id": "${{ github.run_id }}"}
+  - language: yaml
+    label: "Downstream (repo-B): receive repository_dispatch from repo-A"
+    code: |
+      # .github/workflows/deploy.yml in repo-B
+      on:
+        repository_dispatch:
+          types: [repo-a-build-complete]
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Deploy
+              run: |
+                echo "Triggered by SHA: ${{ github.event.client_payload.sha }}"
+                echo "Source run: ${{ github.event.client_payload.run_id }}"
+                # deploy steps here
+prevention:
+  - "Use repository_dispatch for cross-repository event chaining — workflow_run is same-repo only"
+  - "Document this limitation in workflow comments so future maintainers don't spend time debugging non-firing triggers"
+  - "Consider reusable workflows (workflow_call) for sharing logic within an org instead of cross-repo triggers"
+  - "For org-wide fan-out, a central platform repo dispatching to all downstream repos is a common pattern"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run"
+    label: "GitHub Docs: workflow_run trigger"
+  - url: "https://docs.github.com/en/rest/repos/repos#create-a-repository-dispatch-event"
+    label: "GitHub REST API: Create a repository dispatch event"
+  - url: "https://github.com/peter-evans/repository-dispatch"
+    label: "peter-evans/repository-dispatch action"
+  - url: "https://github.com/orgs/community/discussions/26323"
+    label: "GitHub Community #26323: workflow_run cross-repo limitation confirmed"
