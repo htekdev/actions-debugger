@@ -1,0 +1,93 @@
+id: silent-failures-050
+title: "continue-on-error: true on a failing step silently prevents if: failure() downstream steps from running"
+category: silent-failures
+severity: silent-failure
+tags:
+  - continue-on-error
+  - if-condition
+  - failure-check
+  - step-outcome
+  - silent-skip
+  - cleanup
+patterns:
+  - regex: 'continue.on.error.*if.*failure|if.*failure.*not.*running.*continue.on.error'
+    flags: "i"
+  - regex: 'cleanup.*step.*skipped.*continue.on.error|failure.*handler.*not.*triggered'
+    flags: "i"
+error_messages:
+  - "Downstream step with if: failure() silently skipped when preceding step uses continue-on-error: true"
+root_cause: |
+  When a step fails AND has continue-on-error: true, GitHub Actions marks that step's
+  conclusion as success (the error was absorbed) while preserving its outcome as failure.
+  Because the step conclusion is success, the job's overall result remains success.
+
+  Any downstream step or job conditioned on if: failure() evaluates the job's overall
+  status, not individual step outcomes. Since the job is still succeeding (the failure was
+  continued past), if: failure() evaluates to false — and those downstream steps are
+  silently skipped with no error or warning.
+
+  The pattern developers expect to work (but doesn't):
+
+    steps:
+      - name: Run tests
+        run: npm test
+        continue-on-error: true
+      - name: Upload failure report   # NEVER runs — job outcome is still 'success'
+        if: failure()
+
+  Silently broken patterns:
+  - Failure notification steps after continue-on-error test or lint steps
+  - Cleanup steps conditioned on job failure after a continued-on-error build
+  - Report upload or artifact save steps expected to fire when tests fail
+  - Alerting steps (Slack, PagerDuty) conditioned on failure() after a tolerated failure
+fix: |
+  Reference the specific failing step's outcome directly using steps.<id>.outcome
+  instead of the job-level failure() function. Give the step-with-continue-on-error an
+  explicit id: field, then condition the downstream step on
+  steps.<step-id>.outcome == 'failure'.
+
+  This correctly captures the step-level failure even when the job overall is succeeding.
+fix_code:
+  - language: yaml
+    label: "Wrong: if: failure() silently never fires after a continue-on-error step"
+    code: |
+      steps:
+        - name: Run tests
+          run: npm test
+          continue-on-error: true
+          # Job outcome stays 'success' — if: failure() below never executes
+
+        - name: Upload test failure report
+          if: failure()
+          uses: actions/upload-artifact@v4
+          with:
+            name: test-report
+            path: test-results/
+  - language: yaml
+    label: "Correct: check the specific step outcome to catch the continued failure"
+    code: |
+      steps:
+        - name: Run tests
+          id: run-tests           # Explicit ID required to reference outcome below
+          run: npm test
+          continue-on-error: true
+
+        - name: Upload test failure report
+          # Fires when tests failed — works correctly even though the job is still 'success'
+          if: steps.run-tests.outcome == 'failure'
+          uses: actions/upload-artifact@v4
+          with:
+            name: test-report
+            path: test-results/
+prevention:
+  - "Never rely on if: failure() to detect failures from steps that use continue-on-error: true"
+  - "Assign explicit id: to any step with continue-on-error that needs downstream conditional checks"
+  - "Use steps.<id>.outcome == 'failure' to condition steps on a specific earlier step's result"
+  - "Test failure-handler steps explicitly by temporarily forcing the upstream step to fail without continue-on-error"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-conditions-to-control-job-execution"
+    label: "GitHub Docs: Using conditions to control job execution"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#steps-context"
+    label: "GitHub Docs: steps context — outcome vs conclusion"
+  - url: "https://github.com/orgs/community/discussions/25420"
+    label: "GitHub Community: continue-on-error and if: failure() interaction explained"
