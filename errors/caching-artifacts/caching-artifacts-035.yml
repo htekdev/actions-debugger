@@ -1,0 +1,119 @@
+id: caching-artifacts-035
+title: 'actions/cache fail-on-cache-miss: true causes first-run workflow failure — no cache exists on initial or rekeyed run'
+category: caching-artifacts
+severity: error
+tags:
+  - cache
+  - fail-on-cache-miss
+  - first-run
+  - actions-cache
+  - cache-miss
+  - bootstrap
+patterns:
+  - regex: 'fail-on-cache-miss:\s*true'
+    flags: 'i'
+  - regex: 'Error: Cannot find a cache that matches the specified keys'
+    flags: 'i'
+error_messages:
+  - 'Error: Cannot find a cache that matches the specified keys'
+  - 'Cache not found for input keys: ...'
+  - '##[error]Cannot find a cache that matches the specified keys'
+root_cause: |
+  The actions/cache action added a fail-on-cache-miss input (introduced in v3.3.0,
+  available in v4). When set to true, the action exits with a non-zero status code
+  if no cache entry matches the provided key or restore-keys list. The intended use
+  case is detecting stale or misconfigured cache keys in established pipelines.
+
+  The critical problem: on the very first run of a workflow (new repository, newly
+  added cache step, or after changing the cache key expression), NO cache exists by
+  definition. With fail-on-cache-miss: true, the action fails immediately and the
+  job exits before any steps produce the artifacts that would be cached.
+
+  This creates a bootstrap deadlock:
+  1. Job starts — no cache exists — fail-on-cache-miss: true fires — job fails
+  2. Post-step cache save never runs because the job failed
+  3. Next run repeats step 1 — cache is never populated — workflow is permanently broken
+
+  The same issue occurs whenever the cache key expression changes (adding runner OS,
+  changing the hash source file, bumping a version prefix), because all existing
+  caches miss the new key pattern. Until the new cache is warm, every run fails.
+
+  Matrix builds compound the problem: each unique matrix dimension (OS × version)
+  needs its own initial run to seed the cache, so all combinations fail in parallel
+  on first use of the new key.
+fix: |
+  Remove fail-on-cache-miss: true from the actions/cache step unless you have an
+  externally pre-seeded cache and a specific requirement to guarantee it exists
+  (rare, advanced use case).
+
+  For the common use case of skipping expensive install steps on cache hit:
+  use the cache-hit output instead. cache-hit is 'true' on exact key match and
+  allows downstream steps to be conditional, while still letting the job complete
+  successfully on a miss so the cache can be populated.
+
+  If you genuinely need to gate on cache existence (e.g., a nightly build that
+  consumes a separately-seeded model or dataset cache), run a dedicated cache-warming
+  workflow first and use fail-on-cache-miss: true only after confirming the seeder
+  workflow has run at least once.
+fix_code:
+  - language: yaml
+    label: 'Use cache-hit output for conditional install instead of fail-on-cache-miss'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Cache npm dependencies
+              id: cache-npm
+              uses: actions/cache@v4
+              with:
+                path: ~/.npm
+                key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+                restore-keys: |
+                  ${{ runner.os }}-npm-
+                # AVOID: fail-on-cache-miss: true  ← breaks first run (deadlock)
+
+            - name: Install dependencies
+              # Only runs on cache miss — fast path skipped on hit
+              if: steps.cache-npm.outputs.cache-hit != 'true'
+              run: npm ci
+
+            - name: Build
+              run: npm run build
+
+  - language: yaml
+    label: 'Dedicated cache-warming workflow to pre-seed before fail-on-cache-miss use'
+    code: |
+      # .github/workflows/warm-cache.yml — run this first to pre-seed
+      name: Warm Cache
+      on:
+        schedule:
+          - cron: '0 6 * * 1'
+        workflow_dispatch:   # Allow manual trigger when rekeying cache
+
+      jobs:
+        warm:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Cache dependencies
+              uses: actions/cache@v4
+              with:
+                path: ~/.npm
+                key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+            - name: Install to populate cache
+              run: npm ci
+prevention:
+  - 'Never set fail-on-cache-miss: true on a fresh workflow or after changing the cache key expression — the cache cannot exist yet'
+  - 'Use cache-hit output and conditional if: steps.id.outputs.cache-hit != true for skip-on-hit behavior without failing on miss'
+  - 'When rekeying cache (OS prefix, hash source change), trigger a manual cache-warming workflow_dispatch run before deploying the new key'
+  - 'Test new cache key expressions in a feature branch where a job failure will not block main'
+docs:
+  - url: 'https://github.com/actions/cache'
+    label: 'actions/cache README — fail-on-cache-miss input documentation'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows'
+    label: 'GitHub Docs: Caching dependencies to speed up workflows'
+  - url: 'https://github.com/actions/cache/blob/main/tips-and-workarounds.md'
+    label: 'actions/cache tips and workarounds — cache miss handling patterns'

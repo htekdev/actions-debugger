@@ -1,0 +1,100 @@
+id: yaml-syntax-036
+title: 'run-name: using github.event.head_commit.message shows "undefined" for schedule and workflow_dispatch events'
+category: yaml-syntax
+severity: warning
+tags:
+  - run-name
+  - head-commit-message
+  - schedule
+  - workflow-dispatch
+  - null-property
+  - expression
+patterns:
+  - regex: 'run-name:.*head_commit\.message'
+    flags: 'i'
+error_messages:
+  - "(Run title in the UI displays 'undefined' or 'Deploy by @actor from undefined' — no log error is emitted)"
+root_cause: |
+  The run-name: workflow key (introduced October 2022) lets you set a custom title
+  for each workflow run using GitHub Actions expressions. The GitHub Docs examples
+  include the pattern:
+
+    run-name: Deploy by @${{ github.actor }} from ${{ github.event.head_commit.message }}
+
+  However, github.event.head_commit is ONLY populated for on: push events. For
+  on: schedule, on: workflow_dispatch, on: pull_request, on: release, and most other
+  event types, the head_commit object is absent from the event payload. Accessing
+  github.event.head_commit.message on a null object evaluates to '' in some contexts
+  but renders as "undefined" in the Actions UI run title.
+
+  The result is a workflow run title like:
+    "Deploy by @octocat from undefined"
+  or simply "undefined" — confusing in the Actions tab and audit logs.
+
+  The workflow parses without error because the expression is syntactically valid.
+  The problem only surfaces at runtime when a non-push event triggers the workflow.
+  This is especially common in workflows that have both on: push and on: schedule or
+  on: workflow_dispatch triggers.
+fix: |
+  Use the || short-circuit operator to provide fallback values for event types where
+  head_commit is absent. GitHub Actions expressions treat || as a null/false fallback:
+
+    run-name: "${{ github.event.head_commit.message || github.event.inputs.reason || 'Scheduled run' }}"
+
+  Prefer contexts that are populated for ALL event types:
+  - github.actor — always set (the user or app that triggered the run)
+  - github.ref_name — always set (branch or tag short name)
+  - github.run_number — always set (monotonically increasing per workflow)
+  - github.event.inputs.* — set for workflow_dispatch when inputs are defined
+fix_code:
+  - language: yaml
+    label: 'Add || fallback so run-name is readable for all trigger types'
+    code: |
+      name: Deploy
+      # Without || fallback, schedule and workflow_dispatch show "undefined"
+      # github.event.head_commit is ONLY available on push events
+      run-name: "${{ github.event.head_commit.message || github.event.inputs.reason || 'Scheduled run' }}"
+      on:
+        push:
+          branches: [main]
+        schedule:
+          - cron: '0 8 * * 1'
+        workflow_dispatch:
+          inputs:
+            reason:
+              description: 'Reason for manual trigger'
+              required: false
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+  - language: yaml
+    label: 'Use always-populated contexts for a universally safe run-name'
+    code: |
+      name: Deploy
+      # github.actor, github.ref_name, and github.run_number are set for every event
+      run-name: '${{ github.actor }} on ${{ github.ref_name }} (#${{ github.run_number }})'
+      on:
+        push:
+        schedule:
+          - cron: '0 8 * * 1'
+        workflow_dispatch:
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+prevention:
+  - 'Test run-name expressions against every trigger in your on: block — head_commit is only available for push events'
+  - 'Always provide a || fallback: github.event.head_commit.message || ''Scheduled run'' handles both push and non-push'
+  - 'Prefer github.actor, github.ref_name, and github.run_number — these are populated for every event type'
+  - 'Check context availability in the GitHub Docs contexts reference before using event-specific properties in run-name'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#run-name'
+    label: 'GitHub Docs: Workflow syntax — run-name'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#github-context'
+    label: 'GitHub Docs: github context — event-specific property availability'
+  - url: 'https://github.blog/changelog/2022-10-05-github-actions-run-name-and-workflow-run-title/'
+    label: 'GitHub Changelog: run-name and workflow run title (October 2022)'
