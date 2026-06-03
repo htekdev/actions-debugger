@@ -1,0 +1,132 @@
+id: 'triggers-029'
+title: "issue_comment Trigger Runs in Default Branch Context — PR Code Not Checked Out"
+category: triggers
+severity: silent-failure
+tags:
+  - issue_comment
+  - pull_request
+  - checkout
+  - default-branch
+  - context
+  - ref
+  - pr-comment
+patterns:
+  - regex: 'on:\s*\n\s*issue_comment'
+    flags: 'im'
+  - regex: 'github\.event\.issue\.pull_request'
+    flags: 'i'
+error_messages:
+  - "Warning: This commit is not necessarily the head of this branch."
+  - "issue_comment event fires in the default branch context, not the PR branch"
+root_cause: |
+  When a comment is posted on a pull request, GitHub fires the `issue_comment`
+  event in the **default branch context**, not in the PR branch context.
+  Specifically:
+  - github.ref = refs/heads/main (or the repo default branch)
+  - github.sha = the HEAD commit of the default branch
+  - github.event.pull_request is undefined (issue_comment doesn't include PR data)
+
+  A workflow triggered by `issue_comment` that runs `actions/checkout` without
+  an explicit `ref:` will silently check out the **default branch**, not the
+  PR's code. The workflow appears to succeed — but it ran against stale or
+  unrelated code, not the PR changes being discussed.
+
+  This is a well-known footgun documented in 67-reaction issues. Developers
+  commonly add /deploy, /test, or /approve slash command workflows on PR comments,
+  expecting the workflow to run against the PR's code.
+
+  A second consequence: `github.event.pull_request` is undefined in this context.
+  Workflows that assume `github.event.pull_request.head.sha` exists will error
+  with "Cannot read properties of undefined (reading 'head')".
+
+  Source: actions/checkout#331 (67 reactions, open since Aug 2020).
+fix: |
+  Explicitly retrieve the PR details from the GitHub API and check out the PR
+  head commit using the pull request number from the issue comment event payload.
+
+  The PR number is available at: github.event.issue.number
+  (issue_comment events on PRs use the issue number, which matches the PR number)
+
+  Two approaches:
+  1. Use actions/github-script to fetch the PR head SHA, then checkout with
+     that explicit ref.
+  2. Use pull_request_target instead of issue_comment for workflows that need
+     to run on PR code — but be aware of the security implications (pull_request_target
+     runs with write permissions in the base repo context, even for fork PRs).
+
+  Always gate on `github.event.issue.pull_request` in an if: condition to
+  distinguish PR comments from plain issue comments.
+fix_code:
+  - language: yaml
+    label: "Checkout PR head commit from issue_comment event"
+    code: |
+      on:
+        issue_comment:
+          types: [created]
+
+      jobs:
+        run-on-pr-comment:
+          runs-on: ubuntu-latest
+          # Only run on PR comments, not plain issue comments
+          if: github.event.issue.pull_request != null
+          steps:
+            - name: Get PR head SHA
+              id: pr
+              uses: actions/github-script@v7
+              with:
+                script: |
+                  const pr = await github.rest.pulls.get({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    pull_number: context.issue.number,
+                  });
+                  core.setOutput('head_sha', pr.data.head.sha);
+                  core.setOutput('head_ref', pr.data.head.ref);
+
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ steps.pr.outputs.head_sha }}
+
+            - name: Run tests on PR code
+              run: npm test
+  - language: yaml
+    label: "Slash command pattern — only act on specific PR comment text"
+    code: |
+      on:
+        issue_comment:
+          types: [created]
+
+      jobs:
+        slash-command:
+          runs-on: ubuntu-latest
+          if: |
+            github.event.issue.pull_request != null &&
+            contains(github.event.comment.body, '/deploy')
+          steps:
+            - name: Get PR head SHA
+              id: pr
+              uses: actions/github-script@v7
+              with:
+                script: |
+                  const pr = await github.rest.pulls.get({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    pull_number: context.issue.number,
+                  });
+                  core.setOutput('head_sha', pr.data.head.sha);
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ steps.pr.outputs.head_sha }}
+            - run: ./scripts/deploy.sh
+prevention:
+  - "Always add `if: github.event.issue.pull_request != null` to distinguish PR comments from issue comments."
+  - "Never rely on github.ref or github.sha in issue_comment workflows — they point to the default branch, not the PR."
+  - "Use actions/github-script to fetch the PR head SHA via the pulls.get API, then pass it to actions/checkout as ref."
+  - "Consider pull_request_target for PR-triggered workflows, but audit for untrusted code execution risk first."
+docs:
+  - url: "https://github.com/actions/checkout/issues/331"
+    label: "actions/checkout#331: Any way to checkout PR from issue_comment event? (67 reactions)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#issue_comment"
+    label: "GitHub Docs: issue_comment event trigger"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request_target"
+    label: "GitHub Docs: pull_request_target event — alternative with write access"

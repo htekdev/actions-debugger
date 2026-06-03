@@ -1,0 +1,108 @@
+id: 'caching-artifacts-030'
+title: "Cache Service 429 Rate Limit During Upload Causes EBADF File Stream Crash"
+category: caching-artifacts
+severity: error
+tags:
+  - cache
+  - rate-limit
+  - 429
+  - ebadf
+  - post-step
+  - upload
+  - toolkit
+patterns:
+  - regex: 'Cache service responded with 429'
+    flags: 'i'
+  - regex: 'Cache upload failed because file read failed with EBADF'
+    flags: 'i'
+  - regex: 'Failed to save:.*429'
+    flags: 'i'
+error_messages:
+  - "Warning: Failed to save: Cache service responded with 429 during upload chunk."
+  - "Error: Cache upload failed because file read failed with EBADF: bad file descriptor, read"
+root_cause: |
+  When the GitHub cache service rate-limits a cache upload request with HTTP 429
+  Too Many Requests, the actions/toolkit cache implementation does not cleanly
+  handle the rate-limit response. It emits a warning but continues attempting
+  to read from the underlying file stream. Because the HTTP upload connection was
+  already torn down after the 429, the file stream is left in a bad state. A
+  subsequent read on the orphaned stream raises EBADF (bad file descriptor), which
+  surfaces as a hard crash in the cleanup or post step of any action that uses
+  the toolkit cache library — including actions/setup-java, actions/setup-node,
+  actions/setup-python, and direct actions/cache usage.
+
+  The root cause is missing retry-with-backoff logic for 429 responses in the
+  toolkit's cache upload path. 429 responses include a Retry-After header that
+  the toolkit ignores entirely.
+
+  Most commonly triggered on large matrix builds (20+ concurrent jobs) where many
+  jobs save large caches simultaneously and collectively exhaust the cache service
+  rate limit. Individual jobs that hit the rate limit fail with the EBADF crash
+  rather than retrying or gracefully degrading.
+
+  Open since November 2023 (actions/toolkit#1589). Multiple large open-source
+  projects have reported it: apache/beam, techmatters/terraso-mobile-client,
+  synapsecns/sanguine, and others.
+fix: |
+  No upstream fix is available — this is an open bug in actions/toolkit since
+  November 2023. The rate-limit retry path is not implemented.
+
+  Workarounds:
+  1. Re-run the failed job from the GitHub Actions UI — on re-run, the cache
+     service rate limit has usually recovered and the upload succeeds.
+  2. Reduce concurrent cache saves: split large matrix builds into smaller
+     batches using strategy.max-parallel to stagger cache upload timing.
+  3. Pin to the latest patch version of actions/cache — GitHub occasionally
+     ships partial fixes. Keep the action version pinned to the latest release.
+  4. Use actions/cache/save with if: always() and accept that the step may
+     still warn on 429 — but it avoids the EBADF crash if the stream
+     handling is improved in a newer version.
+  5. Increase actions/cache version: v4+ has the most recent reliability fixes.
+fix_code:
+  - language: yaml
+    label: "Limit concurrent cache saves with max-parallel to avoid rate limiting"
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, macos-latest, windows-latest]
+              node: [18, 20, 22]
+            max-parallel: 4   # Stagger cache saves — avoid 20+ simultaneous uploads
+          runs-on: ${{ matrix.os }}
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                node-version: ${{ matrix.node }}
+                cache: npm
+            - run: npm ci
+            - run: npm test
+  - language: yaml
+    label: "Accept cache-save failure gracefully with continue-on-error"
+    code: |
+      steps:
+        - uses: actions/cache/restore@v4
+          with:
+            path: ~/.m2/repository
+            key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+        - name: Build
+          run: mvn --batch-mode package
+        - name: Save cache (continue even if 429 occurs)
+          uses: actions/cache/save@v4
+          continue-on-error: true   # Prevents EBADF crash from failing the job
+          with:
+            path: ~/.m2/repository
+            key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+prevention:
+  - "Use strategy.max-parallel to limit concurrent matrix jobs and stagger cache upload timing."
+  - "Prefer actions/cache@v4 (latest) which includes the most recent reliability patches."
+  - "Add continue-on-error: true to explicit cache save steps to prevent EBADF from failing the workflow."
+  - "Monitor large matrix builds for recurring 429 errors — they indicate you need to reduce concurrency or shard differently."
+docs:
+  - url: "https://github.com/actions/toolkit/issues/1589"
+    label: "actions/toolkit#1589: Cache upload does not handle 429 error (open since Nov 2023, 6 reactions)"
+  - url: "https://github.com/actions/setup-java/issues/543"
+    label: "actions/setup-java#543: Transient 429 error fail upload cache cause workflow failure"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows"
+    label: "GitHub Docs: Caching dependencies to speed up workflows"
