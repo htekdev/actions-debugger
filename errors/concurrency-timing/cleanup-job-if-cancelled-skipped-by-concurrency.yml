@@ -1,0 +1,86 @@
+id: 'concurrency-timing-023'
+title: 'Cleanup jobs with if: cancelled() do not run when workflow is canceled by concurrency group'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - cancelled
+  - cleanup
+  - cancel-in-progress
+  - if-condition
+patterns:
+  - regex: 'cancel-in-progress:\s*true'
+    flags: 'i'
+  - regex: 'if:\s*cancelled\(\)'
+    flags: 'i'
+error_messages:
+  - 'This run has been cancelled.'
+  - 'Job cancelled by a newer workflow run'
+root_cause: |
+  When cancel-in-progress: true cancels a workflow run because a new run was queued in the same
+  concurrency group, GitHub cancels the entire workflow run at the infrastructure level before
+  individual job-level if: conditions are evaluated. As a result, jobs with if: cancelled() or
+  if: always() defined to run after a canceled parent job are themselves canceled before they
+  can be dispatched to a runner.
+
+  This is distinct from a job failing or being manually canceled: concurrency-group cancellation
+  is an external platform signal. In practice, cleanup jobs that rely on if: cancelled() may
+  start briefly but are killed mid-execution if they happen to be in-flight when the cancel
+  propagates.
+fix: |
+  Use a separate workflow triggered by workflow_run with types: [completed] as the cleanup
+  trigger rather than relying on in-workflow if: cancelled() jobs. The workflow_run approach
+  fires reliably regardless of how the parent workflow ended.
+
+  If the in-workflow approach is required, use if: always() rather than if: cancelled() and
+  ensure the cleanup job starts quickly (lightweight first step) to reduce the window during
+  which the cancellation signal can reach it.
+fix_code:
+  - language: yaml
+    label: 'Reliable cleanup via separate workflow_run trigger'
+    code: |
+      # .github/workflows/cleanup.yml
+      on:
+        workflow_run:
+          workflows: ['CI']
+          types: [completed]
+
+      jobs:
+        cleanup:
+          runs-on: ubuntu-latest
+          if: >-
+            ${{ github.event.workflow_run.conclusion == 'cancelled' ||
+                github.event.workflow_run.conclusion == 'failure' }}
+          steps:
+            - name: Run cleanup
+              run: echo "Cleaning up after ${{ github.event.workflow_run.conclusion }}"
+  - language: yaml
+    label: 'Best-effort if:always() with fast first step'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./run-tests.sh
+
+        cleanup:
+          needs: build
+          if: always()
+          runs-on: ubuntu-latest
+          steps:
+            - name: Signal start immediately
+              run: echo "Cleanup starting"
+            - name: Do cleanup
+              run: ./cleanup.sh
+prevention:
+  - 'Do not rely solely on if: cancelled() for critical cleanup when cancel-in-progress: true is active'
+  - 'Use a separate workflow_run: completed trigger for guaranteed post-run cleanup logic'
+  - 'Use if: always() instead of if: cancelled() for broader coverage'
+  - 'Keep cleanup steps inside the main job where possible — step-level if: always() is more reliable than job-level when concurrency cancels the run'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency'
+    label: 'GitHub Docs: Using concurrency'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run'
+    label: 'GitHub Docs: workflow_run event'
+  - url: 'https://github.com/orgs/community/discussions/13655'
+    label: 'GitHub Community: cleanup jobs not running after concurrency cancellation'
