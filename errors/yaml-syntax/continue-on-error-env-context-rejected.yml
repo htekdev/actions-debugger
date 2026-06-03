@@ -1,0 +1,130 @@
+id: yaml-syntax-022
+title: "env Context Rejected in continue-on-error and Other Job-Level Boolean Attributes"
+category: yaml-syntax
+severity: error
+tags:
+  - continue-on-error
+  - env-context
+  - expression
+  - job-level
+  - unrecognized-named-value
+  - context-availability
+patterns:
+  - regex: "Unrecognized named-value: 'env'"
+    flags: "i"
+  - regex: "Unexpected value.*env\\."
+    flags: "i"
+  - regex: "continue-on-error.*env\\.|env\\..*continue-on-error"
+    flags: "i"
+  - regex: "The workflow is not valid.*Unrecognized named-value: 'env'"
+    flags: "i"
+error_messages:
+  - "The workflow is not valid. .github/workflows/ci.yml (Line X, Col Y): Unrecognized named-value: 'env'. Located at position 1 within expression: env.MY_FLAG"
+  - "Unexpected value '${{ contains(env.MY_LIST, matrix.value) }}'"
+root_cause: |
+  The `env` context is NOT available in all workflow attribute positions. Specifically,
+  job-level and step-level attributes that accept boolean values or simple flags — such as
+  `continue-on-error`, `timeout-minutes` (value expressions), and similar fields — do not
+  support the `env` context in their expression evaluations.
+
+  This is a known GitHub Actions platform limitation documented in actions/runner#1492. The
+  error occurs because these attributes are evaluated at workflow parse/validation time (before
+  the job runs), when environment variables have not yet been set in the runner context.
+
+  Contexts available in `continue-on-error`:
+  - ✅ `github`, `needs`, `strategy`, `matrix`
+  - ❌ `env`, `secrets`, `steps`, `jobs`
+
+  A common pattern that fails:
+  ```yaml
+  steps:
+    - run: ./build.sh
+      continue-on-error: ${{ contains(env.SUPPORTED_VERSIONS, matrix.version) }}
+  ```
+
+  Even if `env.SUPPORTED_VERSIONS` was set in the `env:` block at the top of the workflow,
+  the expression fails because `env` is not a supported context in that attribute.
+fix: |
+  Move the boolean logic into a step output computed earlier in the job, then reference the
+  step output in `continue-on-error`. Alternatively, restructure the workflow to avoid needing
+  `env`-based expressions in boolean job/step attributes.
+
+  **Option 1**: Compute the flag in an earlier step and use `steps` context:
+  ```yaml
+  - id: check
+    run: echo "should_skip=$([[ "$MY_FLAG" == "true" ]] && echo true || echo false)" >> $GITHUB_OUTPUT
+  - run: ./potentially-failing-task.sh
+    continue-on-error: ${{ steps.check.outputs.should_skip == 'true' }}
+  ```
+
+  **Option 2**: Use `matrix` context directly (supported in continue-on-error):
+  ```yaml
+  strategy:
+    matrix:
+      experimental: [true, false]
+  steps:
+    - run: ./build.sh
+      continue-on-error: ${{ matrix.experimental }}
+  ```
+
+  **Option 3**: Wrap the step in a conditional run script that handles the error inline.
+fix_code:
+  - language: yaml
+    label: "Use step output to control continue-on-error dynamically"
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          env:
+            EXPERIMENTAL_VERSIONS: "3.12 3.13"
+          steps:
+            - uses: actions/checkout@v4
+
+            # ❌ This FAILS: env context not available in continue-on-error
+            # - run: pytest
+            #   continue-on-error: ${{ contains(env.EXPERIMENTAL_VERSIONS, matrix.python) }}
+
+            # ✅ Compute the flag first, then reference via steps context
+            - id: flags
+              run: |
+                if echo "$EXPERIMENTAL_VERSIONS" | grep -qw "${{ matrix.python }}"; then
+                  echo "experimental=true" >> $GITHUB_OUTPUT
+                else
+                  echo "experimental=false" >> $GITHUB_OUTPUT
+                fi
+            - run: pytest
+              continue-on-error: ${{ steps.flags.outputs.experimental == 'true' }}
+  - language: yaml
+    label: "Use matrix boolean directly (no env needed)"
+    code: |
+      jobs:
+        test:
+          strategy:
+            matrix:
+              include:
+                - python: "3.11"
+                  experimental: false
+                - python: "3.12"
+                  experimental: true
+                - python: "3.13"
+                  experimental: true
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-python@v5
+              with:
+                python-version: ${{ matrix.python }}
+            - run: pytest
+              continue-on-error: ${{ matrix.experimental }}   # ✅ matrix context IS supported
+prevention:
+  - "Check the GitHub Actions context availability table before using any context in job-level attributes — not all contexts are available everywhere."
+  - "When you need dynamic boolean flags in `continue-on-error`, compute them in an earlier step and read via `steps.<id>.outputs`."
+  - "The `matrix` context is fully supported in `continue-on-error` — prefer encoding experimental flags in the matrix definition."
+  - "Run `actionlint` on your workflow to catch context-availability errors before pushing."
+docs:
+  - url: "https://github.com/actions/runner/issues/1492"
+    label: "actions/runner#1492 — env context not available in continue-on-error (original report)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#context-availability"
+    label: "GitHub Docs — context availability table (where each context can be used)"
+  - url: "https://github.com/rhysd/actionlint"
+    label: "actionlint — static analyzer that catches context-availability errors"

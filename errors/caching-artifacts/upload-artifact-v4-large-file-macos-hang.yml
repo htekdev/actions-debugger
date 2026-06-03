@@ -1,0 +1,111 @@
+id: caching-artifacts-021
+title: "upload-artifact v4 Silently Hangs on Large Files (500MB+) on macOS Runners"
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - upload-artifact
+  - macos
+  - large-file
+  - hang
+  - timeout
+  - silent-failure
+  - v4
+patterns:
+  - regex: "Uploaded bytes \\d+"
+    flags: "i"
+  - regex: "upload-artifact.*stall|stall.*upload-artifact"
+    flags: "i"
+  - regex: "The operation was cancelled.*upload|upload.*operation was cancelled"
+    flags: "i"
+  - regex: "Error: The process.*took too long.*upload-artifact"
+    flags: "i"
+error_messages:
+  - "Uploaded bytes 8388608"
+  - "The runner has received a shutdown signal. This can happen when the runner service is stopped, or a manually started runner is canceled."
+root_cause: |
+  `actions/upload-artifact@v4` intermittently stalls during upload on macOS GitHub-hosted
+  runners (macos-13-xl-arm64, macos-14-xlarge, macos-15) when artifact size is approximately
+  500 MB or larger. The stall manifests as the upload progress halting after logging "Uploaded
+  bytes XXXXXXXXX" with no further output — the job then exceeds its timeout and is cancelled
+  by GitHub without an explicit error message.
+
+  This behavior was reported and tracked in actions/upload-artifact#527. The hang appears
+  intermittent (roughly 30–50% failure rate for affected workflows), which makes it difficult
+  to diagnose in standard CI logs — the workflow shows as "cancelled" rather than "failed",
+  masking the root cause.
+
+  Contributing factors observed in community reports:
+  - Large uncompressed artifacts (binaries, build artifacts, test reports with raw data)
+  - macOS ARM64 hosted runners appear more susceptible than Linux or Windows runners
+  - Compression level settings do not consistently prevent the hang
+
+  This is a silent failure because:
+  1. The upload simply stops with no error log entry
+  2. The job shows as "cancelled" (not "failed") in the GitHub UI
+  3. Downstream artifact-download steps fail with "no artifact found" — the real cause is upstream
+fix: |
+  Use one or more of these mitigations while the issue is tracked by the actions team:
+
+  1. **Split large artifacts**: Break large upload paths into multiple smaller upload steps, each
+     under ~200MB. This reduces the risk of hitting the hang threshold.
+
+  2. **Add an explicit timeout**: Set `timeout-minutes` on the upload step to detect hangs faster
+     and fail with a clear error rather than waiting for the job-level timeout.
+
+  3. **Retry the upload**: Wrap the upload step in a retry loop or use a community action like
+     `nick-fields/retry` to automatically re-attempt on failure.
+
+  4. **Use direct storage for very large artifacts**: For artifacts over 1GB, upload directly to
+     S3, Azure Blob Storage, or GCS using provider CLI tools. Use upload-artifact only for test
+     reports and smaller build outputs.
+
+  5. **Switch to Linux runners**: If macOS-specific features are not required for the upload
+     phase, run artifact collection on an ubuntu-latest runner where the hang does not occur.
+fix_code:
+  - language: yaml
+    label: "Add timeout and retry to upload step"
+    code: |
+      - name: Upload large artifact
+        uses: actions/upload-artifact@v4
+        timeout-minutes: 10   # fail fast instead of waiting for job timeout
+        with:
+          name: release-binaries
+          path: dist/
+          compression-level: 6
+          retention-days: 7
+  - language: yaml
+    label: "Split large artifact into parts to reduce hang risk"
+    code: |
+      - name: Upload binaries (part 1)
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-part1
+          path: dist/platform-a/
+
+      - name: Upload binaries (part 2)
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-part2
+          path: dist/platform-b/
+  - language: yaml
+    label: "Upload to S3 for very large artifacts (bypass upload-artifact)"
+    code: |
+      - name: Upload large artifact to S3
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          aws s3 cp dist/release.tar.gz s3://my-bucket/artifacts/${{ github.sha }}/release.tar.gz
+          echo "Uploaded to s3://my-bucket/artifacts/${{ github.sha }}/release.tar.gz"
+prevention:
+  - "Keep individual artifact uploads under 200MB per upload step on macOS runners to avoid the hang threshold."
+  - "Always set `timeout-minutes` on upload steps for large files so the CI job fails fast with a clear error instead of silently timing out."
+  - "Monitor for `cancelled` status on jobs that use upload-artifact on macOS — these may be silently failing uploads."
+  - "For release artifacts exceeding 1GB, use cloud storage (S3, Azure Blob, GCS) directly rather than upload-artifact."
+docs:
+  - url: "https://github.com/actions/upload-artifact/issues/527"
+    label: "actions/upload-artifact#527 — macOS large-file upload hang report and discussion"
+  - url: "https://github.com/actions/upload-artifact"
+    label: "actions/upload-artifact — official repository and documentation"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-workflow-data-as-artifacts"
+    label: "GitHub Docs — storing workflow data as artifacts"
