@@ -1,0 +1,134 @@
+id: runner-environment-067
+title: "Self-Hosted Runner 'An error occurred: Runner not found'"
+category: runner-environment
+severity: error
+tags:
+  - self-hosted
+  - runner
+  - runner-not-found
+  - jit
+  - registration
+  - ephemeral
+patterns:
+  - regex: "An error occurred: Runner not found"
+    flags: "i"
+  - regex: "Runner not found"
+    flags: "i"
+  - regex: "No runner matching the specified criteria was found"
+    flags: "i"
+  - regex: "Could not find any runner that matches the selector"
+    flags: "i"
+error_messages:
+  - "An error occurred: Runner not found"
+  - "Error: An error occurred: Runner not found"
+  - "No runner matching the specified criteria was found"
+root_cause: |
+  "An error occurred: Runner not found" is a vague error emitted by the
+  GitHub Actions broker when it cannot match or allocate a self-hosted runner
+  for a queued job. It has multiple distinct root causes:
+
+  1. **JIT (Just-in-Time) token expiry** (most common with ARC/Kubernetes runners):
+     Ephemeral runners provisioned via Just-in-Time tokens have a short registration
+     window. If the runner process does not connect within the token validity period
+     (~60 seconds), the broker discards the registration and emits "Runner not found"
+     when the job is dispatched. This particularly affects actions-runner-controller
+     (ARC) on Kubernetes when pod startup time exceeds the JIT window.
+
+  2. **Runner de-registered before job starts**:
+     Autoscaling controllers (ARC, custom scripts) that aggressively recycle idle
+     runners may de-register the runner in the brief window between job queue and
+     job dispatch. The broker finds no runner for the job's labels.
+
+  3. **Label mismatch**:
+     The workflow specifies `runs-on: [self-hosted, linux, x64]` but the registered
+     runner has different labels (e.g., just `[self-hosted, linux]`). The broker
+     treats this as "no matching runner found" and emits the same vague error.
+
+  4. **Runner registered at wrong scope**:
+     A runner registered at the organization level is not visible to a repository
+     not in that runner's group, or vice versa. Org runner group access policy
+     may restrict which repos can use the runner.
+
+  5. **Concurrent job stealing**:
+     In autoscaling pools where multiple runners share the same label set, a
+     job token issued to one runner is occasionally "stolen" by another — the
+     original runner's job token is invalid when it tries to start. Less common
+     but documented in high-concurrency pools (actions/runner#3857, 116 reactions).
+
+  The error is intentionally vague because it covers multiple broker-side failures
+  that are indistinguishable from the runner's perspective.
+fix: |
+  Diagnose by checking the runner registration logs first:
+
+  1. **For JIT token expiry (ARC/Kubernetes)**:
+     Reduce pod startup time — use pre-pulled images, smaller base images, or
+     warm pools. Alternatively, switch to Long-Running runners (PAT/App-registered)
+     which don't have JIT token windows. Check actions-runner-controller v0.9+
+     which extended the JIT window.
+
+  2. **For de-registered runner race condition**:
+     Add a grace period to your autoscaler before de-registering idle runners —
+     at least 60 seconds after a job completes. Use `--once` flag on ephemeral
+     runners so they only exit after completing one job, not before.
+
+  3. **For label mismatch**:
+     Run `gh api repos/{owner}/{repo}/actions/runners --jq '.[].labels'` to inspect
+     registered runner labels. Compare against the `runs-on:` in your workflow.
+     Labels are case-sensitive and must be an exact subset match.
+
+  4. **For wrong scope (org vs repo)**:
+     Check Settings → Actions → Runners in both the repo and org. Confirm the
+     runner appears under the correct scope and the runner group allows access
+     to the repository.
+
+  5. **General debugging**:
+     Enable runner diagnostic logs by setting `ACTIONS_RUNNER_DEBUG: true` and
+     `ACTIONS_STEP_DEBUG: true` as repository secrets. This enables verbose
+     broker negotiation logs in the Actions runner output.
+fix_code:
+  - language: yaml
+    label: "Enable runner diagnostic logs to capture broker negotiation details"
+    code: |
+      # Add these as repository secrets (Settings → Secrets → Actions):
+      # ACTIONS_RUNNER_DEBUG = true
+      # ACTIONS_STEP_DEBUG = true
+
+      # Then re-run the failing job. The runner logs will include:
+      # "Checking runner for labels: [self-hosted, linux, x64]"
+      # "Connected to GitHub Actions service"
+      # "Received job assignment: ..."
+      jobs:
+        build:
+          runs-on: [self-hosted, linux, x64]
+          steps:
+            - uses: actions/checkout@v4
+            - run: echo "Runner labels verified"
+  - language: yaml
+    label: "Verify registered runner labels via GitHub API"
+    code: |
+      # Check what labels your self-hosted runners actually have:
+      # gh api repos/{owner}/{repo}/actions/runners --jq '.runners[] | {name: .name, labels: [.labels[].name]}'
+      # Example output:
+      # {"name": "my-runner", "labels": ["self-hosted", "Linux", "X64"]}
+      # Note: Labels are case-sensitive — "Linux" != "linux"
+
+      # Workflow label must match runner label exactly:
+      jobs:
+        build:
+          # Use exact case matching the runner's registered labels:
+          runs-on: [self-hosted, Linux, X64]
+prevention:
+  - "Use explicit, versioned runner labels instead of generic `self-hosted` to make label mismatches immediately visible in the runner registration."
+  - "For ephemeral/JIT runners on Kubernetes, use pre-pulled base images and resource requests that ensure fast pod startup to avoid JIT token expiry."
+  - "Add ACTIONS_RUNNER_DEBUG=true as a repository secret during initial setup to capture detailed registration logs before the runner goes into production."
+  - "Implement health monitoring on your self-hosted runner pool — alert when the runner count drops below the minimum needed for your queue depth."
+  - "Prefer Long-Running runners over JIT ephemeral runners for workflows with unpredictable startup patterns — JIT token windows are unforgiving on slow infrastructure."
+docs:
+  - url: "https://github.com/actions/runner/issues/3857"
+    label: "actions/runner #3857: 'An error occurred: Runner not found' (116 reactions)"
+  - url: "https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/monitoring-and-troubleshooting-self-hosted-runners"
+    label: "GitHub Docs: Monitoring and troubleshooting self-hosted runners"
+  - url: "https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/using-labels-with-self-hosted-runners"
+    label: "GitHub Docs: Using labels with self-hosted runners"
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions#hardening-for-self-hosted-runners"
+    label: "GitHub Docs: Security hardening for self-hosted runners"
