@@ -1,0 +1,95 @@
+id: 'permissions-auth-031'
+title: 'GitHub App installation token new stateless JWT format (~520 chars) breaks hardcoded length and regex validation'
+category: permissions-auth
+severity: error
+tags:
+  - github-app-token
+  - ghs-token
+  - jwt-format
+  - token-validation
+  - installation-token
+  - breaking-change-2026
+patterns:
+  - regex: 'ghs_[A-Za-z0-9]{36}\b'
+    flags: ''
+  - regex: 'Data too long for column|token.*length.*40|varchar\s*\(\s*40\s*\)'
+    flags: 'i'
+error_messages:
+  - "Data too long for column 'access_token' at row 1"
+  - 'Token validation failed: token length 521 does not match expected 40'
+  - 'Invalid token format: expected 40 characters, got 523'
+  - 'ghs_[A-Za-z0-9]{36} pattern did not match token starting with ghs_'
+root_cause: |
+  Starting April 27, 2026, GitHub began a staged rollout that changes the format of all
+  GitHub App installation tokens (ghs_ prefixed tokens), including the GITHUB_TOKEN
+  issued to Actions workflows.
+
+  Old format: ghs_<36 alphanumeric chars> — exactly 40 characters, opaque string
+  New format: ghs_<AppID>_<JWT> — approximately 520 characters (variable length),
+              JWT payload is signed by a GitHub-internal issuer
+
+  Any code that validates or stores tokens with the old format assumption WILL break:
+  - Regex: ghs_[A-Za-z0-9]{36} — the {36} quantifier rejects the new variable-length JWT
+  - Length checks: len(token) == 40, token.length === 40, strlen($token) == 40
+  - Database columns: VARCHAR(40) or CHAR(40) — the new ~520-char token truncates or errors
+  - Secret scanning rules with exact-length matchers for ghs_ tokens miss leaked tokens
+
+  The rollout timeline:
+  - April 27 – mid-May 2026: GITHUB_TOKEN and first-party tokens (Dependabot, Slack, Teams)
+  - Mid-May to late-June 2026: staged rollout to all GitHub App installation tokens
+
+  Despite the new internal JWT structure, the token prefix ghs_ is unchanged. Clients
+  must treat the entire token as an opaque string and must NOT parse or validate the JWT.
+fix: |
+  Treat all ghs_ tokens as variable-length opaque strings. Remove any assumptions about
+  exact length or character structure after the ghs_ prefix:
+
+  1. Update regex patterns: replace ghs_[A-Za-z0-9]{36} with ghs_[A-Za-z0-9._-]+
+  2. Increase database columns: VARCHAR(40) or CHAR(40) → TEXT or VARCHAR(1024)
+  3. Remove hardcoded length checks: len(token) == 40 → len(token) > 3
+  4. Update secret scanning rules to match variable-length ghs_ tokens
+
+  To test your tooling against the new format BEFORE the rollout reaches your integration,
+  use the X-GitHub-Stateless-S2S-Token: enabled header on access token API requests.
+fix_code:
+  - language: yaml
+    label: 'Verify GITHUB_TOKEN length in a workflow — expect ~520 chars with new format'
+    code: |
+      jobs:
+        check-token-format:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Check GITHUB_TOKEN length
+              env:
+                TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                echo "Token length: ${#TOKEN}"
+                # Old format: exactly 40 chars
+                # New format (post-April 2026 rollout): ~520 chars (variable)
+                # If your tooling uses this token, ensure it handles both lengths
+  - language: yaml
+    label: 'Correct regex for ghs_ tokens in secret scanning custom patterns'
+    code: |
+      # WRONG — only matches old 40-char opaque tokens:
+      #   ghs_[A-Za-z0-9]{36}
+      #
+      # CORRECT — matches old and new JWT format:
+      #   ghs_[A-Za-z0-9._-]+
+      #
+      # .github/secret_scanning.yml custom pattern (if scanning for leaked tokens):
+      custom_patterns:
+        - name: GitHub App installation token (all formats)
+          regex: 'ghs_[A-Za-z0-9._-]+'
+prevention:
+  - 'Treat all GitHub tokens as variable-length opaque strings — never hardcode expected length'
+  - 'Use TEXT or VARCHAR(1024) for any database column that stores GitHub App installation tokens'
+  - 'Validate ghs_ tokens by prefix only, not by exact length or post-prefix character class'
+  - 'Subscribe to the GitHub Changelog (github.blog/changelog) to catch token format changes early'
+  - 'Use X-GitHub-Stateless-S2S-Token: enabled header to test your tooling before the rollout reaches your repos'
+docs:
+  - url: 'https://github.blog/changelog/2026-04-24-notice-about-upcoming-new-format-for-github-app-installation-tokens/'
+    label: 'GitHub Changelog: Notice about upcoming new format for GitHub App installation tokens (April 24, 2026)'
+  - url: 'https://github.blog/changelog/2026-05-15-github-app-installation-tokens-per-request-override-header/'
+    label: 'GitHub Changelog: Per-request override header for testing the new token format (May 15, 2026)'
+  - url: 'https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-an-installation-access-token-for-a-github-app'
+    label: 'GitHub Docs: Generating an installation access token for a GitHub App'
