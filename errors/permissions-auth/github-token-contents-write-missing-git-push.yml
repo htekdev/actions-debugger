@@ -1,0 +1,117 @@
+id: permissions-auth-025
+title: "GITHUB_TOKEN Missing contents:write — git push Returns 403 Write Access Not Granted"
+category: permissions-auth
+severity: error
+tags:
+  - github-token
+  - contents-write
+  - git-push
+  - 403
+  - permissions-block
+  - auto-commit
+  - write-access
+patterns:
+  - regex: "remote: Write access to repository not granted"
+    flags: "i"
+  - regex: "error: failed to push some refs"
+    flags: "i"
+  - regex: "refusing to allow.*GitHub Actions.*to create or update workflow"
+    flags: "i"
+  - regex: "HttpError: Resource not accessible by integration"
+    flags: "i"
+error_messages:
+  - "remote: Write access to repository not granted."
+  - "error: failed to push some refs to 'https://github.com/owner/repo.git'"
+  - "fatal: unable to access 'https://github.com/owner/repo.git/': The requested URL returned error: 403"
+  - "Resource not accessible by integration"
+root_cause: |
+  The GITHUB_TOKEN is scoped by the `permissions:` block on the workflow or job. When any
+  `permissions:` block is present, all unspecified permissions are set to `none` (not to their
+  defaults). If `contents: write` is not explicitly granted, any `git push`, `git commit`, or
+  REST API call that writes to the repository will be rejected with HTTP 403 "Write access to
+  repository not granted."
+
+  Three common situations:
+
+  1. **Minimal permissions block** — the workflow declares `permissions: read-all` or lists
+     specific permissions (e.g., `pull-requests: write`) but omits `contents: write`. Any
+     subsequent git push fails with 403.
+
+  2. **Inherited restrictive org policy** — the organization sets the default token permission
+     to "read repository contents" (Settings → Actions → General → Workflow permissions). Without
+     an explicit `contents: write` in the workflow, the token cannot push.
+
+  3. **Fine-grained token in workflow context** — a PAT or GitHub App token is used for checkout
+     but the GITHUB_TOKEN (still the effective token for `git push`) lacks write access.
+
+  This is distinct from `permissions-auth-017` (empty `permissions: {}` block removing
+  `contents: read` and breaking checkout). This pattern specifically affects git write operations
+  and REST API calls that create or update repository content.
+fix: |
+  Add `contents: write` to the permissions block on the job or workflow where the push occurs.
+  Grant the narrowest scope needed — prefer job-level `permissions:` over workflow-level to
+  limit the blast radius.
+
+  If the org policy sets the default to "read-only", every workflow that writes to the repo
+  must explicitly declare `contents: write`.
+fix_code:
+  - language: yaml
+    label: "Add contents:write at the job level (preferred — narrowest scope)"
+    code: |
+      jobs:
+        auto-commit:
+          runs-on: ubuntu-latest
+          permissions:
+            contents: write   # ← required for git push / creating commits via API
+          steps:
+            - uses: actions/checkout@v4
+            - name: Bump version and push
+              run: |
+                git config user.name  "github-actions[bot]"
+                git config user.email "github-actions[bot]@users.noreply.github.com"
+                npm version patch --no-git-tag-version
+                git add package.json
+                git commit -m "chore: bump version [skip ci]"
+                git push
+  - language: yaml
+    label: "Org default is read-only — always set explicit contents:write for push workflows"
+    code: |
+      # When Settings → Actions → General → Workflow permissions = "Read repository contents and packages"
+      # EVERY workflow that pushes must declare contents: write:
+
+      permissions:
+        contents: write       # required for git push, release creation, branch creation
+        pull-requests: write  # only if the workflow also comments on PRs
+
+      jobs:
+        release:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Create release
+              run: gh release create "${{ github.ref_name }}" --generate-notes
+              env:
+                GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  - language: yaml
+    label: "Debug: print effective token permissions before failing"
+    code: |
+      - name: Check token permissions
+        run: |
+          gh api /repos/${{ github.repository }} --jq '.permissions'
+          gh auth status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+prevention:
+  - "Always add `contents: write` to any job that does `git push`, `git tag`, creates releases, or writes files via the GitHub API."
+  - "Set the organization default to 'Read and write' only when necessary; otherwise document that all push workflows must declare `contents: write`."
+  - "Use job-level `permissions:` blocks instead of workflow-level to minimize token scope."
+  - "Add a permissions comment near the `permissions:` block listing what each grant is needed for, so future maintainers don't accidentally remove it."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/controlling-permissions-for-github_token"
+    label: "GitHub Docs: Controlling permissions for GITHUB_TOKEN"
+  - url: "https://stackoverflow.com/questions/79437803/git-commit-in-github-actions-workflow-failing-write-access-to-repository-not"
+    label: "SO#79437803 — git commit failing: Write access to repository not granted, 403"
+  - url: "https://stackoverflow.com/questions/79471500/github-actions-authentication-failed-for-pushing-to-repository"
+    label: "SO#79471500 — Authentication failed for pushing to repository"
+  - url: "https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository#setting-the-permissions-of-the-github_token-for-your-repository"
+    label: "GitHub Docs: Setting GITHUB_TOKEN default permissions"
