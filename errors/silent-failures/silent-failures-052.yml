@@ -1,0 +1,102 @@
+id: silent-failures-052
+title: 'Step outputs referenced in the job-level env: block are always empty string — job env is evaluated before any steps run'
+category: silent-failures
+severity: silent-failure
+tags:
+  - env
+  - steps-outputs
+  - job-level
+  - context-evaluation
+  - expression
+  - environment-variables
+patterns:
+  - regex: 'steps\.[a-z0-9_-]+\.outputs\.[a-z0-9_-]+'
+    flags: 'i'
+error_messages:
+  - "(No error — steps.<id>.outputs.<name> silently resolves to '' when used in a job-level env: block)"
+root_cause: |
+  GitHub Actions evaluates the jobs.<id>.env: block once at job initialization, before
+  any steps begin executing. At that point, the steps context exists but all step
+  outputs are empty — no step has run yet, so no outputs have been set.
+
+  This means that ${{ steps.my-step.outputs.value }} in the jobs.<id>.env: block
+  always resolves to '' regardless of what the step later produces. The job does not
+  fail or warn — the environment variable is simply set to empty string and all steps
+  that reference it via $VAR or %VAR% receive nothing.
+
+  This is a context availability limitation documented by GitHub, but it is easy to
+  miss because the expression syntax is valid and the job runs without error.
+
+  Affected env: scopes (evaluated before steps run):
+  - jobs.<id>.env: — job-level env block
+  - The workflow-level env: block also cannot access steps.*, for the same reason
+
+  Env scopes that CAN access step outputs (evaluated per-step):
+  - jobs.<id>.steps.<id>.env: — step-level env block, evaluated when that step runs
+
+  Common mistake: a developer sets a job-level env var to a computed step output
+  (e.g., a parsed version string or a generated artifact path) and then uses that
+  var in multiple subsequent steps, not realizing it is always empty.
+fix: |
+  Move the env: block referencing step outputs from job level down to the individual
+  step level. Step-level env: blocks are evaluated when that step runs, so earlier
+  step outputs are already populated.
+
+  If the same value is needed across many steps, pass it via $GITHUB_OUTPUT and
+  reference it inline with ${{ steps.step-id.outputs.name }} in each step's run:.
+fix_code:
+  - language: yaml
+    label: 'Move env that references step outputs from job level to step level'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+
+          # WRONG: job-level env block — evaluated before any step runs
+          # steps.version.outputs.tag is '' here, no matter what the step produces
+          # env:
+          #   RELEASE_TAG: ${{ steps.version.outputs.tag }}
+
+          steps:
+            - name: Compute release tag
+              id: version
+              run: echo "tag=v1.2.3" >> $GITHUB_OUTPUT
+
+            - name: Build with release tag
+              # CORRECT: step-level env block — evaluated when this step runs
+              # steps.version.outputs.tag is populated by the prior step at this point
+              env:
+                RELEASE_TAG: ${{ steps.version.outputs.tag }}
+              run: echo "Building $RELEASE_TAG"
+
+            - name: Publish with release tag
+              env:
+                RELEASE_TAG: ${{ steps.version.outputs.tag }}
+              run: echo "Publishing $RELEASE_TAG"
+
+  - language: yaml
+    label: 'Use inline expression in run steps to avoid repeating step-level env blocks'
+    code: |
+      jobs:
+        release:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Resolve version
+              id: version
+              run: echo "tag=v2.0.0" >> $GITHUB_OUTPUT
+
+            - name: Tag Docker image
+              # Reference step output directly in run — no env: block needed
+              run: echo "Tagging image as ${{ steps.version.outputs.tag }}"
+
+            - name: Push Docker image
+              run: echo "Pushing tag ${{ steps.version.outputs.tag }}"
+prevention:
+  - 'Never reference steps.<id>.outputs.* in the jobs.<id>.env: block — use step-level env: or inline expressions in run: instead'
+  - 'Enable actionlint locally to catch step output references in job-level env blocks before they reach CI'
+  - 'When the same step output is needed in many steps, document it with a comment on the generating step so readers know where to look'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#context-availability'
+    label: 'GitHub Docs: Context availability — which contexts are accessible at each location'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/store-information-in-variables'
+    label: 'GitHub Docs: Store information in variables'

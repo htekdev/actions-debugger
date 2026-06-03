@@ -1,0 +1,103 @@
+id: runner-environment-104
+title: 'Private container registry image (ghcr.io, Docker Hub private) requires credentials: in the container: block — a docker login step is too late'
+category: runner-environment
+severity: error
+tags:
+  - container
+  - ghcr
+  - private-registry
+  - credentials
+  - docker-pull
+  - job-container
+  - services
+patterns:
+  - regex: 'pull access denied.*repository does not exist or may require.*login'
+    flags: 'i'
+  - regex: 'unauthorized.*authentication required|denied.*requested access to the resource is denied'
+    flags: 'i'
+error_messages:
+  - 'Error response from daemon: pull access denied for ghcr.io/org/image, repository does not exist or may require docker login: denied'
+  - 'Error: unauthorized: authentication required'
+  - 'Error pulling image: denied: requested access to the resource is denied'
+  - 'toomanyrequests: You have reached your pull rate limit'
+root_cause: |
+  When a job specifies a container image via jobs.<id>.container.image:, GitHub Actions
+  pulls the image before the job starts — before any steps execute. There is no
+  opportunity to authenticate with a docker login step because steps run inside the
+  already-running container.
+
+  Many workflows attempt to call docker/login-action or similar in a step, but by
+  then the container pull has either succeeded or already failed. The login step
+  has no effect on the original image pull.
+
+  The same limitation applies to services containers (jobs.<id>.services.<id>.image:):
+  all service containers are also pulled at job startup before any steps run.
+
+  Common scenarios that hit this error:
+  - Private GitHub Container Registry (ghcr.io) images requiring a PAT with
+    read:packages scope
+  - Docker Hub private repository images (rate-limited or private-tier)
+  - Self-hosted or corporate registries requiring Basic auth
+  - AWS ECR private images (ECR is not directly supported via credentials: block —
+    see fix for the ECR-specific workaround)
+fix: |
+  Provide credentials in the container: or services: block using the credentials: key.
+  These credentials are used at image pull time, before any steps begin.
+
+  For ghcr.io: use github.actor as username and a PAT with read:packages scope as
+  password. If the package is in the same org and the repository has package access,
+  secrets.GITHUB_TOKEN may also work.
+
+  For Docker Hub: use a Docker Hub username and access token (not password).
+
+  For AWS ECR private images: use a self-hosted runner with ECR credentials
+  pre-configured on the host, or build a public mirror of your private image.
+  The credentials: block does not support dynamic ECR token retrieval.
+fix_code:
+  - language: yaml
+    label: 'Authenticate to a private ghcr.io image using credentials in the container block'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          container:
+            image: ghcr.io/myorg/private-runner:latest
+            # credentials: evaluated at job startup BEFORE any steps run
+            credentials:
+              username: ${{ github.actor }}
+              password: ${{ secrets.GHCR_PAT }}
+              # For same-org packages with package access enabled:
+              # password: ${{ secrets.GITHUB_TOKEN }}
+          steps:
+            - uses: actions/checkout@v4
+            - run: echo "Running inside authenticated private container"
+
+  - language: yaml
+    label: 'Private Docker Hub image in a services block using credentials'
+    code: |
+      jobs:
+        integration-test:
+          runs-on: ubuntu-latest
+          services:
+            database:
+              image: myorg/private-db:5.7
+              # credentials: here too — service images are pulled before steps
+              credentials:
+                username: ${{ secrets.DOCKER_USERNAME }}
+                password: ${{ secrets.DOCKER_TOKEN }}
+              ports:
+                - 5432:5432
+          steps:
+            - uses: actions/checkout@v4
+            - run: echo "Integration test against private DB image"
+prevention:
+  - 'Always use the credentials: block inside container: or services: for private images — a docker login step in run: is too late'
+  - 'For same-org ghcr.io images, configure package visibility to allow GITHUB_TOKEN to avoid managing a separate PAT'
+  - 'Test authentication separately with docker pull from a local machine using the same credentials before wiring into a workflow'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idcontainer'
+    label: 'GitHub Docs: jobs.<job_id>.container.credentials'
+  - url: 'https://docs.github.com/en/packages/managing-github-packages-using-github-actions-workflows/publishing-and-installing-a-package-with-github-actions'
+    label: 'GitHub Docs: Using GITHUB_TOKEN with GitHub Packages (ghcr.io)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idservicesservice_idcredentials'
+    label: 'GitHub Docs: jobs.<job_id>.services.<service_id>.credentials'
