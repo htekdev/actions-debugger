@@ -1,0 +1,114 @@
+id: triggers-035
+title: "push: paths: filter silently prevents workflow from running on tag pushes — tags don't modify files"
+category: triggers
+severity: silent-failure
+tags:
+  - push
+  - paths-filter
+  - tags
+  - silent-skip
+  - tag-push
+  - release
+patterns:
+  - regex: 'push.*tags.*paths.*not.*trigger|tag.*push.*paths.*filter.*skip'
+    flags: "i"
+  - regex: 'release.*workflow.*not.*run.*tag|on\.push.*paths.*tags.*silent'
+    flags: "i"
+error_messages:
+  - "Release workflow does not trigger on tag push when push: paths: filter is present"
+  - "Tag v1.0.0 pushed but no workflow run created — paths filter silently blocking trigger"
+root_cause: |
+  When a GitHub Actions push trigger includes both tags: and paths: conditions, GitHub
+  evaluates BOTH conditions using AND logic — the event must match the tag pattern AND
+  at least one file in the push must match the paths pattern. A tag push (e.g., v1.0.0)
+  creates a new ref pointing to an existing commit without modifying any file contents.
+  Because no files are changed, the paths: filter never matches, and the workflow
+  silently does not run.
+
+  Example trigger block that silently fails on all tag pushes:
+
+    on:
+      push:
+        branches: [main]
+        tags: ['v*']
+        paths: ['src/**', 'package.json']   # blocks ALL tag triggers — tags change no files
+
+  YAML does not support duplicate map keys, so two separate on: push: blocks are not
+  possible in the same workflow file. The paths: filter applies globally to every push
+  event evaluated by that trigger block, including tag pushes.
+
+  This is commonly introduced when developers add a paths: filter to an existing release
+  workflow to avoid running expensive builds on documentation commits, inadvertently
+  also filtering out all tag-triggered release runs. The workflow appears to work on
+  branch pushes (which do change files) while silently never running on tag pushes.
+fix: |
+  Option 1 (recommended): Replace push: tags: with the release event. The release event
+  fires when a GitHub Release is published from a tag and has no paths filter concept.
+  This also provides richer release metadata (release notes, asset URLs) via github.event.
+
+  Option 2: Remove paths: from the trigger and use an if: condition on jobs to skip
+  non-relevant branch pushes. The job runs for all tag pushes unconditionally, and
+  runs for branch pushes only when the if: condition evaluates to true based on
+  changed file data or event type.
+
+  Option 3: Use paths-ignore: instead of paths: with an inverted pattern. This approach
+  still silently blocks tag pushes (same AND-logic issue), so it should only be combined
+  with Option 1 or 2.
+fix_code:
+  - language: yaml
+    label: "Replace push: tags: with release event — no paths filter interference"
+    code: |
+      on:
+        push:
+          branches: [main]
+          paths:
+            - 'src/**'
+            - 'package.json'
+        # Use release event for tag-based release workflows
+        # Fires on Release published — no paths filter concept applies
+        release:
+          types: [published]
+
+      jobs:
+        build-and-release:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: echo "runs on branch push matching paths AND on release publish"
+  - language: yaml
+    label: "Remove paths: and guard branch pushes with if: condition instead"
+    code: |
+      on:
+        push:
+          branches: [main]
+          tags: ['v*.*.*']
+          # No paths: filter — use if: condition on job to skip irrelevant branch pushes
+
+      jobs:
+        release:
+          runs-on: ubuntu-latest
+          # Always run on tag pushes; on branch pushes only if relevant files changed
+          if: startsWith(github.ref, 'refs/tags/')
+          steps:
+            - uses: actions/checkout@v4
+            - run: echo "only runs on tag pushes"
+
+        ci:
+          runs-on: ubuntu-latest
+          # Separate job for branch-push CI with file-change guard
+          if: "!startsWith(github.ref, 'refs/tags/')"
+          steps:
+            - uses: actions/checkout@v4
+            - run: echo "only runs on branch pushes"
+prevention:
+  - "Never mix tags: and paths: in the same push trigger block — paths filter applies to tag pushes too"
+  - "Use the release event instead of push: tags: for release workflows to avoid paths filter confusion"
+  - "After adding a paths: filter to any workflow, test by pushing a tag to verify release triggering still works"
+  - "Add a comment near any paths: filter warning that it will also suppress tag-push triggers in the same block"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#push"
+    label: "GitHub Docs: push event trigger and filters"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#release"
+    label: "GitHub Docs: release event trigger"
+  - url: "https://github.com/orgs/community/discussions/25597"
+    label: "GitHub Community #25597: paths filter prevents tag-triggered workflow runs"
