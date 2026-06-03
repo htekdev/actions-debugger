@@ -1,0 +1,96 @@
+id: silent-failures-031
+title: "cache-hit Output Is a String Not a Boolean — Bare true Comparison Always False"
+category: silent-failures
+severity: silent-failure
+tags:
+  - actions/cache
+  - cache-hit
+  - string-comparison
+  - boolean-coercion
+  - conditional
+  - step-outputs
+patterns:
+  - regex: "cache-hit\\s*[!=]=\\s*true(?!')"
+    flags: "i"
+  - regex: "if:\\s+steps\\.\\w+\\.outputs\\.cache-hit\\s*$"
+    flags: "im"
+error_messages:
+  - "steps.cache.outputs.cache-hit == true"
+  - "steps.cache.outputs.cache-hit != true"
+root_cause: |
+  The `cache-hit` output from `actions/cache` and `actions/cache/restore` is a **string** value
+  (`'true'` or `'false'`), not a native boolean. GitHub Actions expression syntax uses strict
+  equality for `==` — there is no implicit type coercion between strings and booleans.
+
+  This means:
+  - `steps.cache.outputs.cache-hit == true`  → ALWAYS false  (string 'true' ≠ boolean true)
+  - `steps.cache.outputs.cache-hit != true`  → ALWAYS true   (install step always runs)
+  - `if: steps.cache.outputs.cache-hit`      → ALWAYS true   ('false' is a non-empty string)
+
+  The most destructive case: `if: steps.cache.outputs.cache-hit != true` is intended to
+  skip the install step on cache hit, but it always evaluates to `true` (runs every time),
+  so the install always runs even after a successful cache restore. Build times remain
+  unchanged, no error is shown, and the caching appears to be broken.
+
+  This applies to ALL GitHub Actions step outputs — they are always strings. A separate
+  but related issue is `cache-hit-restore-keys-misleading` (cache-hit is 'true' on partial
+  key match); this entry covers the unquoted boolean comparison pattern specifically.
+fix: |
+  Always compare `cache-hit` to the string `'true'` with single quotes:
+
+  - Skip install on cache hit:  `if: steps.cache.outputs.cache-hit != 'true'`
+  - Confirm cache was used:     `if: steps.cache.outputs.cache-hit == 'true'`
+
+  Do NOT use bare `true` / `false` (without quotes) in comparisons with step outputs.
+  Do NOT use `if: steps.cache.outputs.cache-hit` as a truthy check — the string 'false'
+  is truthy in most contexts and will always pass.
+fix_code:
+  - language: yaml
+    label: "Correct string comparison for cache-hit (single quotes required)"
+    code: |
+      - name: Cache node_modules
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+
+      # ❌ WRONG: string 'true' != boolean true → always runs (never skips on cache hit)
+      - name: Install (broken — always runs)
+        if: steps.cache.outputs.cache-hit != true
+        run: npm ci
+
+      # ✅ CORRECT: compare to string 'true' with single quotes
+      - name: Install (correct — skips on cache hit)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: npm ci
+  - language: yaml
+    label: "Full cache-then-install pattern with correct comparisons"
+    code: |
+      - uses: actions/cache@v4
+        id: npm-cache
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
+      - name: Install dependencies
+        if: steps.npm-cache.outputs.cache-hit != 'true'
+        run: npm ci
+
+      - name: Confirm cache was used
+        if: steps.npm-cache.outputs.cache-hit == 'true'
+        run: echo "Cache hit — install skipped"
+prevention:
+  - "Always compare step outputs to string literals with quotes: `== 'true'` not `== true`."
+  - "Remember: ALL GitHub Actions step outputs are strings — never native booleans or numbers."
+  - "Use `actionlint` to lint workflow YAML; it detects boolean vs string type mismatches in conditionals."
+  - "Verify caching is working by observing run time reduction — a successful cache hit noticeably speeds up installs."
+docs:
+  - url: "https://github.com/actions/cache#outputs"
+    label: "actions/cache README: outputs — cache-hit is a string"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#steps-context"
+    label: "GitHub Docs: steps context — all outputs are strings"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#operators"
+    label: "GitHub Docs: Expression operators — == uses strict equality"
