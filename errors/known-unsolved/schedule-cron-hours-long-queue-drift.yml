@@ -1,0 +1,101 @@
+id: known-unsolved-025
+title: "Scheduled Workflow Queue Drift Exceeds Hours and Worsens Over Time"
+category: known-unsolved
+severity: limitation
+tags:
+  - cron
+  - schedule
+  - drift
+  - queue-delay
+  - best-effort
+  - platform-load
+patterns:
+  - regex: "schedule"
+    flags: "i"
+error_messages:
+  - "Scheduled workflows can be delayed during periods of high loads of GitHub Actions workflow runs."
+root_cause: |
+  GitHub Actions scheduled workflows use a best-effort queue. GitHub does not guarantee
+  that a schedule: trigger fires at the exact cron time. During periods of high platform
+  load, workflows are queued and the dispatch delay can reach multiple hours.
+
+  Since 2025, average delays have been growing on the GitHub-hosted infrastructure:
+  workflows that previously started within 10-20 minutes now commonly wait 1-4+ hours.
+  The drift is not constant — it varies by time of day and platform load and compounds
+  over months for daily/nightly jobs.
+
+  Key contributing factors:
+  - Growth in GitHub's user base means more repositories with scheduled workflows compete
+    for the same dispatch queue infrastructure.
+  - The midnight UTC window is severely congested; nearby times face similar load.
+  - GitHub dispatches schedule events in batches; individual repos have no dispatch priority.
+  - Repositories with no activity for 60+ days have their schedules disabled entirely.
+  - GitHub's documentation explicitly states schedules are best-effort with no SLA.
+
+  This is a known platform-capacity limitation, not a bug. No fix or workaround guarantees
+  on-time execution from within GitHub's scheduler.
+  Reported in actions/runner#4468 (open Jun 2026); discussed in community/196910.
+fix: |
+  There is no way to guarantee on-time execution of a scheduled GitHub Actions workflow.
+  Mitigation strategies depend on how time-sensitive the job is.
+
+  Mitigation 1: Schedule away from congestion windows.
+  Avoid exact hours and midnight UTC. Use irregular minutes and off-peak hours
+  (e.g., 23 14 * * * instead of 0 0 * * *).
+
+  Mitigation 2: Use an external cron service with workflow_dispatch.
+  Remove the on: schedule trigger and replace it with workflow_dispatch. An external
+  scheduler (cloud function, server cron, GitHub App) calls the GitHub REST API dispatches
+  endpoint on time. The workflow starts immediately because workflow_dispatch jobs are not
+  subject to the schedule queue.
+
+  Mitigation 3: Accept the delay and build tolerance.
+  For non-time-critical automations (nightly builds, maintenance tasks), build tolerance
+  into downstream systems rather than fighting the delay.
+
+  Mitigation 4: Self-hosted runners with external scheduling.
+  For strict timing requirements, combine self-hosted runners with an external trigger so
+  the job bypasses GitHub hosted-runner queuing entirely.
+fix_code:
+  - language: yaml
+    label: "Use irregular schedule time to avoid peak congestion"
+    code: |
+      on:
+        schedule:
+          # Avoid :00, :15, :30, :45 and midnight UTC — use irregular off-peak times
+          - cron: '23 14 * * *'   # 2:23 PM UTC
+        workflow_dispatch: {}     # Manual fallback for missed or delayed runs
+  - language: yaml
+    label: "External cron dispatch via GitHub API (reliable timing)"
+    code: |
+      # External scheduler (Lambda, cron job, GitHub App) calls:
+      # curl -X POST \
+      #   -H "Authorization: Bearer $GH_TOKEN" \
+      #   https://api.github.com/repos/OWNER/REPO/actions/workflows/nightly.yml/dispatches \
+      #   -d '{"ref":"main"}'
+      #
+      # Your workflow — no on: schedule needed:
+      on:
+        workflow_dispatch: {}
+
+      jobs:
+        nightly:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./scripts/nightly-build.sh
+prevention:
+  - "Never build SLAs or downstream dependencies that assume a scheduled workflow starts within minutes of its cron time."
+  - "Always add workflow_dispatch: alongside schedule: so delayed or missed runs can be manually triggered from the Actions UI."
+  - "Use non-round-number cron minutes (17, 23, 41, etc.) to avoid the most congested slots."
+  - "For time-critical jobs, use an external scheduler that calls the GitHub API rather than relying on GitHub scheduler queue."
+  - "Track repository activity — GitHub disables scheduled workflows on repos inactive for 60+ days."
+docs:
+  - url: "https://github.com/actions/runner/issues/4468"
+    label: "actions/runner#4468 — Continuously increasing schedule drift (Jun 2026)"
+  - url: "https://github.com/orgs/community/discussions/196910"
+    label: "Community discussion: schedule drift increasing over time"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#schedule"
+    label: "schedule event — best-effort documentation"
+  - url: "https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-workflow-runs/disabling-and-enabling-a-workflow"
+    label: "Scheduled workflow disabled after 60 days inactivity"
