@@ -1,0 +1,87 @@
+id: triggers-020
+title: "Renamed Workflow or Job Leaves Stale Required Status Check Permanently Blocking Merges"
+category: triggers
+severity: error
+tags:
+  - branch-protection
+  - required-status-checks
+  - workflow-rename
+  - merge-blocked
+  - repository-settings
+patterns:
+  - regex: "Expected.*Waiting for status to be reported"
+    flags: "i"
+  - regex: "Required status check.*has not passed"
+    flags: "i"
+error_messages:
+  - "Required status checks have not passed for this pull request"
+  - "Expected — Waiting for status to be reported"
+  - "Required status check has not passed"
+root_cause: |
+  GitHub branch protection rules reference required status checks by their EXACT string
+  name: `<Workflow Name> / <job-id>` (e.g., `CI / build`). When a workflow file's
+  `name:` field is changed, a job ID is renamed, or a third-party check context string
+  changes, the new check runs and passes — but the branch protection rule still
+  references the old string.
+
+  The old check name is stuck at "Expected — Waiting for status to be reported"
+  permanently because no workflow run ever reports that exact string again. Every PR
+  targeting the protected branch is blocked from merging regardless of CI status.
+
+  Common triggers:
+  - Renaming the top-level `name:` of a workflow file
+  - Renaming a job ID (`jobs.<id>`)
+  - Migrating from one CI system to another
+  - Using a third-party action that changed its check context string
+  - Refactoring a monorepo with multiple workflow files that share a check name
+
+  This affects all open PRs immediately when the workflow is renamed — there is no
+  grace period or deprecation.
+fix: |
+  1. Go to Settings → Branches → Branch protection rules → Edit for the affected branch.
+  2. Under "Require status checks to pass before merging", remove the stale check name.
+  3. Start typing the NEW check name and select it from the autocomplete dropdown.
+     The format is: "Workflow Name / job-id" (exactly as shown in the PR checks UI).
+  4. Save the branch protection rule.
+
+  To find the exact new check name without guessing:
+    gh api repos/{owner}/{repo}/commits/{ref}/check-runs --jq '.check_runs[].name'
+
+  If multiple branches are protected with the same stale rule, repeat for each.
+fix_code:
+  - language: yaml
+    label: "Find current check names via GitHub CLI"
+    code: |
+      # List all check names currently reported for the default branch
+      gh api "repos/{owner}/{repo}/commits/main/check-runs" \
+        --jq '.check_runs[] | "\(.name) — \(.status)/\(.conclusion)"'
+
+      # Or for a specific open PR's head SHA:
+      gh api "repos/{owner}/{repo}/commits/{sha}/check-runs" \
+        --jq '.check_runs[].name'
+  - language: yaml
+    label: "Prevention: document required check names in workflow comments"
+    code: |
+      # Branch protection references this check as: "CI / build"
+      # If you rename this workflow or job, update Settings > Branches > Protection rules
+      name: CI   # <-- changing this breaks the required check "CI / build"
+      on: [push, pull_request]
+
+      jobs:
+        build:   # <-- changing this ID also breaks "CI / build"
+          runs-on: ubuntu-latest
+          steps:
+            - run: make build
+prevention:
+  - "Before renaming a workflow or job, check Settings → Branches to see if any protection rules reference the current check name."
+  - "Add a comment in the workflow file listing the exact required status check string so renames are noticed."
+  - "After any workflow rename, immediately update branch protection rules and verify with an open PR."
+  - "Use the GitHub CLI command above to audit current check names after any CI refactor."
+  - "In monorepos, standardize workflow names and job IDs to minimize rename frequency."
+docs:
+  - url: "https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-status-checks-before-merging"
+    label: "GitHub Docs: Required status checks"
+  - url: "https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference"
+    label: "REST API: List check runs for a git reference"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#name"
+    label: "Workflow syntax: name field"
