@@ -1,0 +1,109 @@
+id: 'runner-environment-082'
+title: 'Self-hosted runner gets stuck "Waiting for a runner to pick up this job" between jobs in the same workflow'
+category: runner-environment
+severity: error
+tags:
+  - self-hosted
+  - runner
+  - multi-job
+  - queued
+  - stuck
+  - windows
+  - auto-update
+patterns:
+  - regex: 'Waiting for a runner to pick up this job'
+    flags: 'i'
+error_messages:
+  - 'Waiting for a runner to pick up this job...'
+root_cause: |
+  After completing the first job in a multi-job workflow, a self-hosted runner sometimes
+  fails to pick up subsequent jobs in the same workflow run. The subsequent jobs remain
+  in queued status indefinitely, with no timeout and no automatic retry.
+
+  Common root causes:
+  - Runner auto-update race condition: when the runner auto-updates between jobs, the post-job
+    cleanup of the first job can leave the runner in a state where it reports idle to the
+    broker but cannot accept new job messages
+  - Windows service restart latency: on Windows hosts, if the runner was auto-updated or
+    the service restarted between jobs, the new process may not have fully re-registered
+    with the GitHub Actions broker before the second job is dispatched
+  - JIT token expiry: in ephemeral/JIT runner setups, the registration token can expire
+    between jobs if the first job runs for a long time, and the runner cannot re-register
+  - Broker disconnect: a transient network interruption between jobs severs the long-poll
+    connection; the runner reconnects but the already-dispatched job message is missed
+
+  Manually cancelling and re-running the workflow, or restarting the runner service,
+  resolves the issue immediately, confirming the runner is functional but lost broker contact.
+fix: |
+  Immediate workaround: cancel the stuck workflow run and re-trigger it, or restart the
+  runner service:
+    Windows: Restart-Service "actions.runner.*"
+    Linux:   sudo systemctl restart actions.runner.*.<name>.service
+
+  Long-term fixes:
+  - Disable runner auto-update during active workflows by setting RUNNER_ALLOW_RUNASROOT
+    environment variable and pinning a specific runner version
+  - Use ephemeral runners (--ephemeral flag) so each job dispatches a fresh runner that
+    registers anew with the broker, eliminating the between-job reconnect window
+  - Split long workflows into separate workflow files triggered via workflow_run or
+    repository_dispatch so each workflow gets an independent runner session
+  - On Windows: ensure the runner service account has the "Log on as a service" right
+    and that antivirus is not blocking runner binary updates
+fix_code:
+  - language: yaml
+    label: 'Use ephemeral runners to avoid stuck-between-jobs on self-hosted'
+    code: |
+      # When configuring the runner, use the --ephemeral flag:
+      # ./config.sh --url https://github.com/OWNER/REPO --token TOKEN --ephemeral
+      #
+      # For ARC (Actions Runner Controller), set runnerScaleSetSettings:
+      # spec:
+      #   template:
+      #     metadata:
+      #       labels:
+      #         ephemeral: 'true'
+      #
+      # Each job gets a freshly-registered runner; no between-job broker reconnect issues.
+  - language: yaml
+    label: 'Split multi-job workflow into two workflows triggered by workflow_run'
+    code: |
+      # phase1.yml
+      on:
+        push:
+      jobs:
+        build:
+          runs-on: [self-hosted, linux]
+          steps:
+            - uses: actions/checkout@v4
+            - run: make build
+            - uses: actions/upload-artifact@v4
+              with:
+                name: build-output
+                path: dist/
+
+      # phase2.yml (fresh runner registration — no stuck-between-jobs risk)
+      on:
+        workflow_run:
+          workflows: [phase1.yml]
+          types: [completed]
+      jobs:
+        test:
+          if: ${{ github.event.workflow_run.conclusion == 'success' }}
+          runs-on: [self-hosted, linux]
+          steps:
+            - uses: actions/download-artifact@v4
+              with:
+                name: build-output
+            - run: make test
+prevention:
+  - 'Use ephemeral runners (--ephemeral) to ensure each job gets a fresh broker registration'
+  - 'Configure the runner service with Restart=on-failure to auto-recover from crashes between jobs'
+  - 'Pin runner versions and suppress auto-updates in production to prevent mid-workflow upgrades'
+  - 'Monitor for stuck runs via the GitHub Actions API and alert or auto-cancel them'
+docs:
+  - url: 'https://github.com/actions/runner/issues/3609'
+    label: 'actions/runner#3609: Self-hosted runner stuck on "Waiting for a runner to pick up this job"'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners'
+    label: 'GitHub Docs: About self-hosted runners'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/autoscaling-with-self-hosted-runners'
+    label: 'GitHub Docs: Autoscaling with self-hosted runners'
