@@ -1,0 +1,100 @@
+id: known-unsolved-034
+title: 'environment deployment protection with required reviewers creates one review request per matrix job — no batch approval'
+category: known-unsolved
+severity: limitation
+tags:
+  - environment
+  - matrix
+  - deployment
+  - required-reviewers
+  - approvals
+  - no-fix
+patterns:
+  - regex: 'Waiting for.*review'
+    flags: 'i'
+  - regex: 'Review required before this job runs'
+    flags: 'i'
+error_messages:
+  - 'Waiting for a reviewer'
+  - 'Review required before this job runs'
+root_cause: |
+  GitHub Actions environments with required reviewers enforce approval at the
+  individual job level. When a job using environment: with required reviewers
+  also uses strategy: matrix, each matrix cell creates a separate deployment
+  instance requiring its own approval.
+
+  A 3x3 matrix (os x environment) produces 9 separate "Waiting for reviewer"
+  prompts in the GitHub Actions UI — one for each matrix combination. Each
+  must be approved individually; there is no "approve all" button for
+  matrix deployments.
+
+  This behavior stems from GitHub's deployment model: each job run creates a
+  discrete deployment record in the repository's deployment history. Matrix
+  jobs are independent job runs, so each creates its own deployment record
+  and independently triggers the environment protection review gate.
+
+  This is confirmed expected behavior per GitHub staff in community discussions.
+  There is no configuration option to batch or group matrix job deployment approvals.
+fix: |
+  There is no supported way to batch-approve matrix jobs targeting a protected
+  environment. The workaround is architectural: separate the build/test matrix
+  from the deployment job, using a single non-matrix deploy job that depends
+  on all matrix results via needs:.
+
+  This "build in matrix, deploy once" pattern also aligns with security best
+  practice — production deployments should be a single auditable event.
+fix_code:
+  - language: yaml
+    label: 'Anti-pattern — matrix job with protected environment (creates N review requests)'
+    code: |
+      jobs:
+        deploy:
+          strategy:
+            matrix:
+              region: [us-east-1, eu-west-1, ap-southeast-1]
+          environment: production   # 3 separate review requests
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "deploying to ${{ matrix.region }}"
+  - language: yaml
+    label: 'Workaround — single non-matrix deploy job collects matrix artifacts and deploys once'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              region: [us-east-1, eu-west-1, ap-southeast-1]
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build for region
+              run: make build REGION=${{ matrix.region }}
+            - uses: actions/upload-artifact@v4
+              with:
+                name: build-${{ matrix.region }}
+                path: dist/
+
+        deploy:
+          needs: build
+          runs-on: ubuntu-latest
+          environment: production   # Single review request for all regions
+          steps:
+            - uses: actions/download-artifact@v4
+              with:
+                pattern: build-*
+                merge-multiple: true
+                path: all-dist/
+            - name: Deploy all regions
+              run: make deploy-all ARTIFACTS_DIR=all-dist/
+prevention:
+  - 'Design deployment workflows so the job with environment: protection is never a matrix job'
+  - 'Use build-in-matrix, deploy-once pattern: matrix for build/test, single serial job for protected deploy'
+  - 'If per-region deployments must be parallel and require environment protection, accept the N-approvals UX'
+  - 'Document this limitation in team runbooks before adopting matrix + environment patterns in production pipelines'
+docs:
+  - url: 'https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment'
+    label: 'GitHub Docs — Managing environments for deployment'
+  - url: 'https://github.com/orgs/community/discussions/15690'
+    label: 'GitHub Community — Matrix deployment creates multiple approval requests'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-a-matrix-for-your-workflow'
+    label: 'GitHub Docs — Using a matrix for your workflow'
