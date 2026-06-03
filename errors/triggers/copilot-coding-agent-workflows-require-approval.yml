@@ -1,0 +1,104 @@
+id: 'triggers-027'
+title: 'Copilot coding agent PR workflows stuck in `action_required` — require human approval before running'
+category: triggers
+severity: error
+tags:
+  - copilot
+  - coding-agent
+  - approval-required
+  - action-required
+  - pull-request
+  - workflow-approval
+patterns:
+  - regex: 'action_required'
+    flags: 'i'
+  - regex: 'waiting for approval.*(?:outside contributor|fork|bot)|Approve and run'
+    flags: 'i'
+error_messages:
+  - 'This workflow is waiting for approval from a maintainer. Learn more about approving workflows from public forks.'
+  - 'Workflow run is in action_required state. Approval is required before jobs can start.'
+root_cause: |
+  Starting April 2025, GitHub treats the Copilot coding agent as an "outside contributor"
+  for GitHub Actions workflow approval purposes — the same policy applied to first-time
+  contributors from public forks.
+
+  When Copilot coding agent opens a pull request or pushes commits to a branch:
+  - Associated CI/CD workflows do NOT run automatically
+  - The check suite is created with conclusion: action_required
+  - No jobs start until a human with repository write access (or actions:write) manually
+    clicks "Approve and run workflows" in the PR UI, or approves via the REST API
+  - Unapproved runs are automatically deleted after 30 days with no notification
+
+  This is by design: Copilot-triggered workflows may have access to GITHUB_TOKEN,
+  repository secrets, and deployment environments. The approval gate prevents a
+  compromised or misbehaving AI agent from triggering arbitrary CI/CD actions.
+
+  However, this significantly slows AI-assisted development loops where developers rely
+  on CI feedback to validate Copilot's work. Teams discover this when:
+  - All Copilot-opened PRs show "Waiting for approval" with no CI results
+  - Required status checks never populate, blocking PR merges
+  - Automated pipelines that expected CI to run on all PRs silently stall
+
+  Affects: all GitHub Actions workflows triggered by pull_request, push, or
+  pull_request_target events on branches where Copilot coding agent is the commit author.
+fix: |
+  Option 1 (Recommended for trusted private repos): Enable automatic workflow runs for
+  Copilot coding agent in repository settings:
+  Settings → Actions → General → "Approval for running workflows triggered by Copilot
+  coding agent" → "Allow Copilot coding agent to trigger workflows without approval"
+  (Available since March 2026 changelog)
+
+  Option 2: Manually approve each run after Copilot opens a PR.
+  In the PR, click "Approve and run workflows" in the Checks section.
+
+  Option 3: Build a lightweight auto-approve workflow triggered by check_suite events
+  with action: requested, scoped to Copilot actor identity.
+fix_code:
+  - language: yaml
+    label: 'Approve a pending workflow run via GitHub CLI'
+    code: |
+      # List runs awaiting approval on a Copilot PR branch:
+      # gh run list --repo owner/repo --branch copilot/issue-123
+
+      # Approve a specific run (requires write access):
+      # gh run review <run-id> --approve --repo owner/repo
+
+      # Or approve via REST API:
+      # POST /repos/{owner}/{repo}/actions/runs/{run_id}/approve
+  - language: yaml
+    label: 'Auto-approve workflow: trigger CI immediately on Copilot PRs (use with caution)'
+    code: |
+      name: Auto-approve Copilot workflows
+      on:
+        workflow_run:
+          workflows: ['CI']
+          types: [requested]
+
+      jobs:
+        approve:
+          runs-on: ubuntu-latest
+          # Only auto-approve if triggered by Copilot coding agent
+          if: github.event.workflow_run.actor.login == 'copilot-swe-agent[bot]'
+          permissions:
+            actions: write
+          steps:
+            - name: Approve the workflow run
+              env:
+                RUN_ID: ${{ github.event.workflow_run.id }}
+                GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                gh run review $RUN_ID --approve --repo ${{ github.repository }}
+prevention:
+  - 'Configure the "Allow Copilot coding agent to trigger workflows without approval" setting if your team uses Copilot heavily and the repo is trusted'
+  - 'Monitor for action_required check suite conclusions so stalled Copilot PRs do not block merges silently'
+  - 'Scope GITHUB_TOKEN permissions to the minimum required before enabling auto-approval, to reduce the blast radius if Copilot misbehaves'
+  - 'Set up required status checks carefully — if CI never runs, required checks will block PR merges indefinitely'
+docs:
+  - url: 'https://github.blog/changelog/2025-04-15-upcoming-breaking-changes-and-releases-for-github-actions/'
+    label: 'GitHub Changelog: Copilot events not automatically triggering GitHub Actions workflows (April 2025)'
+  - url: 'https://github.blog/changelog/2026-03-13-optionally-skip-approval-for-copilot-coding-agent-actions-workflows/'
+    label: 'GitHub Changelog: Optionally skip approval for Copilot coding agent Actions workflows (March 2026)'
+  - url: 'https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-workflow-runs/approving-workflow-runs-from-public-forks'
+    label: 'GitHub Docs: Approving workflow runs from public forks'
+  - url: 'https://docs.github.com/en/copilot/using-github-copilot/using-copilot-coding-agent-to-work-on-tasks/configuring-settings-for-github-copilot-coding-agent'
+    label: 'GitHub Docs: Configuring settings for GitHub Copilot coding agent'

@@ -1,0 +1,106 @@
+id: 'caching-artifacts-029'
+title: '`download-artifact` v5+ omits artifact subdirectory when only one artifact exists — dynamic workflows break intermittently'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - download-artifact
+  - v5-breaking-change
+  - path-behavior
+  - single-artifact
+  - subdirectory
+  - dynamic-matrix
+patterns:
+  - regex: 'uses:\s*actions/download-artifact@v[5-9]'
+    flags: 'i'
+  - regex: 'An extra directory with the artifact name will be created for each download'
+    flags: 'i'
+error_messages:
+  - 'No input name, artifact-ids or pattern filtered specified, downloading all artifacts'
+  - 'An extra directory with the artifact name will be created for each download'
+root_cause: |
+  In actions/download-artifact v5 (released August 2025) and later (v6, v7), when
+  downloading ALL artifacts without specifying name: or id:, and only ONE artifact exists
+  in the workflow run, the action does NOT create a subdirectory for that artifact.
+  Files are extracted directly into the destination path (default ./):
+
+    Expected (v4 and v5+ with >=2 artifacts): ./{artifact-name}/file.ext
+    Actual (v5+ with exactly 1 artifact):      ./file.ext
+
+  When two or more artifacts exist, subdirectories are created correctly. This
+  inconsistency breaks workflows where artifact count varies dynamically — e.g., matrix
+  strategies that produce 0, 1, or N artifacts based on test conditions.
+
+  The action logs "An extra directory with the artifact name will be created for each
+  download" even when it will NOT do this — making the bug invisible in logs.
+
+  Bug tracked in actions/download-artifact#455 (December 2025, still open).
+  Affected versions: v5.0.0+, v6.0.0+, v7.0.0+
+  v4 behavior (correct): always creates a named subdirectory, regardless of artifact count.
+
+  This is a regression from a path behavior fix introduced in v5 for single-artifact
+  downloads by ID (PR #416), which had an unintended side effect on the "all artifacts"
+  code path when n=1.
+fix: |
+  Option 1 (simplest): Pin to actions/download-artifact@v4, which always creates a
+  subdirectory regardless of artifact count. v4 remains maintained for GHES compatibility.
+
+  Option 2: Always specify name: for each download to avoid the "all artifacts" code path.
+
+  Option 3: In downstream steps, detect the n=1 case at runtime and normalize the
+  directory structure before relying on subdirectory paths.
+fix_code:
+  - language: yaml
+    label: 'Pin to download-artifact@v4 for consistent subdirectory behavior'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Download all artifacts
+              uses: actions/download-artifact@v4    # v4: always creates subdirs
+              with:
+                path: artifacts/
+              # Result: artifacts/{name}/... for every artifact, even when n=1
+
+            - name: Deploy each artifact directory
+              run: |
+                for dir in artifacts/*/; do
+                  name=$(basename "$dir")
+                  echo "Deploying $name from $dir"
+                done
+  - language: yaml
+    label: 'Workaround for v5+: download by name into named subdirectories explicitly'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: List artifact names for this run
+              id: list
+              uses: actions/github-script@v7
+              with:
+                script: |
+                  const { data } = await github.rest.actions.listWorkflowRunArtifacts({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    run_id: context.runId
+                  });
+                  return data.artifacts.map(a => a.name);
+
+            - name: Download artifact into named subdirectory
+              uses: actions/download-artifact@v5
+              with:
+                name: my-artifact
+                path: artifacts/my-artifact/   # Explicit subdir — consistent always
+prevention:
+  - 'Pin to download-artifact@v4 if your deployment logic assumes each artifact lands in its own named subdirectory'
+  - 'Test your workflow with exactly one artifact in CI — the n=1 edge case is easy to miss in standard multi-run testing'
+  - 'Avoid relying on implicit subdirectory creation; always specify explicit path: values that include the artifact name'
+  - 'Track actions/download-artifact#455 for a fix in v5+ that restores consistent subdirectory behavior'
+docs:
+  - url: 'https://github.com/actions/download-artifact/issues/455'
+    label: 'actions/download-artifact#455: Single artifact omits subdirectory in v5+ (open, December 2025)'
+  - url: 'https://github.com/actions/download-artifact/releases/tag/v5.0.0'
+    label: 'download-artifact v5.0.0 release notes: path behavior breaking change'
+  - url: 'https://github.com/actions/download-artifact/blob/main/docs/MIGRATION.md'
+    label: 'download-artifact migration guide: v3/v4 to v5+'
