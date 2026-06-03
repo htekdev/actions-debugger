@@ -1,0 +1,97 @@
+id: concurrency-timing-028
+title: "Matrix job outputs use last-writer-wins — only the final completing matrix instance's value is visible to downstream jobs"
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - matrix
+  - outputs
+  - last-writer-wins
+  - job-outputs
+  - needs
+  - aggregation
+patterns:
+  - regex: 'jobs\.\w+\.outputs\.\w+'
+    flags: "i"
+  - regex: 'matrix.*output.*empty|matrix.*output.*missing|output.*only.*one.*matrix'
+    flags: "i"
+error_messages:
+  - "Job output contains only one matrix item's value despite all matrix jobs completing successfully"
+  - "Downstream job receives empty string from needs.<job>.outputs.<name> after matrix build"
+root_cause: |
+  When a matrix strategy job writes to GITHUB_OUTPUT, all parallel matrix instances share
+  the same output key namespace keyed at the logical job ID level in the workflow DAG.
+  Multiple matrix runners mapping to one job ID race to write the same output keys. The
+  last matrix runner to flush its output to the Actions service wins — all prior values for
+  that key are silently overwritten.
+
+  GitHub Docs state explicitly: "The value of the output is the last value set by the
+  expression that evaluates the output." There is no merge, append, or aggregation of
+  outputs across matrix instances.
+
+  Common manifestations:
+  - A release matrix collecting artifact paths — the downstream job sees only one path
+  - A test matrix emitting pass/fail status per OS — only the last-completing OS result survives
+  - A build matrix producing version or hash strings — final output value is non-deterministic
+    and varies by runner scheduling order, making the issue intermittent and hard to reproduce
+
+  This is an intentional platform constraint. The job outputs map is a flat key-value store
+  keyed at the job level, not the matrix-instance level. It cannot store per-instance values.
+fix: |
+  Aggregate matrix results via uniquely-named artifacts rather than job outputs.
+
+  Strategy: each matrix instance uploads its result as a named artifact that includes the
+  matrix dimension in the artifact name (required by actions/upload-artifact@v4 anyway, which
+  rejects duplicate names). The fan-in dependent job downloads all artifacts and processes
+  them together.
+
+  For simple pass/fail aggregation, rely on the default needs: behavior — a job with
+  needs: [build] only starts when ALL matrix instances of build have completed successfully.
+  No custom output collection is needed for overall-success gating.
+fix_code:
+  - language: yaml
+    label: "Aggregate matrix results via uniquely-named artifacts (recommended pattern)"
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest, macos-latest]
+          runs-on: ${{ matrix.os }}
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Build and capture result
+              run: echo "artifact-for-${{ matrix.os }}" > result.txt
+
+            - name: Upload per-matrix artifact
+              uses: actions/upload-artifact@v4
+              with:
+                # Matrix dimension in name prevents v4 duplicate-name error
+                name: build-result-${{ matrix.os }}
+                path: result.txt
+
+        release:
+          needs: build    # Waits for ALL matrix instances to succeed
+          runs-on: ubuntu-latest
+          steps:
+            - name: Download all matrix results
+              uses: actions/download-artifact@v4
+              with:
+                pattern: build-result-*
+                merge-multiple: true
+                path: results/
+
+            - name: Process aggregated results
+              run: ls results/ && cat results/result.txt
+prevention:
+  - "Never rely on GITHUB_OUTPUT in matrix jobs to pass per-instance values to downstream jobs"
+  - "Always include the matrix dimension in artifact names when uploading from matrix jobs"
+  - "Use needs: [job] to gate on all matrix instances succeeding — no custom output collection needed for pass/fail"
+  - "Add a workflow comment documenting that the fan-in pattern is required for multi-value matrix aggregation"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/passing-information-between-jobs"
+    label: "GitHub Docs: Passing information between jobs"
+  - url: "https://github.com/orgs/community/discussions/26286"
+    label: "GitHub Community #26286: Matrix job outputs — last writer wins"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idoutputs"
+    label: "GitHub Docs: jobs.<job_id>.outputs"
