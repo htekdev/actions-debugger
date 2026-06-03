@@ -1,0 +1,100 @@
+id: permissions-auth-037
+title: 'Environment secrets are only accessible to jobs that declare a matching environment: key — other jobs silently receive empty string'
+category: permissions-auth
+severity: silent-failure
+tags:
+  - environment
+  - secrets
+  - environment-secrets
+  - deployment-environment
+  - job-scoped
+  - secret-scope
+patterns:
+  - regex: 'environment:\s*[a-z0-9_-]+.*secrets\.|secrets\.[A-Z_]+'
+    flags: 'i'
+error_messages:
+  - "(No error — secrets.<SECRET_NAME> resolves to '' in jobs that do not declare the matching environment:)"
+root_cause: |
+  GitHub Actions supports three secret scopes with different visibility:
+  1. Repository secrets — available to all jobs in all workflows in the repository
+  2. Organization secrets — available to authorized repositories/workflows
+  3. Environment secrets — ONLY available to jobs that declare environment: <env-name>
+
+  Environment secrets are scoped to a specific deployment environment and are
+  intentionally isolated. A job that references secrets.MY_ENV_SECRET without
+  declaring environment: production receives '' (empty string) for that secret
+  with no error, no warning, and no indication that the secret exists elsewhere.
+
+  This isolation is a security feature: environment secrets are only released to
+  jobs that have satisfied environment protection rules (required reviewers, wait
+  timers, deployment branch policies). However it becomes a silent failure when:
+
+  - A secret is accidentally created in an environment instead of the repository scope
+  - A reusable workflow job uses the secret but the caller job did not declare environment:
+  - A job is refactored to remove environment: (to skip protection rules in testing) but
+    still references the now-inaccessible environment secret
+  - A developer expects an environment secret to work like a repository secret
+
+  The effect is indistinguishable from the secret not existing: the value is '' and the
+  job may fail with an auth error, a blank config value, or silently produce wrong output.
+fix: |
+  Determine the intended scope:
+  - If the secret should be accessible to all jobs: create it as a repository secret
+    (Settings > Secrets and variables > Actions > Repository secrets)
+  - If the secret must be gated by deployment protection rules: keep it as an environment
+    secret AND add environment: <env-name> to every job that needs it
+  - If both a repository secret and an environment secret share the same name:
+    the environment secret takes precedence in jobs that declare that environment
+
+  Use the GitHub Settings UI to confirm which scope a secret belongs to before
+  debugging unexpected empty values in run steps.
+fix_code:
+  - language: yaml
+    label: 'Add environment: to the job that needs the environment-scoped secret'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          # Without this environment: key, secrets.DEPLOY_API_KEY is ''
+          # even though it exists as an environment secret for 'production'
+          environment: production
+          steps:
+            - name: Deploy to production
+              env:
+                API_KEY: ${{ secrets.DEPLOY_API_KEY }}
+              run: echo "Deploying with scoped key"
+
+  - language: yaml
+    label: 'Separate build (no environment) from deploy (with environment) to scope protection rules to deploy only'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          # No environment: here — only repository-scoped secrets are needed for build
+          steps:
+            - uses: actions/checkout@v4
+            - run: echo "Building artifacts"
+
+        deploy:
+          needs: build
+          runs-on: ubuntu-latest
+          environment: production   # Required reviewers or wait timer enforced here
+          steps:
+            - name: Deploy
+              env:
+                # DEPLOY_KEY is an environment secret — only available because
+                # environment: production is declared on this job
+                DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+              run: echo "Deploying with environment-scoped secret"
+prevention:
+  - 'When creating a secret, confirm its intended scope: environment secrets require the matching environment: on every job that needs them'
+  - 'If a secret is needed in a build job (no deployment environment), create it as a repository secret not an environment secret'
+  - 'Add environment: to reusable workflow caller jobs when the called workflow references environment-scoped secrets'
+  - 'Use the GitHub Settings UI to audit secret scopes when debugging empty secret values'
+docs:
+  - url: 'https://docs.github.com/en/actions/deployment/targeting-different-environments/using-environments-for-deployment'
+    label: 'GitHub Docs: Using environments for deployment'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/using-secrets-in-github-actions#creating-secrets-for-an-environment'
+    label: 'GitHub Docs: Creating secrets for an environment'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idenvironment'
+    label: 'GitHub Docs: jobs.<job_id>.environment syntax'
