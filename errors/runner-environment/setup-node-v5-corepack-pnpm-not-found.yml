@@ -1,0 +1,101 @@
+id: runner-environment-060
+title: "setup-node@v5 Cannot Locate pnpm After Corepack Enable"
+category: runner-environment
+severity: error
+tags:
+  - setup-node
+  - pnpm
+  - corepack
+  - v5
+  - package-manager
+patterns:
+  - regex: "Unable to locate executable file: pnpm"
+    flags: "i"
+  - regex: "actions/setup-node@[a-z0-9]+ # v5"
+    flags: "i"
+  - regex: "package-manager-cache: true"
+    flags: "i"
+error_messages:
+  - "Error: Unable to locate executable file: pnpm. Please verify either the file path exists or the file can be found within a directory specified by the PATH environment variable. Also check the file mode to verify the file is executable."
+root_cause: |
+  `actions/setup-node@v5` changed how corepack and package manager shims are
+  initialized compared to v4. In v5, the action enables `package-manager-cache: true`
+  by default and reads the `packageManager` field from `package.json` to configure
+  corepack, but it no longer automatically activates corepack shims for the pnpm
+  binary in the runner's PATH.
+
+  In v4, setup-node would run `corepack enable` implicitly as part of its package
+  manager setup, making pnpm available immediately after the action. In v5 this
+  behavior changed: corepack is configured for caching purposes but pnpm shims are
+  not written into PATH, so any subsequent `corepack enable` or direct `pnpm`
+  invocation fails with "Unable to locate executable file: pnpm."
+
+  The issue is specific to v5 because the internal action scripts now use Node 24
+  and a refactored corepack integration path that treats corepack enablement as
+  separate from the shim installation step.
+
+  Downgrading to `actions/setup-node@v4` restores the previous behavior where pnpm
+  shims are automatically available after the action.
+fix: |
+  Use `pnpm/action-setup` BEFORE `actions/setup-node` to install pnpm independently
+  of corepack shim management. This is the officially recommended pattern for pnpm
+  on GitHub-hosted runners and works correctly with both v4 and v5 of setup-node.
+
+  Alternatively, pin to `actions/setup-node@v4` until setup-node@v5 resolves the
+  corepack shim regression.
+
+  Do NOT rely on `corepack enable` run after setup-node@v5 to make pnpm available —
+  the shim is not written even after corepack is enabled in a subsequent step.
+fix_code:
+  - language: yaml
+    label: "Wrong: setup-node@v5 + corepack enable (pnpm not found)"
+    code: |
+      steps:
+        - uses: actions/checkout@v4
+        - uses: actions/setup-node@v5   # v5 does not write pnpm shim
+          with:
+            node-version-file: package.json
+        - run: |
+            corepack enable             # pnpm still not in PATH after this
+            corepack prepare --activate
+        - run: pnpm install             # Error: Unable to locate executable file: pnpm
+  - language: yaml
+    label: "Correct: pnpm/action-setup before setup-node (works with v4 and v5)"
+    code: |
+      steps:
+        - uses: actions/checkout@v4
+        - uses: pnpm/action-setup@v4    # install pnpm FIRST, independent of corepack
+          with:
+            version: 10
+        - uses: actions/setup-node@v5
+          with:
+            node-version-file: package.json
+            cache: pnpm
+        - run: pnpm install --frozen-lockfile
+  - language: yaml
+    label: "Alternative: pin to setup-node@v4 (restores previous corepack behavior)"
+    code: |
+      steps:
+        - uses: actions/checkout@v4
+        - uses: actions/setup-node@v4   # v4 writes corepack shims automatically
+          with:
+            node-version-file: package.json
+        - run: |
+            corepack enable
+            corepack prepare --activate
+        - run: pnpm install --frozen-lockfile
+prevention:
+  - "Use pnpm/action-setup before setup-node for reliable pnpm availability regardless of setup-node version."
+  - "Do not assume corepack shim behavior is identical between setup-node major versions."
+  - "Pin action versions with SHAs (e.g. @a0853c24...) to avoid unexpected behavior changes on major bumps."
+  - "Read setup-node release notes and CHANGELOG when upgrading from v4 to v5 — corepack integration changed."
+  - "Test pnpm availability explicitly in CI by adding a debug step: run: which pnpm && pnpm --version"
+docs:
+  - url: "https://github.com/actions/setup-node/issues/1357"
+    label: "actions/setup-node#1357: v5 fails immediately when using pnpm (31 reactions)"
+  - url: "https://github.com/pnpm/action-setup"
+    label: "pnpm/action-setup: Official pnpm GitHub Action"
+  - url: "https://nodejs.org/api/corepack.html"
+    label: "Node.js Corepack documentation"
+  - url: "https://github.com/actions/setup-node/releases"
+    label: "actions/setup-node releases and CHANGELOG"

@@ -1,0 +1,128 @@
+id: caching-artifacts-023
+title: "Cache Saved Successfully But Unavailable for Restore for Several Minutes (API Propagation Lag)"
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - actions/cache
+  - cache-miss
+  - propagation-delay
+  - api-lag
+  - restore
+  - gh-cache-list
+patterns:
+  - regex: "Cache not found for input keys"
+    flags: "i"
+  - regex: "Cache service responded with 404"
+    flags: "i"
+  - regex: "Saved successfully"
+    flags: "i"
+error_messages:
+  - "Cache not found for input keys"
+  - "Cache service responded with 404"
+  - "Received 0 of 0 (0.0 B), 0.0 MBs/sec"
+root_cause: |
+  There is a deliberate propagation delay between when the cache backend finishes
+  writing a cache entry (reporting "Saved successfully") and when that entry becomes
+  visible via the cache REST API or available for restore by subsequent jobs.
+
+  GitHub's cache service uses an eventually-consistent storage backend. After a cache
+  save completes, the cache metadata may not propagate to the query/restore API for
+  up to 4-5 minutes. During this window:
+
+  - `gh cache list` reports no cache for the key
+  - The Actions UI cache tab does not show the entry
+  - `actions/cache/restore@v5` reports a cache miss on the exact key
+
+  This is commonly hit when a workflow saves a cache in a "warm-up" job that is a
+  dependency for a fan-out matrix job. If the downstream jobs start before the cache
+  propagates, they all miss the cache and fall back to a cold install — often on a
+  schedule-triggered first-run-of-day workflow.
+
+  The issue was reported against `actions/cache` v4.2.2 with GitHub-hosted runners
+  and is not unique to any runner OS.
+fix: |
+  Design workflows to tolerate cache misses — always include a fallback install step
+  that runs when the cache is cold. Do not architect workflows where a cache miss
+  causes a hard failure.
+
+  For workflows that must read a cache from a previous job, add a `restore-keys`
+  fallback so a partial match is used while the exact key propagates:
+
+    restore-keys: |
+      build-deps-${{ runner.os }}-
+
+  If you need the exact cache entry, add a sleep + retry loop in the calling job
+  using `actions/cache/restore` wrapped with `nick-invision/retry`.
+
+  Alternatively, restructure the workflow so that cache-consuming jobs share the
+  same job context as the cache writer (using job outputs or artifacts) rather
+  than relying on cross-run cache availability.
+fix_code:
+  - language: yaml
+    label: "Always include restore-keys fallback to tolerate propagation lag"
+    code: |
+      steps:
+        - uses: actions/cache/restore@v5
+          id: cache-restore
+          with:
+            path: |
+              ~/.npm
+              node_modules
+            key: build-deps-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
+            restore-keys: |
+              build-deps-${{ runner.os }}-   # partial match handles lag window
+            fail-on-cache-miss: false        # never hard-fail on cache miss
+
+        - name: Install (runs on cache miss or during lag window)
+          if: steps.cache-restore.outputs.cache-hit != 'true'
+          run: npm ci
+  - language: yaml
+    label: "Warm-up job: save cache with explicit key confirmation before fan-out"
+    code: |
+      jobs:
+        warm-cache:
+          runs-on: ubuntu-latest
+          outputs:
+            cache-key: ${{ steps.cache-key.outputs.key }}
+          steps:
+            - uses: actions/checkout@v4
+            - id: cache-key
+              run: echo "key=build-deps-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}" >> "$GITHUB_OUTPUT"
+            - uses: actions/cache@v5
+              id: cache
+              with:
+                path: node_modules
+                key: ${{ steps.cache-key.outputs.key }}
+            - if: steps.cache.outputs.cache-hit != 'true'
+              run: npm ci
+            - if: steps.cache.outputs.cache-hit != 'true'
+              uses: actions/cache/save@v5
+              with:
+                path: node_modules
+                key: ${{ steps.cache-key.outputs.key }}
+
+        # Fan-out jobs include restore-keys fallback; tolerate lag window
+        build:
+          needs: warm-cache
+          strategy:
+            matrix:
+              target: [lint, test, typecheck]
+          steps:
+            - uses: actions/cache/restore@v5
+              with:
+                path: node_modules
+                key: ${{ needs.warm-cache.outputs.cache-key }}
+                restore-keys: build-deps-${{ runner.os }}-
+prevention:
+  - "Never hard-fail on cache miss (fail-on-cache-miss: false) — always include a fallback install."
+  - "Include restore-keys to allow partial matches during the propagation window."
+  - "Avoid architectures where downstream jobs strictly require a cache written in the same run's prior job."
+  - "Use job artifacts (upload-artifact/download-artifact) for dependencies that must be reliably shared within a run."
+  - "If using gh cache list to verify saves, wait at least 5 minutes before concluding a save failed."
+docs:
+  - url: "https://github.com/actions/cache/issues/1710"
+    label: "actions/cache#1710: Cache indexing lag / API propagation delay (15 reactions)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows"
+    label: "GitHub Docs: Caching dependencies to speed up workflows"
+  - url: "https://github.com/actions/cache/tree/main/restore"
+    label: "actions/cache/restore: restore-only action"
