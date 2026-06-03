@@ -1,0 +1,78 @@
+id: 'caching-artifacts-028'
+title: 'hashFiles() returns empty string when no files match pattern, causing cache key collision across all runs'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - hashfiles
+  - cache-key
+  - empty-string
+  - collision
+  - lock-file
+  - monorepo
+patterns:
+  - regex: 'hashFiles\('
+    flags: 'i'
+error_messages:
+  - 'Cache hit for key:'
+  - 'hashFiles result is empty string'
+root_cause: |
+  When hashFiles('**/package-lock.json') finds no matching files, it returns an empty
+  string instead of failing. A cache key like:
+    ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+  evaluates to:
+    Linux-node-
+  (no hash suffix). All workflow runs — regardless of their actual dependency state —
+  then share this single cache key. The first run to complete saves its node_modules
+  under this key; every subsequent run gets a stale cache hit with potentially outdated
+  or wrong dependencies.
+
+  The cache-hit output shows 'true' and the step succeeds with no warning. Developers
+  see unexpectedly fast runs (cache always hits) but may encounter subtle dependency
+  staleness bugs.
+
+  Behavior varies across versions: actions/toolkit prior to 1.9.0 threw an exception
+  on empty results; later versions silently return empty string, making the collapsing
+  key the default behavior for repositories without the expected lock file.
+fix: |
+  Guard hashFiles() with a fallback value so the cache key is never incomplete when
+  no matching files exist. Using || github.sha or || github.run_id ensures each run
+  gets a unique key when no lock file is present, preventing stale cache collisions.
+fix_code:
+  - language: yaml
+    label: 'Add fallback to hashFiles to prevent empty cache key'
+    code: |
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          # Fallback to github.sha when no lock file exists — prevents key collision
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') || github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+  - language: yaml
+    label: 'Verify cache is populated before relying on it'
+    code: |
+      - uses: actions/cache@v4
+        id: npm-cache
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') || github.sha }}
+
+      - name: Confirm cache restored correctly
+        if: steps.npm-cache.outputs.cache-hit == 'true'
+        run: |
+          if [ ! -d ~/.npm ]; then
+            echo "Cache hit claimed but directory missing — likely empty-key collision"
+            exit 1
+          fi
+prevention:
+  - 'Always add || github.sha fallback after hashFiles() in cache keys'
+  - 'Use actions built-in caching (setup-node cache: npm) which handles missing lock files safely'
+  - 'In monorepos without a root-level lock file, construct keys from per-package hash patterns'
+  - 'Test cache behavior in branches or forks where lock files might not yet exist'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#hashfiles'
+    label: 'GitHub Docs: hashFiles() function'
+  - url: 'https://github.com/actions/cache/issues/1175'
+    label: 'actions/cache#1175: hashFiles empty result causes key collision'
+  - url: 'https://github.com/actions/toolkit/blob/main/packages/glob/README.md'
+    label: 'actions/toolkit: glob — hashFiles behavior on no match'
