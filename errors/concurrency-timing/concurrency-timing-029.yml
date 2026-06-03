@@ -1,0 +1,92 @@
+id: concurrency-timing-029
+title: "cancel-in-progress: true does not release a deployment environment lock — subsequent runs wait indefinitely"
+category: concurrency-timing
+severity: error
+tags:
+  - concurrency
+  - cancel-in-progress
+  - deployment-environment
+  - environment-lock
+  - queue-stall
+  - protection-rules
+patterns:
+  - regex: 'waiting.*deployment.*environment|environment.*lock.*not.*released'
+    flags: "i"
+  - regex: 'deployment.*stuck.*waiting|cancel.*in.*progress.*environment.*stall'
+    flags: "i"
+error_messages:
+  - "Deployment stuck in 'Waiting for deployment' state after previous run was cancelled"
+  - "Job has been waiting for a deployment to complete for over N minutes"
+root_cause: |
+  GitHub Actions deployment environments use a distributed lock to ensure only one workflow
+  run deploys to an environment at a time. When a job is cancelled while holding or waiting
+  for an environment lock, the lock release is not guaranteed to be atomic with the cancellation.
+
+  The race condition sequence:
+  1. Run A acquires the environment lock and begins deploying
+  2. Run B starts, enters "Waiting for deployment" state (environment locked by A)
+  3. Run C triggers with cancel-in-progress: true — Run B (the waiting run) is cancelled
+  4. Run A completes and releases its lock
+  5. Run C's deploy job is now queued but sees the environment still showing a pending entry
+     from the cancelled Run B, causing it to wait indefinitely
+
+  A separate scenario: Run A itself is cancelled mid-deploy. The environment can enter
+  a "deployment in progress" limbo state where no active run owns the lock but the
+  environment page still shows a pending deployment. New runs queue successfully but
+  hang waiting for a lock that will never be released automatically.
+
+  This is exacerbated on active repos where pushes arrive faster than deploy jobs complete,
+  causing continuous queue stalls on the environment.
+fix: |
+  Separate the concurrency group into two distinct layers: one for build/test jobs
+  (safe to cancel freely) and one for deploy jobs (must serialize to completion).
+
+  Build jobs use cancel-in-progress: true — wasteful test runs are discarded when
+  a newer commit arrives. Deploy jobs use cancel-in-progress: false — they run to
+  completion serially, preventing mid-deploy cancellations that create lock limbo.
+
+  Set timeout-minutes on all deploy jobs so stuck environment waits self-resolve with
+  a clear failure rather than hanging for the job's default 6-hour timeout.
+
+  To manually recover a stalled environment: navigate to Settings → Environments →
+  select the stalled environment → cancel any pending deployment entries in the UI.
+fix_code:
+  - language: yaml
+    label: "Separate concurrency groups — cancel builds freely, serialize deploys safely"
+    code: |
+      jobs:
+        build:
+          # Cancel in-progress builds freely — no environment lock at stake
+          concurrency:
+            group: build-${{ github.ref }}
+            cancel-in-progress: true
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: echo "build and test steps"
+
+        deploy:
+          needs: build
+          environment: production
+          # NEVER cancel in-progress deploy jobs — let them finish to avoid lock limbo
+          concurrency:
+            group: deploy-production
+            cancel-in-progress: false
+          timeout-minutes: 30    # Self-heal on stuck environment wait (default is 6h)
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: echo "deploy steps here"
+prevention:
+  - "Never use cancel-in-progress: true on jobs that target a deployment environment"
+  - "Always set timeout-minutes on deploy jobs — the default 6-hour timeout makes stalls very painful"
+  - "Use separate concurrency groups for build (cancel-friendly) vs deploy (serialize) stages"
+  - "Monitor the Environments page for stale 'Deployment pending' entries after CI incidents"
+  - "Consider dedicated environment concurrency groups (e.g., deploy-production vs deploy-staging) to prevent cross-environment interference"
+docs:
+  - url: "https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment"
+    label: "GitHub Docs: Managing environments for deployment"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#concurrency"
+    label: "GitHub Docs: Workflow concurrency"
+  - url: "https://github.com/orgs/community/discussions/14490"
+    label: "GitHub Community #14490: cancel-in-progress and deployment environment lock"
