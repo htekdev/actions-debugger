@@ -1,0 +1,107 @@
+id: permissions-auth-023
+title: "PAT Fails with 'Not Found' on SSO-Protected Organization Repository"
+category: permissions-auth
+severity: error
+tags:
+  - personal-access-token
+  - saml-sso
+  - organization
+  - checkout
+  - authentication
+patterns:
+  - regex: "Not Found - https://docs\\.github\\.com/rest/repos/repos#get-a-repository"
+    flags: "i"
+  - regex: "fatal: unable to access.*403|Syncing repository.*Not Found"
+    flags: "i"
+  - regex: "could not read Username.*https://github\\.com"
+    flags: "i"
+error_messages:
+  - "Not Found - https://docs.github.com/rest/repos/repos#get-a-repository"
+  - "Retrieving the default branch name"
+  - "  Not Found - https://docs.github.com/rest/repos/repos#get-a-repository"
+  - "Error: Not Found - https://docs.github.com/rest/repos/repos#get-a-repository"
+root_cause: |
+  When a GitHub organization enforces SAML SSO (Single Sign-On), every PAT
+  (Personal Access Token) used to access that organization's resources must be
+  explicitly authorized for the SSO organization — even if the token has all the
+  correct scopes (repo, read:org, etc.).
+
+  A PAT that hasn't been authorized for the SSO org will receive a 404 "Not Found"
+  response when attempting to access org resources via the API or when cloning/
+  checking out a repository. The response is 404 (not 401/403) because GitHub
+  treats an unauthorized SSO request as "resource doesn't exist for this token."
+
+  Common symptoms:
+  - `actions/checkout` fails with "Not Found" on the default branch retrieval step
+  - The PAT works locally in a browser (which has an active SSO session) but fails
+    in GitHub Actions
+  - The token has `repo` scope or `contents: read` permission but still 404s
+
+  Sources: stackoverflow.com/questions/79874764,
+           stackoverflow.com/questions/77957649,
+           GitHub Docs on SAML SSO authorization
+fix: |
+  Authorize the PAT for the SSO organization:
+
+  1. Go to GitHub → Settings → Developer settings → Personal access tokens
+  2. Select the PAT used in the workflow
+  3. Click "Configure SSO" next to the token
+  4. Click "Authorize" next to the target organization
+  5. Complete any SSO prompts
+
+  The PAT is now authorized for that org and will work in Actions workflows.
+
+  For fine-grained PATs: ensure the token's "Resource owner" is the organization
+  (not your personal account) and that the org admin has approved it.
+fix_code:
+  - language: yaml
+    label: "Authorize the PAT for SSO org (no workflow change needed)"
+    code: |
+      # This is a GitHub settings action, not a workflow change.
+      # GitHub.com > Settings > Developer settings > Personal access tokens
+      # > (select token) > Configure SSO > Authorize > (org name)
+      #
+      # After authorizing, your workflow using the PAT will work:
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                repository: my-org/private-repo
+                token: ${{ secrets.MY_ORG_PAT }}
+                # MY_ORG_PAT must have 'repo' scope AND be SSO-authorized for my-org
+  - language: yaml
+    label: "Use a GitHub App token instead (recommended for SSO orgs)"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Generate GitHub App token
+              id: app-token
+              uses: actions/create-github-app-token@v1
+              with:
+                app-id: ${{ vars.APP_ID }}
+                private-key: ${{ secrets.APP_PRIVATE_KEY }}
+                owner: my-org
+                # GitHub App tokens for org installations are not subject to
+                # SAML SSO PAT authorization requirements
+            - uses: actions/checkout@v4
+              with:
+                repository: my-org/private-repo
+                token: ${{ steps.app-token.outputs.token }}
+prevention:
+  - "After creating a new PAT for use with an SSO-enforcing organization, always authorize it via Configure SSO before adding it to Actions secrets."
+  - "Test PAT access locally with `gh auth login --with-token` and `gh repo view my-org/repo` to confirm SSO authorization before using in CI."
+  - "Prefer GitHub App tokens over PATs for organization repositories — they are not subject to SAML SSO authorization requirements."
+  - "Document which secrets require SSO authorization in your repo's CONTRIBUTING or CI documentation to prevent the same issue for new contributors."
+docs:
+  - url: "https://docs.github.com/en/enterprise-cloud@latest/authentication/authenticating-with-saml-single-sign-on/authorizing-a-personal-access-token-for-use-with-saml-single-sign-on"
+    label: "Authorizing a PAT for use with SAML SSO"
+  - url: "https://docs.github.com/en/enterprise-cloud@latest/organizations/managing-saml-single-sign-on-for-your-organization/about-identity-and-access-management-with-saml-single-sign-on"
+    label: "About SAML SSO for organizations"
+  - url: "https://stackoverflow.com/questions/79874764/github-actions-checkout-fails-with-not-found-error-for-sso-protected-enterprise"
+    label: "SO: checkout fails with Not Found for SSO-protected enterprise repo"
+  - url: "https://stackoverflow.com/questions/77957649/repository-not-found-error-while-using-actions-checkoutv4-to-clone-a-private-re"
+    label: "SO: Repository not found error with actions/checkout@v4 on private repo"

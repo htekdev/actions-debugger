@@ -1,0 +1,143 @@
+id: runner-environment-052
+title: "Docker Multi-Platform Build Uses Matrix per Platform — Tags Overwrite Each Other"
+category: runner-environment
+severity: silent-failure
+tags:
+  - docker
+  - buildx
+  - multi-platform
+  - matrix
+  - ghcr
+  - manifest
+patterns:
+  - regex: "no matching manifest for .* in the manifest list entries"
+    flags: "i"
+  - regex: "image operating system .* does not match host operating system"
+    flags: "i"
+  - regex: "manifest unknown"
+    flags: "i"
+error_messages:
+  - "no matching manifest for linux/amd64 in the manifest list entries"
+  - "Error response from daemon: manifest unknown: manifest unknown"
+  - "image operating system \"linux\" does not match host operating system \"linux\""
+root_cause: |
+  A common pattern for multi-platform Docker images in GitHub Actions is to use
+  `strategy.matrix` with one platform per job and `docker/build-push-action` in
+  each job. This approach is incorrect: each job pushes a single-platform image
+  to the same tag, and each push *overwrites* the previous one. There is no merging
+  of single-platform images into a multi-platform manifest list.
+
+  After all matrix jobs complete, the tag only contains the image from the last
+  job to push — typically whichever platform finished last. All other platforms are
+  silently lost.
+
+  When another host tries to pull the image on a different architecture (e.g.,
+  linux/arm64 pulling after linux/amd64 was last to write), they receive:
+  "no matching manifest for linux/arm64 in the manifest list entries"
+
+  The workflow itself reports success — all matrix jobs push successfully. The
+  failure is silent until image consumers on other architectures try to pull.
+
+  Sources: stackoverflow.com/questions/79315376,
+           Docker multi-platform build documentation
+fix: |
+  Use a single `docker/build-push-action` step with comma-separated platforms
+  instead of a matrix. Docker Buildx handles building all platforms in one job
+  and pushes a proper multi-platform manifest list.
+
+  If you need dedicated builders for each platform (e.g., native ARM runners),
+  use the "bake + merge manifest" pattern with `docker buildx imagetools create`
+  to merge per-platform digests into a single manifest after all builds complete.
+fix_code:
+  - language: yaml
+    label: "Single buildx job with comma-separated platforms (recommended)"
+    code: |
+      jobs:
+        build-and-push:
+          runs-on: ubuntu-latest
+          permissions:
+            packages: write
+            contents: read
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Set up QEMU
+              uses: docker/setup-qemu-action@v3
+
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@v3
+
+            - name: Login to GHCR
+              uses: docker/login-action@v3
+              with:
+                registry: ghcr.io
+                username: ${{ github.actor }}
+                password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Build and push multi-platform image
+              uses: docker/build-push-action@v6
+              with:
+                push: true
+                platforms: linux/amd64,linux/arm64,linux/arm/v7
+                # All platforms in one step → proper manifest list created
+                tags: ghcr.io/${{ github.repository_owner }}/myapp:latest
+  - language: yaml
+    label: "Native-builder pattern: build per platform, merge manifest (advanced)"
+    code: |
+      # Build per-platform in parallel jobs, then merge into a manifest list
+      jobs:
+        build:
+          strategy:
+            matrix:
+              include:
+                - platform: linux/amd64
+                  runner: ubuntu-latest
+                - platform: linux/arm64
+                  runner: ubuntu-24.04-arm  # native ARM runner
+          runs-on: ${{ matrix.runner }}
+          outputs:
+            digest: ${{ steps.push.outputs.digest }}
+          steps:
+            - uses: actions/checkout@v4
+            - uses: docker/setup-buildx-action@v3
+            - uses: docker/login-action@v3
+              with:
+                registry: ghcr.io
+                username: ${{ github.actor }}
+                password: ${{ secrets.GITHUB_TOKEN }}
+            - name: Build and push by digest (no tag yet)
+              id: push
+              uses: docker/build-push-action@v6
+              with:
+                push: true
+                platforms: ${{ matrix.platform }}
+                # Push by digest only — do NOT set a tag here
+                outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/myapp,push-by-digest=true,name-canonical=true
+
+        merge:
+          needs: build
+          runs-on: ubuntu-latest
+          steps:
+            - uses: docker/login-action@v3
+              with:
+                registry: ghcr.io
+                username: ${{ github.actor }}
+                password: ${{ secrets.GITHUB_TOKEN }}
+            - name: Create and push multi-platform manifest
+              run: |
+                docker buildx imagetools create \
+                  -t ghcr.io/${{ github.repository_owner }}/myapp:latest \
+                  ${{ needs.build.outputs.digest }}
+                  # Merges per-platform digests into one manifest list
+prevention:
+  - "Never use strategy.matrix to build separate platforms and push to the same tag — each push overwrites the previous."
+  - "Use a single build-push-action step with comma-separated platforms for most multi-platform use cases."
+  - "Validate multi-platform images after push with `docker buildx imagetools inspect ghcr.io/owner/image:tag` to confirm all platforms are present."
+  - "When matrix builds are needed for native performance, use push-by-digest and a fan-in merge job."
+docs:
+  - url: "https://docs.docker.com/build/ci/github-actions/multi-platform/"
+    label: "Docker: Multi-platform image with GitHub Actions"
+  - url: "https://github.com/docker/build-push-action"
+    label: "docker/build-push-action — multi-platform examples"
+  - url: "https://stackoverflow.com/questions/79315376/docker-multiplatform-image-pushed-successfully-to-ghcr-but-pulling-image-result"
+    label: "SO: Docker multiplatform image pushed successfully but pulling results in manifest not found"
