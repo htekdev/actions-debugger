@@ -1,0 +1,115 @@
+id: 'silent-failures-040'
+title: '`actions/cache/restore` `fail-on-cache-miss: true` silently does not halt the workflow in v3.3.2–v3.3.3 — subsequent steps execute despite cache miss'
+category: silent-failures
+severity: silent-failure
+tags:
+  - cache
+  - fail-on-cache-miss
+  - cache-restore
+  - silent-failure
+  - regression
+  - cache-v3
+  - cache-v4
+patterns:
+  - regex: 'Failed to restore cache entry\. Exiting as fail-on-cache-miss is set\.'
+    flags: 'i'
+  - regex: 'fail-on-cache-miss.*true'
+    flags: 'i'
+error_messages:
+  - 'Error: Failed to restore cache entry. Exiting as fail-on-cache-miss is set.'
+  - 'Warning: Cache not found for keys:'
+root_cause: |
+  actions/cache@v3.3.2 and v3.3.3 contain a bug in the actions/cache/restore sub-action
+  where fail-on-cache-miss: true does not actually halt the workflow when no cache entry
+  is found.
+
+  The bug has two components (tracked in PR#1327):
+
+  1. Logic error: restoreImpl.ts initializes earlyExit to undefined (falsy) regardless
+     of whether fail-on-cache-miss is set. The conditional `if (earlyExit)` check always
+     evaluates to false, so process.exit(1) is never called on a miss.
+
+  2. Exit code conflict: even when process.exit(1) is called, it overwrites the exit
+     code previously set by core.setFailed(), causing the runner to record the step
+     outcome as 'success' despite the logged error message.
+
+  Observable behavior in affected versions:
+  - The step log shows: "Error: Failed to restore cache entry. Exiting as
+    fail-on-cache-miss is set."
+  - The step is marked with a red X in the UI but step.outcome is 'success'
+  - All subsequent steps execute normally as if no error occurred
+  - Jobs that should have stopped at the cache guard proceed to completion
+
+  This silently undermines workflows that use fail-on-cache-miss to enforce a
+  warm-cache-required pattern (e.g., a build artifact must exist from a prior job).
+
+  Fixed in: actions/cache@v3.3.4 and actions/cache@v4.0.2+ via PR#1327 (merged March 2024).
+  Affected: actions/cache@v3.3.2, v3.3.3 and the corresponding actions/cache/restore versions.
+
+  Source: actions/cache#1265 (11 reactions), actions/cache PR#1327 (merged March 2024).
+fix: |
+  Option 1 (recommended): Update to actions/cache@v4 (v4.0.2+) or actions/cache@v3.3.4+
+  where the earlyExit logic and exit code handling are corrected.
+
+  Option 2: Roll back to actions/cache@v3.3.1 — the last version before the regression
+  was introduced.
+
+  Option 3 (belt-and-suspenders, any version): Add an explicit guard step after the
+  restore that checks the cache-hit output and exits manually. This works regardless
+  of the action version and is the most robust approach.
+fix_code:
+  - language: yaml
+    label: 'Upgrade to fixed actions/cache version (v3.3.4+ or v4.0.2+)'
+    code: |
+      jobs:
+        downstream:
+          needs: build
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            # v4.0.2+ correctly fails the step AND stops the job on cache miss
+            - name: Restore build artifacts
+              uses: actions/cache/restore@v4
+              with:
+                path: dist/
+                key: build-${{ github.sha }}
+                fail-on-cache-miss: true
+
+            - name: Run tests against build
+              run: make test-dist
+  - language: yaml
+    label: 'Belt-and-suspenders explicit guard (works on all cache versions)'
+    code: |
+      jobs:
+        downstream:
+          needs: build
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Restore build artifacts
+              id: cache-restore
+              uses: actions/cache/restore@v4
+              with:
+                path: dist/
+                key: build-${{ github.sha }}
+                fail-on-cache-miss: false   # Do not rely on this alone
+
+            - name: Abort if build cache missing
+              if: steps.cache-restore.outputs.cache-hit != 'true'
+              run: |
+                echo "::error::Build artifacts not found in cache — run the build job first."
+                exit 1
+
+            - name: Run tests against build
+              run: make test-dist
+prevention:
+  - 'Pin actions/cache and actions/cache/restore to v3.3.4+ or v4.0.2+ when using fail-on-cache-miss'
+  - 'Add an explicit guard step checking steps.ID.outputs.cache-hit alongside fail-on-cache-miss for critical cache gates'
+  - 'Verify that a failed cache restore truly stops downstream steps by running a workflow with a known cache miss before relying on fail-on-cache-miss in production'
+docs:
+  - url: 'https://github.com/actions/cache/issues/1265'
+    label: 'actions/cache#1265: fail-on-cache-miss not failing the workflow (11 reactions, Oct 2023)'
+  - url: 'https://github.com/actions/cache/pull/1327'
+    label: 'actions/cache PR#1327: Fix fail-on-cache-miss not working (merged March 2024)'

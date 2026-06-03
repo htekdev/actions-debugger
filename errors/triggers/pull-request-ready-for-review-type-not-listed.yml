@@ -1,0 +1,101 @@
+id: 'triggers-028'
+title: 'Converting a draft PR to ready-for-review does not trigger `pull_request` workflow unless `ready_for_review` is explicitly listed in `types:`'
+category: triggers
+severity: silent-failure
+tags:
+  - pull-request
+  - draft
+  - ready-for-review
+  - types
+  - trigger
+  - silent-failure
+patterns:
+  - regex: 'ready_for_review'
+    flags: 'i'
+  - regex: 'pull_request\.draft\s*==\s*false'
+    flags: 'i'
+error_messages:
+  - 'Workflow not triggered when draft PR converted to ready for review'
+  - 'No workflow runs appeared after marking PR as ready for review'
+root_cause: |
+  GitHub fires a distinct pull_request event type — ready_for_review — when a draft PR
+  is converted to ready. This event type is NOT included in the default types list
+  of [opened, synchronize, reopened].
+
+  Two common misconfigured patterns that silently fail:
+
+  Pattern 1 — draft filter with default types:
+    A workflow uses `if: github.event.pull_request.draft == false` with default types.
+    The if: condition filters jobs correctly on synchronize/opened events, but the
+    ready_for_review conversion event is never fired because ready_for_review is not
+    in the types list. Result: a PR opened as draft, then converted to ready, will
+    never have had CI run against its commits.
+
+  Pattern 2 — only ready_for_review type:
+    A workflow lists only `types: [ready_for_review]`. This fires once when the draft
+    is converted, but never on subsequent commits to the PR (synchronize is not listed).
+
+  The correct pattern combines all four types AND adds the draft check condition so
+  that draft-state pushes are skipped while draft-to-ready conversion and subsequent
+  synchronize events all trigger the workflow.
+
+  Source: Stack Overflow #73948443 (score 8, 4,466 views), GitHub Docs pull_request
+  event types documentation.
+fix: |
+  Combine all required event types including ready_for_review in the types: list, and
+  add a job-level if: condition to skip workflow runs while the PR is still in draft.
+
+  This ensures:
+  - Draft PRs do not run CI (filtered by the if: condition)
+  - Converting a draft to ready fires the workflow against the current HEAD commit
+  - Subsequent commits to a ready PR trigger the workflow via synchronize events
+fix_code:
+  - language: yaml
+    label: 'Correct configuration: all four types plus draft guard condition'
+    code: |
+      on:
+        pull_request:
+          types:
+            - opened
+            - synchronize
+            - reopened
+            - ready_for_review   # Must be explicit — not included in default types
+
+      jobs:
+        ci:
+          # Skip while PR is in draft state — fires for all non-draft PR events above
+          if: '! github.event.pull_request.draft'
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: echo "CI running on non-draft PR"
+  - language: yaml
+    label: 'Alternative: run on all PR events, annotate draft runs as informational'
+    code: |
+      on:
+        pull_request:
+          types:
+            - opened
+            - synchronize
+            - reopened
+            - ready_for_review
+
+      jobs:
+        ci:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Annotate draft status
+              if: github.event.pull_request.draft == true
+              run: echo "::notice::Running on draft PR — results are informational"
+
+            - uses: actions/checkout@v4
+            - run: make test
+prevention:
+  - 'Always explicitly list all four pull_request types when your workflow must run on draft-to-ready conversions'
+  - 'Validate your trigger configuration by: opening a draft PR, pushing a commit to it, then converting to ready — all three events should behave as expected'
+  - 'Use github.event.pull_request.draft in job-level if: conditions rather than filtering by type alone, so the same workflow handles draft and non-draft PRs correctly'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request'
+    label: 'GitHub Docs: pull_request event types including ready_for_review'
+  - url: 'https://stackoverflow.com/questions/73948443/github-actions-running-a-workflow-on-non-draft-prs'
+    label: 'Stack Overflow #73948443: Running a workflow on non-draft PRs (score 8, 4,466 views)'
