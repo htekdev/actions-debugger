@@ -1,0 +1,124 @@
+id: concurrency-timing-019
+title: "Reusable Workflow Inherits Caller's ${{ github.workflow }} — Concurrency Group Collision Cancels Caller"
+category: concurrency-timing
+severity: error
+tags:
+  - reusable-workflow
+  - workflow-call
+  - concurrency
+  - github-workflow-context
+  - cancel-in-progress
+  - context-inheritance
+patterns:
+  - regex: "Run was cancelled|Canceling since a higher priority waiting request"
+    flags: "i"
+  - regex: "called workflow.*cancel|reusable.*workflow.*concurrency"
+    flags: "i"
+  - regex: "github\\.workflow.*concurrency group|concurrency.*reusable"
+    flags: "i"
+error_messages:
+  - "Run was cancelled"
+  - "Canceling since a higher priority waiting request for '...' exists"
+  - "This run was cancelled because another run in the same concurrency group was started"
+root_cause: |
+  When a called (reusable) workflow uses `${{ github.workflow }}` in its `concurrency.group`
+  expression, it inherits the CALLER workflow's name — not its own file name. This causes both
+  the caller and the called workflow to join the same concurrency group, leading to cascading
+  cancellations.
+
+  Example: Caller workflow named "CI" calls "Deploy" as a reusable workflow. Both define:
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+
+  At runtime, `github.workflow` inside "Deploy" evaluates to "CI" — the same string as the
+  caller. When the called workflow starts, `cancel-in-progress: true` fires and cancels the
+  still-running caller workflow.
+
+  This is documented behavior: the GitHub Actions runner passes the caller workflow's
+  `github` context to all called workflows. The called workflow has no way to determine its
+  own filename via context expressions alone.
+
+  The GitHub Docs now include an explicit warning: "A called workflow uses the name of its
+  caller workflow in ${{ github.workflow }}, so using this context as the value of
+  jobs.<job_id>.concurrency.group in both caller and called workflows will cause the caller
+  workflow to be cancelled when the called workflow runs."
+
+  Source: actions/runner#3205 (github.workflow context variable causes child workflow runs to
+  be prematurely canceled — opened Mar 2024, closed stale Apr 2025, 0 official fix)
+  Source: GitHub Docs — Using concurrency with reusable workflows
+fix: |
+  Do not use `${{ github.workflow }}` in concurrency group expressions inside reusable
+  (workflow_call) workflows.
+
+  Option A — Hard-code a unique identifier for the called workflow:
+    Use a static string that cannot match the caller's concurrency group.
+
+  Option B — Pass caller context as an explicit input:
+    Accept a `concurrency_key` input from the caller and use that in the called
+    workflow's concurrency group, giving the caller full control.
+
+  Option C — Remove concurrency from the called workflow entirely:
+    If the caller manages concurrency at the job level, the called workflow's internal
+    concurrency is often redundant and causes more harm than good.
+fix_code:
+  - language: yaml
+    label: "caller.yml — standard concurrency group using github.workflow (safe here)"
+    code: |
+      name: CI
+
+      on:
+        push:
+          branches: [main]
+
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: true
+
+      jobs:
+        test:
+          uses: ./.github/workflows/deploy.yml
+          with:
+            environment: staging
+
+  - language: yaml
+    label: "deploy.yml (called) — DO NOT use github.workflow; use a static name instead"
+    code: |
+      name: Deploy
+      # NOTE: when called, github.workflow returns "CI" (caller name), NOT "Deploy"
+
+      on:
+        workflow_call:
+          inputs:
+            environment:
+              type: string
+              required: true
+
+      # ✅ CORRECT: static unique identifier — never collides with caller group
+      concurrency:
+        group: deploy-called-${{ inputs.environment }}-${{ github.ref }}
+        cancel-in-progress: false
+
+      # ❌ WRONG: "CI-refs/heads/main" == caller's group → caller gets cancelled
+      # concurrency:
+      #   group: ${{ github.workflow }}-${{ github.ref }}
+      #   cancel-in-progress: true
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./deploy.sh ${{ inputs.environment }}
+prevention:
+  - "Never use `${{ github.workflow }}` in concurrency group expressions inside reusable (workflow_call) workflows."
+  - "Use hard-coded or input-derived identifiers in called workflow concurrency groups to ensure uniqueness."
+  - "If the caller already manages concurrency at the job level, omit concurrency from the called workflow entirely."
+  - "Test by triggering two back-to-back runs and confirming neither cancels the other unexpectedly."
+docs:
+  - url: "https://docs.github.com/en/actions/sharing-automations/reusing-workflows"
+    label: "GitHub Docs: Reusing workflows — concurrency warning"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/using-concurrency"
+    label: "GitHub Docs: Using concurrency in GitHub Actions"
+  - url: "https://github.com/actions/runner/issues/3205"
+    label: "actions/runner#3205: github.workflow context causes child workflow cancellation"

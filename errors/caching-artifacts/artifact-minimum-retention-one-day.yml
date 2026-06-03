@@ -1,0 +1,153 @@
+id: caching-artifacts-024
+title: "Artifact Minimum Retention Is 1 Day — Cannot Set retention-days to 0 for Immediate Cleanup"
+category: caching-artifacts
+severity: limitation
+tags:
+  - artifact
+  - retention
+  - storage
+  - quota
+  - known-limit
+  - upload-artifact
+patterns:
+  - regex: "retention.days.*0|minimum.*retention.*1|retention.*must be between"
+    flags: "i"
+  - regex: "artifact.*storage.*quota|storage.*quota.*exceeded"
+    flags: "i"
+  - regex: "invalid.*retention|retention.*invalid"
+    flags: "i"
+error_messages:
+  - "Invalid retention days: must be between 1 and 90 inclusive"
+  - "Artifact storage quota has been exceeded"
+  - "retention-days must be between 1 and 90"
+  - "Artifact storage quota has been hit"
+root_cause: |
+  GitHub Actions enforces a minimum artifact retention period of 1 day. Setting
+  `retention-days: 0` in `actions/upload-artifact` causes a validation error. There is
+  no way to have artifacts automatically deleted at workflow completion — they persist for
+  at least 24 hours, consuming storage quota whether needed or not.
+
+  This limitation is tied to the backing storage system's minimum time-based retention
+  policy: "the minimum retention interval for a time-based retention policy is one day."
+
+  Practical consequences:
+  1. Workflows using artifacts for intra-workflow job-to-job data passing (build outputs,
+     test binaries, coverage reports) accumulate unwanted 1-day artifacts that count
+     against the repository's artifact storage quota.
+  2. Quota exhaustion can appear "sudden" because storage usage is recalculated every
+     6-12 hours — a burst of CI runs can drain the quota before the next recalculation.
+  3. The first signal of an impending quota problem is a failed upload: "Artifact storage
+     quota has been exceeded." There is no proactive warning in the UI.
+  4. Free/Pro plan organizations with small storage quotas (500 MB free tier) are
+     especially vulnerable when intermediate build artifacts accumulate across many runs.
+  5. Setting `retention-days: 1` (the minimum) still means 24 hours of quota usage per
+     artifact, which multiplies quickly in high-velocity repos with large CI matrices.
+
+  This is a known platform limitation with 301+ reactions on the tracking issue
+  (actions/upload-artifact#290, open since January 2022) and no committed resolution.
+
+  Source: actions/upload-artifact#290 (Allow retention-days: 0 for immediate cleanup)
+  Source: GitHub Docs — Artifact and log retention policies
+fix: |
+  There is no way to set `retention-days: 0`. Use these strategies to manage storage:
+
+  Mitigation 1 — Set retention-days: 1 (minimum possible):
+    Limits accumulation to 24 hours instead of the 90-day default. Use for all
+    intermediate build artifacts not needed for post-run debugging.
+
+  Mitigation 2 — Delete artifacts after use via workflow_run trigger:
+    Trigger a cleanup workflow via `workflow_run` that uses the GitHub REST API to
+    delete all artifacts from the completed run immediately after it finishes.
+
+  Mitigation 3 — Use GitHub Cache for intra-workflow job-to-job data:
+    Cache entries are auto-evicted after 7 days without access and when the 10 GB
+    repo cache limit is approached. For transient build outputs, cache is better than
+    artifacts because it has no minimum retention window.
+
+  Mitigation 4 — Use job outputs for small values:
+    For small job-to-job values (build numbers, git SHAs, test counts), use
+    `$GITHUB_OUTPUT` + `needs.<job>.outputs` instead of uploading an artifact entirely.
+
+  Mitigation 5 — Set a repository-level default retention policy:
+    In Settings → Actions → General, set a shorter default retention period (e.g., 7 days)
+    to limit the blast radius for workflows that forget to set `retention-days`.
+fix_code:
+  - language: yaml
+    label: "Set retention-days: 1 (minimum) for disposable intermediate artifacts"
+    code: |
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()   # Upload even on failure for debugging
+        with:
+          name: test-results-${{ matrix.os }}-${{ matrix.node }}
+          path: coverage/
+          retention-days: 1   # Minimum: deleted after ~24 hours
+
+  - language: yaml
+    label: "Post-run artifact cleanup via workflow_run trigger"
+    code: |
+      # .github/workflows/cleanup-artifacts.yml
+      name: Cleanup Run Artifacts
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+
+      jobs:
+        cleanup:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Delete all artifacts from completed run
+              run: |
+                ARTIFACT_IDS=$(gh api \
+                  "/repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}/artifacts" \
+                  --jq '.artifacts[].id')
+                for ID in $ARTIFACT_IDS; do
+                  gh api --method DELETE \
+                    "/repos/${{ github.repository }}/actions/artifacts/$ID"
+                  echo "Deleted artifact $ID"
+                done
+              env:
+                GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  - language: yaml
+    label: "Use cache instead of artifact for intra-workflow data (auto-evicted)"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build
+              run: npm run build
+            - name: Cache build output for downstream jobs
+              uses: actions/cache/save@v4
+              with:
+                path: dist/
+                key: build-${{ github.run_id }}-${{ github.run_attempt }}
+                # Cache auto-evicts after 7 days or when repo 10 GB limit is approached
+
+        deploy:
+          needs: build
+          runs-on: ubuntu-latest
+          steps:
+            - name: Restore build output
+              uses: actions/cache/restore@v4
+              with:
+                path: dist/
+                key: build-${{ github.run_id }}-${{ github.run_attempt }}
+            - name: Deploy
+              run: ./deploy.sh dist/
+prevention:
+  - "Always set `retention-days: 1` for intermediate build artifacts not needed after workflow completion."
+  - "Monitor artifact storage in Settings → Billing → Actions — spikes indicate uncleaned intermediate artifacts."
+  - "Set a repository-level default retention period in Settings → Actions → General to limit the default."
+  - "Use GitHub Cache for intra-workflow job-to-job data when persistence after the run is not required."
+  - "For matrix workflows, multiply the artifact size by matrix dimension count to estimate storage impact per run."
+docs:
+  - url: "https://github.com/actions/upload-artifact/issues/290"
+    label: "actions/upload-artifact#290: Allow retention-days: 0 (301 reactions, open since 2022)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-workflow-data-as-artifacts#configuring-a-custom-artifact-retention-period"
+    label: "GitHub Docs: Configuring a custom artifact retention period"
+  - url: "https://docs.github.com/en/actions/administering-github-actions/usage-limits-billing-and-administration#artifact-and-log-retention-policy"
+    label: "GitHub Docs: Artifact and log retention policy"
