@@ -1,0 +1,100 @@
+id: triggers-033
+title: "Commits, PRs, and releases created using GITHUB_TOKEN do not trigger new workflow runs"
+category: triggers
+severity: limitation
+tags:
+  - GITHUB_TOKEN
+  - loopback-prevention
+  - push-event
+  - pull-request
+  - no-trigger
+  - known-limitation
+patterns:
+  - regex: 'GITHUB_TOKEN.*push.*not.*trigger|workflow.*not.*triggered.*after.*commit'
+    flags: "i"
+  - regex: 'auto.commit.*no.*workflow|push.*token.*not.*firing.*CI'
+    flags: "i"
+error_messages:
+  - "Workflow not triggered after automated push using GITHUB_TOKEN"
+root_cause: |
+  GitHub Actions intentionally prevents new workflow runs from being triggered by events
+  performed with the built-in GITHUB_TOKEN. This loopback prevention exists to stop
+  accidental or malicious infinite workflow loops — for example, a push workflow that
+  commits back to the repo and re-triggers itself in perpetuity.
+
+  Affected operations when performed with GITHUB_TOKEN:
+  - Pushing a commit to a branch (no push event fired; CI does not run on the new SHA)
+  - Creating a pull request via REST API (no pull_request event fired; PR checks do not start)
+  - Publishing a release (no release event fired)
+  - Merging a PR programmatically (no push or pull_request closed event fired)
+
+  Common surprise scenarios:
+  - Auto-version-bump workflows that commit package.json and expect CI to run on the result
+  - Automated changelog commits that should trigger a docs publish pipeline
+  - Bots that open PRs using GITHUB_TOKEN expecting branch protection checks to start
+  - Tag-from-workflow jobs expecting the resulting tag push to start a release pipeline
+fix: |
+  To trigger new workflow runs from operations performed inside a workflow, use a Personal
+  Access Token (PAT) or a GitHub App installation token instead of GITHUB_TOKEN. Events
+  created with these tokens are not subject to the loopback prevention rule.
+
+  For organizational workflows, GitHub App tokens are the recommended approach — they
+  do not rely on a personal user's credentials and can be scoped to minimum permissions.
+
+  If triggering new runs is NOT needed, add [skip ci] to the commit message to make the
+  intent explicit and prevent accidental CI consumption if a PAT is used later.
+fix_code:
+  - language: yaml
+    label: "PAT-based checkout so the resulting push triggers downstream CI"
+    code: |
+      jobs:
+        version-bump:
+          runs-on: ubuntu-latest
+          steps:
+            # Check out with PAT — any subsequent push WILL trigger a new push workflow run
+            - uses: actions/checkout@v4
+              with:
+                token: ${{ secrets.MY_PAT }}
+
+            - name: Bump version
+              run: npm version patch --no-git-tag-version
+
+            - name: Commit and push version bump
+              uses: stefanzweifel/git-auto-commit-action@v5
+              with:
+                commit_message: 'chore: bump version'
+  - language: yaml
+    label: "GitHub App token so an auto-created PR triggers branch protection checks"
+    code: |
+      jobs:
+        create-pr:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Get GitHub App token
+              id: app-token
+              uses: actions/create-github-app-token@v1
+              with:
+                app-id: ${{ secrets.APP_ID }}
+                private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+            - uses: actions/checkout@v4
+              with:
+                token: ${{ steps.app-token.outputs.token }}
+
+            - name: Create PR — App token causes PR checks to be triggered
+              uses: peter-evans/create-pull-request@v6
+              with:
+                token: ${{ steps.app-token.outputs.token }}
+                title: 'chore: automated update'
+prevention:
+  - "Use a PAT or GitHub App token when downstream workflow runs must be triggered by a commit or PR"
+  - "Add [skip ci] to auto-commit messages when downstream CI triggering is explicitly NOT needed"
+  - "Document in workflow comments why PAT or App token is used instead of GITHUB_TOKEN"
+  - "When debugging missing CI runs after automated commits, check whether GITHUB_TOKEN loopback prevention applies"
+docs:
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#using-the-github_token-in-a-workflow"
+    label: "GitHub Docs: Automatic token authentication — events triggered by GITHUB_TOKEN"
+  - url: "https://github.com/orgs/community/discussions/27072"
+    label: "GitHub Community: Push with GITHUB_TOKEN does not trigger new workflow runs"
+  - url: "https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/making-authenticated-api-requests-with-a-github-app-in-a-github-actions-workflow"
+    label: "GitHub Docs: Using a GitHub App token in Actions workflows"
