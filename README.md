@@ -4,7 +4,7 @@
 [![npm](https://img.shields.io/npm/v/@htekdev/actions-debugger)](https://www.npmjs.com/package/@htekdev/actions-debugger)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-> 65+ real GitHub Actions errors, queryable by agents. MCP server + Copilot skills + error database.
+> 65+ real GitHub Actions errors, queryable by agents. CLI + MCP server + Copilot skills + error database.
 
 **Stop debugging the same CI failures over and over.** This repo packages 65+ real-world GitHub Actions error scenarios — with regex-matchable patterns, root causes, and copy-paste fixes — into formats that both humans and AI agents can consume.
 
@@ -12,12 +12,53 @@
 
 ```
 errors/              → Structured YAML error database (65+ entries)
-src/                 → MCP server (TypeScript + @modelcontextprotocol/sdk)
+src/                 → CLI + MCP server (TypeScript)
 .github/skills/      → Copilot CLI skills for CI debugging
 .github/agents/      → Copilot agent definition
 ```
 
 ## Quick Start
+
+### CLI (Zero Install)
+
+```bash
+# Look up an error
+npx @htekdev/actions-debugger lookup "Permission to org/repo.git denied"
+
+# Search by keyword
+npx @htekdev/actions-debugger search "OIDC" --category permissions-auth
+
+# Diagnose a workflow file
+npx @htekdev/actions-debugger diagnose .github/workflows/ci.yml
+
+# Get fix suggestions
+npx @htekdev/actions-debugger suggest-fix "artifact upload fails intermittently"
+
+# List all categories
+npx @htekdev/actions-debugger categories
+```
+
+#### Output Formats
+
+```bash
+# Text (default for TTY)
+npx @htekdev/actions-debugger lookup "error message"
+
+# JSON (default when piped, or explicit)
+npx @htekdev/actions-debugger lookup "error message" --format json
+
+# Markdown
+npx @htekdev/actions-debugger lookup "error message" --format md
+```
+
+#### Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success / matches found |
+| 1 | No matches found |
+| 2 | Invalid input / parse error |
+| 3 | Database load error |
 
 ### As an MCP Server (Claude Desktop, Copilot CLI, Cursor, etc.)
 
@@ -47,10 +88,10 @@ Add to your MCP client config:
 
 ### As a Copilot CLI Skill (No MCP Required)
 
-Copy `.github/skills/actions-debugging/SKILL.md` to your repo's `.github/skills/` directory. Reference it in your agent:
+Copy `.github/skills/actions-debugging-cli/SKILL.md` to your repo's `.github/skills/` directory. Any agent with shell access can use the CLI — no MCP config needed.
 
 ```markdown
-> **Skill reference:** For CI debugging, use the `actions-debugging` skill.
+> **Skill reference:** For CI debugging, use the `actions-debugging-cli` skill.
 ```
 
 ### Programmatic (npm Package)
