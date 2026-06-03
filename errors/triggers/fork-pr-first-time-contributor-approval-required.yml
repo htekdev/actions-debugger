@@ -1,0 +1,142 @@
+id: triggers-022
+title: "Fork PR Workflows Paused — First-Time Contributor Requires Approval"
+category: triggers
+severity: warning
+tags:
+  - fork
+  - pull_request
+  - first-time-contributor
+  - approval
+  - secrets
+  - outside-collaborator
+patterns:
+  - regex: "This run (?:was triggered by a (?:first-time contributor|new GitHub user)|requires approval)"
+    flags: "i"
+  - regex: "Workflow run requires approval"
+    flags: "i"
+  - regex: "requires approval from a maintainer"
+    flags: "i"
+  - regex: "waiting for approval"
+    flags: "i"
+error_messages:
+  - "This run was triggered by a first-time contributor and requires approval from a maintainer with write access."
+  - "Workflow run requires approval"
+  - "This run requires approval from a maintainer with write access."
+root_cause: |
+  GitHub requires manual approval before running workflows triggered by pull
+  requests from forked repositories when the contributor meets certain criteria.
+  This is a security measure to prevent untrusted code from accessing repository
+  secrets or running CI at the organization's expense.
+
+  GitHub's fork PR approval policy (configurable per repo, org, or enterprise)
+  determines when approval is required. The default for public repos is:
+  "Require approval for first-time contributors who are new to GitHub" — meaning
+  contributors who have never contributed to any public GitHub repo need approval
+  on their first PR. For private repos, the default is to require approval from
+  all outside collaborators.
+
+  When approval is required, the workflow run is shown in the Actions tab with
+  a yellow banner reading "This run was triggered by a first-time contributor
+  and requires approval from a maintainer with write access." The workflow does
+  not start until a maintainer with write access clicks "Approve and run."
+
+  Workflows awaiting approval for more than 30 days are automatically deleted.
+  Importantly, if no maintainer approves the run, CI results will never appear
+  on the pull request — blocking any required status checks from passing and
+  preventing the PR from being merged.
+
+  Three root causes are commonly conflated:
+  1. First-time contributor to GitHub (no prior public repo contributions).
+  2. First-time contributor to this specific repository (even if experienced on GitHub).
+  3. Outside collaborator (not a member of the org that owns the repo).
+
+  The approval gate is per-workflow-run, not per-PR. If a contributor pushes
+  additional commits to an already-approved PR, each new push triggers a new
+  run that must be re-approved.
+fix: |
+  Option 1 — Approve manually (per-run action):
+    Go to the repository's Actions tab → find the pending workflow run with the
+    yellow approval banner → click "Approve and run". Repeat for each new commit
+    push by the same contributor.
+
+  Option 2 — Change the approval policy (repo setting):
+    Go to Settings → Actions → General → Fork pull request workflows.
+    Change from "Require approval for first-time contributors who are new to GitHub"
+    to "Require approval for first-time contributors" (blocks all new contributors
+    to THIS repo, not all of GitHub) or "Not required" (disables the gate entirely).
+    Note: "Not required" means secrets are accessible to fork PR workflows —
+    only use this for private repos or repos with no sensitive secrets.
+
+  Option 3 — Use pull_request_target for secret-free PR workflows:
+    If you only need access to repository secrets in a separate, controlled job,
+    use pull_request_target instead of pull_request. The pull_request_target
+    event runs in the context of the base repo and has access to secrets, but
+    you should NEVER check out the PR's code and run it — only read PR metadata.
+
+  Option 4 — Approve all runs for a contributor via REST API:
+    POST /repos/{owner}/{repo}/actions/runs/{run_id}/approve
+    Use this to batch-approve pending runs from a trusted contributor programmatically.
+fix_code:
+  - language: yaml
+    label: "Change approval policy — require approval for first-time contributors to THIS repo only"
+    code: |
+      # In GitHub UI: Settings → Actions → General → Fork pull request workflows
+      # Select: "Require approval for first-time contributors"
+      # This is the balanced option — trusts repeat contributors, gates new ones.
+
+      # For automation workflows that need to run on all fork PRs without approval,
+      # use pull_request_target (read-only PR metadata only — NEVER run PR code):
+      on:
+        pull_request_target:
+          types: [opened, synchronize]
+
+      jobs:
+        label:
+          runs-on: ubuntu-latest
+          permissions:
+            pull-requests: write
+          steps:
+            - name: Label first-time contributor
+              uses: actions/github-script@v7
+              with:
+                script: |
+                  const pr = context.payload.pull_request;
+                  if (pr.author_association === 'FIRST_TIME_CONTRIBUTOR') {
+                    await github.rest.issues.addLabels({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: pr.number,
+                      labels: ['first-time-contributor']
+                    });
+                  }
+  - language: yaml
+    label: "Separate workflow — gate secrets behind explicit approval check"
+    code: |
+      # Use pull_request for the CI job (no secrets, runs on fork code safely)
+      # Use pull_request_target with environment protection for secret-requiring jobs
+      on:
+        pull_request:
+          branches: [main]
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+            # No secrets needed — runs without approval gate
+prevention:
+  - "Document in CONTRIBUTING.md that first-time contributors' CI runs require maintainer approval before they start — set expectations early."
+  - "Set the approval policy to 'Require approval for first-time contributors' (not 'new to GitHub') to minimize repeated approvals for experienced contributors who are new to your repo."
+  - "Use separate workflow files for CI (no secrets, runs on pull_request) and deployment/release (needs secrets, runs on merge to main) — this reduces how often the approval gate is hit."
+  - "For open-source projects with many external PRs, consider a bot that auto-approves workflow runs from contributors who have already passed a one-time review (e.g., using the approve-run REST API after manually approving the first PR)."
+  - "Never use pull_request_target to run code from the fork — only use it for read-only operations on PR metadata. Mixing it with code execution from the fork is a security vulnerability."
+docs:
+  - url: "https://docs.github.com/en/actions/how-tos/manage-workflow-runs/approve-runs-from-forks"
+    label: "GitHub Docs: Approving workflow runs from forks"
+  - url: "https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository#configuring-required-approval-for-workflows-from-public-forks"
+    label: "GitHub Docs: Configuring required approval for workflows from public forks"
+  - url: "https://github.blog/changelog/2022-11-14-github-actions-require-approval-for-running-workflows-from-private-forks/"
+    label: "GitHub Changelog: Require approval for workflows from private forks (Nov 2022)"
+  - url: "https://github.com/orgs/community/discussions/14334"
+    label: "GitHub Community Discussion #14334: Fork PR approval pain points"
