@@ -1,0 +1,90 @@
+id: concurrency-timing-022
+title: "Concurrent Self-Hosted Runner Workers Share _temp — Cancelled Job Wipes Active Job Files"
+category: concurrency-timing
+severity: error
+tags:
+  - self-hosted-runner
+  - temp-directory
+  - race-condition
+  - worker
+  - non-ephemeral
+patterns:
+  - regex: "Missing file at path:.*_temp.*_runner_file_commands.*set_output"
+    flags: "i"
+  - regex: "TempDirectoryManager.*Cleaning runner temp folder"
+    flags: "i"
+  - regex: "We are not yet checking the state of jobrequest.*Cancel running worker right away"
+    flags: "i"
+  - regex: "Worker finished for job.*Code: 102"
+    flags: "i"
+error_messages:
+  - "Error: Missing file at path: /home/runner/work/_temp/_runner_file_commands/set_output_<uuid>"
+  - "[TempDirectoryManager] Cleaning runner temp folder: /home/runner/work/_temp"
+  - "[JobDispatcher] We are not yet checking the state of jobrequest ... Cancel running worker right away."
+  - "Worker finished for job ... Code: 102"
+root_cause: |
+  When two jobs are dispatched to the same non-ephemeral self-hosted runner in quick succession,
+  the runner cancels the first Worker and immediately spawns a second Worker — both run
+  simultaneously for several seconds. Both Workers share the same _temp directory
+  (_work/_temp). The cancelled Worker TempDirectoryManager cleanup fires 10-30 seconds
+  after cancellation, which is after the new Worker has already created its file-command
+  pipes (_runner_file_commands/set_output_*, step_summary_*) in the shared _temp.
+
+  The cleanup unconditionally wipes the entire _temp folder, deleting the new Worker active
+  file command pipes mid-step. The new job exits with code 102
+  (runner infrastructure failure), not a workflow step failure.
+
+  Root issue: JobDispatcher does not wait for the previous Worker process to exit before
+  spawning the new Worker. Both PIDs coexist on the same temp path.
+  Reported in actions/runner#4357, Apr 2026; fix proposed in PR #4371.
+fix: |
+  Primary fix (recommended): Use ephemeral runners.
+  Ephemeral runners (--ephemeral) start fresh for each job and never receive a second job
+  assignment, eliminating the race entirely.
+
+  Alternative: Limit concurrency on the runner group.
+  If ephemeral mode is not an option, configure the workflow concurrency group to prevent
+  two workflows from targeting the same runner label simultaneously.
+
+  Alternative: Use a per-job container.
+  Run each job inside an isolated Docker container on the self-hosted runner so
+  the file paths do not collide between concurrent jobs.
+fix_code:
+  - language: yaml
+    label: "Use ephemeral self-hosted runner (recommended)"
+    code: |
+      # Register your runner with --ephemeral flag:
+      # ./config.sh --url https://github.com/org/repo --token TOKEN --ephemeral
+      #
+      # In your workflow, the runner label stays the same:
+      jobs:
+        build:
+          runs-on: [self-hosted, linux, x64]
+          steps:
+            - uses: actions/checkout@v4
+            - run: make build
+  - language: yaml
+    label: "Limit per-runner concurrency via workflow concurrency group"
+    code: |
+      concurrency:
+        group: self-hosted-runner-${{ github.ref }}
+        cancel-in-progress: false   # Queue instead of cancel
+
+      jobs:
+        build:
+          runs-on: [self-hosted, linux, x64]
+          steps:
+            - uses: actions/checkout@v4
+            - run: make build
+prevention:
+  - "Use ephemeral runners for all self-hosted CI workloads — they also improve security and reduce state leakage between jobs."
+  - "Avoid non-ephemeral runners for workflows that run frequently; shorter intervals increase the chance of dispatch overlap."
+  - "Monitor for exit code 102 in workflow logs — it indicates a runner infrastructure failure, not a step failure."
+  - "Track actions/runner#4357 for an official fix to TempDirectoryManager shared-path cleanup behavior."
+docs:
+  - url: "https://github.com/actions/runner/issues/4357"
+    label: "actions/runner#4357 — TempDirectoryManager race condition (Apr 2026)"
+  - url: "https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/autoscaling-with-self-hosted-runners#using-ephemeral-runners-for-autoscaling"
+    label: "Ephemeral runners for autoscaling"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency"
+    label: "Using concurrency"
