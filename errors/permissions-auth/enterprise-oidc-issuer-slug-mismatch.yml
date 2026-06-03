@@ -1,0 +1,103 @@
+id: permissions-auth-020
+title: "GHEC enterprise OIDC issuer slug causes token verification mismatch with cloud tools"
+category: permissions-auth
+severity: error
+tags:
+  - oidc
+  - enterprise
+  - ghec
+  - issuer
+  - attestation
+  - cloud-auth
+patterns:
+  - regex: "expected issuer.*got.*githubusercontent\\.com/[a-z0-9-]+"
+    flags: "i"
+  - regex: "issuer mismatch.*token\\.actions\\.githubusercontent\\.com"
+    flags: "i"
+  - regex: "no matching CertificateIdentity.*issuer"
+    flags: "i"
+error_messages:
+  - "Error: verifying with issuer \"sigstore.dev\": failed to verify certificate identity: no matching CertificateIdentity found, last error: expected issuer value \"https://token.actions.githubusercontent.com\", got \"https://token.actions.githubusercontent.com/my-enterprise\""
+  - "Error: expected issuer to be https://token.actions.githubusercontent.com, got https://token.actions.githubusercontent.com/my-enterprise"
+  - "UnauthorizedException: Issuer does not match configured value"
+root_cause: |
+  GitHub Enterprise Cloud (GHEC) organizations can customize the OIDC token issuer
+  claim to include their unique enterprise slug, for example:
+
+    Default issuer: https://token.actions.githubusercontent.com
+    Enterprise issuer: https://token.actions.githubusercontent.com/my-enterprise
+
+  This customization is a security feature (prevents tokens from one enterprise from
+  being used against another's cloud resources), but it creates a mismatch for:
+
+  1. **`gh attestation verify`**: The CLI tool defaults to verifying against the
+     standard issuer. If the enterprise issuer is active, verification fails with
+     "expected issuer … got … my-enterprise" unless `--cert-oidc-issuer` is passed.
+
+  2. **Cloud provider trust policies**: AWS, Azure, GCP OIDC federation configured
+     against the default issuer URL rejects enterprise-slug tokens with auth errors.
+
+  3. **Third-party actions**: Actions that validate the OIDC token internally may
+     hardcode the default issuer and fail silently.
+
+  This affects any GHEC organization that has enabled the enterprise issuer
+  customization (via Enterprise Settings → OIDC provider → Customize issuer).
+fix: |
+  **For `gh attestation verify`:** Pass the enterprise-specific issuer URL:
+
+    gh attestation verify artifact.zip \
+      --owner my-enterprise \
+      --cert-oidc-issuer https://token.actions.githubusercontent.com/my-enterprise
+
+  **For AWS IAM:** Update the OIDC provider URL in IAM to use the enterprise issuer:
+
+    Provider URL: https://token.actions.githubusercontent.com/my-enterprise
+    Audience: sts.amazonaws.com
+
+  **For Azure Workload Identity:** Set the issuer in the federated credential to:
+
+    https://token.actions.githubusercontent.com/my-enterprise
+
+  **For GCP Workload Identity Pool:** Set the issuer URI in the OIDC provider config
+  to the enterprise issuer URL.
+
+  **To check your enterprise issuer:**
+  Visit https://token.actions.githubusercontent.com/my-enterprise/.well-known/openid-configuration
+  — if it returns a valid document, enterprise issuer customization is active.
+fix_code:
+  - language: yaml
+    label: "gh attestation verify with enterprise issuer"
+    code: |
+      - name: Attest artifact
+        run: |
+          gh attestation verify dist/my-app \
+            --owner my-enterprise \
+            --cert-oidc-issuer https://token.actions.githubusercontent.com/my-enterprise
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  - language: yaml
+    label: "AWS credentials action with enterprise OIDC issuer"
+    code: |
+      # In AWS IAM, create the OIDC identity provider with the enterprise issuer URL
+      # instead of the default https://token.actions.githubusercontent.com
+      # Then configure the federated role trust policy:
+      {
+        "Condition": {
+          "StringEquals": {
+            "token.actions.githubusercontent.com/my-enterprise:aud": "sts.amazonaws.com",
+            "token.actions.githubusercontent.com/my-enterprise:sub": "repo:my-enterprise/my-repo:ref:refs/heads/main"
+          }
+        }
+      }
+prevention:
+  - "Document whether your GHEC enterprise has the custom issuer enabled — include it in your OIDC onboarding checklist"
+  - "Store the full enterprise issuer URL in a reusable variable or org-level secret to avoid hardcoding it in every workflow"
+  - "When setting up new cloud OIDC federation, verify the issuer from the well-known endpoint rather than copying from docs"
+  - "Pin `gh attestation verify` calls to always include `--cert-oidc-issuer` in enterprise repos"
+docs:
+  - url: "https://docs.github.com/en/enterprise-cloud@latest/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect#customizing-the-issuer-value-for-an-enterprise"
+    label: "GitHub Docs — Customizing the OIDC issuer value for an enterprise"
+  - url: "https://github.com/cli/cli/pull/9616"
+    label: "cli/cli#9616 — Better messaging for attestation verify custom issuer mismatch error"
+  - url: "https://token.actions.githubusercontent.com/.well-known/openid-configuration"
+    label: "GitHub OIDC well-known endpoint (check your enterprise variant at /{slug}/.well-known/openid-configuration)"

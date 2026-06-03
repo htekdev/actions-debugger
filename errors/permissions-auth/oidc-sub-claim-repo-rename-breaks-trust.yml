@@ -1,0 +1,111 @@
+id: permissions-auth-019
+title: "OIDC sub claim breaks cloud trust policies after repository rename or transfer"
+category: permissions-auth
+severity: error
+tags:
+  - oidc
+  - sub-claim
+  - repo-rename
+  - repo-transfer
+  - cloud-auth
+  - aws
+  - azure
+  - gcp
+patterns:
+  - regex: "no matching CertificateIdentity"
+    flags: "i"
+  - regex: "sub.*does not match|subject.*mismatch|token validation failed"
+    flags: "i"
+  - regex: "Error: Could not assume role.*subject claim"
+    flags: "i"
+error_messages:
+  - "Error: No matching identity found in OIDC token"
+  - "Error: Could not assume role with web identity: NotAuthorized"
+  - "no matching CertificateIdentity found, last error: certificate identity not found"
+  - "subject claim mismatch: expected repo:old-owner/old-repo, got repo:new-owner/new-repo"
+root_cause: |
+  GitHub Actions OIDC tokens include a `sub` (subject) claim that encodes the repository
+  owner and name using their **mutable string names**, for example:
+
+    repo:octocat/my-app:ref:refs/heads/main
+
+  Cloud providers (AWS, Azure, GCP) and tools like `gh attestation verify` configure
+  trust policies against this `sub` claim value. When a repository is **renamed** or
+  **transferred** to a different organization, the `sub` claim changes immediately:
+
+    Before transfer: repo:old-org/my-app:ref:refs/heads/main
+    After transfer:  repo:new-org/my-app:ref:refs/heads/main
+
+  All cloud trust policies that reference the old `sub` format instantly break.
+  OIDC authentication fails with "subject mismatch" or "no matching identity" errors
+  even though the workflow code and secrets are identical.
+
+  GitHub announced immutable sub claims (appending numeric owner/repo IDs) on
+  2026-04-23, but existing repositories must opt in explicitly. New repositories
+  created or transferred after June 18, 2026 automatically use the new format.
+
+  Old (mutable) format:  repo:owner/repo:ref:refs/heads/main
+  New (immutable) format: repo:owner-123456/repo-789012:ref:refs/heads/main
+fix: |
+  **Before renaming or transferring a repo:**
+
+  1. Enable immutable subject claims in repository or organization OIDC settings
+     (Settings → Actions → General → OIDC subject claims → Enable immutable format).
+  2. Use the preview endpoint to see the new sub claim format before it takes effect.
+  3. Update all cloud provider trust policies and IAM role conditions to accept the
+     new immutable format (includes numeric IDs alongside names).
+
+  **After an unplanned rename/transfer:**
+
+  1. Identify the new `sub` claim value by decoding the OIDC token from a failed run
+     or using the GitHub OIDC preview API.
+  2. Update the trust policy in each cloud provider to reference the new repo path.
+  3. Optionally opt into immutable claims to future-proof against further renames.
+
+  **For AWS IAM (StringLike condition):**
+    Condition:
+      StringLike:
+        token.actions.githubusercontent.com:sub:
+          - "repo:new-org/new-repo:*"
+fix_code:
+  - language: yaml
+    label: "AWS IAM trust policy update after repo rename"
+    code: |
+      # Update the StringLike condition in your IAM role trust policy
+      # Replace old path with new path after rename/transfer
+      {
+        "Condition": {
+          "StringLike": {
+            "token.actions.githubusercontent.com:sub": "repo:new-org/new-repo:*"
+          }
+        }
+      }
+  - language: yaml
+    label: "Workflow: use immutable OIDC subject for new repos (June 18 2026+)"
+    code: |
+      # No workflow change needed — immutable format is set in repo/org settings.
+      # Once enabled, the sub claim becomes:
+      #   repo:owner-123456/repo-789012:ref:refs/heads/main
+      # Update cloud trust policies to use the new format BEFORE enabling immutable claims.
+      jobs:
+        deploy:
+          permissions:
+            id-token: write
+            contents: read
+          steps:
+            - uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-to-assume: arn:aws:iam::123456789:role/my-role
+                aws-region: us-east-1
+prevention:
+  - "Enable immutable OIDC subject claims before any rename or transfer to prevent trust policy breakage"
+  - "Store the expected sub claim value in cloud trust policies as a wildcard (`repo:owner/repo:*`) rather than exact paths to tolerate ref changes"
+  - "Add OIDC trust policy updates to your repo rename/transfer runbook"
+  - "New repos created after June 18, 2026 automatically use immutable sub claims — update trust policies accordingly"
+docs:
+  - url: "https://github.blog/changelog/2026-04-23-immutable-subject-claims-for-github-actions-oidc-tokens/"
+    label: "GitHub Changelog 2026-04-23 — Immutable subject claims for GitHub Actions OIDC tokens"
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect"
+    label: "GitHub Docs — About security hardening with OpenID Connect"
+  - url: "https://docs.github.com/en/enterprise-cloud@latest/actions/reference/security/oidc"
+    label: "GitHub Docs — OIDC token claims reference"
