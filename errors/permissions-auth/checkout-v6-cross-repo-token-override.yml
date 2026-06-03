@@ -1,0 +1,103 @@
+id: permissions-auth-029
+title: "checkout@v6 http.extraheader overrides inline token for cross-repository push"
+category: permissions-auth
+severity: error
+tags:
+  - checkout
+  - v6
+  - cross-repo
+  - extraheader
+  - token
+  - push
+  - persist-credentials
+
+patterns:
+  - regex: "remote: Permission to .+ denied to github-actions\\[bot\\]"
+    flags: "i"
+  - regex: "fatal: unable to access '.+': The requested URL returned error: 403"
+    flags: "i"
+  - regex: "The requested URL returned error: 403"
+    flags: "i"
+
+error_messages:
+  - "remote: Permission to org/other-repo.git denied to github-actions[bot]."
+  - "fatal: unable to access 'https://github.com/org/other-repo.git/': The requested URL returned error: 403"
+
+root_cause: |
+  checkout@v6 changed how credentials are stored compared to v4/v5. Instead of writing the
+  GITHUB_TOKEN directly into .git/config, v6 stores credentials in a separate file under
+  $RUNNER_TEMP and registers it via a git includeIf directive. This injects an
+  http.extraheader = Authorization: Bearer <GITHUB_TOKEN> for ALL https://github.com/ URLs.
+
+  When a workflow adds a second remote using an inline Personal Access Token (PAT) in the URL
+  (e.g., https://PAT@github.com/other-org/other-repo.git), git still sends the checkout-injected
+  Authorization header alongside the URL-embedded token. The injected GITHUB_TOKEN header takes
+  precedence over the URL-embedded PAT, and since GITHUB_TOKEN only has access to the current
+  repository, the push to the other repository is rejected with 403 Forbidden.
+
+  This regression is specific to workflows that push to repositories other than the one that
+  was checked out. Workflows that only interact with the current repository are unaffected.
+
+fix: |
+  Option 1 (recommended): Set persist-credentials: false in the checkout step. This prevents
+  checkout@v6 from injecting the extraheader entirely. Configure authentication explicitly in
+  subsequent steps using the token in the remote URL or via GH_TOKEN environment variable.
+
+  Option 2 (targeted): Explicitly unset the http extraheader before performing cross-repo
+  operations. Add a step that clears the auth override for github.com URLs before pushing
+  to the other repository.
+
+  Option 3 (fallback): Pin to checkout@v5 for workflows that require cross-repo push
+  until a v6 upstream fix is available (actions/checkout#2424 is open).
+
+fix_code:
+  - language: yaml
+    label: "Option 1: Disable persist-credentials to prevent extraheader injection"
+    code: |
+      steps:
+        - name: Checkout current repo
+          uses: actions/checkout@v6
+          with:
+            persist-credentials: false   # No extraheader injected; manual auth required
+
+        - name: Push tag to target repository
+          env:
+            TARGET_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          run: |
+            # Token embedded in remote URL; no competing extraheader present
+            TARGET_REMOTE="https://x-access-token:${TARGET_PAT}@github.com/org/target-repo.git"
+            git remote add target "${TARGET_REMOTE}"
+            git tag -f nightly
+            git push -f target nightly
+
+  - language: yaml
+    label: "Option 2: Clear the injected extraheader before cross-repo operations"
+    code: |
+      steps:
+        - uses: actions/checkout@v6
+
+        # ... build steps ...
+
+        - name: Unset checkout extraheader for cross-repo push
+          run: git config --unset-all "http.https://github.com/.extraheader" || true
+
+        - name: Push tag to target repository
+          env:
+            TARGET_PAT: ${{ secrets.TARGET_REPO_PAT }}
+          run: |
+            git remote add target "https://x-access-token:${TARGET_PAT}@github.com/org/target-repo.git"
+            git push -f target nightly
+
+prevention:
+  - "Use persist-credentials: false on all checkout steps in workflows that interact with multiple repositories."
+  - "Avoid embedding tokens directly in remote URLs when checkout@v6 is used without persist-credentials:false."
+  - "Test cross-repo operations in a staging branch after upgrading from checkout@v4 or v5 to v6."
+  - "Check actions/checkout release notes for credential storage changes when upgrading major versions."
+
+docs:
+  - url: "https://github.com/actions/checkout/issues/2424"
+    label: "actions/checkout#2424: Unable to create tags in another repo with v6"
+  - url: "https://github.com/actions/checkout/releases/tag/v6.0.0"
+    label: "checkout@v6.0.0 release notes — persist-credentials storage change"
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication"
+    label: "GitHub Docs: Automatic token authentication and GITHUB_TOKEN scopes"
