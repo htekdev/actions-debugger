@@ -1,0 +1,108 @@
+id: 'runner-environment-088'
+title: '`ubuntu-slim` runner has empty Node.js toolcache — `setup-node` with semver range downloads latest patch instead of using cached version'
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-slim
+  - setup-node
+  - toolcache
+  - semver
+  - caching
+  - node
+  - version-mismatch
+patterns:
+  - regex: 'evaluating 0 versions'
+    flags: 'i'
+  - regex: 'Attempting to download.*\.\.\.'
+    flags: 'i'
+  - regex: 'ubuntu-slim.*setup-node'
+    flags: 'i'
+error_messages:
+  - '##[debug]evaluating 0 versions'
+  - '##[debug]match not found'
+  - 'Attempting to download 24.x...'
+  - 'Acquiring 24.13.1 - x64 from https://github.com/actions/node-versions/releases/download/'
+root_cause: |
+  The ubuntu-slim runner image ships with an empty or absent Node.js toolcache manifest.
+  When actions/setup-node evaluates a semver range (e.g., 24, 24.x, 22.x) it first
+  inspects the local toolcache versions manifest. On ubuntu-slim, the manifest contains
+  zero cached versions (log line: "evaluating 0 versions"), so setup-node falls through
+  to download the latest matching version from GitHub releases at runtime.
+
+  On ubuntu-24.04 and ubuntu-latest, setup-node finds the cached version (e.g., 24.13.0)
+  and logs "Found tool in cache". The same workflow on ubuntu-slim downloads a newer
+  patch release (e.g., 24.13.1) because the remote versions API returns the freshest
+  available release.
+
+  This causes three distinct problems:
+  1. Slower CI: every job downloads Node.js from the network instead of using the cache
+  2. Version drift: ubuntu-slim jobs may use a different Node.js version than ubuntu-24.04
+     jobs in the same matrix, silently breaking cross-platform consistency checks
+  3. Test failures: libraries that cache built binaries keyed on Node.js version will
+     produce cache misses across ubuntu-slim and ubuntu-latest jobs in the same run
+
+  Reproduced on ubuntu-slim image version 20260120.46.1.
+  Tracked in actions/runner-images#13671 and actions/setup-node#1492 (February 2026).
+fix: |
+  Option 1: Pin an explicit Node.js version (e.g., 24.13.0) instead of a semver range.
+  setup-node downloads this version on ubuntu-slim, but the result is deterministic and
+  matches any version you also pin on ubuntu-latest or ubuntu-24.04.
+
+  Option 2: Use a .node-version or .nvmrc file with an exact version. setup-node reads
+  the file and pins to that version on all runner images.
+
+  Option 3: Use actions/cache to manually cache the Node.js installation directory on
+  ubuntu-slim jobs.
+
+  Option 4: Avoid ubuntu-slim for workflows that require a specific Node.js toolcache
+  version. Use ubuntu-24.04 or ubuntu-latest which ship pre-cached Node.js versions.
+fix_code:
+  - language: yaml
+    label: 'Pin exact Node.js version to avoid toolcache miss on ubuntu-slim'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-slim   # empty toolcache
+          steps:
+            - uses: actions/checkout@v6
+
+            # WRONG: semver range downloads latest patch on ubuntu-slim
+            # - uses: actions/setup-node@v6
+            #   with:
+            #     node-version: '24'    # evaluating 0 versions → downloads 24.13.1
+
+            # CORRECT: explicit version is deterministic on all images
+            - uses: actions/setup-node@v6
+              with:
+                node-version: '24.13.0'   # exact — no toolcache lookup needed
+
+  - language: yaml
+    label: 'Use .node-version file for consistent version across all runner images'
+    code: |
+      # .node-version (at repo root):
+      #   24.13.0
+
+      jobs:
+        build:
+          runs-on: ${{ matrix.os }}
+          strategy:
+            matrix:
+              os: [ubuntu-slim, ubuntu-24.04, macos-latest]
+          steps:
+            - uses: actions/checkout@v6
+
+            - uses: actions/setup-node@v6
+              with:
+                node-version-file: '.node-version'   # same version on all images
+prevention:
+  - 'Use exact Node.js versions (not semver ranges like 24.x) when running on ubuntu-slim to ensure deterministic toolcache behavior'
+  - 'Add a .node-version or .nvmrc file at the repo root and reference it with node-version-file: for consistent versions across all runner images'
+  - 'In matrix builds mixing ubuntu-slim with ubuntu-24.04, verify that node --version outputs match to detect silent version drift'
+  - 'Watch actions/runner-images#13671 for a fix that pre-populates the ubuntu-slim toolcache with a Node.js manifest'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/13671'
+    label: 'actions/runner-images#13671: setup-node incorrectly downloads latest on ubuntu-slim'
+  - url: 'https://github.com/actions/setup-node/issues/1492'
+    label: 'actions/setup-node#1492: ubuntu-slim toolcache manifest missing'
+  - url: 'https://github.com/actions/setup-node#usage'
+    label: 'actions/setup-node documentation: node-version-file option'
