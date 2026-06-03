@@ -1,0 +1,97 @@
+id: runner-environment-055
+title: "Android SDK Platform 37 Installed as 'android-37.0' — Builds Fail Looking for 'android-37'"
+category: runner-environment
+severity: error
+tags:
+  - android
+  - android-sdk
+  - gradle
+  - ubuntu-2404
+  - sdk-platform
+  - hash-string
+patterns:
+  - regex: "Failed to find target with hash string 'android-37'"
+    flags: "i"
+  - regex: "Failed to find target.*android-37[^\\d]"
+    flags: "i"
+  - regex: "Could not determine.*dependencies.*android-37[^\\d]"
+    flags: "i"
+  - regex: "platforms/android-37\\.0.*android-37[^\\.]"
+    flags: "i"
+error_messages:
+  - "Failed to find target with hash string 'android-37' in: /usr/local/lib/android/sdk"
+  - "Could not determine the dependencies of task ':app:compileDebugJavaWithJavac'."
+  - "> Failed to find target with hash string 'android-37'"
+root_cause: |
+  On the Ubuntu 24.04 runner image (from approximately image version 20260323), the
+  Android SDK Platform 37 is installed under the directory name `android-37.0` rather
+  than the expected `android-37`. Gradle and the Android Gradle Plugin (AGP) look up
+  platform targets by their hash string (`android-37`), which must exactly match the
+  subdirectory name inside `$ANDROID_SDK_ROOT/platforms/`.
+
+  When `sdkmanager` installs `platforms;android-37.0`, it creates:
+    `/usr/local/lib/android/sdk/platforms/android-37.0/`
+
+  But AGP resolves `compileSdk = 37` (or `compileSdkVersion 37`) to hash string
+  `android-37`, not `android-37.0`. The lookup fails even though the SDK is physically
+  present on the runner (runner-images#13859).
+
+  Root cause in the runner image: the `platforms;android-37.0` package name was published
+  by Google with a `.0` version suffix in the SDK package path, causing a naming
+  inconsistency between the package identifier and the installed directory name expected
+  by build tools.
+fix: |
+  Add a workaround step that creates a symlink from `android-37` → `android-37.0` before
+  the Gradle build. This resolves the hash lookup without any source code changes.
+
+  Alternatively, pin `compileSdk` to 36 (which is installed normally) until the runner
+  image is fixed, or install `platforms;android-37` explicitly via sdkmanager — but note
+  that as of the time of writing the `android-37` (non-.0) package may not yet be
+  published to the official SDK registry.
+fix_code:
+  - language: yaml
+    label: "Symlink workaround — link android-37 to android-37.0 before build"
+    code: |
+      steps:
+        - uses: actions/checkout@v4
+
+        - name: Fix Android SDK 37 directory name mismatch
+          run: |
+            SDK_PLATFORMS="$ANDROID_SDK_ROOT/platforms"
+            if [ -d "$SDK_PLATFORMS/android-37.0" ] && [ ! -d "$SDK_PLATFORMS/android-37" ]; then
+              ln -s "$SDK_PLATFORMS/android-37.0" "$SDK_PLATFORMS/android-37"
+              echo "Symlinked android-37 -> android-37.0"
+            fi
+
+        - name: Build APK
+          run: ./gradlew assembleDebug
+  - language: yaml
+    label: "Pin compileSdk to 36 as temporary workaround"
+    code: |
+      # In app/build.gradle or build.gradle.kts:
+      android {
+          compileSdk = 36   # Use 36 until android-37 symlink issue is resolved
+          # compileSdk = 37  # <- caused 'android-37' hash mismatch
+      }
+  - language: yaml
+    label: "Install android-37 explicitly via sdkmanager"
+    code: |
+      steps:
+        - name: Install Android SDK Platform 37
+          run: |
+            echo "y" | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager \
+              "platforms;android-37" \
+              "build-tools;37.0.0"
+        - name: Build
+          run: ./gradlew assembleDebug
+prevention:
+  - "When upgrading `compileSdk` to a newly released Android API level, test against ubuntu-24.04 runners in a feature branch first before rolling out to all jobs."
+  - "Subscribe to runner-images releases for `ubuntu-24.04` to catch SDK directory naming changes early."
+  - "Add an explicit `sdkmanager` install step for the exact platform and build-tools version your project requires instead of relying on pre-installed SDKs."
+docs:
+  - url: "https://github.com/actions/runner-images/issues/13859"
+    label: "runner-images#13859 — Ubuntu 24.04 installs API 37 as android-37.0; builds fail looking for android-37"
+  - url: "https://developer.android.com/studio/releases/platforms"
+    label: "Android SDK Platform releases — official platform package naming"
+  - url: "https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners/about-github-hosted-runners#supported-runners-and-hardware-resources"
+    label: "GitHub Docs — GitHub-hosted runner software"
