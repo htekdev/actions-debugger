@@ -1,0 +1,95 @@
+id: caching-artifacts-022
+title: "cache-hit Output Always Empty Due to Case-Sensitive Step ID Mismatch"
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - actions/cache
+  - cache-hit
+  - step-id
+  - case-sensitive
+  - conditional-install
+patterns:
+  - regex: "steps\.[a-zA-Z0-9_-]+\.outputs\.cache-hit"
+    flags: "i"
+  - regex: "cache-hit\s*!=\s*'true'"
+    flags: "i"
+  - regex: "cache-hit\s*==\s*'true'"
+    flags: "i"
+error_messages:
+  - "Cache not found for input keys"
+  - "Post Cache: Saved successfully"
+root_cause: |
+  The `actions/cache` action sets a `cache-hit` output on the step that can be read
+  via `steps.<step-id>.outputs.cache-hit`. Step IDs in GitHub Actions are case-sensitive
+  and must exactly match between the `id:` field and the `steps.<id>.outputs.*` reference.
+
+  If the step ID in `id:` does not exactly match the ID in the `if:` condition — even
+  by a single character difference (hyphen vs underscore, camelCase vs kebab-case) —
+  the expression evaluates to an empty string, not `false`. No error or warning is emitted.
+
+  Common ID mismatches:
+  - `id: npm-cache` referenced as `steps.npmCache.outputs.cache-hit`
+  - `id: node_modules_cache` referenced as `steps.node-modules-cache.outputs.cache-hit`
+  - `id: Cache` referenced as `steps.cache.outputs.cache-hit` (capitalization)
+
+  The result is that the conditional install step (`if: steps.X.outputs.cache-hit !=
+  'true'`) ALWAYS runs (because empty string != 'true' is always true), wasting time
+  on every run even when the cache was a perfect hit.
+fix: |
+  Verify that the step `id:` field and all `steps.<id>.outputs.cache-hit` references
+  are identical character-for-character. Use lowercase kebab-case IDs to minimize
+  typo risk.
+
+  To debug: add a step that prints the cache-hit value before the conditional:
+    - run: echo "cache-hit=${{ steps.my-cache.outputs.cache-hit }}"
+
+  If the value is empty (not 'true' or 'false'), the ID is mismatched.
+fix_code:
+  - language: yaml
+    label: "Wrong: mismatched step IDs (cache-hit always empty)"
+    code: |
+      steps:
+        - name: Cache node_modules
+          uses: actions/cache@v4
+          id: npm-cache           # ID: npm-cache (hyphen)
+          with:
+            path: node_modules
+            key: npm-${{ hashFiles('package-lock.json') }}
+
+        - name: Install
+          # BUG: references npmCache (camelCase) — evaluates to empty string
+          if: steps.npmCache.outputs.cache-hit != 'true'
+          run: npm ci
+  - language: yaml
+    label: "Correct: matching step IDs (cache-hit works as expected)"
+    code: |
+      steps:
+        - name: Cache node_modules
+          uses: actions/cache@v4
+          id: npm-cache           # ID: npm-cache
+          with:
+            path: node_modules
+            key: npm-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
+            restore-keys: |
+              npm-${{ runner.os }}-
+
+        - name: Debug cache hit
+          run: echo "cache-hit=${{ steps.npm-cache.outputs.cache-hit }}"
+
+        - name: Install
+          # CORRECT: matches id exactly — cache-hit is 'true' or 'false'
+          if: steps.npm-cache.outputs.cache-hit != 'true'
+          run: npm ci
+prevention:
+  - "Always use identical lowercase kebab-case strings in id: and steps.<id>.outputs.cache-hit references."
+  - "Add a debug echo step to print the cache-hit value when troubleshooting unexpected installs."
+  - "Use actions/cache's save-always: true option to always save cache and remove the conditional entirely."
+  - "Lint workflows with actionlint — it catches step ID reference mismatches at the expression level."
+  - "Consider using the setup-* actions (setup-node, setup-python) which manage caching internally."
+docs:
+  - url: "https://github.com/actions/cache#outputs"
+    label: "actions/cache: Outputs (cache-hit)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#steps-context"
+    label: "GitHub Docs: steps context"
+  - url: "https://github.com/rhysd/actionlint"
+    label: "actionlint: Static checker for GitHub Actions workflow files"
