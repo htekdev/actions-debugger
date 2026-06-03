@@ -1,0 +1,96 @@
+id: silent-failures-047
+title: "GITHUB_ENV variables are job-scoped — not shared with downstream needs: jobs"
+category: silent-failures
+severity: silent-failure
+tags:
+  - GITHUB_ENV
+  - environment-variables
+  - job-outputs
+  - cross-job
+  - silent-failure
+patterns:
+  - regex: 'GITHUB_ENV'
+    flags: ''
+  - regex: 'echo\s+".+=.+"\s*>>\s*\$GITHUB_ENV'
+    flags: i
+error_messages: []
+root_cause: |
+  Environment variables written to $GITHUB_ENV are scoped to the CURRENT JOB
+  only. They persist across all subsequent steps within that job, but are NOT
+  propagated to any other job — including jobs that depend on the producing
+  job via needs:.
+
+  This is a silent failure because:
+  1. The producing step exits 0 with no warning
+  2. The downstream job runs normally with no error message
+  3. The variable evaluates to empty string in the downstream job
+  4. Steps that depend on the value produce wrong results or silently skip
+     based on the empty string condition
+
+  Common scenario (silently broken):
+    Job A: echo "VERSION=1.2.3" >> $GITHUB_ENV
+    Job B (needs: job-a): echo $VERSION  → prints empty string
+
+  The correct mechanism for sharing values across job boundaries is job outputs
+  combined with the needs context. GITHUB_ENV is appropriate only for values
+  that need to persist across multiple steps within the same job.
+
+  Source: GitHub Docs — Passing information between jobs; GitHub Community and
+  Stack Overflow cross-job environment variable questions.
+fix: |
+  To pass a value from one job to a downstream job:
+
+  1. Write the value to $GITHUB_OUTPUT (not $GITHUB_ENV) in the producing step
+  2. Declare the step output in the producing job's outputs: block
+  3. Reference the value in the consuming job via ${{ needs.job-id.outputs.key }}
+
+  Continue using $GITHUB_ENV when the value only needs to be available to later
+  steps within the same job.
+fix_code:
+  - language: yaml
+    label: "Correct cross-job value sharing via GITHUB_OUTPUT and job outputs"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          outputs:
+            # Expose the step output as a job output
+            version: ${{ steps.get-version.outputs.version }}
+          steps:
+            - id: get-version
+              # Write to GITHUB_OUTPUT for cross-job sharing, not GITHUB_ENV
+              run: echo "version=1.2.3" >> $GITHUB_OUTPUT
+
+        deploy:
+          needs: build
+          runs-on: ubuntu-latest
+          steps:
+            - name: Use version from build job
+              run: echo "Deploying version ${{ needs.build.outputs.version }}"
+  - language: yaml
+    label: "GITHUB_ENV is correct for within-job cross-step sharing"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Set version for this job's steps
+              run: echo "VERSION=1.2.3" >> $GITHUB_ENV
+
+            - name: Step 2 in same job — $VERSION is available
+              run: echo "Building $VERSION"
+
+            - name: Step 3 in same job — $VERSION is still available
+              run: echo "Packaging $VERSION"
+
+            # $VERSION is NOT available in any other job
+prevention:
+  - "Use GITHUB_OUTPUT + job outputs: for any value that must cross a job boundary"
+  - "Use GITHUB_ENV only for values shared between steps within the same job"
+  - "Add a verification step in the consuming job that echoes the value and fails if empty"
+  - "Avoid setting both GITHUB_ENV and GITHUB_OUTPUT for the same value — use GITHUB_OUTPUT as the single source of truth"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/passing-information-between-jobs"
+    label: "GitHub Docs — Passing information between jobs"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/store-information-in-variables"
+    label: "GitHub Docs — Storing information in variables (GITHUB_ENV)"
