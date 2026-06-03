@@ -1,0 +1,78 @@
+id: 'known-unsolved-030'
+title: 'core.getInput cannot distinguish unset input from explicitly-empty input'
+category: known-unsolved
+severity: limitation
+tags:
+  - toolkit
+  - core-getInput
+  - composite-action
+  - empty-string
+  - null-input
+  - fork-secrets
+patterns:
+  - regex: 'core\.getInput\('
+    flags: 'i'
+error_messages:
+  - 'No way to detect if input was provided vs set to empty string'
+root_cause: |
+  The `core.getInput(name)` function in `@actions/core` always returns an empty string ('')
+  when an input is either not provided by the caller or explicitly set to the empty string.
+  There is no `core.hasInput(name)` API or other mechanism to distinguish these two cases.
+
+  This creates several practical problems for action authors:
+  - A required input set to '' passes the required: true check in getInput but is semantically absent
+  - Fork pull requests inject secrets as empty strings (secrets are unavailable); an action cannot tell
+    if a secret input was omitted vs provided-as-empty-because-fork
+  - Composite action callers cannot express "I intentionally leave this blank" vs "I don't provide this at all"
+  - YAML null or ~ values (e.g., with: my_val: ~) are coerced to '' by the runner before the action sees them
+
+  Upstream GitHub toolkit issue #940 has been open since 2022 with 22 upvotes and no fix planned.
+fix: |
+  No direct fix exists — there is no core.hasInput() API. Workarounds depend on the use case:
+  - For sentinel detection: document a convention like 'none' or '__unset__' as the explicit absent value
+    and check getInput('x') === 'none'
+  - For fork secret detection: check github.event.pull_request.head.repo.fork == true and gate on that
+    rather than on whether the secret is empty
+  - For optional inputs: provide a well-documented default value in action.yml so callers always get a
+    predictable non-empty string when they omit the input
+  - For composite actions: use ${{ inputs.my_input != '' }} in if: conditions, documenting that
+    callers must pass a non-empty string to opt in
+fix_code:
+  - language: yaml
+    label: 'Use sentinel value convention to detect absent input'
+    code: |
+      # action.yml — declare sentinel default
+      inputs:
+        deploy_env:
+          description: 'Target environment (leave blank to skip deployment)'
+          required: false
+          default: '__unset__'
+
+      # In composite action steps
+      steps:
+        - name: Deploy
+          if: ${{ inputs.deploy_env != '__unset__' && inputs.deploy_env != '' }}
+          run: echo "Deploying to ${{ inputs.deploy_env }}"
+  - language: yaml
+    label: 'Detect fork PR to guard secret-gated steps instead of empty-check'
+    code: |
+      steps:
+        - name: Publish (skip on fork PRs)
+          if: >-
+            ${{ github.event_name != 'pull_request' ||
+                github.event.pull_request.head.repo.full_name == github.repository }}
+          run: echo "$NPM_TOKEN" | npm login --registry https://registry.npmjs.org
+          env:
+            NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+prevention:
+  - 'Document in action.yml that empty string and absent are treated identically by core.getInput'
+  - 'Use a non-empty sentinel default value (e.g. __unset__) instead of relying on empty-check logic'
+  - 'Never gate fork-secret logic on secret emptiness — use fork-detection via event context instead'
+  - 'For required inputs that must be non-empty, add an explicit validation step that fails with a helpful message'
+docs:
+  - url: 'https://github.com/actions/toolkit/issues/940'
+    label: 'actions/toolkit#940: Impossible to detect unset inputs from inputs set as empty string'
+  - url: 'https://github.com/actions/toolkit/tree/main/packages/core'
+    label: 'actions/toolkit core package — getInput API'
+  - url: 'https://docs.github.com/en/actions/sharing-automations/creating-actions/metadata-syntax-for-github-actions#inputs'
+    label: 'GitHub Docs: Action metadata — inputs'
