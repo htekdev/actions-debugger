@@ -1,0 +1,100 @@
+id: runner-environment-098
+title: "runner.workspace is the parent of the repo root — not the checked-out repo"
+category: runner-environment
+severity: silent-failure
+tags:
+  - runner.workspace
+  - github.workspace
+  - path
+  - working-directory
+  - context
+patterns:
+  - regex: 'runner\.workspace'
+    flags: i
+  - regex: '\$\{\{\s*runner\.workspace\s*\}\}'
+    flags: i
+error_messages:
+  - "No such file or directory"
+  - "Error: Path does not exist"
+  - "ENOENT: no such file or directory"
+root_cause: |
+  Two similarly-named contexts point to DIFFERENT directories on GitHub-hosted
+  runners:
+
+    github.workspace  = /home/runner/work/REPO/REPO   ← the checked-out repo root
+    runner.workspace  = /home/runner/work/REPO        ← one level ABOVE the repo root
+
+  runner.workspace is the "runner work directory" that CONTAINS the repo clone
+  folder, not the repo itself. The official documentation describes this distinction,
+  but the names are confusingly similar and many developers assume runner.workspace
+  is equivalent to "where my code is" — which is github.workspace.
+
+  Consequences:
+  - working-directory: ${{ runner.workspace }} silently points one level above
+    the repo, causing file-not-found errors on relative paths inside the repo.
+  - Path-building expressions like runner.workspace + '/src' resolve to a
+    path that doesn't exist.
+  - The error surfaces as "No such file or directory" or a missing file, not as
+    a context resolution failure, making the root cause hard to identify.
+
+  On some self-hosted runner configurations both paths may resolve to the same
+  directory, masking the bug until the workflow runs on a GitHub-hosted runner.
+
+  Source: GitHub Actions contexts documentation; GitHub Community/15327;
+  Stack Overflow path confusion questions with 100K+ combined views.
+fix: |
+  Replace runner.workspace with github.workspace (or the $GITHUB_WORKSPACE
+  environment variable) when the intent is to reference the checked-out repo root.
+
+  Use runner.workspace only when intentionally targeting the parent directory
+  that contains the repo clone — for example, creating a sibling directory for
+  build artifacts that should live outside the repo tree.
+fix_code:
+  - language: yaml
+    label: "Use github.workspace for the repo root"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            # ❌ WRONG — runner.workspace is one level ABOVE the repo
+            # - name: Wrong path
+            #   working-directory: ${{ runner.workspace }}
+
+            # ✅ CORRECT — github.workspace is the repo root
+            - name: List repo files
+              run: ls ${{ github.workspace }}
+
+            # ✅ ALSO CORRECT — $GITHUB_WORKSPACE env var is identical
+            - name: Build from repo root
+              working-directory: ${{ github.workspace }}
+              run: ls .
+
+            # ✅ Intentional use of runner.workspace — sibling dir outside repo
+            - name: Create output dir alongside repo
+              run: mkdir ${{ runner.workspace }}/build-output
+  - language: yaml
+    label: "Directory layout reference"
+    code: |
+      # GitHub-hosted runner path layout:
+      #
+      # /home/runner/work/
+      # └── my-repo/                 ← runner.workspace  (${{ runner.workspace }})
+      #     └── my-repo/             ← github.workspace  (${{ github.workspace }})
+      #         ├── src/
+      #         ├── package.json
+      #         └── .github/
+      #
+      # $GITHUB_WORKSPACE == ${{ github.workspace }} (same value, two access methods)
+prevention:
+  - "Always use github.workspace (or $GITHUB_WORKSPACE) to reference the checked-out repo root"
+  - "Reserve runner.workspace for intentional parent-directory operations such as sibling build directories"
+  - "When debugging path issues, print both: echo $GITHUB_WORKSPACE and echo ${{ runner.workspace }}"
+  - "Self-hosted runner paths may differ from GitHub-hosted runners — use named contexts rather than hardcoded absolute paths"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context"
+    label: "GitHub Actions — github context (workspace)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#runner-context"
+    label: "GitHub Actions — runner context (workspace)"
