@@ -1,0 +1,100 @@
+id: runner-environment-103
+title: "actions/setup-go cache skipped with 'no file matched go.sum' when go.sum is absent or not at workspace root"
+category: runner-environment
+severity: warning
+tags:
+  - setup-go
+  - go
+  - cache
+  - go-sum
+  - monorepo
+  - cache-miss
+  - cache-dependency-path
+patterns:
+  - regex: 'No file.*matched.*go\.sum|go\.sum.*not.*found.*cache'
+    flags: 'i'
+  - regex: 'setup-go.*cache.*skip|Unable to find.*go\.sum'
+    flags: 'i'
+error_messages:
+  - 'Warning: No file in /home/runner/work/repo/repo matched to [**/go.sum, !**/vendor/**], make sure you have checked out the target repository'
+  - 'go.sum not found, module cache will not be saved'
+  - 'Cache miss — no go.sum file located at expected path'
+root_cause: |
+  actions/setup-go uses go.sum as the cache key hash source. When cache: true (the default
+  since setup-go@v4), the action runs hashFiles('**/go.sum') to compute the cache key.
+  If no go.sum file is found anywhere in the workspace, the action emits a warning and
+  silently skips saving and restoring the module cache entirely — the job continues with
+  exit 0 but all Go dependencies are downloaded from scratch on every run.
+
+  Common root causes:
+
+  1. New project: go mod tidy has not been run — go.sum does not yet exist in the repo.
+
+  2. Monorepo layout: Go modules live under subdirectories (e.g., services/api/go.sum).
+     The default glob **/go.sum should find nested files, but when combined with the
+     !**/vendor/** exclusion or when the repo structure is non-standard, detection can fail.
+
+  3. Go workspace (go.work): modules are organized under subdirectories managed by a
+     go.work file; individual go.sum files may be present but not at the expected root.
+
+  4. Ordering issue: actions/setup-go runs before actions/checkout, so go.sum is not
+     yet in the workspace when the cache key is computed.
+
+  5. go.sum is listed in .gitignore (non-standard but seen in internal tooling repos
+     that regenerate dependencies on every run).
+
+  The missing-cache warning is only visible in the setup-go step's log output and does
+  not fail the workflow. On large Go projects, silent cache bypass wastes 60-120+ seconds
+  downloading modules from proxy.golang.org on every CI run.
+fix: |
+  For monorepo or nested module layouts, explicitly set cache-dependency-path to the
+  location of the go.sum file(s). A glob pattern can match multiple modules if needed.
+
+  For new projects: run go mod tidy locally and commit go.sum before pushing.
+
+  For go.work workspaces: list each module's go.sum explicitly in cache-dependency-path
+  to ensure all modules participate in the cache key.
+
+  Always confirm actions/checkout runs before actions/setup-go in the steps list.
+fix_code:
+  - language: yaml
+    label: 'Set cache-dependency-path for a nested module in a monorepo'
+    code: |
+      steps:
+        - uses: actions/checkout@v4
+
+        - uses: actions/setup-go@v5
+          with:
+            go-version: '1.22'
+            cache: true
+            # Explicit path overrides default glob — required when go.sum is not at repo root
+            cache-dependency-path: services/api/go.sum
+
+  - language: yaml
+    label: 'Multiple modules in a go.work workspace — list all go.sum paths'
+    code: |
+      steps:
+        - uses: actions/checkout@v4
+
+        - uses: actions/setup-go@v5
+          with:
+            go-version: '1.22'
+            cache: true
+            # Multi-line value: each module go.sum contributes to the aggregate cache key
+            cache-dependency-path: |
+              services/api/go.sum
+              services/worker/go.sum
+              pkg/shared/go.sum
+prevention:
+  - 'Always run go mod tidy before the first commit to ensure go.sum exists in the repository'
+  - 'In monorepos, explicitly set cache-dependency-path rather than relying on the default **/go.sum glob'
+  - 'Check the setup-go step output for "No file matched" warnings — caching may be silently disabled without failing the job'
+  - 'Ensure actions/checkout runs before actions/setup-go so go.sum is present when the cache key is computed'
+  - 'Never add go.sum to .gitignore — it is required for reproducible builds and module cache keying'
+docs:
+  - url: 'https://github.com/actions/setup-go#caching-dependency-files-and-build-outputs'
+    label: 'actions/setup-go: Caching dependency files and build outputs'
+  - url: 'https://github.com/actions/setup-go/issues/289'
+    label: 'setup-go #289: Cache fails when go.sum not at repository root'
+  - url: 'https://docs.github.com/en/actions/use-cases-and-examples/building-and-testing/building-and-testing-go'
+    label: 'GitHub Docs: Building and testing Go'
