@@ -1,0 +1,144 @@
+id: 'known-unsolved-032'
+title: "Ejecting a PR from the Merge Queue Does Not Cancel Its Running Workflow Runs"
+category: known-unsolved
+severity: limitation
+tags:
+  - merge-queue
+  - merge_group
+  - cancellation
+  - orphaned-runs
+  - ci-minutes
+  - limitation
+  - waste
+patterns:
+  - regex: 'gh-readonly-queue/'
+    flags: 'i'
+  - regex: 'on:\s*\n\s*merge_group'
+    flags: 'im'
+error_messages:
+  - "Workflow run continues after PR is ejected from the merge queue"
+  - "No automatic cancellation for gh-readonly-queue/... runs on PR removal"
+root_cause: |
+  When GitHub's merge queue ejects a PR — due to a failing required check,
+  a merge conflict with another PR in the batch, or manual removal — GitHub
+  does NOT automatically cancel the workflow runs that were started for the
+  merge group batch that contained that PR.
+
+  Those runs continue to execute and consume CI minutes even though the
+  associated PR will never be merged via that queue entry. In active
+  repositories with large merge queues (especially monorepos or high-velocity
+  teams), a single failed check can cause a wave of orphaned runs as PRs are
+  rebatched and re-queued, multiplying wasted CI time.
+
+  Merge group workflow runs are triggered on ephemeral
+  `gh-readonly-queue/<base-branch>/pr-<number>-<sha>` refs. When the queue
+  ejects a PR, the ref is deleted but in-progress runs are not signalled.
+
+  GitHub has acknowledged this as working-as-designed behavior: workflow run
+  cancellation on merge queue ejection must be managed by the repository owner.
+
+  Source: dotCMS/core#34592 (GitHub merge queue orphaned workflow runs waste
+  CI resources, Feb 2026, open).
+fix: |
+  No built-in automatic cancellation mechanism exists. Available workarounds:
+
+  Option 1 — Scoped concurrency group per merge queue entry:
+  Set a concurrency group scoped to the workflow and the merge group ref. This
+  prevents a single PR from accumulating multiple parallel runs as it is
+  rebatched, but does NOT cancel runs when the PR is ejected.
+
+  Option 2 — Differentiated cancel-in-progress by event:
+  Use cancel-in-progress only for pull_request events (not merge_group events)
+  to avoid cancelling sibling PRs in the same batch while still cancelling
+  redundant PR-branch runs.
+
+  Option 3 — External cleanup script:
+  A separate monitoring workflow on schedule or repository_dispatch can call
+  the Actions API to cancel in-progress runs on refs that no longer exist.
+  This is operationally complex but achieves true cleanup.
+fix_code:
+  - language: yaml
+    label: "Differentiated concurrency — cancel PR runs but not merge queue runs"
+    code: |
+      on:
+        push:
+          branches: [main]
+        pull_request:
+        merge_group:
+
+      concurrency:
+        # Include workflow name to avoid cross-workflow cancellation
+        group: ${{ github.workflow }}-${{ github.ref }}
+        # Cancel duplicate PR branch runs, but do NOT cancel merge queue runs
+        # (cancelling merge_group runs ejects sibling PRs from the queue)
+        cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+      jobs:
+        ci:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+  - language: yaml
+    label: "Monitoring workflow to cancel orphaned merge queue runs (advanced)"
+    code: |
+      # This workflow runs periodically and cancels in-progress runs
+      # on merge queue refs that no longer exist as active queue entries.
+      # Requires: contents: read, actions: write
+      on:
+        schedule:
+          - cron: '*/15 * * * *'   # Every 15 minutes
+        workflow_dispatch:
+
+      permissions:
+        actions: write
+        contents: read
+
+      jobs:
+        cleanup-orphaned-runs:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Cancel orphaned merge queue runs
+              uses: actions/github-script@v7
+              with:
+                script: |
+                  const runs = await github.rest.actions.listWorkflowRunsForRepo({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    status: 'in_progress',
+                    per_page: 100,
+                  });
+                  for (const run of runs.data.workflow_runs) {
+                    if (run.head_branch?.startsWith('gh-readonly-queue/')) {
+                      // Verify the queue ref still exists
+                      try {
+                        await github.rest.git.getRef({
+                          owner: context.repo.owner,
+                          repo: context.repo.repo,
+                          ref: `heads/${run.head_branch}`,
+                        });
+                      } catch (e) {
+                        if (e.status === 404) {
+                          // Ref gone — cancel the orphaned run
+                          await github.rest.actions.cancelWorkflowRun({
+                            owner: context.repo.owner,
+                            repo: context.repo.repo,
+                            run_id: run.id,
+                          });
+                          console.log(`Cancelled orphaned run ${run.id} for ${run.head_branch}`);
+                        }
+                      }
+                    }
+                  }
+prevention:
+  - "Accept that some CI minutes will be wasted on ejected PRs — this is a known platform constraint with no first-class solution."
+  - "Monitor total merge queue depth in high-velocity repos; if the queue frequently rebatches, orphaned runs accumulate quickly."
+  - "Use differentiated cancel-in-progress (disabled for merge_group events) to at least avoid accidentally ejecting sibling PRs while managing PR-branch redundancy."
+  - "Consider a periodic cleanup workflow using the Actions API to cancel in-progress runs on deleted merge queue refs."
+docs:
+  - url: "https://github.com/dotCMS/core/issues/34592"
+    label: "dotCMS/core#34592: Merge queue orphaned workflow runs waste CI resources (open, Feb 2026)"
+  - url: "https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue"
+    label: "GitHub Docs: Managing a merge queue"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#merge_group"
+    label: "GitHub Docs: merge_group event"
