@@ -1,0 +1,119 @@
+id: triggers-031
+title: 'Required status check never satisfied when workflow uses paths: filter — PR permanently blocked'
+category: triggers
+severity: error
+tags:
+  - required-status-check
+  - paths-filter
+  - pull-request
+  - branch-protection
+  - PR-blocked
+  - monorepo
+  - status-check
+patterns:
+  - regex: 'Required status check.*is expected'
+    flags: 'i'
+  - regex: 'Merging is blocked.*required status check'
+    flags: 'i'
+  - regex: 'Waiting for status to be reported'
+    flags: 'i'
+error_messages:
+  - "Required status check 'CI / build' is expected — 1 pending check"
+  - "Merging is blocked: 1 required status check has not completed"
+  - "Waiting for status to be reported"
+root_cause: |
+  When a GitHub Actions workflow uses on: push: paths: or on: pull_request: paths:
+  filter AND that workflow's job name is configured as a required status check in
+  branch protection rules, a critical gap emerges.
+
+  If a pull request does NOT modify any files matching the paths: filter, the
+  workflow is skipped entirely — no workflow run is created and no check status
+  is posted to the commit. GitHub branch protection interprets a missing status
+  check as "pending" (not as "skipped" or "passed"), which permanently blocks the
+  PR from merging.
+
+  This is the most common misconfiguration in monorepo setups where teams add
+  per-service CI: a workflow for service-A runs only when src/service-a/** changes.
+  Adding this workflow's job as a required status check then breaks ALL other PRs
+  that don't touch service-A — they are blocked forever waiting for a check that
+  will never run.
+
+  The same issue occurs with paths-ignore: if ALL changed files match the ignore
+  patterns, the workflow is skipped and the required check is never posted.
+
+  Note: GitHub does not automatically treat a "skipped" workflow as passing a
+  required status check. The job must explicitly run and succeed.
+fix: |
+  Remove the paths: filter from the on: trigger and instead use dorny/paths-filter
+  or tj-actions/changed-files inside the workflow to detect changed files. The
+  workflow always runs (posting a check status) but skips expensive build steps
+  when irrelevant files changed.
+
+  Add a final ci-complete or always-pass job that runs with if: always() and
+  depends on the conditional jobs. Configure this final job name as the required
+  status check. It posts a success status for all PRs, whether or not the
+  upstream jobs ran.
+fix_code:
+  - language: yaml
+    label: 'Replace paths: filter with internal file detection — always post a check status'
+    code: |
+      name: Service A CI
+
+      on:
+        pull_request:
+          branches: [main]
+          # REMOVE the paths: filter that prevents check from running on non-matching PRs
+          # paths:
+          #   - src/service-a/**
+
+      jobs:
+        detect-changes:
+          runs-on: ubuntu-latest
+          outputs:
+            service-a-changed: ${{ steps.filter.outputs.service-a }}
+          steps:
+            - uses: actions/checkout@v4
+            - uses: dorny/paths-filter@v3
+              id: filter
+              with:
+                filters: |
+                  service-a:
+                    - 'src/service-a/**'
+
+        build:
+          needs: detect-changes
+          if: needs.detect-changes.outputs.service-a-changed == 'true'
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: make build-service-a
+
+        # Required status check name: "Service A CI / ci-complete"
+        # This job ALWAYS runs and posts a check — satisfies branch protection for all PRs
+        ci-complete:
+          needs: [detect-changes, build]
+          if: always()
+          runs-on: ubuntu-latest
+          steps:
+            - name: Evaluate build result
+              run: |
+                if [[ "${{ needs.build.result }}" == "failure" ]]; then
+                  echo "Build failed"
+                  exit 1
+                fi
+                echo "CI complete (build skipped or passed)"
+prevention:
+  - 'Never add a required status check on a workflow that has a paths: filter — the check will be missing for non-matching PRs'
+  - 'Use paths-filter action inside the workflow instead of on.pull_request.paths to keep the workflow always running'
+  - 'Add a ci-complete job with if: always() as the required status check — not the individual build job'
+  - 'Test branch protection + paths filter by opening a PR that changes only unrelated files before enabling required checks'
+  - 'Document in your monorepo contributing guide that required checks use the internal paths-filter pattern'
+docs:
+  - url: 'https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-status-checks-before-merging'
+    label: 'About protected branches — require status checks before merging'
+  - url: 'https://github.com/orgs/community/discussions/20548'
+    label: 'GitHub Community: Required status check never satisfies when workflow has paths filter (30+ reactions)'
+  - url: 'https://github.com/dorny/paths-filter'
+    label: 'dorny/paths-filter — recommended replacement for workflow-level paths: filter'
+  - url: 'https://github.com/orgs/community/discussions/44490'
+    label: 'GitHub Community: paths filter skips required checks causing PR stuck (additional discussion)'
