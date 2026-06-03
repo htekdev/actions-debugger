@@ -1,0 +1,90 @@
+id: 'runner-environment-083'
+title: 'Actions Runner Controller pods intermittently fail with "A task was cancelled" during large matrix jobs'
+category: runner-environment
+severity: error
+tags:
+  - arc
+  - kubernetes
+  - matrix
+  - task-cancelled
+  - pod-eviction
+  - self-hosted
+  - keda
+patterns:
+  - regex: 'A task was cancell?ed\.'
+    flags: 'i'
+  - regex: 'The operation was canceled\.'
+    flags: 'i'
+error_messages:
+  - 'Error: A task was cancelled.'
+  - 'Error: The operation was canceled.'
+root_cause: |
+  When using Actions Runner Controller (ARC) to run GitHub Actions on Kubernetes, ephemeral
+  runner pods can be evicted or preempted mid-job by the Kubernetes scheduler, producing
+  a "A task was cancelled" or "The operation was canceled" error with no application-level
+  log output before the failure.
+
+  Common causes:
+  - Kubernetes resource pressure: if a node is under memory or CPU pressure, the kubelet
+    evicts lower-priority pods. ARC runner pods have no PriorityClass by default and are
+    among the first to be evicted
+  - Node autoscaling: Cluster Autoscaler draining nodes for scale-down triggers eviction of
+    runner pods that have been running longer than the scale-down grace period
+  - KEDA queue-length scaling: KEDA scaling down the runner Deployment while jobs are
+    in-flight terminates runner pods before jobs complete
+  - OOM kills: matrix jobs that each consume significant memory can saturate node memory,
+    causing the OOM killer to terminate runner pods
+
+  The issue is especially common with large matrix builds (10+ parallel jobs) because the
+  aggregate resource demand spike can trigger autoscaler or eviction behavior. Because ARC
+  runner pods are ephemeral and have no restart policy, the job is permanently failed when
+  the pod is evicted.
+fix: |
+  Assign a high PriorityClass to ARC runner pods so the Kubernetes scheduler avoids evicting
+  them during resource pressure. Also set adequate resource requests/limits and configure
+  terminationGracePeriodSeconds to at least the expected maximum job duration.
+fix_code:
+  - language: yaml
+    label: 'Create a high-priority PriorityClass for ARC runner pods'
+    code: |
+      apiVersion: scheduling.k8s.io/v1
+      kind: PriorityClass
+      metadata:
+        name: github-runner-high
+      value: 1000000
+      globalDefault: false
+      description: 'High priority for GitHub Actions runner pods to prevent eviction'
+  - language: yaml
+    label: 'Reference PriorityClass and set resource limits in ARC AutoscalingRunnerSet values'
+    code: |
+      # helm values for actions-runner-controller AutoscalingRunnerSet chart
+      template:
+        spec:
+          priorityClassName: github-runner-high
+          # Allow jobs up to 1 hour to finish before pod is force-terminated
+          terminationGracePeriodSeconds: 3600
+          containers:
+            - name: runner
+              resources:
+                requests:
+                  memory: '2Gi'
+                  cpu: '500m'
+                limits:
+                  memory: '4Gi'
+                  cpu: '2000m'
+prevention:
+  - 'Assign a PriorityClass to ARC runner pods to prevent eviction under resource pressure'
+  - 'Set terminationGracePeriodSeconds to at least the expected maximum single-job duration'
+  - 'Set explicit resource requests and limits to avoid OOM kills during large matrix builds'
+  - 'Configure KEDA scale-down stabilization windows to prevent scaling down while jobs run'
+  - 'Monitor node resource utilization and right-size cluster nodes for peak matrix concurrency'
+  - 'Enable PodDisruptionBudgets for runner workloads to reduce involuntary evictions during node drains'
+docs:
+  - url: 'https://github.com/actions/runner/issues/3819'
+    label: 'actions/runner#3819: A lot of random "A task was cancelled" errors'
+  - url: 'https://kubernetes.io/docs/concepts/scheduling-eviction/pod-priority-preemption/'
+    label: 'Kubernetes: Pod Priority and Preemption'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/autoscaling-with-self-hosted-runners'
+    label: 'GitHub Docs: Autoscaling with self-hosted runners'
+  - url: 'https://github.com/actions/actions-runner-controller'
+    label: 'Actions Runner Controller (ARC) GitHub repository'
