@@ -1,0 +1,104 @@
+id: 'runner-environment-089'
+title: '`actions/checkout` leaves repository in detached HEAD state — subsequent `push` operations fail with "You are not currently on a branch"'
+category: runner-environment
+severity: error
+tags:
+  - checkout
+  - detached-head
+  - push
+  - pull-request
+  - branch
+  - git-operations
+patterns:
+  - regex: 'fatal: You are not currently on a branch\.'
+    flags: 'i'
+  - regex: 'To push the history leading to the current \(detached HEAD\)'
+    flags: 'i'
+  - regex: 'detached HEAD.*\d+\].*fatal'
+    flags: 'i'
+error_messages:
+  - 'fatal: You are not currently on a branch.'
+  - 'To push the history leading to the current (detached HEAD) state now, use'
+  - '    git push origin HEAD:<name-of-remote-branch>'
+  - 'Process completed with exit code 128.'
+root_cause: |
+  actions/checkout performs a detached HEAD checkout by default for pull_request events.
+  For pull_request triggers, GitHub provides a synthetic merge ref
+  (refs/pull/N/merge) rather than a real branch ref, so the action checks out
+  this merge commit without creating or tracking a local branch.
+
+  When subsequent workflow steps attempt to commit and push changes back to the
+  repository — for example, auto-formatting, documentation builds, coverage report
+  generation, or generated file updates — the operation fails because no remote
+  branch can be determined from a detached HEAD state.
+
+  This affects any workflow step that:
+  - Runs push operations after making commits in the workflow
+  - Uses tools that internally run push operations (e.g., auto-commit, changelog tools,
+    version bumpers)
+  - Expects to push back to the PR branch after making modifications
+
+  On push events, the checkout is also detached if ref: is not specified with the
+  branch name, because the default ref is github.sha (a commit SHA, not a branch name).
+
+  Tracked: actions/checkout#317 (44 reactions, ongoing since 2020, still receiving
+  comments in 2025).
+fix: |
+  Specify ref: in the checkout step to check out the branch name rather than a
+  commit SHA or merge ref. Once on a named branch, push-back operations work normally.
+
+  For pull_request events: use github.event.pull_request.head.ref
+  For push events: use github.ref_name (available since Runner 2.294.0)
+  For workflows triggered by multiple event types: branch the ref selection by
+  event name as shown in the third example below.
+fix_code:
+  - language: yaml
+    label: 'Fix for pull_request-triggered workflows that push back to the PR branch'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                # Check out the actual PR branch, not the detached merge ref
+                ref: ${{ github.event.pull_request.head.ref }}
+  - language: yaml
+    label: 'Fix for push-triggered workflows that commit and push back'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                # Checks out the branch name (e.g. main) instead of the commit SHA
+                ref: ${{ github.ref_name }}
+  - language: yaml
+    label: 'Universal fix for workflows triggered by multiple event types'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Checkout (pull_request)
+              if: github.event_name == 'pull_request'
+              uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.pull_request.head.ref }}
+
+            - name: Checkout (push or workflow_dispatch)
+              if: github.event_name != 'pull_request'
+              uses: actions/checkout@v4
+              with:
+                ref: ${{ github.ref_name }}
+prevention:
+  - 'Always specify ref: in checkout steps for workflows that push changes back to the repository'
+  - 'Use github.ref_name (not github.sha) for push-triggered workflows to get the branch name rather than a detached commit SHA'
+  - 'Test push-back workflows on both pull_request and push triggers to detect detached HEAD issues before they reach production'
+  - 'If using actions/checkout@v4, prefer explicit ref: values over relying on defaults when the workflow modifies and pushes files'
+docs:
+  - url: 'https://github.com/actions/checkout/issues/317'
+    label: 'actions/checkout#317: fatal: You are not currently on a branch (44 reactions, 2020–2025)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request'
+    label: 'GitHub Docs: pull_request event — uses synthetic merge ref by default'

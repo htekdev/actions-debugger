@@ -1,0 +1,115 @@
+id: 'known-unsolved-031'
+title: 'Pushing more than 3 tags simultaneously silently drops workflow runs for excess tags — GitHub platform limit'
+category: known-unsolved
+severity: silent-failure
+tags:
+  - push
+  - tags
+  - bulk-push
+  - webhook
+  - workflow-trigger
+  - limitation
+  - monorepo
+patterns:
+  - regex: 'push\s+--tags'
+    flags: 'i'
+  - regex: 'on:\s*\n\s*push:\s*\n\s*tags:'
+    flags: 'im'
+error_messages:
+  - 'No workflow runs created for some tags in bulk tag push'
+root_cause: |
+  GitHub's webhook delivery system has a documented hard limit: when more than 3 tags
+  are pushed simultaneously in a single push operation, push webhook events are only
+  created for the first 3 matching tags. Workflows for the remaining tags are silently
+  never triggered — no warning, no error, no failed run.
+
+  From the GitHub webhook events and payloads documentation:
+  "Events will not be created for tags when more than three tags are pushed at once."
+  (A similar limit of 5000 applies to branch pushes in a single operation, making the
+  3-tag threshold unexpectedly low by comparison.)
+
+  This is a platform-level constraint with no opt-out or configuration setting.
+
+  Common use cases affected:
+  - Monorepo release pipelines that tag multiple packages simultaneously
+    (e.g., package-a/v1.2.0, package-b/v1.0.0, package-c/v2.0.0, package-d/v0.5.0)
+  - Automated tooling that creates and pushes several version tags in one batch
+  - Release scripts using bulk push operations after creating several release tags
+  - Any CI pipeline where batch tagging is a normal part of the release flow
+
+  Source: actions/runner#3644 (7 reactions, Jan 2025, open), GitHub Docs push event.
+fix: |
+  No native fix — the 3-tag limit is a GitHub platform constraint. Workarounds:
+
+  Option 1: Push tags individually one at a time in a loop (slower but reliable).
+
+  Option 2: After a bulk tag operation, use the GitHub CLI to manually trigger
+  workflows for the tags that were silently skipped:
+    gh workflow run release.yml --ref tag-name
+
+  Option 3 (recommended for monorepos): Switch from push:tags triggered workflows to
+  repository_dispatch triggered release workflows. Use a coordination script that
+  pushes tags and then dispatches one workflow event per tag. This removes the
+  3-tag webhook constraint entirely.
+
+  Option 4: Use workflow_dispatch with a tag name input parameter and invoke it once
+  per tag from a release coordination script.
+fix_code:
+  - language: yaml
+    label: 'repository_dispatch-based release trigger bypassing the 3-tag limit'
+    code: |
+      # Release coordination script (run in CI or locally):
+      #
+      # For each tag you want to release, dispatch a repository_dispatch event:
+      #
+      #   for tag in package-a/v1.2.0 package-b/v1.0.0 package-c/v2.0.0; do
+      #     gh api repos/{owner}/{repo}/dispatches \
+      #       --field event_type=release \
+      #       --field "client_payload[tag]=$tag"
+      #   done
+
+      # Workflow triggered per tag via repository_dispatch:
+      on:
+        repository_dispatch:
+          types: [release]
+
+      jobs:
+        release:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.client_payload.tag }}
+
+            - name: Build and publish
+              run: |
+                echo "Releasing ${{ github.event.client_payload.tag }}"
+                # add actual release steps here
+  - language: yaml
+    label: 'workflow_dispatch with tag input — invoke once per tag from release script'
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            tag:
+              description: 'Tag to release (e.g. package-a/v1.2.0)'
+              required: true
+              type: string
+
+      jobs:
+        release:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ inputs.tag }}
+            - run: echo "Releasing ${{ inputs.tag }}"
+prevention:
+  - 'Never rely on bulk push operations to trigger per-tag workflows in monorepos — push tags individually or use repository_dispatch/workflow_dispatch patterns'
+  - 'Audit your release pipeline: if bulk tag operations are used and more than 3 tags are pushed at once, some workflow runs are silently missing'
+  - 'Add a post-release verification step that confirms a workflow run exists for each expected tag, alerting if any are missing'
+docs:
+  - url: 'https://docs.github.com/en/webhooks/webhook-events-and-payloads#push'
+    label: 'GitHub Docs: push webhook — 3-tag limit for simultaneous bulk tag pushes'
+  - url: 'https://github.com/actions/runner/issues/3644'
+    label: 'actions/runner#3644: Workflow fails to trigger on multiple tags push simultaneously (Jan 2025, open)'
