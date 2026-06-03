@@ -1,0 +1,107 @@
+id: silent-failures-051
+title: 'environment.url expression evaluates to empty string when referencing steps.*.outputs — resolved before steps run'
+category: silent-failures
+severity: silent-failure
+tags:
+  - environment
+  - deployment-url
+  - step-outputs
+  - expression-evaluation
+  - dynamic-url
+  - deployment-widget
+patterns:
+  - regex: 'environment.*url.*steps\.\w+\.outputs\.\w+'
+    flags: 'i'
+  - regex: 'deployment.*url.*empty|environment.*url.*not.*set|page_url.*empty'
+    flags: 'i'
+error_messages:
+  - 'Deployment environment shows no URL in GitHub UI despite environment.url referencing a step output'
+  - 'Deployment URL is empty string — steps.deploy.outputs.url is non-empty in the step logs'
+root_cause: |
+  The jobs.<id>.environment.url field is evaluated at job scheduling time — before ANY steps
+  in the job have run and before any step outputs exist. Expressions that reference
+  steps.*.outputs.* from the same job silently resolve to empty string. GitHub does not
+  emit a warning or error when this occurs.
+
+  This is a fundamental evaluation ordering constraint: the environment block (both name and
+  url) is part of the workflow plan GitHub evaluates once when the job is queued. The job
+  has not yet started, so step outputs are undefined and resolve to empty.
+
+  Contexts SAFE to use in environment.url (available at scheduling time):
+  - github.* — static for the run
+  - vars.* — repository/org/environment variables
+  - inputs.* — workflow_dispatch or workflow_call inputs
+  - needs.<prior-job>.outputs.* — outputs from already-completed upstream jobs
+  - env.* declared at the job level
+
+  Contexts that silently resolve to empty in environment.url:
+  - steps.*.outputs.* — step has not run yet
+  - steps.*.conclusion / steps.*.outcome — step has not run yet
+  - Any runtime-computed value from within the same job
+
+  Common scenario: a deploy step creates a preview URL (e.g., Vercel preview, Heroku review
+  app, AWS CloudFormation output), writes it to GITHUB_OUTPUT, and the developer tries to
+  surface it via environment.url so it appears in the GitHub deployment widget on the PR.
+  The widget shows no URL, and no error is ever raised.
+fix: |
+  Route the dynamic deployment URL through job outputs of the deploy job, then reference
+  needs.deploy.outputs.<name> in a dependent job's environment.url. The needs context IS
+  available at scheduling time for downstream jobs because the upstream job has already
+  completed.
+
+  For cases where the URL can be computed entirely from pre-execution contexts (github.ref_name,
+  inputs.*, vars.*), use a static URL expression directly in environment.url without
+  any step output dependency.
+fix_code:
+  - language: yaml
+    label: 'Two-job pattern — expose deployment URL as job output, reference via needs in downstream job'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          outputs:
+            # Promote step output to job output — available to downstream jobs via needs
+            app_url: ${{ steps.deploy.outputs.url }}
+          steps:
+            - uses: actions/checkout@v4
+            - name: Deploy
+              id: deploy
+              run: |
+                DEPLOY_URL="https://preview-${{ github.run_id }}.example.com"
+                echo "url=${DEPLOY_URL}" >> $GITHUB_OUTPUT
+
+        link-deployment:
+          needs: deploy
+          runs-on: ubuntu-latest
+          environment:
+            name: preview
+            # needs.deploy.outputs.* resolves correctly — deploy job already completed
+            url: ${{ needs.deploy.outputs.app_url }}
+          steps:
+            - run: echo "Linked deployment to ${{ needs.deploy.outputs.app_url }}"
+
+  - language: yaml
+    label: 'Static URL pattern using pre-execution context (no step output dependency)'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          environment:
+            name: preview
+            # github.ref_name is available at scheduling time — always resolves correctly
+            url: 'https://preview-${{ github.ref_name }}.example.com'
+          steps:
+            - uses: actions/checkout@v4
+            - run: echo "deploying..."
+prevention:
+  - 'Never reference steps.*.outputs.* directly in environment.url — promote to a job output and reference via needs in a downstream job instead'
+  - 'Test environment.url by checking the deployment widget on a pull request — an empty URL indicates the expression evaluated to empty string at scheduling time'
+  - 'Document the two-job deploy-then-link pattern in team workflow templates to prevent rediscovery'
+  - 'If the URL requires a step output, always add an outputs: block to the job and reference it via needs.<job>.outputs.<name> in a downstream job'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idenvironment'
+    label: 'GitHub Docs: jobs.<job_id>.environment syntax'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/passing-information-between-jobs'
+    label: 'GitHub Docs: Passing information between jobs'
+  - url: 'https://github.com/orgs/community/discussions/9366'
+    label: 'GitHub Community #9366: Dynamic environment URL from step output resolves to empty'
