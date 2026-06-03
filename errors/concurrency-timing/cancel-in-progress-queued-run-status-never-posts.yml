@@ -1,0 +1,111 @@
+id: concurrency-timing-027
+title: 'Queued run cancelled by cancel-in-progress before any job starts — required status check never posts, PR permanently blocked'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - cancel-in-progress
+  - required-status-check
+  - branch-protection
+  - pr-blocked
+  - status-check
+patterns:
+  - regex: 'This run was cancelled because another run in the same concurrency group'
+    flags: 'i'
+  - regex: 'Waiting for.*status.*reported|Expected.*Waiting'
+    flags: 'i'
+error_messages:
+  - "This run was cancelled because another run in the same concurrency group is in progress."
+  - "Waiting for status to be reported"
+root_cause: |
+  When cancel-in-progress: true cancels a workflow run that was queued but had
+  not yet started any job, GitHub does NOT post a status (pending, cancelled, or
+  failure) to the commit SHA. The run silently disappears from the run list.
+
+  Branch protection rules that require a specific status check (e.g., "CI / test")
+  only observe statuses that were posted. A run cancelled before its first job
+  starts never posts any status — not even "pending".
+
+  Impact on PRs with high push frequency:
+  1. Developer opens PR, pushes commit A — run starts, posts "pending"
+  2. Developer pushes fix commit B — run for A is cancelled, run for B is queued
+  3. Developer pushes commit C before B's run starts — B's run cancelled (never
+     started), run for C queued
+  4. Run for C finally starts and posts statuses
+  5. But if C is also cancelled before starting, the commit has NO status
+  6. Branch protection shows the required check as "Expected" forever
+  7. PR cannot be merged — the Merge button stays disabled indefinitely
+
+  This condition is self-healing if a new commit is pushed (starting a fresh
+  run that won't be cancelled), but in rapid-push scenarios the window persists
+  for many minutes and developers mistakenly believe the CI is broken.
+fix: |
+  Option 1 — Queue instead of cancel (safest):
+    concurrency:
+      group: "${{ github.workflow }}-${{ github.ref }}"
+      cancel-in-progress: false
+
+  Runs queue behind one another; every commit eventually gets a status posted.
+
+  Option 2 — Status anchor job:
+  Add a minimal first job that completes instantly. Its "queued" + "in_progress"
+  status is posted to the commit SHA immediately, ensuring GitHub registers the
+  run before any cancellation can remove the status.
+
+  Option 3 — GitHub Actions recommended pattern:
+  Use cancel-in-progress: true for the expensive test jobs only, and have a
+  separate fast-posting job that always runs (not subject to concurrency group).
+fix_code:
+  - language: yaml
+    label: 'Queue runs instead of cancelling — every commit gets a status'
+    code: |
+      on:
+        pull_request:
+
+      concurrency:
+        # Queue instead of cancel — latest run waits, but always posts status
+        group: '${{ github.workflow }}-${{ github.ref }}'
+        cancel-in-progress: false
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+  - language: yaml
+    label: 'Status anchor job — posts status immediately before cancel window'
+    code: |
+      on:
+        pull_request:
+
+      concurrency:
+        group: '${{ github.workflow }}-${{ github.ref }}'
+        cancel-in-progress: true    # OK — anchor ensures status is posted first
+
+      jobs:
+        # Minimal job: completes in seconds, ensuring a status is recorded on the SHA
+        anchor:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "CI registered for ${{ github.sha }}"
+
+        # Expensive test job that is safe to cancel
+        test:
+          needs: anchor
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+prevention:
+  - 'Avoid cancel-in-progress: true on workflows whose jobs are required status checks for branch protection'
+  - 'Use cancel-in-progress: false with queuing semantics when PR mergeability must be preserved on every commit'
+  - 'Add a lightweight anchor job as the first required job to ensure a status posts before any cancel window closes'
+  - 'Monitor PRs stuck with Expected required checks — check whether recent commits had all their runs cancelled before starting'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/using-concurrency'
+    label: 'GitHub Actions: Using concurrency — cancel-in-progress behavior'
+  - url: 'https://github.com/orgs/community/discussions/21280'
+    label: 'GitHub Community: Required status check never posts when run cancelled before start (120+ reactions)'
+  - url: 'https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-status-checks-before-merging'
+    label: 'GitHub Docs: Required status checks — how commit statuses are evaluated for branch protection'
