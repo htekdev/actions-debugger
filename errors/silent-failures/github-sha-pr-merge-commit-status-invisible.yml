@@ -1,0 +1,95 @@
+id: silent-failures-041
+title: "`github.sha` Is the Merge Commit on Pull Request Events — Commit Status Invisible"
+category: silent-failures
+severity: silent-failure
+tags:
+  - github.sha
+  - pull_request
+  - commit-status
+  - merge-commit
+  - sha
+  - statuses
+patterns:
+  - regex: 'github\.sha'
+    flags: "i"
+  - regex: 'pull_request\.head\.sha'
+    flags: "i"
+error_messages:
+  - "No error — commit status silently attached to ephemeral merge commit not visible in PR timeline"
+  - "No pending/passing status appears on the PR despite successful workflow run"
+root_cause: |
+  On pull_request and pull_request_target events, github.sha is set to the SHA of a temporary
+  merge commit GitHub creates to test mergeability (refs/pull/<n>/merge), NOT the actual head
+  commit of the feature branch (refs/pull/<n>/head). This merge commit is ephemeral and is
+  never directly visible in the PR timeline or commit history.
+
+  Developers who pass github.sha to the GitHub Commit Status API (POST
+  /repos/{owner}/{repo}/statuses/{sha}), build provenance attestation tools, cosign, or other
+  tooling expecting the PR head commit get a silent mismatch: the API call succeeds with HTTP
+  201, the status is written, but it targets a commit no reviewer can see. The PR status checks
+  panel remains empty or stale, required checks are never satisfied, and the PR cannot be merged
+  even though the workflow ran successfully.
+
+  This is distinct from the checkout/ref problem where the wrong code is built — here the build
+  is correct but status reporting is silently targeting the wrong commit.
+fix: |
+  Use github.event.pull_request.head.sha instead of github.sha when targeting the PR head
+  commit for status APIs or attestation. For non-PR events (push, workflow_dispatch,
+  schedule), github.sha is correct. Use a combined expression for reusable workflows that
+  run on both event types.
+fix_code:
+  - language: yaml
+    label: "WRONG — status set on merge commit (never shows on PR)"
+    code: |
+      - name: Set commit status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,  // merge commit SHA on pull_request events
+              state: 'success',
+              context: 'my-check',
+            });
+  - language: yaml
+    label: "RIGHT — use PR head SHA for pull_request events"
+    code: |
+      - name: Set commit status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const sha = context.eventName === 'pull_request'
+              ? context.payload.pull_request.head.sha  // actual PR head commit
+              : context.sha;
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha,
+              state: 'success',
+              context: 'my-check',
+            });
+  - language: yaml
+    label: "RIGHT — pass head SHA via env for run steps"
+    code: |
+      - name: Attest or sign artifact
+        env:
+          COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          cosign sign-blob --bundle bundle.json artifact.tar.gz
+          # $COMMIT_SHA is the visible PR head SHA on pull_request events,
+          # falls back to github.sha for push/schedule/workflow_dispatch
+prevention:
+  - "Never use github.sha directly for Commit Status API calls in pull_request workflows — always use github.event.pull_request.head.sha."
+  - "For workflows triggered by both push and pull_request, use the safe fallback expression: ${{ github.event.pull_request.head.sha || github.sha }}."
+  - "After adding required status checks, verify they actually appear in the PR timeline — a missing check often means the wrong SHA is being targeted."
+  - "Run 'echo ${{ github.sha }} ${{ github.event.pull_request.head.sha }}' in a debug step to confirm the SHAs differ on a PR event."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context"
+    label: "GitHub context — github.sha documentation"
+  - url: "https://docs.github.com/en/rest/commits/statuses"
+    label: "GitHub REST API — Commit statuses"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request"
+    label: "Events that trigger workflows — pull_request event and merge commit"
+  - url: "https://stackoverflow.com/questions/71264370/why-is-github-sha-not-pointing-to-the-pr-head-commit-on-pull-request-events"
+    label: "Stack Overflow — Why is github.sha not the PR head commit on pull_request events?"
