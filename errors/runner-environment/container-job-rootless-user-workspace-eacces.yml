@@ -1,0 +1,103 @@
+id: runner-environment-097
+title: 'Container job with non-root Docker user fails with EACCES on workspace and command files'
+category: runner-environment
+severity: error
+tags:
+  - container-jobs
+  - non-root
+  - rootless
+  - permissions
+  - EACCES
+  - docker
+  - workspace
+patterns:
+  - regex: 'EACCES.*permission denied.*_runner_file_commands|permission denied.*_runner_file_commands'
+    flags: 'i'
+  - regex: 'permission denied.*GITHUB_ENV|permission denied.*GITHUB_OUTPUT|permission denied.*GITHUB_PATH|permission denied.*GITHUB_STEP_SUMMARY'
+    flags: 'i'
+  - regex: 'could not lock config file.*Permission denied'
+    flags: 'i'
+  - regex: 'EACCES.*permission denied.*__w|permission denied.*github/workspace'
+    flags: 'i'
+error_messages:
+  - "Error: EACCES: permission denied, open '/home/runner/work/_temp/_runner_file_commands/set_env_'"
+  - "Error: EACCES: permission denied, open '/__w/_temp/_runner_file_commands/add_path_'"
+  - "error: could not lock config file /home/runner/work/repo/.git/config: Permission denied"
+  - "EACCES: permission denied, open '/github/workspace/_temp/_runner_file_commands/'"
+root_cause: |
+  When a workflow uses a container job (jobs.<id>.container), the GitHub Actions
+  runner creates the workspace directories, .git directory, and all special command
+  files (GITHUB_ENV, GITHUB_OUTPUT, GITHUB_PATH, GITHUB_STEP_SUMMARY) as root UID
+  on the host before starting the container.
+
+  If the container image runs as a non-root user — via a USER directive in the
+  Dockerfile, docker run --user, or a Kubernetes securityContext.runAsUser setting —
+  that user has no write access to the root-owned files and directories. Every step
+  that writes to GITHUB_ENV, GITHUB_OUTPUT, GITHUB_PATH, or GITHUB_STEP_SUMMARY
+  fails with EACCES: permission denied. The checkout step also fails because git
+  cannot write the lock file for the config.
+
+  The runner does not automatically adjust ownership, set ACLs, or apply mount
+  options to make the workspace writable by non-root container users. This is a
+  known long-standing platform limitation tracked in runner#2411 (30 reactions)
+  with no built-in fix as of 2026. The issue also affects ARC (actions-runner-controller)
+  Kubernetes runners when the pod securityContext sets a non-root runAsUser.
+fix: |
+  Option 1 — Add `options: --user root` to the container definition.
+  This overrides the container USER and runs job steps as root, granting
+  full access to all runner-created files.
+
+  Option 2 — Set fsGroup in Kubernetes/ARC pod spec so mounted directories
+  are group-writable and the container's supplemental group matches.
+
+  Option 3 — Use a privileged init step (--user 0) to chown the workspace
+  to the container's non-root UID before executing actual build steps.
+
+  Option 4 — Build the container image with UID 1001 (the runner UID on
+  GitHub-hosted runners) instead of a custom non-root UID, so ownership
+  matches automatically.
+fix_code:
+  - language: yaml
+    label: 'Force container to run as root with options: --user root'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          container:
+            image: myapp:latest       # Has a non-root USER in its Dockerfile
+            options: --user root      # Override: run job steps as root
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build
+              run: make build
+  - language: yaml
+    label: 'Set fsGroup in ARC RunnerSet to make workspace group-writable'
+    code: |
+      apiVersion: actions.github.com/v1alpha1
+      kind: RunnerSet
+      metadata:
+        name: my-runners
+      spec:
+        template:
+          spec:
+            securityContext:
+              fsGroup: 1001          # Match runner UID so workspace is accessible
+            containers:
+              - name: runner
+                image: ghcr.io/actions/actions-runner:latest
+                securityContext:
+                  runAsUser: 1001
+                  runAsGroup: 1001
+prevention:
+  - 'Prefer running container jobs as root or as UID 1001 to match the runner workspace ownership'
+  - 'Test container images locally with docker run --user <uid> to catch permission issues before CI'
+  - 'Document the --user root workaround in workflow templates that use custom container images'
+  - 'Consider using a job-level container for tool availability only, keeping privileged steps on the host runner'
+  - 'When building custom runner images, set USER to UID 1001 to match GitHub-hosted runner conventions'
+docs:
+  - url: 'https://github.com/actions/runner/issues/2411'
+    label: 'runner#2411: Runner does not set proper permissions for mounted folders in rootless container jobs (30 reactions)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-where-your-workflow-runs/running-jobs-in-a-container'
+    label: 'Running jobs in a container — options field and container configuration'
+  - url: 'https://github.com/actions/runner/issues/3290'
+    label: 'runner#3290: Kubernetes container pods fail with EACCES when using a custom user'
