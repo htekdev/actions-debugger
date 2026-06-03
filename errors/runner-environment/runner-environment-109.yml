@@ -1,0 +1,121 @@
+id: runner-environment-109
+title: 'macOS 14+ (Apple Silicon) runner: Homebrew prefix changed from /usr/local to /opt/homebrew — hardcoded paths fail'
+category: runner-environment
+severity: error
+tags:
+  - macos-14
+  - apple-silicon
+  - homebrew
+  - arm64
+  - path
+  - macos-sonoma
+  - opt-homebrew
+  - cross-architecture
+patterns:
+  - regex: '/usr/local/(bin/brew|Cellar|opt)\b'
+    flags: 'i'
+  - regex: 'No such file or directory.*(/usr/local/bin/brew|/usr/local/opt|/usr/local/Cellar)'
+    flags: 'i'
+error_messages:
+  - '/usr/local/bin/brew: No such file or directory'
+  - 'Error: No such file or directory @ rb_sysopen - /usr/local/Cellar'
+  - '/usr/local/opt/openssl: No such file or directory'
+  - 'pkg-config: /usr/local/opt/openssl/lib/pkgconfig: No such file or directory'
+root_cause: |
+  Homebrew on Apple Silicon (ARM64) installs to /opt/homebrew, while Homebrew on
+  Intel x86-64 installs to /usr/local. This architectural split was introduced when
+  Homebrew added native Apple Silicon support in early 2021.
+
+  GitHub-hosted macOS runners on Apple Silicon hardware (macos-14, macos-15, and
+  macos-latest since October 2024) use /opt/homebrew as the Homebrew prefix.
+  Workflows migrating from macOS 12 or macOS 13 (Intel x86-64) to macOS 14+
+  (Apple Silicon) break when they reference hardcoded /usr/local paths:
+
+  - /usr/local/bin/brew — the brew binary itself
+  - /usr/local/Cellar/package-name — installed package files
+  - /usr/local/opt/package-name — formula options/keg link (very common for
+    openssl, readline, libpq, libyaml, icu4c, pkg-config)
+  - PKG_CONFIG_PATH=/usr/local/opt/openssl/lib/pkgconfig in env: blocks
+  - OPENSSL_ROOT_DIR=/usr/local/opt/openssl in build steps
+  - LDFLAGS=-L/usr/local/opt/readline/lib for native extension builds
+  - CPPFLAGS=-I/usr/local/opt/openssl/include for C/C++ compilation
+  - Shell scripts that source /usr/local/etc/profile.d/
+
+  Commonly broken language ecosystems:
+  - Ruby gems with native extensions (nokogiri --with-opt-dir=/usr/local/opt/openssl)
+  - Python packages (pycurl, psycopg2, cryptography) with hardcoded CPPFLAGS
+  - Node.js native add-ons reading PKG_CONFIG_PATH pointing to /usr/local/opt
+  - Go builds with CGO_CFLAGS referencing /usr/local/include
+fix: |
+  Replace all hardcoded /usr/local/opt and /usr/local/Cellar paths with the
+  dynamic output of brew --prefix [formula-name].
+
+  The portable pattern:
+    OPENSSL_ROOT_DIR=$(brew --prefix openssl)
+    PKG_CONFIG_PATH="$(brew --prefix openssl)/lib/pkgconfig"
+
+  brew --prefix returns /usr/local/opt/package on Intel and /opt/homebrew/opt/package
+  on Apple Silicon — making it correct on both architectures automatically.
+
+  For the Homebrew root itself, use the $HOMEBREW_PREFIX environment variable
+  which is pre-set by the runner image to the correct prefix (/usr/local or
+  /opt/homebrew) depending on the runner architecture.
+
+  Actionlint does not flag hardcoded /usr/local paths — a manual audit of
+  env: blocks and run: scripts is required when migrating runner architectures.
+fix_code:
+  - language: yaml
+    label: 'Use brew --prefix for portable formula paths across Intel and Apple Silicon'
+    code: |
+      jobs:
+        build:
+          runs-on: macos-latest   # macos-14+ on Apple Silicon (/opt/homebrew)
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Install dependencies
+              run: brew install openssl readline libpq
+
+            - name: Set library paths (portable — works on Intel and Apple Silicon)
+              run: |
+                echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl)" >> $GITHUB_ENV
+                echo "PKG_CONFIG_PATH=$(brew --prefix openssl)/lib/pkgconfig:$(brew --prefix readline)/lib/pkgconfig" >> $GITHUB_ENV
+                echo "LDFLAGS=-L$(brew --prefix openssl)/lib -L$(brew --prefix readline)/lib" >> $GITHUB_ENV
+                echo "CPPFLAGS=-I$(brew --prefix openssl)/include -I$(brew --prefix readline)/include" >> $GITHUB_ENV
+                # DO NOT hardcode /usr/local/opt/... — breaks on Apple Silicon (/opt/homebrew)
+
+            - name: Install native gems
+              run: bundle install
+
+  - language: yaml
+    label: 'Use $HOMEBREW_PREFIX env variable for Homebrew root references'
+    code: |
+      jobs:
+        build:
+          runs-on: macos-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Install tool
+              run: brew install libffi
+
+            - name: Build with native dependency
+              run: |
+                # $HOMEBREW_PREFIX is pre-set by the runner image
+                # Intel macOS 12/13:   /usr/local
+                # Apple Silicon 14/15: /opt/homebrew
+                export LIBRARY_PATH="$HOMEBREW_PREFIX/lib:$LIBRARY_PATH"
+                export C_INCLUDE_PATH="$HOMEBREW_PREFIX/include:$C_INCLUDE_PATH"
+                make install
+prevention:
+  - 'Never hardcode /usr/local/opt, /usr/local/Cellar, or /usr/local/bin/brew — always use brew --prefix <formula> at runtime'
+  - 'Use $HOMEBREW_PREFIX (set by runner images) for generic Homebrew root path references'
+  - 'When migrating from macos-12/13 (Intel) to macos-14+ (Apple Silicon), grep workflow files and scripts for /usr/local/ strings'
+  - 'Test with runs-on: macos-14 in a feature branch before switching macos-latest to catch architecture-specific path failures'
+docs:
+  - url: 'https://docs.brew.sh/Installation'
+    label: 'Homebrew Installation docs: default prefix differences between Intel and Apple Silicon'
+  - url: 'https://github.com/actions/runner-images/blob/main/images/macos/macos-14-arm64-Readme.md'
+    label: 'actions/runner-images: macOS 14 ARM64 image README'
+  - url: 'https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners'
+    label: 'GitHub Docs: About GitHub-hosted runners — macOS runner architecture details'
