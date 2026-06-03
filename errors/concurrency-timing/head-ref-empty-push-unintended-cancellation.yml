@@ -1,0 +1,76 @@
+id: concurrency-timing-014
+title: "github.head_ref empty on push events collapses concurrency group and cancels unrelated runs"
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - head_ref
+  - push-event
+  - cancel-in-progress
+  - cross-branch
+patterns:
+  - regex: "Run .*? was cancelled"
+    flags: "i"
+  - regex: "cancel-in-progress.*true"
+    flags: "i"
+error_messages:
+  - "Run <workflow-name> was cancelled"
+  - "This run has been cancelled by a newer run"
+root_cause: |
+  On `push` events, `github.head_ref` is always an empty string — it is only populated
+  for `pull_request` and `pull_request_target` events where a source branch exists.
+
+  When a concurrency group expression uses `github.head_ref` without a fallback value,
+  every push to any branch evaluates to the same empty-string group key. With
+  `cancel-in-progress: true`, each new push cancels any other in-progress run across
+  ALL branches — including unrelated feature branches and main.
+
+  Example of the broken pattern:
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.head_ref }}
+      cancel-in-progress: true
+
+  Pushing to `main` and `feature-branch` simultaneously means the second push cancels
+  the first, even though they are completely unrelated.
+
+  This is confirmed by GitHub Actions documentation and illustrated by Gitea's
+  implementation fix for the same semantic (go-gitea/gitea#37311, April 2026).
+fix: |
+  Use the `||` fallback operator so that push events fall back to `github.run_id`,
+  which is unique per workflow run and thus prevents any cross-run cancellation on push:
+
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+      cancel-in-progress: true
+
+  With this pattern:
+  - On pull_request events: `github.head_ref` is the source branch name — runs for the
+    same branch/PR cancel each other (desired behavior).
+  - On push events: `github.head_ref` is empty, so `github.run_id` is used — each
+    push run gets a unique group and is never cancelled by an unrelated run.
+fix_code:
+  - language: yaml
+    label: "Correct: fallback to github.run_id on push events"
+    code: |
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+        cancel-in-progress: true
+  - language: yaml
+    label: "Wrong: head_ref alone is empty on push — collapses all pushes to one group"
+    code: |
+      # DO NOT USE — cancels unrelated push runs
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.head_ref }}
+        cancel-in-progress: true
+prevention:
+  - "Always use `${{ github.head_ref || github.run_id }}` in concurrency groups, never `github.head_ref` alone"
+  - "Test concurrency behavior with simultaneous pushes to two unrelated branches to verify isolation"
+  - "If you only want per-PR cancellation and not per-push cancellation, restrict the concurrency block to PR events using an `if:` condition"
+  - "Add a CI job that verifies no two concurrent push runs share a group key"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs"
+    label: "GitHub Docs — Controlling workflow concurrency"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#push"
+    label: "GitHub Docs — push event payload (head_ref is absent)"
+  - url: "https://github.com/go-gitea/gitea/pull/37311"
+    label: "go-gitea/gitea#37311 — Fix actions concurrency groups cross-branch leak"

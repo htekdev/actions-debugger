@@ -1,0 +1,89 @@
+id: concurrency-timing-015
+title: "Cancelling workflow from the Actions runs list leaves downstream needs/always() jobs zombie-queued"
+category: concurrency-timing
+severity: error
+tags:
+  - cancel
+  - needs
+  - always
+  - zombie
+  - matrix
+  - queued
+patterns:
+  - regex: "queued.*cancel|cancel.*queued"
+    flags: "i"
+  - regex: "This run has been cancelled"
+    flags: "i"
+error_messages:
+  - "This run has been cancelled"
+  - "Job is queued"
+root_cause: |
+  When a workflow is cancelled from the GitHub Actions **runs list page**
+  (https://github.com/{owner}/{repo}/actions), the cancellation signal does not
+  propagate to all pending/queued jobs. Specifically:
+
+  - Running jobs receive the cancellation correctly and terminate.
+  - Jobs that were not yet picked up by a runner but are waiting in a `needs:` chain
+    (especially with `if: always()`) remain stuck indefinitely in a "queued" state.
+  - These "zombie" queued jobs never start and never cancel on their own.
+
+  The problem is reproducible with:
+  1. A large matrix build (many parallel jobs)
+  2. A finalizer/aggregator job using `needs: [matrix-job]` + `if: always()`
+  3. Cancelling from the Actions overview list before all matrix jobs have started
+
+  The finalizer job enters the "queued" state but never receives the cancel signal
+  because the runs-list cancel does not do a full transitive cancel of downstream jobs.
+
+  Reported in actions/runner#4411 (May 2026) — closed as a known UI inconsistency.
+fix: |
+  **Workaround (immediate):** To fully cancel a stuck workflow:
+  1. Click through to the specific workflow run detail page
+     (not the Actions overview list)
+  2. Click the red "Cancel workflow" button from inside the run page
+
+  This second cancel terminates all zombie queued jobs immediately.
+
+  **Structural mitigation:** Add a `timeout-minutes` to your finalizer/aggregator job
+  so it self-terminates even if the cancel signal is not received:
+
+    jobs:
+      aggregate:
+        needs: [build]
+        if: always()
+        timeout-minutes: 5
+        runs-on: ubuntu-latest
+        steps:
+          - run: echo "Aggregating results"
+fix_code:
+  - language: yaml
+    label: "Add timeout-minutes to always() jobs as a safety net"
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              target: [a, b, c, d, e, f, g, h]
+          runs-on: ubuntu-latest
+          steps:
+            - run: make ${{ matrix.target }}
+
+        aggregate:
+          needs: [build]
+          if: always()
+          timeout-minutes: 5      # prevents zombie queueing if cancel signal is lost
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Build result ${{ needs.build.result }}"
+prevention:
+  - "Always add `timeout-minutes` to finalizer jobs that use `if: always()` to limit zombie lifetime"
+  - "When cancelling a stuck workflow, navigate to the specific run page and use the in-run Cancel button"
+  - "Avoid relying on the Actions overview Cancel — it has incomplete propagation to queued downstream jobs"
+  - "Consider using a concurrency group to auto-cancel the entire workflow on re-trigger instead of manual cancellation"
+docs:
+  - url: "https://github.com/actions/runner/issues/4411"
+    label: "actions/runner#4411 — Cancellation from runs list leaves needs+always() jobs zombie-queued"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-jobs-in-a-workflow#defining-prerequisite-jobs"
+    label: "GitHub Docs — Defining prerequisite jobs (needs:)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/expressions#always"
+    label: "GitHub Docs — always() status check function"
