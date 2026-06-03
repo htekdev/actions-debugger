@@ -1,0 +1,114 @@
+id: runner-environment-072
+title: "macOS 26 Upgrades Default Ruby from 3.3 to 3.4 — Native Gem ABI Breaks"
+category: runner-environment
+severity: error
+tags:
+  - macos
+  - ruby
+  - macos-26
+  - runner-image
+  - breaking-change
+  - native-extensions
+patterns:
+  - regex: "incompatible library version.*\.bundle|LoadError.*incompatible library"
+    flags: "i"
+  - regex: "ruby.*3\.3.*required.*3\.4|Gem.*compiled.*Ruby 3\.3.*running.*3\.4"
+    flags: "i"
+  - regex: "Bundler.*RUBY_VERSION.*mismatch|native extension.*wrong Ruby version"
+    flags: "i"
+  - regex: "Error loading.*\.bundle.*built for Ruby 3\.3"
+    flags: "i"
+error_messages:
+  - "LoadError: incompatible library version - /path/to/gem.bundle (expected 3.3, got 3.4)"
+  - "Bundler::GemNotFound: Could not find gem 'pg (>= 0) ruby' in locally installed gems"
+  - "An error occurred while installing nokogiri, and Bundler cannot continue."
+  - "Your Ruby version is 3.4.x, but your Gemfile specified 3.3.x"
+root_cause: |
+  When macos-latest migrates to macos-26 (June 15 through July 15, 2026), the default
+  system Ruby version jumps from 3.3.11 to 3.4.9. This is a minor Ruby version change
+  but it breaks any workflow that:
+
+  1. Has a Gemfile or .ruby-version pinning Ruby 3.3.x
+  2. Uses cached gem bundles built against Ruby 3.3's C ABI (native extensions
+     like nokogiri, pg, mysql2, ffi compile to .bundle files tied to the Ruby ABI)
+  3. Hardcodes RUBY_VERSION in build scripts or Gemfile.lock references
+
+  Ruby native extensions (.bundle files) are ABI-specific — gems compiled against
+  Ruby 3.3 cannot be loaded by Ruby 3.4 and vice versa. If a workflow caches
+  bundled gems from a prior run on macos-15 (Ruby 3.3) and restores them on
+  macos-26 (Ruby 3.4), native extension gems will fail to load.
+
+  Source: runner-images#14167 — macOS 15 vs macOS 26 software diff shows Ruby
+  jumping from 3.3.11 to 3.4.9.
+fix: |
+  Option 1 — Use ruby/setup-ruby to pin an explicit Ruby version (recommended):
+    - uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: '3.3'  # or '3.4' to target the new default
+        bundler-cache: true
+
+  Option 2 — Add .ruby-version file to your repo specifying the target Ruby version.
+  setup-ruby will read this automatically.
+
+  Option 3 — Update your Gemfile to remove Ruby version constraint or bump it to 3.4:
+    # In Gemfile, remove or update:
+    # ruby '3.3'  <- remove or change to '3.4'
+
+  For cache invalidation: if you use actions/cache for bundler, include the Ruby
+  version in the cache key:
+    key: gems-${{ runner.os }}-ruby-${{ env.RUBY_VERSION }}-${{ hashFiles('**/Gemfile.lock') }}
+fix_code:
+  - language: yaml
+    label: "Pin Ruby version with setup-ruby (cross-image safe)"
+    code: |
+      jobs:
+        test:
+          runs-on: macos-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - uses: ruby/setup-ruby@v1
+              with:
+                # Pin explicitly — do not rely on runner default Ruby
+                ruby-version: '3.4'
+                bundler-cache: true
+
+            - name: Run tests
+              run: bundle exec rspec
+
+  - language: yaml
+    label: "Cache key including Ruby version to avoid ABI mismatch"
+    code: |
+      jobs:
+        test:
+          runs-on: macos-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - uses: ruby/setup-ruby@v1
+              with:
+                ruby-version: '3.4'
+
+            - name: Cache bundler gems
+              uses: actions/cache@v4
+              with:
+                path: vendor/bundle
+                # Include Ruby version in cache key to prevent ABI mismatch
+                key: gems-${{ runner.os }}-ruby-${{ env.RUBY_VERSION }}-${{ hashFiles('**/Gemfile.lock') }}
+                restore-keys: |
+                  gems-${{ runner.os }}-ruby-${{ env.RUBY_VERSION }}-
+
+            - name: Install gems
+              run: bundle install --path vendor/bundle
+prevention:
+  - "Always use ruby/setup-ruby with an explicit ruby-version — never rely on the runner's default Ruby."
+  - "Include the Ruby version in bundler cache keys to prevent loading native gems built for a different Ruby ABI."
+  - "Add a .ruby-version file to your repository to make the intended Ruby version visible and enforceable."
+  - "Test on macos-26 before macos-latest migrates to catch Ruby 3.3 to 3.4 incompatibilities early."
+docs:
+  - url: "https://github.com/actions/runner-images/issues/14167"
+    label: "GitHub Announcement: macos-latest will use macos-26 in June 2026 (includes Ruby version diff)"
+  - url: "https://github.com/ruby/setup-ruby"
+    label: "ruby/setup-ruby action"
+  - url: "https://www.ruby-lang.org/en/news/2024/12/25/ruby-3-4-0-released/"
+    label: "Ruby 3.4.0 Release Notes"
