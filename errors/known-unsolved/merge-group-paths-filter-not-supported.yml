@@ -1,0 +1,137 @@
+id: known-unsolved-028
+title: "merge_group Event Does Not Support paths, branches, or tags Filters"
+category: known-unsolved
+severity: limitation
+tags:
+  - merge_group
+  - merge-queue
+  - paths
+  - branches
+  - filters
+  - monorepo
+  - known-limitation
+patterns:
+  - regex: "merge_group:\\s*\\n\\s+paths:"
+    flags: "ms"
+  - regex: "merge_group:\\s*\\n\\s+branches:"
+    flags: "ms"
+error_messages:
+  - "on:\n  merge_group:\n    paths:\n      - 'src/**'"
+  - "workflow triggered for merge_group despite paths filter"
+root_cause: |
+  The merge_group event (used with GitHub's merge queue feature) does not support
+  the standard event activity filters that other events support. Specifically,
+  the following filters are silently IGNORED when listed under merge_group:
+
+  - paths and paths-ignore
+  - branches and branches-ignore
+  - tags
+
+  When a workflow defines:
+    on:
+      pull_request:
+        paths: ['src/**']
+      merge_group:
+        paths: ['src/**']   # silently ignored
+
+  The paths filter applies to pull_request but NOT to merge_group. The workflow
+  always triggers for every merge_group event regardless of which files changed,
+  even if no files in src/** were modified.
+
+  This is particularly painful for monorepos that use paths filters to scope CI
+  workflows to service boundaries — the merge queue bypasses those boundaries
+  and runs all required checks for every PR regardless of which service changed.
+
+  The merge_group event only supports filtering by:
+    types: [checks_requested]   (default and only supported activity type)
+
+  GitHub has acknowledged this is a known limitation with no native fix planned.
+fix: |
+  There is no native path filtering for merge_group. Workarounds:
+
+  1. Step-level change detection: Use a job step with dorny/paths-filter or
+     tj-actions/changed-files to detect whether relevant files changed, then
+     gate subsequent steps on that output. This allows individual steps to
+     short-circuit while the job still runs (satisfying required check status).
+
+  2. Gate job pattern: Add a detect-changes job that runs paths detection and
+     exposes outputs. Downstream jobs use needs: + if: to conditionally run
+     based on the detected changes.
+
+  3. Accept always-run: For merge queue, it is generally safer to run all
+     required checks regardless of file changes. This ensures complete
+     validation before merging and avoids stale-cache scenarios.
+fix_code:
+  - language: yaml
+    label: "Workaround — step-level paths filter inside merge_group triggered job"
+    code: |
+      on:
+        pull_request:
+          paths: ['src/**']   # pull_request respects this filter
+        merge_group:            # merge_group ignores all path/branch filters
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                fetch-depth: 0
+
+            - uses: dorny/paths-filter@v3
+              id: changes
+              with:
+                filters: |
+                  src:
+                    - 'src/**'
+
+            - name: Build (skip if no src changes on pull_request)
+              if: steps.changes.outputs.src == 'true' || github.event_name == 'merge_group'
+              run: npm run build
+              shell: bash
+
+  - language: yaml
+    label: "Workaround — detect-changes gate job for monorepo required checks"
+    code: |
+      on:
+        pull_request:
+        merge_group:
+
+      jobs:
+        detect-changes:
+          runs-on: ubuntu-latest
+          outputs:
+            src-changed: ${{ steps.filter.outputs.src }}
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                fetch-depth: 0
+            - uses: dorny/paths-filter@v3
+              id: filter
+              with:
+                filters: |
+                  src:
+                    - 'src/**'
+
+        build:
+          needs: detect-changes
+          if: needs.detect-changes.outputs.src-changed == 'true' || github.event_name == 'merge_group'
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm run build
+              shell: bash
+prevention:
+  - "Do not add paths: or branches: under merge_group: — they are silently ignored."
+  - "For monorepo required checks, plan for merge_group always running all required checks regardless of file changes."
+  - "Use step-level change detection (dorny/paths-filter, tj-actions/changed-files) to short-circuit expensive work inside jobs."
+  - "Document that merge queue bypasses path filters in your monorepo CI design documentation."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#merge_group"
+    label: "GitHub Docs: merge_group event — supported filter types"
+  - url: "https://stackoverflow.com/questions/76655935/when-does-a-github-workflow-trigger-for-merge-group-and-is-it-restricted-by-branch"
+    label: "Stack Overflow: merge_group trigger and branch restrictions (Score: 7, 9K views)"
+  - url: "https://github.com/orgs/community/discussions/90533"
+    label: "GitHub Community: merge_group does not support path filters"
+  - url: "https://github.com/dorny/paths-filter"
+    label: "dorny/paths-filter: step-level changed-files detection for monorepos"

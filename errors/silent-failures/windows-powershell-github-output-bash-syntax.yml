@@ -1,0 +1,118 @@
+id: silent-failures-034
+title: "Windows PowerShell GITHUB_OUTPUT and GITHUB_ENV Require $env: Prefix, Not Bash-Style $VARIABLE Syntax"
+category: silent-failures
+severity: silent-failure
+tags:
+  - windows
+  - powershell
+  - GITHUB_OUTPUT
+  - GITHUB_ENV
+  - environment-variables
+  - shell-syntax
+patterns:
+  - regex: "echo\\s+[\"']?[A-Z_]+=.*>>\\s+\\$GITHUB_OUTPUT"
+    flags: "i"
+  - regex: "echo\\s+[\"']?[A-Z_]+=.*>>\\s+\\$GITHUB_ENV"
+    flags: "i"
+  - regex: "shell:\\s*(pwsh|powershell)"
+    flags: "i"
+error_messages:
+  - "echo \"KEY=value\" >> $GITHUB_OUTPUT"
+  - "echo \"KEY=value\" >> $GITHUB_ENV"
+  - "Val1: "
+  - "Val2: "
+root_cause: |
+  When a workflow step uses shell: pwsh (PowerShell Core, the default on Windows
+  runners) or shell: powershell (legacy Windows PowerShell), the bash-style
+  variable syntax $GITHUB_OUTPUT and $GITHUB_ENV does NOT work.
+
+  In PowerShell, $GITHUB_OUTPUT is treated as a PowerShell variable (undefined
+  and therefore null). The >> append operator writes nothing to a null path.
+  The step exits 0 (success) with no error or warning. All downstream jobs
+  that reference step outputs or environment variables receive empty strings.
+
+  The correct PowerShell syntax uses $env:GITHUB_OUTPUT to access the OS
+  environment variable, not $GITHUB_OUTPUT (a PS variable).
+
+  Shell-specific syntax comparison:
+  - bash / sh:     echo "KEY=val" >> $GITHUB_OUTPUT
+  - pwsh (PS 7+):  "KEY=val" >> $env:GITHUB_OUTPUT
+  - powershell:    "KEY=val" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+  - cmd:           echo KEY=val >> %GITHUB_OUTPUT%
+
+  This is a common mistake when:
+  - Migrating workflows from Linux to Windows runners
+  - Copying bash examples from documentation into PowerShell steps
+  - Writing cross-platform workflows without specifying shell: per step
+fix: |
+  Replace $GITHUB_OUTPUT with $env:GITHUB_OUTPUT and $GITHUB_ENV with
+  $env:GITHUB_ENV in all PowerShell steps.
+
+  Alternatively, add shell: bash to every run: step that uses bash-style
+  syntax — Git Bash is available on all Windows GitHub-hosted runners and
+  supports the standard $GITHUB_OUTPUT syntax.
+
+  For old Windows PowerShell (shell: powershell), use Out-File with
+  explicit UTF-8 encoding to avoid BOM issues.
+fix_code:
+  - language: yaml
+    label: "Broken — bash syntax in PowerShell step silently produces no output"
+    code: |
+      - name: Set output (broken on PowerShell)
+        shell: pwsh
+        run: |
+          # WRONG: $GITHUB_OUTPUT is a null PS variable — no output is set
+          echo "BUILD_VERSION=1.2.3" >> $GITHUB_OUTPUT
+
+  - language: yaml
+    label: "Fixed — correct $env: prefix for PowerShell Core (pwsh)"
+    code: |
+      - name: Set output (PowerShell Core)
+        id: version
+        shell: pwsh
+        run: |
+          # CORRECT: $env:GITHUB_OUTPUT accesses the OS environment variable
+          "BUILD_VERSION=1.2.3" >> $env:GITHUB_OUTPUT
+
+      - name: Use output
+        run: echo "Version is ${{ steps.version.outputs.BUILD_VERSION }}"
+        shell: pwsh
+
+  - language: yaml
+    label: "Old Windows PowerShell (shell: powershell) — explicit UTF-8 required"
+    code: |
+      - name: Set output (legacy Windows PowerShell)
+        shell: powershell
+        run: |
+          "BUILD_VERSION=1.2.3" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+  - language: yaml
+    label: "Cross-platform — use shell: bash to keep bash-style syntax on Windows"
+    code: |
+      - name: Set output (bash on Windows runner)
+        shell: bash
+        run: |
+          # shell: bash uses Git Bash on Windows — $GITHUB_OUTPUT works fine
+          echo "BUILD_VERSION=1.2.3" >> $GITHUB_OUTPUT
+
+  - language: yaml
+    label: "CMD shell syntax"
+    code: |
+      - name: Set output (CMD)
+        shell: cmd
+        run: echo BUILD_VERSION=1.2.3 >> %GITHUB_OUTPUT%
+prevention:
+  - "Use shell: bash for all run: steps that use bash-style $GITHUB_OUTPUT or $GITHUB_ENV syntax, even on Windows runners."
+  - "In team workflow templates, document the shell-specific syntax for GITHUB_OUTPUT and GITHUB_ENV."
+  - "Add actionlint to CI — it can detect shell/syntax mismatches in workflow files."
+  - "Add an explicit post-step validation that reads back expected outputs to confirm they were written correctly."
+  - "Prefer shell: bash globally (via defaults: run: shell: bash) when your workflows target cross-platform and use bash syntax."
+docs:
+  - url: "https://stackoverflow.com/questions/74443940/value-not-set-using-github-output"
+    label: "Stack Overflow: Value not set using $GITHUB_OUTPUT on Windows PowerShell (Score: 22, 17K views)"
+  - url: "https://stackoverflow.com/questions/66733076/github-actions-set-environment-variable-for-windows-build-with-powershell"
+    label: "Stack Overflow: Set environment variable for Windows build with PowerShell (Score: 16, 11K views)"
+  - url: "https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#setting-an-output-parameter"
+    label: "GitHub Docs: Setting an output parameter (includes PowerShell examples)"
+  - url: "https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#defaultsrun"
+    label: "GitHub Docs: defaults.run.shell — set default shell for all run steps"
