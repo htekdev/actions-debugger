@@ -1,0 +1,83 @@
+id: 'runner-environment-084'
+title: 'Bash/sh script handler does not quote script path — fails when path contains spaces'
+category: runner-environment
+severity: error
+tags:
+  - bash
+  - shell
+  - path-spaces
+  - job-hooks
+  - self-hosted
+  - macos
+  - tart-vm
+patterns:
+  - regex: 'ACTIONS_RUNNER_HOOK_JOB_(?:STARTED|COMPLETED)'
+    flags: 'i'
+  - regex: 'bash.*No such file or directory'
+    flags: 'i'
+error_messages:
+  - 'bash: /Volumes/My Shared Files/hook.sh: No such file or directory'
+  - 'sh: /path with spaces/script.sh: not found'
+  - '/path/with: not found'
+root_cause: |
+  The GitHub Actions runner bash/sh script handler does not quote the script path
+  placeholder when building the shell invocation. The default bash arguments in
+  ScriptHandlerHelpers.cs are:
+    --noprofile --norc -e -o pipefail {0}
+  When {0} is replaced with a path containing spaces — e.g.,
+    /Volumes/My Shared Files/hook.sh
+  bash receives the path as two separate arguments due to word splitting:
+    bash --noprofile --norc -e -o pipefail /Volumes/My Shared Files/hook.sh
+  This causes a "No such file or directory" error for the first word-split token.
+
+  By contrast, the PowerShell and cmd handlers correctly quote the path:
+    pwsh:       -command "& '{0}'"
+    powershell: -command ". '{0}'"
+    cmd:        /D /E:ON /V:OFF /S /C "CALL "{0}""
+  Only bash and sh are affected (runner#4404, unresolved as of June 2026).
+
+  Practical impact:
+  - Job hooks (ACTIONS_RUNNER_HOOK_JOB_STARTED, ACTIONS_RUNNER_HOOK_JOB_COMPLETED) placed in
+    shared directories with spaces — common on macOS Tart VMs mounted at /Volumes/My Shared Files/
+  - Self-hosted runner workspaces on paths containing spaces (less common but possible)
+  - Any run: step using a working-directory with spaces in the resolved path
+fix: |
+  Ensure hook script paths and runner working directories never contain spaces.
+  On macOS Tart VMs, place hook scripts under a path without spaces (e.g., /Users/runner/hooks/).
+
+  Use a wrapper script at a space-free path that exec-delegates to the actual script if
+  it must reside under a shared mount with spaces in its path.
+
+  Monitor actions/runner#4404 for the upstream fix and upgrade when a patched runner ships.
+fix_code:
+  - language: yaml
+    label: 'Configure job hook at a space-free path (environment variable)'
+    code: |
+      # In the runner .env file (e.g., /home/runner/actions-runner/.env):
+      # Point hook variables to a path WITHOUT spaces
+      ACTIONS_RUNNER_HOOK_JOB_STARTED=/Users/runner/hooks/job-started.sh
+      ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/Users/runner/hooks/job-completed.sh
+      #
+      # Avoid paths like:
+      # /Volumes/My Shared Files/hooks/  ← spaces cause bash word-splitting error
+  - language: yaml
+    label: 'Wrapper script at space-free path delegates to actual hook in shared mount'
+    code: |
+      #!/bin/bash
+      # /Users/runner/hooks/job-started.sh  (space-free path — registered as the hook)
+      #
+      # Exec-delegates to the actual hook that lives under a shared volume with spaces.
+      # Using exec preserves exit codes and avoids a subprocess layer.
+      exec "/Volumes/My Shared Files/hooks/actual-job-started.sh" "$@"
+prevention:
+  - 'Never place runner hooks, workspace paths, or working-directories in paths containing spaces'
+  - 'On macOS Tart VMs, configure shared mounts to use space-free mount points (e.g., /Volumes/SharedFiles)'
+  - 'Test runner hook invocations explicitly on macOS or Windows deployments with shared mounts'
+  - 'Watch actions/runner#4404 for the upstream fix; upgrade the runner version when it ships'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4404'
+    label: 'actions/runner#4404: Bash script handler does not quote script path — breaks with spaces'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/running-scripts-before-or-after-a-job'
+    label: 'GitHub Docs: Running scripts before or after a job (hooks)'
+  - url: 'https://github.com/actions/runner/blob/main/src/Runner.Worker/Handlers/ScriptHandlerHelpers.cs'
+    label: 'Runner source: ScriptHandlerHelpers.cs (unquoted bash path template)'
