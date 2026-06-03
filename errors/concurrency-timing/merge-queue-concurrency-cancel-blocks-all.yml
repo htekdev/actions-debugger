@@ -1,0 +1,86 @@
+id: concurrency-timing-017
+title: "merge_group Trigger With cancel-in-progress Cascades Cancellations Across Queued Merges"
+category: concurrency-timing
+severity: error
+tags:
+  - merge-queue
+  - merge_group
+  - concurrency
+  - cancel-in-progress
+  - branch-protection
+patterns:
+  - regex: "merge_group"
+    flags: "i"
+  - regex: "cancel-in-progress:\s*true"
+    flags: "i"
+error_messages:
+  - "Some checks were not successful"
+  - "This check was cancelled"
+  - "Run was cancelled by a newer queued run"
+root_cause: |
+  GitHub's merge queue processes PRs by grouping them and running CI on each queued
+  batch via the `merge_group` event. When a workflow triggered by `merge_group` uses a
+  shared concurrency group key with `cancel-in-progress: true`, each new PR entry in
+  the queue triggers a new workflow run. Because the concurrency key is shared (e.g.,
+  based on the branch name or workflow name), the new run cancels the already-running
+  check for the previous queued PR.
+
+  The cancelled PR's required check fails or is marked cancelled, causing GitHub to
+  remove that PR from the merge queue and requeue it. The requeued PR triggers a new
+  run — which cancels the next PR's check — creating an infinite cascade. No PR
+  successfully merges.
+
+  The merge queue is designed to serialize merges safely. Adding `cancel-in-progress:
+  true` to `merge_group` workflows defeats the serialization and creates cascading
+  failures.
+fix: |
+  For `merge_group` events, always use `cancel-in-progress: false` (or omit it).
+  Each merge queue entry must complete independently. To keep cancellation for regular
+  pull_request events (to cancel superseded draft checks), use a conditional expression:
+
+  concurrency:
+    group: ci-${{ github.event.merge_group.head_sha || github.head_ref || github.ref }}
+    cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+  This cancels in-progress runs for updated PRs but never cancels merge queue checks.
+fix_code:
+  - language: yaml
+    label: "Safe: conditional cancel-in-progress for merge_group + pull_request"
+    code: |
+      on:
+        pull_request:
+        merge_group:
+
+      concurrency:
+        # Use merge_group head SHA for unique per-entry key; fall back for PR events
+        group: ci-${{ github.event.merge_group.head_sha || github.head_ref || github.ref }}
+        # Only cancel for PRs (draft updates), NEVER for merge queue entries
+        cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+  - language: yaml
+    label: "Broken: cancel-in-progress true on merge_group causes cascade"
+    code: |
+      # DO NOT USE — cancels queued merge checks, nothing merges
+      on:
+        merge_group:
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: true
+prevention:
+  - "Never use cancel-in-progress: true when the workflow is triggered by the merge_group event."
+  - "Use github.event.merge_group.head_sha in the concurrency key to ensure each queue entry gets a unique group."
+  - "Test merge queue behavior by simultaneously queuing 2-3 PRs and confirming all checks complete."
+  - "If combining pull_request and merge_group triggers, make cancel-in-progress conditional on the event type."
+docs:
+  - url: "https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue"
+    label: "GitHub Docs: Managing a merge queue"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#merge_group"
+    label: "Events that trigger workflows: merge_group"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/controlling-concurrency"
+    label: "GitHub Docs: Controlling concurrency"
