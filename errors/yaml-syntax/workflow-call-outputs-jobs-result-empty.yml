@@ -1,0 +1,125 @@
+id: 'yaml-syntax-032'
+title: "jobs.<id>.result Always Returns Empty String in on.workflow_call.outputs..value"
+category: yaml-syntax
+severity: silent-failure
+tags:
+  - reusable-workflow
+  - workflow_call
+  - outputs
+  - jobs-context
+  - result
+  - expression
+  - empty-string
+patterns:
+  - regex: 'jobs\.\w+\.result'
+    flags: 'i'
+  - regex: 'on:\s*\n\s*workflow_call:\s*\n[\s\S]*?outputs:'
+    flags: 'im'
+error_messages:
+  - "jobs.<job_id>.result evaluates to empty string in on.workflow_call.outputs value"
+  - "needs.<reusable_workflow>.outputs.<output> is empty string instead of success/failure/skipped"
+root_cause: |
+  In a reusable workflow, the expression `${{ jobs.<id>.result }}` silently
+  evaluates to an empty string when referenced inside an
+  `on.workflow_call.outputs.<output_name>.value` expression.
+
+  Despite the GitHub documentation stating that the `jobs` context is available
+  in that expression scope, direct property access to the `.result` field of a
+  job object returns empty string rather than the expected outcome value
+  (`success`, `failure`, `cancelled`, or `skipped`).
+
+  This causes downstream caller workflows that test the reusable workflow's
+  output (e.g., `needs.reusable.outputs.my-result == 'skipped'`) to silently
+  receive an empty string. Conditions that gate follow-up jobs on the result
+  of the reusable workflow never evaluate to true.
+
+  Open since January 2024 (actions/runner#3087, 11 reactions). The issue
+  affects all GitHub-hosted runners. A workaround exists using
+  `fromJSON(toJSON(jobs.<id>)).result` which forces the expression through JSON
+  serialization and correctly surfaces the result value.
+
+  Note: This is distinct from the more common mistake of referencing outputs
+  without declaring them in the job's outputs: block. The bug occurs even when
+  the job produces no step outputs and you simply want to surface whether the
+  job ran, was skipped, or failed.
+fix: |
+  Two approaches:
+
+  Option 1 — fromJSON/toJSON workaround (quickest):
+  Replace `${{ jobs.build.result }}` with
+  `${{ fromJSON(toJSON(jobs.build)).result }}`. The JSON round-trip forces
+  full evaluation of the jobs context object and correctly returns the result
+  string.
+
+  Option 2 — Surface result via step output (most reliable):
+  Add an explicit step with `if: always()` that writes `job.status` to
+  GITHUB_OUTPUT. Reference the step output in the job's outputs block and
+  in the top-level workflow_call outputs. This avoids the expression evaluation
+  quirk entirely.
+fix_code:
+  - language: yaml
+    label: "Broken pattern vs fromJSON/toJSON workaround"
+    code: |
+      # BROKEN: jobs.build.result returns empty string
+      on:
+        workflow_call:
+          outputs:
+            job-result:
+              value: ${{ jobs.build.result }}   # Always empty string
+
+      # FIXED: fromJSON/toJSON forces expression evaluation
+      on:
+        workflow_call:
+          outputs:
+            job-result:
+              value: ${{ fromJSON(toJSON(jobs.build)).result }}   # Returns success/failure/skipped
+  - language: yaml
+    label: "Preferred fix — surface result via explicit step output"
+    code: |
+      on:
+        workflow_call:
+          outputs:
+            job-result:
+              description: "The build job outcome"
+              value: ${{ jobs.build.outputs.result }}
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          outputs:
+            result: ${{ steps.capture-result.outputs.result }}
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build
+              run: npm run build
+
+            - name: Capture job result
+              id: capture-result
+              if: always()
+              run: echo "result=${{ job.status }}" >> $GITHUB_OUTPUT
+  - language: yaml
+    label: "Caller workflow checking reusable output"
+    code: |
+      jobs:
+        reusable:
+          uses: ./.github/workflows/build.yml
+          secrets: inherit
+
+        deploy:
+          needs: reusable
+          runs-on: ubuntu-latest
+          # This condition now works correctly with either fix above
+          if: needs.reusable.outputs.job-result == 'success'
+          steps:
+            - run: echo "Deploying after successful build"
+prevention:
+  - "Never rely on direct `jobs.<id>.result` access in workflow_call top-level outputs — use the fromJSON(toJSON()) workaround or explicit step outputs."
+  - "Add integration tests for reusable workflows that verify output values are non-empty strings."
+  - "Use job.status (available inside step runs) rather than jobs.<id>.result (the problematic context) when capturing job outcome."
+docs:
+  - url: "https://github.com/actions/runner/issues/3087"
+    label: "actions/runner#3087: Cannot access jobs.<id>.result from on.workflow_call.outputs (open since Jan 2024, 11 reactions)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/passing-information-between-jobs"
+    label: "GitHub Docs: Passing information between jobs"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#jobs-context"
+    label: "GitHub Docs: jobs context (documents result property)"
