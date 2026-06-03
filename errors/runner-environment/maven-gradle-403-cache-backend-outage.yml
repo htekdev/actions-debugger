@@ -1,0 +1,116 @@
+id: runner-environment-075
+title: "Maven/Gradle 403 Forbidden when GitHub Actions cache backend is degraded"
+category: runner-environment
+severity: error
+tags:
+  - maven
+  - gradle
+  - 403
+  - cache-backend
+  - outage
+  - rate-limit
+  - sonatype
+  - dependency-download
+
+patterns:
+  - regex: "Received status code 403 from server"
+    flags: "i"
+  - regex: "Could not transfer artifact .+ from .+ Forbidden"
+    flags: "i"
+  - regex: "Our services aren't available right now"
+    flags: "i"
+  - regex: "Received HTTP 403 from Maven Repository"
+    flags: "i"
+
+error_messages:
+  - "Could not transfer artifact org.springframework:spring-core:jar:6.1.0 from/to central (https://repo.maven.apache.org/maven2): Received status code 403 from server: Forbidden"
+  - "Received status code 403 from server: Forbidden"
+  - "Our services aren't available right now\nWe're working to restore all services as soon as possible. Please check back soon."
+  - "Exception in thread \"main\" org.gradle.api.UncheckedIOException: com.amazonaws.SdkClientException: Unable to execute HTTP request: The target server failed to respond"
+
+root_cause: |
+  GitHub Actions cache backend (actions/cache) is an eventually-consistent distributed storage
+  system. During degradation incidents, cache restore operations fail with the message
+  "Our services aren't available right now" and exit 0 (the job continues). Maven and Gradle
+  builds that normally cache artifacts under .m2/repository or .gradle/caches fall through
+  to downloading all dependencies directly from Maven Central (repo.maven.apache.org).
+
+  GitHub-hosted runners share IP address ranges across thousands of concurrent workflow runs.
+  During a cache backend outage, every affected build simultaneously requests artifacts
+  from Maven Central. Sonatype (which operates Maven Central) rate-limits abusive traffic
+  patterns from shared IP ranges, returning HTTP 403 Forbidden. This creates a cascading
+  failure: one cache service incident causes all Java/Kotlin/Scala CI pipelines to fail
+  until the cache backend recovers.
+
+  The failure is misleading because the error comes from Maven Central, not GitHub, so
+  developers often suspect repository permissions, network configuration, or Sonatype policy
+  changes rather than GitHub infrastructure.
+
+fix: |
+  Short-term: Check GitHub Status (githubstatus.com) for cache service incidents before
+  debugging Maven/Gradle configuration. Retry the workflow after the incident resolves.
+
+  Medium-term: Add Maven retry configuration to pom.xml or build.gradle to tolerate
+  transient 403/429 responses. Configure a secondary mirror as a fallback to reduce
+  direct Maven Central dependency.
+
+  Long-term: Host a private artifact cache (Nexus, Artifactory, or AWS CodeArtifact)
+  that proxies Maven Central. This prevents GitHub runner IP ranges from hitting Maven
+  Central directly and provides a stable fallback during GitHub cache outages.
+
+fix_code:
+  - language: yaml
+    label: "Workflow: Add retry wrapper step for Maven builds during cache degradation"
+    code: |
+      steps:
+        - uses: actions/cache@v4
+          id: maven-cache
+          with:
+            path: ~/.m2/repository
+            key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+            restore-keys: |
+              ${{ runner.os }}-maven-
+
+        - name: Check cache status and set retry flag
+          if: steps.maven-cache.outputs.cache-hit != 'true'
+          run: echo "MAVEN_OPTS=-Dmaven.artifact.threads=5" >> $GITHUB_ENV
+
+        - name: Build with Maven
+          run: mvn --batch-mode --no-transfer-progress -T 1C verify
+
+  - language: yaml
+    label: "Maven settings.xml: Add mirror fallback to reduce direct Maven Central load"
+    code: |
+      # .github/maven-settings.xml — add to repository root
+      # Reference in workflow: mvn -s .github/maven-settings.xml ...
+      #
+      # <settings>
+      #   <mirrors>
+      #     <mirror>
+      #       <id>central-mirror</id>
+      #       <mirrorOf>central</mirrorOf>
+      #       <url>https://repo1.maven.org/maven2/</url>
+      #     </mirror>
+      #   </mirrors>
+      # </settings>
+      #
+      # Then in workflow:
+      - name: Build with Maven (mirror fallback)
+        run: mvn -s .github/maven-settings.xml --batch-mode verify
+
+prevention:
+  - "Monitor githubstatus.com/history for GitHub Actions cache incidents before assuming build failures are configuration errors."
+  - "Add --no-transfer-progress to Maven commands to reduce output noise; add -Dmaven.artifact.threads=3 to reduce concurrent Central requests."
+  - "Configure restore-keys fallback in actions/cache so partial cache hits reduce Maven Central traffic."
+  - "Consider self-hosted Nexus or AWS CodeArtifact as a Maven Central proxy for production CI pipelines."
+  - "Add 'if: always()' or cache-miss detection to skip cache restore wait during known outages."
+
+docs:
+  - url: "https://github.com/actions/runner/issues/4180"
+    label: "actions/runner#4180: CI Runners Failing with 403 Forbidden for Maven/Gradle (75 reactions)"
+  - url: "https://www.githubstatus.com/"
+    label: "GitHub Status — check for Actions cache service incidents"
+  - url: "https://central.sonatype.org/faq/rate-limiting/"
+    label: "Sonatype Maven Central: Rate limiting and fair use policy"
+  - url: "https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows"
+    label: "GitHub Docs: Caching dependencies to speed up workflows"
