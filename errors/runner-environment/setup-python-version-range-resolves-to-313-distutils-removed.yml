@@ -1,0 +1,107 @@
+id: runner-environment-099
+title: "setup-python python-version '3' resolves to Python 3.13 — distutils and other removed modules cause ImportError"
+category: runner-environment
+severity: error
+tags:
+  - setup-python
+  - python-3-13
+  - distutils
+  - breaking-change
+  - version-pinning
+patterns:
+  - regex: 'ModuleNotFoundError.*distutils'
+    flags: 'i'
+  - regex: 'No module named .distutils.'
+    flags: 'i'
+  - regex: 'ImportError.*distutils'
+    flags: 'i'
+error_messages:
+  - "ModuleNotFoundError: No module named 'distutils'"
+  - "No module named 'distutils'"
+  - "error: can't find distutils"
+root_cause: |
+  Python 3.12 moved distutils into setuptools (no longer stdlib), and Python 3.13
+  fully removed it from the standard library (PEP 632, deprecated since 3.10).
+
+  GitHub Actions workflows using a floating python-version constraint:
+    python-version: '3'
+    python-version: '3.x'
+    python-version: 'latest'
+  ...resolved to Python 3.13 when it became the latest stable release (October 2024).
+  Runner images updated to include 3.13 as the available version for these constraints.
+
+  Any project that imports distutils directly (setup.py, older NumPy, Cython, some
+  SWIG bindings) or tools that internally import it will fail with:
+    ModuleNotFoundError: No module named 'distutils'
+
+  Additional modules removed in Python 3.12-3.13 that break CI:
+  - cgi, imghdr (removed 3.13)
+  - aifc, sunau, chunk, crypt (removed 3.13)
+  - imp module (removed 3.12)
+  - asynchat, asyncore (removed 3.12)
+
+  The failure is from the floating version constraint resolving higher than intended,
+  not from the runner image itself. Pinned workflows on 3.11 or 3.12 are unaffected.
+fix: |
+  Pin python-version to a specific minor version instead of using a floating
+  constraint. If distutils is required, use the setuptools-provided shim.
+
+  Migration options for distutils usage:
+  - Replace distutils.core.setup with setuptools.setup
+  - Replace distutils.util.strtobool with a custom bool parser
+  - Replace distutils.version.LooseVersion with packaging.version.Version
+  - Install setuptools on Python 3.13 to restore the distutils shim
+fix_code:
+  - language: yaml
+    label: 'Pin to specific minor version to avoid 3.13+ resolution'
+    code: |
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'   # Pinned — won't resolve to 3.13+
+          # OR: '3.12'  (distutils still available via setuptools shim)
+  - language: yaml
+    label: 'Use setuptools shim on Python 3.13'
+    code: |
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install setuptools for distutils compatibility
+        run: pip install setuptools   # Restores distutils shim on 3.13+
+  - language: yaml
+    label: 'Pin version via .python-version file'
+    code: |
+      # .python-version file in repo root:
+      # 3.11.9
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: '.python-version'   # Reads from repo file
+  - language: yaml
+    label: 'Matrix across versions to catch breakage early'
+    code: |
+      jobs:
+        test:
+          strategy:
+            matrix:
+              python-version: ['3.11', '3.12', '3.13']
+          steps:
+            - uses: actions/setup-python@v5
+              with:
+                python-version: ${{ matrix.python-version }}
+            - run: pip install setuptools   # Shim for 3.13
+            - run: pip install -e .
+            - run: pytest
+prevention:
+  - 'Never use python-version: 3 or python-version: 3.x in production workflows without testing each new minor release'
+  - 'Pin to a specific minor version (3.11, 3.12) or use a .python-version file in the repo'
+  - 'Run CI on a matrix of python versions to catch version-specific breakage early'
+  - 'Audit setup.py for direct distutils imports and replace with setuptools equivalents before upgrading to 3.13'
+docs:
+  - url: 'https://docs.python.org/3/whatsnew/3.13.html#removed-modules'
+    label: 'Python 3.13 — Removed Modules'
+  - url: 'https://peps.python.org/pep-0632/'
+    label: 'PEP 632 — Deprecate distutils'
+  - url: 'https://github.com/actions/setup-python'
+    label: 'actions/setup-python repository'
+  - url: 'https://docs.github.com/en/actions/use-cases-and-examples/building-and-testing/building-and-testing-python'
+    label: 'GitHub Docs — Building and testing Python'
