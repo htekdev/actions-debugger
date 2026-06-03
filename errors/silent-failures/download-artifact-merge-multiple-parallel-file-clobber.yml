@@ -1,0 +1,119 @@
+id: 'silent-failures-038'
+title: '`download-artifact` `merge-multiple: true` silently corrupts files when multiple artifacts contain identical filenames'
+category: silent-failures
+severity: silent-failure
+tags:
+  - download-artifact
+  - merge-multiple
+  - file-corruption
+  - parallel-download
+  - race-condition
+  - artifacts
+patterns:
+  - regex: 'merge-multiple:\s*true'
+    flags: 'i'
+  - regex: 'Downloading artifact:.*\n.*Downloading artifact:'
+    flags: 'im'
+error_messages:
+  - 'Downloading artifact: build-linux to /home/runner/work/repo/repo/dist'
+  - 'Downloading artifact: build-macos to /home/runner/work/repo/repo/dist'
+root_cause: |
+  When actions/download-artifact (v4+) is used with merge-multiple: true and two or more
+  artifacts contain files with identical relative paths (e.g., multiple matrix builds each
+  upload a file named checksums.txt or report.json), the action downloads all artifacts
+  in parallel using a PARALLEL_DOWNLOADS worker pool.
+
+  All parallel workers write to the same destination directory concurrently. When two
+  workers attempt to write to the same filename simultaneously, the result is undefined:
+  - The output file may contain interleaved bytes from both sources
+  - The file may be truncated to the size of the smaller upload
+  - One artifact's version may completely overwrite the other (last writer wins)
+
+  The action exits with code 0 and emits no error or warning. The log shows both artifacts
+  downloading normally. The resulting corrupt file is indistinguishable from a valid one
+  unless explicitly checksummed.
+
+  Bug confirmed in actions/download-artifact#395 (March 2025, still open as of Jan 2026).
+  Affects: v4.x, v5.x, v6.x, v7.x
+
+  Common patterns that trigger this bug:
+  - Matrix builds across OS/arch each producing a same-named binary or manifest
+  - Release workflows where each artifact contains a same-named README.md or LICENSE
+  - Merge-and-sign workflows where each per-platform artifact has a checksums.txt
+fix: |
+  Option 1 — Rename artifact files to include OS/arch before uploading so no two
+  artifacts ever contain a file at the same relative path.
+
+  Option 2 — Download each artifact by name into a separate directory rather than using
+  merge-multiple: true.
+
+  Option 3 — Validate checksums of all critical files after downloading and before
+  using them, so corruption is detected rather than silently propagated.
+
+  Option 4 — Use pattern: to download specific artifact subsets one group at a time,
+  ensuring no overlapping filenames within each group.
+fix_code:
+  - language: yaml
+    label: 'Include OS/arch in output filenames to eliminate same-path collisions'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, macos-latest, windows-latest]
+          runs-on: ${{ matrix.os }}
+          steps:
+            - name: Build and rename output to include OS identifier
+              run: |
+                cp build/output dist/output-${{ runner.os }}-${{ runner.arch }}
+
+            - uses: actions/upload-artifact@v4
+              with:
+                name: build-${{ runner.os }}-${{ runner.arch }}
+                path: dist/output-${{ runner.os }}-${{ runner.arch }}
+
+        release:
+          needs: build
+          runs-on: ubuntu-latest
+          steps:
+            - name: Download all artifacts (safe — all filenames are unique)
+              uses: actions/download-artifact@v4
+              with:
+                pattern: build-*
+                path: dist/
+                merge-multiple: true
+  - language: yaml
+    label: 'Download each artifact by name into a separate directory (avoids merge-multiple entirely)'
+    code: |
+      jobs:
+        release:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/download-artifact@v4
+              with:
+                name: build-Linux
+                path: dist/linux/
+
+            - uses: actions/download-artifact@v4
+              with:
+                name: build-macOS
+                path: dist/macos/
+
+            - uses: actions/download-artifact@v4
+              with:
+                name: build-Windows
+                path: dist/windows/
+
+            # Files are in separate directories — no parallel write collision possible
+prevention:
+  - 'Always include a unique dimension (OS, arch, matrix value) in filenames when uploading from matrix jobs'
+  - 'Audit all artifacts before using merge-multiple: true to confirm no two artifacts share a file path'
+  - 'Verify checksums of all merged files before using them in signing, publishing, or deployment steps'
+  - 'Prefer downloading by name into separate directories over merge-multiple when file collisions are possible'
+docs:
+  - url: 'https://github.com/actions/download-artifact/issues/395'
+    label: 'actions/download-artifact#395: merge-multiple silently corrupts files when same-named files exist (open, March 2025)'
+  - url: 'https://github.com/actions/download-artifact/blob/main/docs/MIGRATION.md#merging-multiple-artifacts'
+    label: 'download-artifact migration guide: Merging multiple artifacts'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflows-do/storing-workflow-data-as-artifacts'
+    label: 'GitHub Docs: Storing workflow data as artifacts'
