@@ -1,0 +1,133 @@
+id: known-unsolved-020
+title: "Homebrew Transitive Dependency Silently Removed — Only Documented Formulas Are Guaranteed"
+category: known-unsolved
+severity: limitation
+tags:
+  - macos
+  - homebrew
+  - transitive-dependency
+  - runner-image
+  - brew
+  - silent-removal
+  - limitation
+patterns:
+  - regex: "No such file or directory.*homebrew.*opt.*\\b(libevent|libiconv|libffi|gettext)\\b"
+    flags: "i"
+  - regex: "Library not loaded.*homebrew.*opt.*\\.dylib.*image not found"
+    flags: "i"
+  - regex: "brew.*error.*([a-z0-9_-]+): No available formula"
+    flags: "i"
+  - regex: "dyld.*Library not loaded.*/opt/homebrew/opt/[a-z0-9_-]+/lib"
+    flags: "i"
+error_messages:
+  - "Error: No such file or directory - /opt/homebrew/opt/libevent/lib/libevent.dylib"
+  - "dyld[80]: Library not loaded: /opt/homebrew/opt/libevent/lib/libevent.dylib"
+  - "pkg-config: Package 'libevent', required by 'virtual:world', not found"
+  - "CMake Error: Could not find a package configuration file provided by 'libevent'"
+root_cause: |
+  GitHub-hosted macOS runner images include a curated list of Homebrew formulae that are
+  **officially documented and guaranteed** (listed in the image README, e.g.
+  `images/macos/macos-15-Readme.md`). Any Homebrew package that is present on the image
+  only as a **transitive dependency** of another formula — not explicitly documented — can
+  silently disappear between image updates when the parent formula's dependency chain changes.
+
+  **What happens:**
+  When a documented formula is upgraded (e.g., `tmux`, `openssl@3`, `ffmpeg`), its new
+  version may no longer depend on the same set of transitive packages as the previous
+  version. The transitive dependency is removed from the image automatically in the next
+  image release, with no announcement, no deprecation notice, and no entry in the image
+  changelog.
+
+  **Real example:** `libevent` was present on `macos-15` images as a transitive dependency
+  of another documented formula. When that formula's dependency chain changed in the
+  `20260525.0142.1` image, `libevent` was removed. Workflows depending on `libevent`
+  (for building tmux from source, libevent-based C++ servers, etc.) began failing with
+  "No such file or directory" errors without any changes to the workflow itself.
+
+  GitHub's response (confirmed in runner-images#14170):
+  > "libevent has never been part of the documented Homebrew Formulae list. It was only
+  > present incidentally as a transitive dependency of another formula, and that
+  > dependency chain has changed in the newer image. Since libevent is not an officially
+  > preinstalled tool on the image, its presence is not guaranteed across image versions
+  > and we don't plan to pin it."
+
+  **This is by design and will not be fixed.** The GitHub runner-images team will not
+  guarantee transitive dependencies — only the explicitly documented formula list is stable.
+
+  Source: actions/runner-images#14170 (closed as `wontfix / not_planned`, May 2026).
+fix: |
+  The only reliable fix is to **explicitly install every library your workflow needs**,
+  regardless of whether it "happens to be there" on the current image.
+
+  **Immediate fix:** Add `brew install <missing-package>` as a workflow step before
+  any step that requires the package:
+
+  **Long-term fix:** Audit ALL your workflow's Homebrew dependencies and cross-reference
+  each one against the official runner image README. Any package NOT listed there must be
+  explicitly installed in your workflow.
+
+  **Finding the image README:**
+  - macOS 15: https://github.com/actions/runner-images/blob/main/images/macos/macos-15-Readme.md
+  - macOS 26: https://github.com/actions/runner-images/blob/main/images/macos/macos-26-Readme.md
+  If your package isn't in the "Homebrew Packages" section of the README, install it
+  explicitly — it's not guaranteed.
+fix_code:
+  - language: yaml
+    label: "Explicitly install transitive dependencies before use"
+    code: |
+      jobs:
+        build:
+          runs-on: macos-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            # Explicitly install ALL required libraries — even ones that "used to be there"
+            - name: Install dependencies
+              run: |
+                brew install libevent libffi gettext
+                # Do NOT rely on transitive deps from other formulae
+
+            - name: Build
+              run: make
+  - language: yaml
+    label: "Audit step — verify dependencies are explicitly documented"
+    code: |
+      # Check if your dependency is in the official image README:
+      # curl -s https://raw.githubusercontent.com/actions/runner-images/main/images/macos/macos-15-Readme.md \
+      #   | grep -i "libevent"
+      # If no output → the package is NOT guaranteed → add brew install
+
+      - name: Ensure all dependencies are installed
+        run: |
+          # Install everything your build actually needs
+          brew install libevent tmux pkg-config
+  - language: yaml
+    label: "Cache explicit brew installs to reduce per-job overhead"
+    code: |
+      - name: Cache Homebrew packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/Homebrew
+            /opt/homebrew/Cellar
+          key: ${{ runner.os }}-brew-${{ hashFiles('Brewfile') }}
+          restore-keys: |
+            ${{ runner.os }}-brew-
+
+      - name: Install dependencies from Brewfile
+        run: brew bundle
+prevention:
+  - "Never rely on a Homebrew package being preinstalled unless it is explicitly listed in the runner image's official README (linked below)."
+  - "Maintain a `Brewfile` in your repository and use `brew bundle` to install all macOS dependencies explicitly — this documents and enforces your true dependency set."
+  - "When a workflow starts failing on macOS runners after an image update, check the runner-images release notes for formula removals and cross-reference against the image README."
+  - "Subscribe to runner-images releases (GitHub → Watch → Releases) to get notified when the image README changes and transitive deps may be affected."
+  - "Run `brew deps --tree <your-installed-formula>` locally to identify which transitive deps your workflow relies on, then add explicit `brew install` calls for each."
+docs:
+  - url: "https://github.com/actions/runner-images/issues/14170"
+    label: "runner-images#14170: macos-15 libevent removed as transitive dep (closed wontfix)"
+  - url: "https://github.com/actions/runner-images/blob/main/images/macos/macos-15-Readme.md"
+    label: "macOS 15 runner image README — official guaranteed software list"
+  - url: "https://github.com/actions/runner-images/blob/main/images/macos/macos-26-Readme.md"
+    label: "macOS 26 runner image README — official guaranteed software list"
+  - url: "https://docs.brew.sh/Manpage#bundle-subcommand"
+    label: "Homebrew Bundle subcommand — manage dependencies via Brewfile"
