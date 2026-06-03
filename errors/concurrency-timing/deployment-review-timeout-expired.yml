@@ -1,0 +1,88 @@
+id: "concurrency-timing-021"
+title: "Deployment job expires when environment review timeout lapses"
+category: "concurrency-timing"
+severity: "error"
+tags:
+  - "deployment"
+  - "environment"
+  - "protection-rule"
+  - "review-timeout"
+  - "pending"
+  - "expired"
+patterns:
+  - regex: "was not approved before the review period expired"
+    flags: "i"
+  - regex: "deployment.*review period expired"
+    flags: "i"
+  - regex: "Your deployment to .+ expired"
+    flags: "i"
+error_messages:
+  - "Your deployment to [environment] was not approved before the review period expired."
+root_cause: |
+  Environment protection rules that require manual reviewers have a configurable review
+  timeout (default 30 days; configurable from 1 to 30 days). When a workflow job waits
+  for approval and no reviewer acts within that window, the deployment job automatically
+  fails with a timeout error.
+
+  This creates a silent cascade: while the job is pending, it appears as "Waiting" in
+  the UI with no failure indicator. Needs-dependent jobs that run after the deployment
+  also remain queued. When the timeout fires, the deployment job fails, which then
+  cascade-fails all downstream jobs simultaneously — a large batch of failures with a
+  confusing single root cause.
+
+  Common triggers:
+  - Teams shorten the timeout from 30 days to 1-7 days for security compliance.
+  - Approvers are on leave or in different time zones and miss the notification.
+  - A deployment is triggered late Friday; nobody approves over the weekend.
+  - The notification email was caught by spam filters or notification fatigue.
+fix: |
+  1. Re-run the failed workflow — a fresh run starts a new review clock.
+  2. Increase the review timeout in: repo Settings → Environments → [env]
+     → Protection rules → Required reviewers → "Timeout".
+  3. Add more reviewers or a team with guaranteed availability across time zones.
+  4. Send a proactive notification (Slack, Teams, PagerDuty) at deploy-queue time
+     so reviewers don't have to poll GitHub.
+fix_code:
+  - language: yaml
+    label: "Notify reviewers immediately when the deployment enters the queue"
+    code: |
+      jobs:
+        notify-pending:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Notify reviewers that approval is needed
+              uses: slackapi/slack-github-action@v2
+              with:
+                webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+                webhook-type: incoming-webhook
+                payload: |
+                  {
+                    "text": ":rocket: Deployment to *production* is waiting for review.\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Approve here>"
+                  }
+
+        deploy:
+          needs: notify-pending
+          runs-on: ubuntu-latest
+          environment: production
+          steps:
+            - name: Deploy
+              run: ./deploy.sh
+
+  - language: yaml
+    label: "Programmatic re-trigger via workflow_dispatch on expiry (escape hatch)"
+    code: |
+      # After a timeout expiry, re-run the failed workflow via GitHub CLI:
+      # gh run rerun <run-id> --repo owner/repo --failed
+      # Or push a no-op commit to trigger a fresh run.
+prevention:
+  - "Configure Slack/Teams/email notifications that fire when a deployment enters the pending approval state — do not rely on reviewers proactively checking GitHub."
+  - "Add multiple reviewers or use a team as reviewer so a single person's absence doesn't block the pipeline."
+  - "Do not shorten the review timeout below what your team can realistically respond to (e.g., account for weekends and holidays)."
+  - "Use the wait-timer setting only if you need a minimum delay; set it lower than the review timeout."
+docs:
+  - url: "https://docs.github.com/en/actions/managing-workflow-runs/reviewing-deployments"
+    label: "GitHub Docs — Reviewing deployments"
+  - url: "https://docs.github.com/en/actions/deployment/targeting-different-environments/using-environments-for-deployment#required-reviewers"
+    label: "GitHub Docs — Environment protection rules: required reviewers and timeout"
+  - url: "https://github.com/orgs/community/discussions/72259"
+    label: "GitHub Community #72259 — Approving environment deployment in Actions"
