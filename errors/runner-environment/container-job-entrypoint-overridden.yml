@@ -1,0 +1,90 @@
+id: runner-environment-080
+title: "Container job ENTRYPOINT silently overridden by GitHub Actions runner"
+category: runner-environment
+severity: silent-failure
+tags:
+  - container
+  - docker
+  - entrypoint
+  - job-container
+  - dockerfile
+  - initialization
+patterns:
+  - regex: 'ENTRYPOINT.*not.*execut|entrypoint.*not.*run|entrypoint.*overrid|custom.*entrypoint.*skip'
+    flags: 'i'
+  - regex: 'container.*init.*fail|setup.*script.*not.*run'
+    flags: 'i'
+error_messages:
+  - "Custom initialization script did not run in container job"
+  - "Expected environment setup from ENTRYPOINT was missing"
+  - "Docker container ENTRYPOINT not executing in GitHub Actions"
+root_cause: |
+  When a workflow job uses a container image via the container: key, the GitHub
+  Actions runner creates the container with --entrypoint "", explicitly replacing
+  any ENTRYPOINT defined in the Docker image with an empty string. This is by
+  design: the runner must inject its own workspace setup and process management
+  before any user steps run.
+
+  As a result, ENTRYPOINT instructions in the container Dockerfile are silently
+  ignored. Steps then run via docker exec into the already-running container, so
+  the ENTRYPOINT never fires. Initialization logic that developers expect to run
+  (environment setup, tool configuration, user switching) simply does not happen.
+
+  This is distinct from Docker container ACTIONS (action.yml with runs.using:
+  docker), which DO execute ENTRYPOINT as specified. The override only applies to
+  workflow job containers (jobs.<id>.container:).
+fix: |
+  Choose one of these approaches:
+
+  1. Move initialization to CMD. GitHub Actions does not override CMD, and the
+     docker container options: field lets you pass --entrypoint pointing to your
+     init script.
+
+  2. Use the container options: field to specify the entrypoint explicitly:
+     options: --entrypoint /path/to/init.sh
+
+  3. Add an explicit initialization step at the top of the job. This is the most
+     transparent approach: the step runs before other steps and is visible in logs.
+
+  4. Switch to a Docker container ACTION (action.yml) if you need ENTRYPOINT
+     semantics and own the action definition.
+fix_code:
+  - language: yaml
+    label: "Option A: Override entrypoint via container options"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          container:
+            image: my-custom-image:latest
+            options: --entrypoint /usr/local/bin/my-init.sh
+          steps:
+            - name: Run build
+              run: make build
+
+  - language: yaml
+    label: "Option B: Run initialization as an explicit first step (most transparent)"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          container:
+            image: my-custom-image:latest
+          steps:
+            - name: Initialize environment
+              run: /usr/local/bin/my-init.sh
+            - name: Run build
+              run: make build
+prevention:
+  - "Do not rely on ENTRYPOINT for initialization in workflow job containers"
+  - "Use CMD for default command arguments; keep setup in workflow steps or the options: field"
+  - "Test container behavior locally with docker run --entrypoint '' myimage bash to simulate GitHub Actions"
+  - "Use Docker container actions (action.yml with runs.using: docker) when ENTRYPOINT execution is required"
+  - "Document any ENTRYPOINT logic removal in a comment in the Dockerfile"
+docs:
+  - url: "https://docs.github.com/en/actions/reference/dockerfile-support-for-github-actions"
+    label: "Dockerfile support for GitHub Actions"
+  - url: "https://docs.github.com/en/actions/using-jobs/running-jobs-in-a-container"
+    label: "Running jobs in a container"
+  - url: "https://github.com/actions/runner/issues/1964"
+    label: "actions/runner#1964: Docker entrypoint not executing in container jobs (open, 8 reactions)"
