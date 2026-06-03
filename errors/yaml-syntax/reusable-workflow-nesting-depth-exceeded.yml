@@ -1,0 +1,113 @@
+id: yaml-syntax-024
+title: "Reusable Workflow Nesting Exceeds Maximum Depth of 4 Levels"
+category: yaml-syntax
+severity: error
+tags:
+  - reusable-workflow
+  - nesting
+  - depth-limit
+  - workflow_call
+  - yaml-parse-error
+
+patterns:
+  - regex: "would exceed the limit on called workflow depth of \\d+"
+    flags: "i"
+  - regex: "calls workflow .+, but doing so would exceed the limit"
+    flags: "i"
+
+error_messages:
+  - "error parsing called workflow \"./.github/workflows/deploy.yml@\": job \"build\" calls workflow \"./.github/workflows/release.yml@\", but doing so would exceed the limit on called workflow depth of 3"
+  - "but doing so would exceed the limit on called workflow depth of 3"
+
+root_cause: |
+  GitHub Actions enforces a maximum reusable workflow call depth of 4 levels total.
+  The top-level workflow counts as level 1, so the maximum number of sequential
+  workflow_call hops is 3 (levels 2, 3, and 4).
+
+  The error message says "depth of 3" because it refers to the maximum allowed
+  zero-indexed depth of called workflows, not the total chain length.  When your
+  chain would require a 4th call (fifth total workflow), GitHub rejects the YAML
+  at parse time — before any runner picks up the job.
+
+  Example chain that fails:
+    root.yml → a.yml → b.yml → c.yml → d.yml   (depth index 4 → rejected)
+
+  Example chain that succeeds:
+    root.yml → a.yml → b.yml → c.yml            (depth index 3 → allowed)
+
+  This limit was increased from 2 to 3 in August 2022 and is currently fixed at 4
+  total levels (depth index 0–3).
+
+fix: |
+  Reduce the nesting depth so the total chain is 4 levels or fewer.
+  Strategies:
+
+  1. Flatten: merge two deeply-nested reusable workflows into one.
+  2. Convert inner reusables to composite actions — composite actions do NOT
+     count toward the reusable workflow depth limit.
+  3. Restructure so leaf workflows are composite actions, keeping reusable
+     workflows only at the top layers.
+
+fix_code:
+  - language: yaml
+    label: "Replace inner reusable workflow with a composite action"
+    code: |
+      # Instead of calling another reusable workflow at depth 4,
+      # use a composite action in .github/actions/my-task/action.yml
+      # which has no depth limit.
+
+      # .github/actions/my-task/action.yml
+      name: My Task
+      description: Previously a reusable workflow, now a composite action
+      runs:
+        using: composite
+        steps:
+          - name: Do the work
+            shell: bash
+            run: echo "doing the work"
+
+      # Called from the deeply-nested workflow:
+      - name: Run my task
+        uses: ./.github/actions/my-task  # composite, no depth counted
+
+  - language: yaml
+    label: "Flatten two reusable workflows into one to reduce depth"
+    code: |
+      # Before (depth 4 — fails):
+      # root.yml  →  build.yml  →  test.yml  →  lint.yml  →  scan.yml
+      #
+      # After (depth 3 — passes):
+      # Merge lint.yml and scan.yml into a single quality.yml
+
+      # quality.yml
+      on:
+        workflow_call:
+          inputs:
+            target:
+              required: true
+              type: string
+      jobs:
+        lint:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: echo "linting ${{ inputs.target }}"
+        scan:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: echo "scanning ${{ inputs.target }}"
+
+prevention:
+  - "Map your reusable workflow call chain before writing YAML — count total levels."
+  - "Prefer composite actions for leaf-level tasks; they have no depth limit."
+  - "Limit reusable workflow use to high-value shared orchestration layers, not every step."
+  - "If depth 4 is genuinely required, consider splitting the pipeline into separate triggered workflows using workflow_run instead of nested workflow_call."
+
+docs:
+  - url: "https://docs.github.com/en/actions/using-workflows/reusing-workflows#nesting-reusable-workflows"
+    label: "GitHub Docs — Nesting reusable workflows"
+  - url: "https://github.blog/changelog/2022-08-22-github-actions-improvements-to-reusable-workflows-2/"
+    label: "GitHub Changelog — Nesting increased to 4 levels (August 2022)"
+  - url: "https://github.com/actions/runner/issues/1797"
+    label: "actions/runner#1797 — Original depth-limit enhancement request"

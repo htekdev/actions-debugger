@@ -1,0 +1,114 @@
+id: triggers-019
+title: "workflow_run-Triggered Job Checks Out Default Branch, Not the Triggering PR's Branch"
+category: triggers
+severity: silent-failure
+tags:
+  - workflow_run
+  - checkout
+  - default-branch
+  - silent-failure
+  - pull-request
+
+patterns:
+  - regex: "workflow_run.*head_branch"
+    flags: "i"
+  - regex: "github\\.event\\.workflow_run\\.head_branch"
+    flags: "i"
+
+error_messages:
+  - "# No error message — the job silently runs against the wrong branch (e.g., main instead of the PR's feature branch)"
+  - "HEAD is now at <main-branch-commit> — expected feature branch content not present"
+
+root_cause: |
+  When a workflow is triggered via `workflow_run`, the triggered workflow ALWAYS
+  runs in the context of the repository's DEFAULT branch, not the branch that
+  caused the original workflow to run.
+
+  This means that `actions/checkout` without an explicit `ref:` will check out
+  the default branch (e.g., `main`), even when the triggering workflow ran on a
+  feature branch or PR. The job may silently pass because it's testing old code
+  on `main` rather than the developer's new changes.
+
+  This is by design: `workflow_run` is intended for privileged workflows that
+  run in the base repository context regardless of where the triggering push came
+  from. It avoids giving fork PRs access to secrets — but it also means the
+  checkout behavior surprises developers expecting to test branch code.
+
+  The branch of the triggering workflow IS available via the event context:
+    `github.event.workflow_run.head_branch`
+    `github.event.workflow_run.head_sha`
+
+fix: |
+  Explicitly set the `ref:` in your `actions/checkout` step to the triggering
+  workflow's head commit SHA or branch name.
+
+  Use `head_sha` (not `head_branch`) for more precise pinning — branch names
+  can advance between trigger and checkout for busy repositories.
+
+fix_code:
+  - language: yaml
+    label: "Checkout the triggering workflow's exact commit"
+    code: |
+      on:
+        workflow_run:
+          workflows: ["CI — Unit Tests"]
+          types: [completed]
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          if: ${{ github.event.workflow_run.conclusion == 'success' }}
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                # Use head_sha for precise pinning — not head_branch
+                ref: ${{ github.event.workflow_run.head_sha }}
+
+  - language: yaml
+    label: "Download artifacts from the triggering workflow run instead of re-checking out"
+    code: |
+      # For deployment workflows, prefer downloading the build artifact
+      # from the triggering run rather than re-building from source.
+      # This avoids the branch checkout problem entirely.
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          if: ${{ github.event.workflow_run.conclusion == 'success' }}
+          steps:
+            - uses: actions/download-artifact@v4
+              with:
+                run-id: ${{ github.event.workflow_run.id }}
+                name: build-output
+                github-token: ${{ secrets.GITHUB_TOKEN }}
+            - name: Deploy
+              run: ./deploy.sh
+
+  - language: yaml
+    label: "Guard against running on wrong branch with a condition"
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          # Only deploy when triggered from the main branch to avoid
+          # accidentally deploying non-main code
+          if: |
+            github.event.workflow_run.conclusion == 'success' &&
+            github.event.workflow_run.head_branch == 'main'
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.workflow_run.head_sha }}
+
+prevention:
+  - "Always specify ref: ${{ github.event.workflow_run.head_sha }} in checkout steps inside workflow_run-triggered jobs."
+  - "Prefer downloading build artifacts over re-checking-out source code in workflow_run jobs to avoid branch confusion."
+  - "Log github.event.workflow_run.head_branch and head_sha at the start of workflow_run jobs for debugging."
+  - "Use the conclusion check (if: github.event.workflow_run.conclusion == 'success') to avoid deploying failed builds."
+
+docs:
+  - url: "https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#workflow_run"
+    label: "GitHub Docs — workflow_run event"
+  - url: "https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#using-data-from-the-triggering-workflow"
+    label: "GitHub Docs — Using data from the triggering workflow"
+  - url: "https://stackoverflow.com/questions/76184351"
+    label: "SO#76184351 — workflow_run job runs on wrong (default) branch"

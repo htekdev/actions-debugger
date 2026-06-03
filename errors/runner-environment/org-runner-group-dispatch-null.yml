@@ -1,0 +1,102 @@
+id: runner-environment-059
+title: "Org-Level Self-Hosted Runner in Group Never Dispatched — Job Queued Indefinitely"
+category: runner-environment
+severity: error
+tags:
+  - self-hosted-runner
+  - runner-group
+  - org-runner
+  - queued
+  - dispatch
+
+patterns:
+  - regex: "no runner.*matching.*label.*self-hosted"
+    flags: "i"
+  - regex: "runner_group_id.*null"
+    flags: "i"
+
+error_messages:
+  - "Can't find any online and idle self-hosted runner in the current repository, account/organization that matches the required labels: 'self-hosted, <group-name>'"
+  - "Waiting for a runner to pick up this job..."
+
+root_cause: |
+  When a self-hosted runner is registered at the ORGANIZATION level and placed into
+  a runner group that has explicit repository access, the GitHub Actions dispatcher
+  sometimes fails to resolve the runner's group membership within the target
+  repository's scope. The job's metadata shows runner_group_id: null throughout the
+  entire wait period, meaning the internal broker never matched the org-level runner
+  to the queued job.
+
+  This affects runners using the V2 broker protocol
+  (broker.actions.githubusercontent.com) on GitHub Team and Enterprise plans.
+  The runner appears "Online" in the org settings, the runner group lists the target
+  repository as allowed, and the runs-on labels match — yet the job never starts.
+
+  Root technical cause: the dispatcher resolves runner group membership differently
+  for org-scoped runners vs. repo-scoped runners. When the runner is registered at
+  org scope, the broker does not propagate its group_id to the queued job record,
+  so no assignment occurs.
+
+fix: |
+  Short-term workaround (immediate):
+    Re-register the runner at the REPOSITORY level instead of the organization level.
+    This bypasses the group dispatch path and the job is assigned immediately.
+
+  Long-term fix:
+    1. Monitor GitHub Actions runner releases for a fix to org-level group dispatch.
+    2. Use GitHub-hosted larger runners or runner scale sets (Actions Runner Controller)
+       for org-level sharing — these use a different dispatch mechanism that is not
+       affected by this bug.
+    3. If org-level management is required, use runner groups with repo-scoped runner
+       registration and rely on group access policies to control visibility.
+
+fix_code:
+  - language: yaml
+    label: "Re-register runner at repository level (workaround)"
+    code: |
+      # 1. Remove the runner from the org-level runner list in GitHub UI:
+      #    Settings → Actions → Runners → (select runner) → Remove runner
+      #
+      # 2. Re-register the runner at the REPO level:
+      #    <repo> → Settings → Actions → Runners → New self-hosted runner
+      #    Follow setup commands shown in the UI.
+      #
+      # 3. Your workflow runs-on stays the same:
+      jobs:
+        build:
+          runs-on: [self-hosted, my-runner-label]
+          steps:
+            - uses: actions/checkout@v4
+
+  - language: yaml
+    label: "Use Actions Runner Controller (ARC) for org-level runners"
+    code: |
+      # ARC scale sets are not affected by the org-runner group dispatch bug.
+      # Install the controller chart and create a runner scale set:
+      #
+      # helm install arc-runner-set \
+      #   --namespace arc-runners \
+      #   oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set \
+      #   --set githubConfigUrl=https://github.com/<org> \
+      #   --set githubConfigSecret.github_token=<token>
+      #
+      # Then reference in your workflow:
+      jobs:
+        build:
+          runs-on: arc-runner-set
+          steps:
+            - uses: actions/checkout@v4
+
+prevention:
+  - "Register self-hosted runners at repository level when possible to avoid org-level dispatch issues."
+  - "After registering a runner, trigger a test workflow immediately to confirm dispatch before relying on it in production."
+  - "Use Actions Runner Controller (ARC) scale sets for org-wide shared runners — ARC bypasses the runner group dispatch path."
+  - "Check runner_group_id via the API (`GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs`) when a job is stuck — null means dispatch failed at the broker level."
+
+docs:
+  - url: "https://github.com/actions/runner/issues/4429"
+    label: "actions/runner#4429 — Org-level runner never dispatched despite correct group access (May 2026)"
+  - url: "https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners"
+    label: "GitHub Docs — Runner registration scopes"
+  - url: "https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/using-self-hosted-runners-in-a-workflow"
+    label: "GitHub Docs — Using self-hosted runners in a workflow"
