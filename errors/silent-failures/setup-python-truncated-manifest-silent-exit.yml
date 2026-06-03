@@ -1,0 +1,111 @@
+id: silent-failures-029
+title: "setup-python Silently Exits 0 Without Installing Python When versions-manifest.json Is Truncated"
+category: silent-failures
+severity: silent-failure
+tags:
+  - setup-python
+  - versions-manifest
+  - silent-exit
+  - truncated-response
+  - python-not-installed
+patterns:
+  - regex: "evaluating 0 versions"
+    flags: "i"
+  - regex: "Version .+ was not found in the local cache"
+    flags: "i"
+  - regex: "Node Action run completed with exit code 0"
+    flags: "i"
+error_messages:
+  - "evaluating 0 versions"
+  - "Version 3.11 - 3.13 was not found in the local cache"
+  - "Getting manifest from actions/python-versions@main"
+  - "##[debug]Node Action run completed with exit code 0"
+  - "##[debug]Finishing: Setup python"
+root_cause: |
+  `actions/setup-python` fetches `versions-manifest.json` from the
+  `actions/python-versions` repository via two GitHub API calls:
+
+  1. A git tree request to locate the blob URL.
+  2. A raw blob fetch with `Accept: application/vnd.github.VERSION.raw`.
+
+  Sporadically, the second call returns HTTP 200 with a **truncated body** — the
+  JSON is cut off mid-object and unparseable. The action catches the JSON parse
+  error silently, treats the result as an empty release list, logs
+  "evaluating 0 versions", and exits with code 0 **without installing Python**.
+
+  The truncated response has two consistent symptoms:
+  - A ~30-second server-side delay before any bytes arrive.
+  - Only affects authenticated requests (5,000 req/hour tier); anonymous requests
+    return the full manifest, but the 60 req/hour limit is too low for real CI.
+
+  After the step exits 0, subsequent steps that call `python`, `pip`, or `python3`
+  either use the system Python (which may differ in version) or fail with
+  "python: not found" — neither of which points back to the manifest fetch failure.
+fix: |
+  Add an explicit Python version check immediately after setup-python to catch the
+  silent exit before it causes confusing downstream errors:
+
+    - run: python --version
+
+  For a more robust workaround, set `python-version` to an exact version string
+  (e.g., "3.11.9") rather than a range — exact versions can fall back to the
+  runner's pre-cached toolcache without requiring a manifest fetch.
+
+  If you must use a version range, add a shell-level retry loop around the Python
+  invocation, or use the `setup-python` `check-latest: false` option with a pinned
+  version to reduce manifest fetches.
+
+  File the issue with captured truncated manifest bodies at actions/setup-python
+  to help maintainers add retry-with-backoff logic to the manifest fetch path.
+fix_code:
+  - language: yaml
+    label: "Catch silent exit immediately after setup-python"
+    code: |
+      steps:
+        - uses: actions/setup-python@v5
+          with:
+            python-version: "3.11 - 3.13"
+            cache: pip
+
+        # Catch silent manifest-fetch failure before downstream confusion
+        - name: Verify Python installed
+          run: |
+            python --version || (echo "::error::setup-python silently failed — Python not installed" && exit 1)
+            pip --version
+
+        - run: pip install -r requirements.txt
+  - language: yaml
+    label: "Use exact version to avoid manifest fetch entirely (uses toolcache)"
+    code: |
+      steps:
+        - uses: actions/setup-python@v5
+          with:
+            python-version: "3.11.9"   # exact version — uses pre-cached toolcache
+            cache: pip                  # no manifest fetch needed for exact match
+        - run: python --version
+        - run: pip install -r requirements.txt
+  - language: yaml
+    label: "Use .python-version file for explicit pinning"
+    code: |
+      # .python-version file: 3.12.7
+      steps:
+        - uses: actions/setup-python@v5
+          with:
+            python-version-file: .python-version  # exact pin, no manifest range fetch
+            cache: pip
+        - run: python --version
+prevention:
+  - "Always add a python --version verification step after setup-python to surface silent failures immediately."
+  - "Pin to an exact Python version (e.g., '3.11.9') rather than a range to use the pre-cached toolcache and avoid manifest fetches."
+  - "Use a .python-version file for reproducible, exact pinning that also works with pyenv locally."
+  - "Monitor for the symptom pattern: setup-python exits 0 + 'evaluating 0 versions' + downstream python-not-found."
+  - "If using version ranges, run setup-python with cache: false first in a debug context to isolate manifest vs. cache failures."
+docs:
+  - url: "https://github.com/actions/setup-python/issues/1318"
+    label: "actions/setup-python#1318: setup-python silently exits 0 on truncated versions-manifest.json"
+  - url: "https://github.com/actions/python-versions"
+    label: "actions/python-versions: Source of versions-manifest.json"
+  - url: "https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python#specifying-a-python-version"
+    label: "GitHub Docs: Specifying a Python version"
+  - url: "https://github.com/actions/setup-python/blob/main/docs/advanced-usage.md"
+    label: "setup-python: Advanced Usage"

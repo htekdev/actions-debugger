@@ -1,0 +1,105 @@
+id: silent-failures-028
+title: "setup-node Silently Exits 0 Without Installing Node.js on Self-Hosted Runners"
+category: silent-failures
+severity: silent-failure
+tags:
+  - setup-node
+  - self-hosted
+  - download-failure
+  - silent-exit
+  - node-not-found
+patterns:
+  - regex: "Attempting to download [0-9]+\.[0-9]+\.[0-9]+\.\.\."
+    flags: "i"
+  - regex: "exec: node: not found"
+    flags: "i"
+  - regex: "node: not found"
+    flags: "i"
+error_messages:
+  - "Attempting to download 24.15.0..."
+  - "exec: node: not found"
+  - "node: not found"
+  - "/usr/bin/bash: node: not found"
+root_cause: |
+  On self-hosted runners (particularly those using `gha-runner-scale-set` or ephemeral
+  ARC runners), `actions/setup-node` can sporadically print
+  "Attempting to download <version>..." and then silently exit 0 without completing
+  the download or install.
+
+  The step outcome is `success` and the runner logs show no error — the action
+  simply returns without installing Node.js. Subsequent steps that invoke `node`,
+  `npm`, `pnpm`, or other Node-dependent tools then fail with "exec: node: not found"
+  or equivalent errors, which are far from the actual root cause.
+
+  This is a transient network or HTTP client failure in the `@actions/tool-cache`
+  download path. When the initial download attempt encounters a non-fatal HTTP error
+  (connection reset, early EOF, or interrupted read), the action sometimes swallows
+  the error and exits cleanly rather than retrying or calling `core.setFailed()`.
+  The issue is more common on self-hosted runners where network conditions are more
+  variable than on GitHub-hosted runners.
+
+  The action version affected is v6.x on self-hosted runners with `gha-runner-scale-set`
+  0.13.x and runner 2.334.x. Retrying the job almost always succeeds.
+fix: |
+  Add an explicit Node version verification step after setup-node to catch silent
+  failures before they cause confusing downstream errors:
+
+    - run: node --version
+
+  If this step fails, the issue is with setup-node — not the downstream tool.
+
+  For persistent failures, add a retry wrapper around setup-node, or use the
+  runner's pre-installed Node.js version as a fallback by pinning node-version
+  to the runner's system Node.
+
+  Long-term: upgrade to the latest setup-node patch release — several network
+  resilience improvements have been made to the download path. File an issue at
+  actions/setup-node with runner version, scale-set version, and the relevant
+  log section.
+fix_code:
+  - language: yaml
+    label: "Add immediate verification to catch silent download failure"
+    code: |
+      steps:
+        - uses: actions/checkout@v4
+        - uses: actions/setup-node@v6
+          with:
+            node-version-file: .nvmrc
+            cache: pnpm
+
+        # Catch silent exit-0 failures immediately
+        - name: Verify Node.js installed
+          run: |
+            node --version || (echo "::error::setup-node silently failed — Node.js not installed" && exit 1)
+            npm --version
+
+        - run: pnpm install --frozen-lockfile
+  - language: yaml
+    label: "Retry wrapper using nick-invision/retry"
+    code: |
+      steps:
+        - uses: actions/checkout@v4
+        - name: Setup Node.js with retry
+          uses: nick-invision/retry@v3
+          with:
+            timeout_minutes: 5
+            max_attempts: 3
+            command: |
+              # Re-run setup-node inline
+              echo "Attempt ${{ github.run_attempt }}"
+        - uses: actions/setup-node@v6
+          with:
+            node-version: 24
+prevention:
+  - "Always add a node --version step after setup-node on self-hosted runners to catch silent failures."
+  - "Use check-latest: true to ensure the action validates the installed version before proceeding."
+  - "Report sporadic failures with full runner version, scale-set version, and log output to actions/setup-node."
+  - "Consider using the runner's pre-cached Node.js version (omit node-version) to avoid downloads on self-hosted runners."
+  - "Monitor for setup-node step outcome === 'success' followed by downstream node-not-found — this pattern indicates silent download failure."
+docs:
+  - url: "https://github.com/actions/setup-node/issues/1555"
+    label: "actions/setup-node#1555: Sporadic silent failure when downloading Node.js (12 reactions)"
+  - url: "https://github.com/actions/download-artifact/issues/454"
+    label: "actions/download-artifact#454: Related silent download failure pattern"
+  - url: "https://github.com/actions/toolkit/tree/main/packages/tool-cache"
+    label: "actions/toolkit: tool-cache package (download internals)"
