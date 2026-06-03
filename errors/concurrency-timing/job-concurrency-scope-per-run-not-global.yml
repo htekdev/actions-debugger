@@ -1,0 +1,81 @@
+id: concurrency-timing-016
+title: "Job-Level Concurrency Does Not Prevent Parallel Runs Across Different Workflow Runs"
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - job-level
+  - cross-run
+  - mutex
+  - deployment
+patterns:
+  - regex: "jobs\.[a-zA-Z_-]+\.concurrency"
+    flags: "i"
+  - regex: "concurrency:\s*\n\s+group:"
+    flags: "im"
+error_messages:
+  - "Multiple deployments running simultaneously"
+  - "Concurrent job executions detected"
+root_cause: |
+  When the `concurrency:` block is placed at the job level (`jobs.<job_id>.concurrency`)
+  rather than the workflow level, the concurrency group is scoped to a single workflow
+  run. This means:
+  - Within one run: duplicate jobs queue against each other (per-run serialization).
+  - Across different runs: jobs with identical concurrency keys execute in parallel with
+    no queuing or cancellation.
+
+  Developers expecting a global mutex — for example, preventing two simultaneous
+  deployments triggered by separate PRs — are surprised when both deploys run
+  concurrently. The GitHub Docs note explicitly states: "If concurrency is specified
+  at a job level, the concurrency group is scoped to that job within the workflow run."
+
+  This is especially confusing because the workflow-level concurrency block syntax is
+  nearly identical to the job-level one, so copy-paste errors are common.
+fix: |
+  Move the concurrency block from the job level to the workflow level (top of the
+  workflow file, alongside `on:` and `name:`). Workflow-level concurrency provides
+  cross-run serialization and prevents parallel executions across all workflow runs.
+
+  For deployment workflows, use cancel-in-progress: false to queue rather than cancel
+  in-flight deployments, preventing accidental skips of intermediate releases.
+fix_code:
+  - language: yaml
+    label: "Wrong: job-level concurrency (only per-run, not cross-run)"
+    code: |
+      # DO NOT USE for cross-run mutex — this only queues within one run
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          concurrency:
+            group: deploy-${{ github.ref }}
+            cancel-in-progress: true
+          steps:
+            - run: ./deploy.sh
+  - language: yaml
+    label: "Correct: workflow-level concurrency (true cross-run mutex)"
+    code: |
+      name: Deploy
+      on: push
+
+      # Workflow-level: prevents parallel deploys across ALL simultaneous runs
+      concurrency:
+        group: deploy-${{ github.ref }}
+        cancel-in-progress: false  # queue deploys, don't skip intermediate releases
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./deploy.sh
+prevention:
+  - "Always use workflow-level concurrency when the goal is preventing simultaneous deployments across PRs or pushes."
+  - "Use job-level concurrency only for intra-run fan-out limiting — document intent with a comment."
+  - "Verify cross-run mutex behavior by triggering two simultaneous push runs and checking the Actions tab."
+  - "Prefer cancel-in-progress: false for deploy workflows to avoid skipping intermediate releases."
+  - "Search your workflows for `jobs.<name>.concurrency` and audit whether cross-run isolation is the intent."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/controlling-concurrency"
+    label: "GitHub Docs: Controlling concurrency"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#concurrency"
+    label: "Workflow syntax: concurrency"
