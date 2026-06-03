@@ -1,0 +1,138 @@
+id: known-unsolved-023
+title: "Concurrency Groups Are Repository-Scoped — Cannot Synchronize Workflows Across Repositories"
+category: known-unsolved
+severity: limitation
+tags:
+  - concurrency
+  - cross-repository
+  - scoping
+  - deployment
+  - mutex
+  - known-limit
+  - organization
+patterns:
+  - regex: "concurrency.*cross.?repo|cross.?repo.*concurrency"
+    flags: "i"
+  - regex: "concurrency.*organization|global.*concurrency|multi.?repo.*concurrency"
+    flags: "i"
+  - regex: "concurrency only works within a single repository"
+    flags: "i"
+error_messages:
+  - "GitHub Actions concurrency only works within a single repository"
+  - "Concurrency groups cannot be shared across repositories — identical group names in different repos run in parallel"
+root_cause: |
+  GitHub Actions `concurrency:` groups are evaluated strictly within a single repository.
+  Two workflows in different repositories that define identical `concurrency.group` strings
+  (e.g., `group: deploy-production`) run in PARALLEL with no coordination — the group
+  name has no cross-repository meaning.
+
+  This is a hard platform-level scope boundary. GitHub's concurrency implementation stores
+  group membership state per-repository, so there is no shared namespace between repos.
+
+  Common scenarios where this surprises teams:
+  - Multiple application repos deploying to a shared staging/production environment
+  - A monorepo split into microservice repos that must not deploy simultaneously
+  - Platform teams providing reusable deploy workflows called from many repos
+  - Organizations trying to limit total simultaneous cloud deployments across a fleet
+  - Trying to prevent two repos from running the same database migration at once
+
+  The behavior is counterintuitive because the same concurrency group string CAN
+  coordinate same-repo workflows — so teams naturally assume it works cross-repo too.
+
+  Source: Stack Overflow #79690697 (Make workflow run sequentially for reusable workflow
+  — accepted answer explicitly states: "GitHub Actions' concurrency only works within
+  a single repository")
+  Source: ben-z/gh-action-mutex (community workaround for cross-repo mutex, 500+ stars)
+  Source: GitHub Actions docs (concurrency group scope is per-repository)
+fix: |
+  There is no native GitHub Actions concurrency primitive that works cross-repository.
+  Use one of these architectural workarounds:
+
+  Workaround 1 — Orchestrator repository with repository_dispatch (recommended):
+    Create a central orchestrator repo. Each application repo sends a
+    `repository_dispatch` event to the orchestrator. The orchestrator runs the shared
+    workflow sequentially using its own concurrency group (single-repo scope is fine
+    here because all dispatch events arrive at one repo).
+
+  Workaround 2 — External mutex via ben-z/gh-action-mutex:
+    Uses a dedicated lock repository's branch as a distributed mutex. Works across
+    repos because the lock state lives in one shared repository.
+
+  Workaround 3 — Environment deployment protection with single-slot reviewers:
+    A deployment environment with required reviewers can throttle approval-gated
+    deployments. Multiple jobs can still enter "waiting" simultaneously, but the
+    gate prevents concurrent execution if reviewers approve only one at a time.
+
+  Workaround 4 — External coordination service (Redis, DynamoDB, Azure Service Bus):
+    For production systems at scale, use a lock/queue service all workflows can reach.
+    Requires infrastructure management but provides the most reliable behavior.
+fix_code:
+  - language: yaml
+    label: "Orchestrator pattern: all repos dispatch to a central repo that serializes deploys"
+    code: |
+      # In each application repo — sends dispatch to orchestrator
+      name: Trigger Orchestrated Deploy
+      on:
+        push:
+          branches: [main]
+      jobs:
+        dispatch:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Dispatch to orchestrator
+              run: |
+                gh api /repos/myorg/deploy-orchestrator/dispatches \
+                  --method POST \
+                  -F event_type=deploy \
+                  -F client_payload[repo]="${{ github.repository }}" \
+                  -F client_payload[sha]="${{ github.sha }}"
+              env:
+                GH_TOKEN: ${{ secrets.ORCHESTRATOR_DISPATCH_PAT }}
+
+      ---
+      # In deploy-orchestrator repo — single-repo concurrency works correctly here
+      name: Orchestrated Deploy
+      on:
+        repository_dispatch:
+          types: [deploy]
+      concurrency:
+        group: deploy-production   # Scoped to orchestrator repo — works as intended
+        cancel-in-progress: false  # Queue all deployments; never skip one
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - run: |
+                echo "Deploying ${{ github.event.client_payload.repo }} @ ${{ github.event.client_payload.sha }}"
+                # ... deploy logic ...
+
+  - language: yaml
+    label: "External mutex using ben-z/gh-action-mutex for cross-repo locking"
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Acquire cross-repo deployment lock
+              uses: ben-z/gh-action-mutex@v1.0-alpha-7
+              with:
+                branch: mutex-deploy-production   # Branch in the shared lock repo
+                repo-token: ${{ secrets.MUTEX_REPO_PAT }}
+                repository: myorg/locks           # Dedicated lock repository
+
+            - name: Deploy
+              run: ./deploy.sh
+
+            # Lock is automatically released when the job completes (success or failure)
+prevention:
+  - "Do not assume identical concurrency group names coordinate across repositories — they have no cross-repo effect."
+  - "Design cross-repo deployment sequencing with an explicit architecture before scaling to multiple repos."
+  - "Document the serialization mechanism in your runbooks — this is a common architecture surprise for new team members."
+  - "Prefer a single orchestrator repo pattern from the start when cross-repo ordering is a requirement."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/using-concurrency"
+    label: "GitHub Docs: Using concurrency in GitHub Actions (repo-scoped)"
+  - url: "https://stackoverflow.com/questions/79690697/make-workflow-run-sequentially-allowing-one-job-run-at-a-time-for-github-action-reusable-workflow"
+    label: "Stack Overflow #79690697: Cross-repo sequential GitHub Actions execution"
+  - url: "https://github.com/ben-z/gh-action-mutex"
+    label: "ben-z/gh-action-mutex — cross-repo mutex via shared lock repository"
