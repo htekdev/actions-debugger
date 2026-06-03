@@ -1,0 +1,80 @@
+id: runner-environment-081
+title: "GITHUB_PATH prepend breaks container job when image has no PATH environment variable"
+category: runner-environment
+severity: error
+tags:
+  - container
+  - GITHUB_PATH
+  - PATH
+  - docker
+  - minimal-image
+  - distroless
+patterns:
+  - regex: 'PATH=:[^:"\s]|PATH=\s*:'
+    flags: ''
+  - regex: '(bash|sh|python|node|java).*not found|exec.*No such file|cannot execute binary'
+    flags: 'i'
+error_messages:
+  - "bash: command not found"
+  - "sh: 1: /usr/local/bin/bash: not found"
+  - "exec: /bin/sh: no such file or directory"
+  - "OCI runtime exec failed: exec failed: unable to start container process"
+  - "/bin/bash: No such file or directory"
+root_cause: |
+  When a workflow step uses echo /new/path >> $GITHUB_PATH to add a directory to
+  PATH in a container job, the Actions runner prepends the new path to the
+  container's existing PATH. If the container image was built without an explicit
+  ENV PATH=... Dockerfile instruction, the container has no PATH environment
+  variable at startup.
+
+  The runner's prepend operation results in PATH=:/new/path — a leading colon
+  that causes the shell to treat an empty string as the first search directory.
+  Worse, standard system paths (/usr/bin, /bin, etc.) are no longer in PATH at
+  all, so subsequent steps cannot find any commands including bash itself.
+
+  Affected images include OpenSUSE, Alpine-based images that inherit from scratch,
+  distroless containers, and any custom image that does not explicitly set PATH.
+  The issue was reported in actions/runner#3210 and closed as not_planned — the
+  runner will not fix this behavior; images must include PATH in their ENV.
+fix: |
+  Add an explicit ENV PATH= instruction to the container Dockerfile. This gives
+  the runner a non-empty base PATH to prepend to, preserving the standard system
+  paths.
+
+  If you cannot modify the container image, set PATH in a step before any
+  GITHUB_PATH usage, or use absolute executable paths in subsequent steps.
+fix_code:
+  - language: yaml
+    label: "Fix 1: Add ENV PATH to Dockerfile (recommended)"
+    code: |
+      # Dockerfile fix — add explicit PATH before your custom layers
+      FROM opensuse/leap:15.5
+      ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+  - language: yaml
+    label: "Fix 2: Set PATH in a workflow step before adding to GITHUB_PATH"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          container: opensuse/leap
+          steps:
+            - name: Initialize PATH for container
+              run: |
+                # Set base PATH first so prepend works correctly
+                echo "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/my/tool" >> $GITHUB_PATH
+            - name: Use tool
+              run: my-tool --version
+prevention:
+  - "Always add ENV PATH=... to custom Docker images used in GitHub Actions container jobs"
+  - "Test container images with docker run --entrypoint '' myimage bash -c 'echo $PATH' to verify PATH is set"
+  - "Prefer official base images (debian, ubuntu, alpine) that include PATH in their default ENV"
+  - "Avoid echo path >> $GITHUB_PATH in minimal, scratch-based, or distroless container images"
+  - "Pin to base image versions that explicitly document their ENV PATH value"
+docs:
+  - url: "https://github.com/actions/runner/issues/3210"
+    label: "actions/runner#3210: Prepending PATH breaks container if image has no PATH env (closed not_planned)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions#adding-a-system-path"
+    label: "Adding a system path — Workflow commands for GitHub Actions"
+  - url: "https://docs.github.com/en/actions/using-jobs/running-jobs-in-a-container"
+    label: "Running jobs in a container"
