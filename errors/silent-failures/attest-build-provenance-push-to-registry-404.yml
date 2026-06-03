@@ -1,0 +1,105 @@
+id: silent-failures-025
+title: "attest-build-provenance: OCIError 404 when image not pushed to registry before attestation"
+category: silent-failures
+severity: error
+tags:
+  - attest-build-provenance
+  - oci
+  - container-registry
+  - slsa
+  - attestation
+  - push-to-registry
+patterns:
+  - regex: "OCIError: Error uploading artifact to container registry"
+    flags: "i"
+  - regex: "Error fetching .+/manifests/sha256:[a-f0-9]+ - expected 200, received 404"
+    flags: "i"
+  - regex: "expected 200, received 404"
+    flags: "i"
+error_messages:
+  - "Error: OCIError: Error uploading artifact to container registry"
+  - "Error: Error fetching https://ghcr.io/v2/owner/repo/manifests/sha256:abc123... - expected 200, received 404"
+root_cause: |
+  `actions/attest-build-provenance` with `push-to-registry: true` fetches the image manifest
+  from the container registry to embed it in the attestation bundle. If the image was built
+  with `load: true` in `docker/build-push-action` but `push: false` (or a conditional push
+  that evaluated to false), the image exists only in the runner's local Docker daemon — not
+  in the remote registry. The attestation step then fails with a 404 when fetching the
+  manifest from the registry URL.
+
+  This is a silent misconfiguration: the build step "succeeds" (because `load: true` works),
+  the attestation step then fails with a cryptic OCI/manifest error instead of a clear message
+  explaining that the image was never pushed.
+
+  Typical trigger: workflows that conditionally push (e.g., only on `main` branch) but run
+  the attestation step unconditionally on every push/PR.
+fix: |
+  Guard the attestation step with the same `if:` condition used for the image push.
+  The attestation step should only run when the image was actually pushed to the registry.
+
+  If you need to generate attestations on PRs (e.g., for preview images), ensure the image
+  is actually pushed to a staging registry before the attestation step runs.
+fix_code:
+  - language: yaml
+    label: "Wrong: attestation runs unconditionally even when image not pushed"
+    code: |
+      - name: Build and push
+        id: build-push
+        uses: docker/build-push-action@v6
+        with:
+          push: ${{ github.ref == 'refs/heads/main' }}  # Only pushes on main
+          load: true
+          tags: ghcr.io/org/app:latest
+      
+      - name: Generate attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/org/app
+          subject-digest: ${{ steps.build-push.outputs.digest }}
+          push-to-registry: true  # ❌ Fails on PRs — image is local-only
+  - language: yaml
+    label: "Fix: match attestation if condition to the push condition"
+    code: |
+      - name: Build and push
+        id: build-push
+        uses: docker/build-push-action@v6
+        with:
+          push: ${{ github.ref == 'refs/heads/main' }}
+          load: true
+          tags: ghcr.io/org/app:latest
+      
+      - name: Generate attestation
+        if: github.ref == 'refs/heads/main'  # ✅ Same condition as push
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/org/app
+          subject-digest: ${{ steps.build-push.outputs.digest }}
+          push-to-registry: true
+  - language: yaml
+    label: "Alternative: use push-to-registry: false for GitHub-only attestations"
+    code: |
+      - name: Build and push
+        id: build-push
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: ghcr.io/org/app:latest
+      
+      - name: Generate attestation (stored in GitHub, not registry)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/org/app
+          subject-digest: ${{ steps.build-push.outputs.digest }}
+          push-to-registry: false  # ✅ Default; stores attestation in GitHub only
+prevention:
+  - "Always guard `push-to-registry: true` attestation steps with the same `if:` condition used for the image push"
+  - "Remember: `load: true` in docker/build-push-action loads the image into the local Docker daemon only — it does not push to any registry"
+  - "Use `push-to-registry: false` (the default) when attestations only need to be verified via `gh attestation verify`, not via the registry manifest"
+  - "Set `push: ${{ steps.should-push.outputs.result }}` and reuse that output in the attestation step's `if:` condition to keep them in sync"
+docs:
+  - url: "https://github.com/actions/attest-build-provenance"
+    label: "actions/attest-build-provenance README"
+  - url: "https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds"
+    label: "Using artifact attestations to establish provenance for builds"
+  - url: "https://github.com/actions/attest-build-provenance/issues/747"
+    label: "actions/attest-build-provenance#747: 404 when uploading artifact to container registry"
