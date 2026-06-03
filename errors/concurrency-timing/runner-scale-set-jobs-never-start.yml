@@ -1,0 +1,123 @@
+id: concurrency-timing-018
+title: "Jobs Dispatched to Runner Scale Set Never Start — Label Mismatch or Registration Failure"
+category: concurrency-timing
+severity: error
+tags:
+  - runner-scale-set
+  - self-hosted
+  - job-routing
+  - label
+  - registration
+  - arc
+  - actions-runner-controller
+  - stuck
+patterns:
+  - regex: "Waiting for a runner to pick up this job"
+    flags: "i"
+  - regex: "runner scale set.*not found"
+    flags: "im"
+  - regex: "No runner matching the required labels .*\\[.*\\] is online"
+    flags: "i"
+  - regex: "Could not find any online and idle runners that match the requested labels"
+    flags: "i"
+error_messages:
+  - "Waiting for a runner to pick up this job..."
+  - "No runner matching the required labels '[self-hosted, production-scale-set]' is online."
+  - "Could not find any online and idle runners that match the requested labels."
+  - "This job was lost while waiting for a runner. Please re-run the job."
+root_cause: |
+  GitHub Actions runner scale sets (introduced via Actions Runner Controller / ARC and the
+  newer Go-based runner scale set client) dispatch jobs to a dynamically scaling pool of
+  runners. When a job is queued but no runner starts to process it, several misconfiguration
+  scenarios cause the job to wait indefinitely:
+
+  1. **Label mismatch**: The workflow's `runs-on` label does not exactly match the
+     runner scale set's configured name/label. Labels are case-sensitive. A workflow
+     specifying `runs-on: prod-scale-set` will never match a scale set registered as
+     `Prod-Scale-Set` or `production-scale-set`.
+
+  2. **Registration failure**: The scale set client failed to register with GitHub
+     (bad `githubConfigUrl`, expired PAT, GitHub App credentials rotated) but no alert
+     was generated. The runner group appears in the UI but receives no jobs because it
+     has zero healthy, registered instances.
+
+  3. **Min runners set to 0, scale-up blocked**: The scale set is configured with
+     `minRunners: 0` and depends on job events to scale up, but a network policy,
+     firewall rule, or Kubernetes resource quota prevents new runner pods from starting.
+     The broker sees a healthy scale set but new runners cannot provision.
+
+  4. **Runner listener terminated unexpectedly**: The runner listener process (the
+     manager component) crashed silently. GitHub shows the scale set as registered but
+     it has no workers accepting the dispatch message.
+
+  5. **Org/repo runner group restriction**: The runner group containing the scale set
+     has repository-access restrictions — the requesting repo is not in the allowed list.
+
+  Jobs in this state do not produce an explicit error in the Actions log; they are
+  stuck in "Waiting for a runner" indefinitely until they hit the 35-day job timeout
+  or are manually cancelled.
+fix: |
+  1. **Verify label exact-match**: Compare `runs-on:` value in the workflow against
+     the registered runner scale set name in Settings → Actions → Runners. Must be
+     an exact case-sensitive match.
+
+  2. **Check registration health**: In the runner scale set client logs (or ARC
+     controller pod logs), look for registration errors. Re-create credentials if
+     the GitHub App or PAT has been rotated.
+
+  3. **Inspect runner group access**: Settings → Actions → Runner groups → the group
+     containing your scale set → confirm the requesting repo is listed under
+     "Repository access".
+
+  4. **Check scale-up events**: Review Kubernetes events (`kubectl get events -n <ns>`)
+     for resource quota exceeded, image pull failures, or scheduling constraints that
+     prevent runner pods from starting.
+
+  5. **Restart the runner listener**: If the manager/listener process crashed, restart
+     the scale set client deployment or the ARC AutoscalingRunnerSet resource.
+fix_code:
+  - language: yaml
+    label: "Workflow: verify exact label matches your scale set registration name"
+    code: |
+      jobs:
+        build:
+          # Must exactly match the scale set name registered in Settings → Actions → Runners
+          # e.g., registered as "prod-k8s-runners" → use exactly "prod-k8s-runners"
+          runs-on: prod-k8s-runners    # ← exact case-sensitive match required
+          steps:
+            - uses: actions/checkout@v4
+            - run: echo "Running on scale set runner"
+  - language: yaml
+    label: "Diagnose label and runner group access via GitHub API"
+    code: |
+      # List runner groups for an org (requires admin PAT):
+      # GET /orgs/{org}/actions/runner-groups
+      #
+      # List repos allowed to use a specific runner group:
+      # GET /orgs/{org}/actions/runner-groups/{group_id}/repositories
+      #
+      # List self-hosted runners in a group:
+      # GET /orgs/{org}/actions/runner-groups/{group_id}/runners
+      #
+      # Using gh CLI:
+      # gh api /orgs/MY-ORG/actions/runner-groups --jq '.[].runners_url'
+      - name: Print runner labels (inside the running job)
+        run: |
+          echo "Runner name: ${{ runner.name }}"
+          echo "Runner OS: ${{ runner.os }}"
+          echo "Runner arch: ${{ runner.arch }}"
+prevention:
+  - "Treat runner scale set names as API contracts — document them in a shared wiki and never rename without updating all workflow files."
+  - "Set up monitoring on the runner scale set listener/controller pod — alert if it crashes or stops processing dispatches."
+  - "Configure `minRunners: 1` on production scale sets to keep at least one warm runner active; `minRunners: 0` requires flawless scale-up on every job dispatch."
+  - "Add a `timeout-minutes` on jobs dispatched to scale sets so stuck jobs fail fast rather than consuming the 35-day wait limit."
+  - "After rotating GitHub App credentials or PATs used by the scale set client, immediately verify a test workflow completes on the scale set."
+docs:
+  - url: "https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners-with-actions-runner-controller/deploying-runner-scale-sets-with-actions-runner-controller"
+    label: "GitHub Docs: Deploying runner scale sets with Actions Runner Controller"
+  - url: "https://github.blog/changelog/2026-02-05-github-actions-early-february-2026-updates/"
+    label: "GitHub Changelog: Actions early February 2026 updates (runner scale set client)"
+  - url: "https://github.com/orgs/community/discussions/171291"
+    label: "Community Discussion: Runner scale set jobs not being dispatched"
+  - url: "https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/managing-access-to-self-hosted-runners-using-groups"
+    label: "GitHub Docs: Managing access to self-hosted runners using groups"
