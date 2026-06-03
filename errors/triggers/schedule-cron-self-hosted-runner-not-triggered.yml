@@ -1,0 +1,107 @@
+id: triggers-024
+title: "Scheduled Cron Workflow Does Not Trigger on Self-Hosted Runner"
+category: triggers
+severity: error
+tags:
+  - cron
+  - schedule
+  - self-hosted-runner
+  - trigger
+  - offline
+patterns:
+  - regex: "cron.*self.hosted"
+    flags: "i"
+  - regex: "schedule.*self.hosted"
+    flags: "i"
+error_messages:
+  - "No trigger for scheduled cron task in Github actions on a self-hosted runner"
+root_cause: |
+  Scheduled (on: schedule) workflows are queued by GitHub hosted-runner dispatch
+  infrastructure. When the job targets a self-hosted runner (runs-on: [self-hosted, ...]),
+  the schedule dispatcher attempts to assign the job to a registered self-hosted runner.
+
+  The workflow silently never runs when:
+  1. The self-hosted runner is offline or disconnected at the moment the schedule fires.
+  2. The runner is busy with another job and no other runner with the required label is idle.
+  3. The runner binary is outdated or the registration token has expired, causing the runner
+     to appear registered but fail to accept new jobs.
+  4. The repository has been inactive for 60+ days (GitHub disables scheduled workflows
+     on inactive repositories automatically).
+
+  Unlike GitHub-hosted runners, where a fresh VM is provisioned on demand for every job,
+  self-hosted runners must be online and idle at exactly the moment the schedule fires.
+  If no eligible runner is available, the queued job is eventually abandoned with no retry
+  and no error visible in the Actions UI. The run simply does not appear.
+  Reported in actions/runner#4210 (21 reactions, open since Jan 2026).
+fix: |
+  Option 1 (recommended): Run the scheduled trigger on a GitHub-hosted runner.
+  Use ubuntu-latest for the schedule job and dispatch the real work to self-hosted
+  via workflow_dispatch or a separate triggered workflow.
+
+  Option 2: Use an external scheduler with workflow_dispatch.
+  Remove the on: schedule trigger. Use an external cron (cron job, cloud function, GitHub App)
+  to call the GitHub REST API dispatches endpoint on a schedule. The workflow is triggered
+  by workflow_dispatch instead, which does not require the runner to be available at a
+  fixed clock time.
+
+  Option 3: Ensure runner availability with a persistent service.
+  Run the self-hosted runner as a systemd service with Restart=always so it is online
+  when schedules fire. This reduces but does not eliminate the risk.
+fix_code:
+  - language: yaml
+    label: "Option 1: Schedule on GitHub-hosted, dispatch to self-hosted"
+    code: |
+      on:
+        schedule:
+          - cron: '0 2 * * *'
+        workflow_dispatch: {}
+
+      jobs:
+        # Lightweight orchestrator runs on GitHub-hosted (always available at schedule time)
+        trigger:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Trigger self-hosted workflow
+              uses: actions/github-script@v7
+              with:
+                script: |
+                  await github.rest.actions.createWorkflowDispatch({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    workflow_id: 'heavy-work.yml',
+                    ref: 'main'
+                  });
+  - language: yaml
+    label: "Option 2: Receive dispatch from external cron scheduler"
+    code: |
+      # External scheduler calls:
+      # curl -X POST \
+      #   -H "Authorization: Bearer $GH_TOKEN" \
+      #   https://api.github.com/repos/OWNER/REPO/actions/workflows/nightly.yml/dispatches \
+      #   -d '{"ref":"main"}'
+      #
+      # Your workflow:
+      on:
+        workflow_dispatch: {}   # Triggered externally; no GitHub-side scheduling dependency
+
+      jobs:
+        nightly:
+          runs-on: [self-hosted, linux, x64]
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./scripts/nightly.sh
+prevention:
+  - "Run self-hosted runners as a persistent systemd service (Restart=always, RestartSec=10) to minimize offline windows."
+  - "Add workflow_dispatch: alongside schedule: so missed runs can be manually re-triggered from the Actions UI."
+  - "Monitor runner registration status via GET /repos/{owner}/{repo}/actions/runners and alert on offline runners."
+  - "Keep repositories active with at least one push or workflow run to prevent scheduled workflow disablement after 60 days of inactivity."
+  - "Consider using ephemeral runners with autoscaling (ARC) so runners are always provisioned on demand."
+docs:
+  - url: "https://github.com/actions/runner/issues/4210"
+    label: "actions/runner#4210 — Cron not triggering on self-hosted runner (Jan 2026)"
+  - url: "https://github.com/orgs/community/discussions/185024"
+    label: "Community discussion: self-hosted runner not triggering scheduled cron"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#schedule"
+    label: "schedule event documentation"
+  - url: "https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-workflow-runs/disabling-and-enabling-a-workflow"
+    label: "Workflow disabled after 60 days of repo inactivity"
