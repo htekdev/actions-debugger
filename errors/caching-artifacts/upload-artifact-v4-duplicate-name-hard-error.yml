@@ -1,0 +1,114 @@
+id: caching-artifacts-033
+title: 'upload-artifact@v4 requires unique artifact names per run — duplicate name is a hard error'
+category: caching-artifacts
+severity: error
+tags:
+  - upload-artifact
+  - v4
+  - duplicate-name
+  - breaking-change
+  - matrix
+patterns:
+  - regex: 'An artifact with this name already exists on the workflow run'
+    flags: 'i'
+  - regex: 'Failed to CreateArtifact.*already exists'
+    flags: 'i'
+error_messages:
+  - 'An artifact with this name already exists on the workflow run'
+  - 'Failed to CreateArtifact: Artifact already exists'
+root_cause: |
+  actions/upload-artifact@v4 changed artifact name uniqueness enforcement from v3:
+
+  v3 behavior: uploading with a duplicate name silently merged the new files
+  into the existing artifact, potentially overwriting same-named files.
+
+  v4 behavior: uploading with a name that already exists in the same workflow
+  run is a hard error. The step fails immediately with:
+    "An artifact with this name already exists on the workflow run"
+
+  Common triggers:
+  1. Matrix jobs all writing to a fixed artifact name (e.g., name: build-output)
+     without including a matrix dimension in the name.
+  2. Multiple upload-artifact steps in the same job with the same name: value.
+  3. Reusable workflows invoked multiple times in one run using identical names.
+  4. Two upload steps with no name: parameter — both default to "artifact".
+
+  Workflows that relied on v3's merge behavior and were silently uploading
+  duplicate names will fail immediately after upgrading to v4.
+fix: |
+  Include a unique identifier in the artifact name for each upload step.
+  For matrix jobs, include a matrix dimension value. For independent parallel
+  jobs, include the job name or a specific run-scoped identifier.
+
+  If you need to consolidate artifacts from multiple sources, have each job
+  upload with a unique name, then use a final consolidation job that downloads
+  all artifacts and re-uploads a merged set.
+fix_code:
+  - language: yaml
+    label: 'Matrix jobs — include matrix dimension in artifact name'
+    code: |
+      strategy:
+        matrix:
+          os: [ubuntu-latest, windows-latest, macos-latest]
+
+      steps:
+        - name: Build
+          run: make build
+
+        - uses: actions/upload-artifact@v4
+          with:
+            name: build-output-${{ matrix.os }}   # Unique per matrix cell
+            path: dist/
+  - language: yaml
+    label: 'Multiple upload steps — use distinct explicit names'
+    code: |
+      steps:
+        - uses: actions/upload-artifact@v4
+          with:
+            name: test-results       # Distinct name
+            path: test-output/
+
+        - uses: actions/upload-artifact@v4
+          with:
+            name: coverage-report    # Different name — no conflict
+            path: coverage/
+  - language: yaml
+    label: 'Merge artifacts across matrix jobs in a downstream job'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest]
+          steps:
+            - uses: actions/upload-artifact@v4
+              with:
+                name: dist-${{ matrix.os }}
+                path: dist/
+
+        package:
+          needs: build
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/download-artifact@v4
+              with:
+                pattern: dist-*
+                merge-multiple: true
+                path: all-dist/
+
+            - uses: actions/upload-artifact@v4
+              with:
+                name: final-package
+                path: all-dist/
+prevention:
+  - 'Always specify an explicit name: for each upload-artifact step rather than relying on the default "artifact"'
+  - 'For matrix jobs, include at least one matrix variable in the artifact name'
+  - 'Audit workflows being migrated from v3 to v4 for any step that omits name: or uses the same name twice'
+  - 'Two steps with no name: both default to "artifact" and will always conflict in v4'
+docs:
+  - url: 'https://github.com/actions/upload-artifact/blob/main/docs/MIGRATION.md'
+    label: 'upload-artifact v3 to v4 migration guide'
+  - url: 'https://github.com/actions/upload-artifact'
+    label: 'actions/upload-artifact repository'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-workflow-data-as-artifacts'
+    label: 'GitHub Docs — Storing workflow data as artifacts'
