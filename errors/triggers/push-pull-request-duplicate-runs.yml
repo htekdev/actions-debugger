@@ -1,0 +1,74 @@
+id: triggers-017
+title: "push and pull_request events both fire for same-repo PR branches causing duplicate CI runs"
+category: triggers
+severity: warning
+tags:
+  - push
+  - pull_request
+  - duplicate-runs
+  - concurrency
+  - same-repo
+  - branch
+patterns:
+  - regex: "on:\\s*\\n\\s+(push|pull_request):"
+    flags: "ms"
+error_messages:
+  - "Duplicate workflow runs triggered for the same commit SHA"
+  - "Two simultaneous CI runs on the same branch"
+root_cause: |
+  When a developer pushes to a branch that has an open pull request within the same
+  repository (not a fork), both the push event and the pull_request event (types:
+  [synchronize]) fire independently for the same commit SHA. This creates two
+  separate workflow runs executing identical CI checks simultaneously. For fork PRs
+  only the pull_request event fires (the fork push doesn't trigger the base repo),
+  so duplication only affects same-repository branches. The redundant run wastes
+  billed minutes, creates confusing duplicate status check entries on the PR, and
+  can cause race conditions in deployment or release workflows where two runs race
+  to update the same environment.
+fix: |
+  For workflows intended purely as PR checks, use only on.pull_request and remove
+  the push trigger. If the same workflow needs to run both on PRs and on direct
+  pushes to main/trunk (post-merge), filter with branches: so they don't overlap.
+  Adding a concurrency group keyed on github.ref or github.head_ref automatically
+  cancels the slower duplicate run when both triggers must remain.
+fix_code:
+  - language: yaml
+    label: "Option 1 — separate triggers so they do not overlap"
+    code: |
+      on:
+        # PR CI: only pull_request covers commits pushed to the PR branch
+        pull_request:
+          branches: [main]
+        # Post-merge CI: only the push to main after merging
+        push:
+          branches: [main]
+      # This way a push to a feature branch triggers pull_request ONLY,
+      # and a merge to main triggers push ONLY — no duplicates.
+  - language: yaml
+    label: "Option 2 — concurrency group to cancel the slower duplicate"
+    code: |
+      on:
+        push:
+          branches-ignore: [main]
+        pull_request:
+          branches: [main]
+
+      concurrency:
+        group: ci-${{ github.head_ref || github.ref }}
+        cancel-in-progress: true
+      # When both push and pull_request fire for the same branch, the second
+      # run cancels the first, leaving only one active run per branch.
+prevention:
+  - "Audit every workflow with both on.push and on.pull_request — verify the branch filters don't overlap for same-repo contributors"
+  - "For PR validation CI, prefer on.pull_request only; add a separate on.push.branches: [main] for post-merge checks"
+  - "Always add a concurrency group when both push and pull_request triggers are needed to prevent redundant runs"
+  - "Check your Actions billing dashboard for unexpectedly doubled minute usage as a signal for duplicate trigger overlap"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request"
+    label: "pull_request event — GitHub Actions documentation"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#push"
+    label: "push event — GitHub Actions documentation"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs"
+    label: "Controlling concurrency of workflows and jobs — GitHub Actions"
+  - url: "https://github.com/orgs/community/discussions/26284"
+    label: "GitHub Community — avoiding duplicate workflow runs on push and pull_request"

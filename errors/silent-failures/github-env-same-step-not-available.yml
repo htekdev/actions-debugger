@@ -1,0 +1,72 @@
+id: silent-failures-024
+title: "GITHUB_ENV variable written in a step is not available within the same step"
+category: silent-failures
+severity: silent-failure
+tags:
+  - GITHUB_ENV
+  - environment-variables
+  - step-ordering
+  - run
+  - same-step
+patterns:
+  - regex: "GITHUB_ENV[^\\n]*\\n[^\\n]*\\$\\{?[A-Z_][A-Z0-9_]*\\}?"
+    flags: "ms"
+  - regex: "echo\\s+[\"']?[A-Z_][A-Z0-9_]*=[^\"'\\n]+[\"']?\\s*>>\\s*\\$GITHUB_ENV"
+    flags: "i"
+error_messages:
+  - "echo MY_VAR=value >> $GITHUB_ENV"
+root_cause: |
+  Writes to $GITHUB_ENV (appending NAME=value lines to the runner's environment file)
+  take effect for all SUBSEQUENT steps in the same job, but NOT for the current
+  step's run block. The Actions runner reads the environment file once at the start
+  of each step, before the run block executes. Any $GITHUB_ENV writes made during
+  that run block are not re-read until the next step begins. Consequently, if a run
+  block writes `echo "BUILD_ID=abc" >> $GITHUB_ENV` and then immediately references
+  `$BUILD_ID` later in the same run block, the variable is empty. No error or warning
+  is emitted — the reference silently evaluates to an empty string. The identical
+  delayed-effect behavior applies to $GITHUB_PATH: path entries added in one step
+  are only visible in the PATH of subsequent steps.
+fix: |
+  Split the write and the read into separate steps. If you need the value within the
+  same shell invocation, use a native shell variable assignment (VAR=value) for
+  immediate access and still write to $GITHUB_ENV if the value is needed by later
+  steps. Do not rely on $GITHUB_ENV for intra-step communication.
+fix_code:
+  - language: yaml
+    label: "Wrong — reference GITHUB_ENV variable in the same step that writes it"
+    code: |
+      steps:
+        - name: Set and use variable (BROKEN — BUILD_ID is empty)
+          run: |
+            echo "BUILD_ID=abc123" >> $GITHUB_ENV
+            echo "Build ID is: $BUILD_ID"  # Empty — GITHUB_ENV not re-read mid-step
+  - language: yaml
+    label: "Correct — read the exported variable in the following step"
+    code: |
+      steps:
+        - name: Export variable
+          run: echo "BUILD_ID=abc123" >> $GITHUB_ENV
+
+        - name: Use exported variable
+          run: echo "Build ID is: $BUILD_ID"  # Available here — next step reads GITHUB_ENV
+  - language: yaml
+    label: "Correct — use a shell variable for same-step access, also export for later steps"
+    code: |
+      steps:
+        - name: Compute and export build ID
+          run: |
+            BUILD_ID=$(git rev-parse --short HEAD)
+            echo "BUILD_ID=${BUILD_ID}" >> $GITHUB_ENV   # Export for later steps
+            echo "Build ID is: ${BUILD_ID}"               # Shell var — available immediately
+prevention:
+  - "Never reference a variable by its GITHUB_ENV name ($VAR_NAME) in the same run block that writes it"
+  - "Use native shell variables (VAR=value; echo $VAR) for same-step access; only use GITHUB_ENV for cross-step sharing"
+  - "The same rule applies to $GITHUB_PATH — path additions take effect in the next step, not the current one"
+  - "If a step relies on a GITHUB_ENV variable set by a prior step in the same run, ensure step ordering is correct"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/store-information-in-variables#passing-a-value-between-steps"
+    label: "Passing values between steps using GITHUB_ENV — GitHub Actions"
+  - url: "https://github.com/orgs/community/discussions/26672"
+    label: "GitHub Community — GITHUB_ENV variable not available in same step it is written"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions#setting-an-environment-variable"
+    label: "Setting an environment variable via workflow commands — GitHub Actions"
