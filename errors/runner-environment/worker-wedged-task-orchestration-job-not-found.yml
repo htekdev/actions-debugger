@@ -1,0 +1,119 @@
+id: runner-environment-091
+title: 'Self-Hosted Runner Worker Wedges Indefinitely After TaskOrchestrationJobNotFoundException'
+category: runner-environment
+severity: error
+tags:
+  - self-hosted
+  - runner-worker
+  - wedged
+  - slot-starvation
+  - v2-runservice
+  - macos
+  - apple-silicon
+patterns:
+  - regex: 'TaskOrchestrationJobNotFoundException.*workflow instance not found'
+    flags: 'i'
+  - regex: 'Job not found:.*workflow instance not found'
+    flags: 'i'
+  - regex: 'CompleteJobAsync.*TaskOrchestrationJobNotFoundException'
+    flags: 'i'
+error_messages:
+  - 'GitHub.DistributedTask.WebApi.TaskOrchestrationJobNotFoundException: Job not found: <job-guid>. workflow instance not found'
+  - 'TaskOrchestrationJobNotFoundException: workflow instance not found'
+  - 'System.AggregateException: One or more errors occurred. (Job not found:'
+root_cause: |
+  When a self-hosted runner Worker process calls CompleteJobAsync in the V2
+  RunService path (useV2Flow: true, RunServiceHttpClient.CompleteJobAsync)
+  and the GitHub orchestrator has discarded the job record (e.g., due to a
+  server-side timeout, infrastructure failover, or job cancellation during
+  finalization), the Worker receives TaskOrchestrationJobNotFoundException
+  with "workflow instance not found."
+
+  After exhausting configured retry attempts (default maxAttempts), the Worker
+  logs the exception and stops processing — but critically, it fails to call
+  Environment.Exit and the process remains alive at ~0.1% CPU with no active
+  work, no child processes, and no job cleanup activity.
+
+  The parent Runner.Listener treats the still-running Worker process as a busy
+  runner slot and refuses to spawn a new Worker. This causes runner slot
+  starvation: the affected runner stops accepting new jobs until the wedged
+  Worker is externally terminated (kill, reboot, or watchdog).
+
+  On one 3-host Apple Silicon runner pool (v2.334.0), this affected 32.8% of
+  Worker invocations (50 of 152) over three weeks, with one incident wedging
+  all three Workers simultaneously and blocking CI for 3+ hours.
+  Source: actions/runner#4418 (open May 2026).
+fix: |
+  No upstream fix available — the Worker does not exit on non-retryable
+  CompleteJobAsync failures. Mitigations:
+
+  1. Deploy a watchdog that monitors _diag/Worker_*.log for the
+     TaskOrchestrationJobNotFoundException pattern and kills the wedged
+     Worker process by PID.
+
+  2. Use Kubernetes ARC ephemeral runners where the pod lifecycle replaces
+     the entire runner environment after each job — a wedged Worker is
+     automatically cleaned up when the pod is recycled.
+
+  3. Configure a hard systemd runtime limit (RuntimeMaxSec) that terminates
+     any runner process exceeding your longest expected job duration plus a
+     safety margin.
+
+  4. Add an external health-check cron that queries the GitHub API for runner
+     status and restarts the runner service if slots show "busy" longer than
+     expected.
+fix_code:
+  - language: yaml
+    label: 'Kubernetes ARC ephemeral runner configuration (avoids wedged Worker state)'
+    code: |
+      # ARC RunnerDeployment — pods are recycled after each job
+      apiVersion: actions.summerwind.dev/v1alpha1
+      kind: RunnerDeployment
+      metadata:
+        name: ephemeral-runner-deployment
+      spec:
+        replicas: 3
+        template:
+          spec:
+            ephemeral: true          # pod recycled after each job, no wedge possible
+            repository: owner/repo
+            labels:
+              - self-hosted
+              - ephemeral
+  - language: yaml
+    label: 'Scheduled watchdog workflow to detect stalled runner slots via API'
+    code: |
+      on:
+        schedule:
+          - cron: '*/15 * * * *'    # every 15 minutes
+
+      jobs:
+        runner-health-check:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Detect stalled self-hosted runners
+              uses: actions/github-script@v7
+              with:
+                script: |
+                  const runners = await github.rest.actions.listSelfHostedRunnersForRepo({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo
+                  });
+                  const offline = runners.data.runners.filter(r => r.status === 'offline');
+                  if (offline.length > 0) {
+                    core.warning('Offline/stalled runners: ' + offline.map(r => r.name).join(', '));
+                    // Trigger your runner restart webhook here
+                  }
+prevention:
+  - 'Use ephemeral Kubernetes ARC runners — pod recycle eliminates wedged Worker slot starvation'
+  - 'Monitor _diag/Worker_*.log for TaskOrchestrationJobNotFoundException patterns'
+  - 'Set systemd RuntimeMaxSec to maximum expected job duration plus 30 minutes'
+  - 'Track runner slot busy duration — sudden sustained busy state with no job output indicates wedge'
+  - 'Deploy a watchdog process alongside the runner that monitors Worker PID lifetime'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4418'
+    label: 'actions/runner #4418: Worker wedges after TaskOrchestrationJobNotFoundException (open May 2026)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/autoscaling-with-self-hosted-runners'
+    label: 'GitHub Docs: Autoscaling with self-hosted runners'
+  - url: 'https://github.com/actions/actions-runner-controller'
+    label: 'actions/actions-runner-controller: Kubernetes ARC runner controller'
