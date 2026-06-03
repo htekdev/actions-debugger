@@ -1,0 +1,121 @@
+id: yaml-syntax-029
+title: "Expression Interpolation in runs-on Array Literal Causes YAML Syntax Error"
+category: yaml-syntax
+severity: error
+tags:
+  - runs-on
+  - self-hosted
+  - expression
+  - dynamic-runner
+  - fromjson
+  - workflow-dispatch
+patterns:
+  - regex: "Invalid workflow file|You have an error in your yaml syntax"
+    flags: "i"
+  - regex: "Unexpected value.*\\$\\{\\{|yaml.*syntax.*runs.on"
+    flags: "i"
+  - regex: "Line.*Col.*Unexpected value.*\\{|error.*yaml.*line.*runs.on"
+    flags: "i"
+error_messages:
+  - "Invalid workflow file: .github/workflows/deploy.yml"
+  - "You have an error in your yaml syntax on line N"
+  - "Error: The workflow is not valid. .github/workflows/....yml (Line: N, Col: N): Unexpected value '{{'"
+  - "Workflow is not valid. (.github/workflows/....yml): There is no event trigger on line N"
+root_cause: |
+  GitHub Actions YAML is fully parsed before any expression evaluation occurs. When an
+  expression like ${{ inputs.runner-label }} appears as a bare value inside a YAML
+  flow sequence (square bracket array), the YAML parser encounters the { character
+  as an unquoted scalar — which is invalid in YAML flow sequence context.
+
+  The error typically surfaces on the job definition line rather than the runs-on
+  line itself, which makes it confusing to diagnose. The workflow annotation says
+  "invalid workflow file" or "yaml syntax error" pointing at the job name line.
+
+  Common trigger: Attempting to dynamically select a self-hosted runner label from
+  a workflow_dispatch input or matrix variable by writing:
+    runs-on: [ self-hosted, ${{ inputs.server-target }} ]
+
+  This is a YAML parsing error, not a GitHub Actions expression error — the file
+  fails validation before any runs even start.
+
+  The idiomatic fix is to pass the label array as a JSON string and deserialize it
+  with fromJSON(), which is supported natively in runs-on since 2021.
+fix: |
+  Three approaches depending on your scenario:
+
+  1. fromJSON() with JSON array input (most flexible, recommended for multi-label):
+     Pass the runs-on labels as a JSON array string and use fromJSON() to deserialize.
+     This fully supports dynamic multi-label selection with no YAML parsing issues.
+
+  2. Quoted expression (for simple labels without YAML-special characters):
+     Quoting the expression as "${{ inputs.label }}" makes it a valid YAML string.
+     Works when the label value is a simple string like "server1" or "linux".
+
+  3. Single dynamic label (when self-hosted prefix is not required):
+     Use runs-on: ${{ inputs.runner_target }} directly without the array syntax.
+     Self-hosted runners can be identified by unique label alone.
+fix_code:
+  - language: yaml
+    label: "fromJSON() — pass full label array as JSON string (recommended)"
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            runs_on:
+              description: 'Runner labels as JSON array (e.g. ["self-hosted","linux"])'
+              required: true
+              type: string
+              default: '["self-hosted", "linux"]'
+
+      jobs:
+        build:
+          runs-on: ${{ fromJSON(inputs.runs_on) }}
+          steps:
+            - uses: actions/checkout@v4
+            - run: echo "Running on labels ${{ inputs.runs_on }}"
+
+  - language: yaml
+    label: "Quoted expression — for simple label values without YAML-special chars"
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            environment:
+              description: 'Target environment runner label'
+              required: true
+              default: 'staging'
+
+      jobs:
+        deploy:
+          runs-on: [ self-hosted, "${{ inputs.environment }}" ]
+          steps:
+            - run: echo "Deploying to ${{ inputs.environment }}"
+
+  - language: yaml
+    label: "Single dynamic label without array syntax"
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            runner_target:
+              description: 'Self-hosted runner label (e.g. server1, server2)'
+              required: true
+              default: 'server1'
+
+      jobs:
+        deploy:
+          runs-on: ${{ inputs.runner_target }}
+          steps:
+            - run: echo "Running on ${{ inputs.runner_target }}"
+prevention:
+  - "Never place bare ${{ }} expressions inside YAML flow sequences (square bracket arrays) — always quote or use fromJSON()."
+  - "For dynamic multi-label runner selection, use the fromJSON() pattern with a JSON-string workflow input."
+  - "Validate workflow YAML before committing with: gh workflow list --repo owner/repo or a local YAML linter."
+  - "Document expected input format in the workflow input description: 'JSON array, e.g. [\"self-hosted\",\"linux\"]'."
+docs:
+  - url: "https://stackoverflow.com/questions/68732881/how-do-you-use-an-input-variable-to-specify-which-self-hosted-runner-a-github-ac"
+    label: "Stack Overflow: Input variable for self-hosted runner in runs-on"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idruns-on"
+    label: "GitHub Docs: jobs.<job_id>.runs-on workflow syntax"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#fromjson"
+    label: "GitHub Docs: fromJSON() expression function"

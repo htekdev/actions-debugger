@@ -1,0 +1,116 @@
+id: runner-environment-068
+title: "Self-Hosted Runner Service Fails on RHEL/CentOS — SELinux Blocks runsvc.sh with status=203/EXEC"
+category: runner-environment
+severity: error
+tags:
+  - self-hosted
+  - selinux
+  - rhel
+  - centos
+  - oracle-linux
+  - service
+  - systemd
+patterns:
+  - regex: "status=203/EXEC|code=exited.*status=203"
+    flags: "i"
+  - regex: "runsvc\\.sh.*failed|svc\\.sh.*start.*fail|runner.*service.*203"
+    flags: "i"
+  - regex: "avc.*denied.*runner|selinux.*denied.*exec.*runsvc"
+    flags: "i"
+error_messages:
+  - "Active: failed (Result: exit-code)"
+  - "Main PID: XXXX (code=exited, status=203/EXEC)"
+  - "Failed to execute: Permission denied"
+  - "svc install succeeded but svc start exits immediately with status=203/EXEC"
+root_cause: |
+  On SELinux-enforcing Linux distributions (RHEL, CentOS, Oracle Linux, AlmaLinux,
+  Rocky Linux), the GitHub Actions self-hosted runner service fails to start with
+  systemd exit code 203/EXEC when run via sudo ./svc.sh start.
+
+  The root cause is a SELinux security context mismatch:
+  1. GitHub's ./config.sh creates runsvc.sh and run.sh with the security context
+     of the installing user's SSH/interactive session (e.g., unconfined_u:object_r:user_home_t:s0).
+  2. When systemd launches the service, it executes the script in a more restricted
+     domain context. SELinux enforces that service scripts must have a context
+     allowing execution from the systemd context.
+  3. The user_home_t label applied during installation does not permit execution by
+     systemd, so the exec() syscall is denied before the process can start.
+  4. Running ./run.sh directly in an interactive shell works because interactive
+     shells run in a more permissive SELinux context that allows user_home_t exec.
+
+  Exit code 203/EXEC specifically means systemd failed during exec() — not during
+  runtime — confirming SELinux is the blocker rather than a configuration or
+  dependency issue.
+fix: |
+  Apply the correct SELinux security context to the runner service scripts using
+  the chcon command. The usr_t type permits execution by systemd service contexts.
+
+  Step 1 — Fix runsvc.sh context (required):
+    cd /path/to/runner
+    sudo chcon system_u:object_r:usr_t:s0 runsvc.sh
+
+  Step 2 — Fix run.sh context (required if service starts but crashes immediately):
+    sudo chcon system_u:object_r:usr_t:s0 run.sh
+
+  Step 3 — Start the service:
+    sudo ./svc.sh start
+    sudo ./svc.sh status   # Should show: Active: active (running)
+
+  For persistent context that survives runner upgrades and ./config.sh reinstalls,
+  use semanage fcontext to write the context rule permanently. This requires the
+  policycoreutils-python-utils package.
+fix_code:
+  - language: yaml
+    label: "Fix SELinux context — run these commands on the host (not in workflow)"
+    code: |
+      # Navigate to the runner installation directory
+      cd /home/github-runner/actions-runner
+
+      # Step 1: Fix runsvc.sh SELinux context (required)
+      sudo chcon system_u:object_r:usr_t:s0 runsvc.sh
+
+      # Step 2: Fix run.sh as well (needed if service crashes immediately after start)
+      sudo chcon system_u:object_r:usr_t:s0 run.sh
+
+      # Step 3: Start the runner service
+      sudo ./svc.sh start
+
+      # Step 4: Verify the service is running
+      sudo ./svc.sh status
+      # Expected output: Active: active (running)
+
+  - language: yaml
+    label: "Persistent SELinux context via semanage (survives reinstalls)"
+    code: |
+      # Install policycoreutils-python-utils if semanage is not available
+      # sudo dnf install policycoreutils-python-utils
+
+      RUNNER_DIR="/home/github-runner/actions-runner"
+
+      # Add permanent file context rules
+      sudo semanage fcontext -a -t usr_t "${RUNNER_DIR}/runsvc.sh"
+      sudo semanage fcontext -a -t usr_t "${RUNNER_DIR}/run.sh"
+
+      # Apply rules to existing files
+      sudo restorecon -v "${RUNNER_DIR}/runsvc.sh"
+      sudo restorecon -v "${RUNNER_DIR}/run.sh"
+
+      # Verify contexts are set correctly
+      ls -lZ "${RUNNER_DIR}/runsvc.sh" "${RUNNER_DIR}/run.sh"
+      # Expected: system_u:object_r:usr_t:s0
+
+      # Start the runner service
+      sudo ./svc.sh start
+prevention:
+  - "After ./config.sh on SELinux-enforcing systems, always run chcon on runsvc.sh before ./svc.sh start."
+  - "Use semanage fcontext for persistent context that survives runner upgrades and reinstalls."
+  - "Add chcon steps to your runner provisioning runbooks and Ansible/Terraform automation."
+  - "Verify SELinux denials with: sudo ausearch -m avc -ts recent | grep runner"
+  - "Consider using the RHEL runner container image which handles SELinux context automatically."
+docs:
+  - url: "https://stackoverflow.com/questions/71818706/github-self-hosted-runner-fails-to-run-as-a-service-on-rh-linux"
+    label: "Stack Overflow: Self-hosted runner fails as service on RH Linux (17-vote answer)"
+  - url: "https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/configuring-the-self-hosted-runner-application-as-a-service"
+    label: "GitHub Docs: Configuring the self-hosted runner as a service"
+  - url: "https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/8/html/using_selinux/changing-selinux-contexts_using-selinux"
+    label: "Red Hat Docs: Changing SELinux file contexts with chcon"

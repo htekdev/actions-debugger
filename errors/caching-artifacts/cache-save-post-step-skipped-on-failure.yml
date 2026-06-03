@@ -1,0 +1,114 @@
+id: caching-artifacts-025
+title: "Cache Post-Step Skipped on Job Failure — Dependencies Not Saved"
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - cache
+  - post-step
+  - job-failure
+  - save-always
+  - actions-cache
+  - dependency-caching
+patterns:
+  - regex: "Post job cleanup|Skipping.*save.*post-if|Cache not saved.*failure"
+    flags: "i"
+  - regex: "post-if.*success\\(\\)|cache.*post.*step.*skip"
+    flags: "i"
+error_messages:
+  - "Post job cleanup."
+  - "Cache not saved due to an early exit"
+  - "##[debug]Skipping: no reason to save state"
+root_cause: |
+  The actions/cache action hardcodes post-if: success() in its action.yml.
+  This means the post-step that actually saves the cache only runs when the
+  entire job succeeds. If any step after the cache restore step fails — a
+  build failure, a test failure, a linting error — the cache is silently
+  discarded and subsequent runs must re-download all dependencies from scratch.
+
+  This is particularly painful when an expensive dependency install succeeds
+  but a later step (npm run build, pytest, etc.) fails. The dependencies are
+  already installed and ready, but the cache save post-step is skipped because
+  job.status != success().
+
+  Original issue opened January 2020 (actions/cache#92, 500+ reactions).
+  Partially addressed in v3 via actions/cache/save sub-action and in v4 via
+  the save-always: true input.
+
+  The silent nature of the failure means developers often waste hours debugging
+  why subsequent runs are slow before realizing the cache was never saved.
+fix: |
+  Three approaches depending on the cache action version in use:
+
+  Option 1 — actions/cache@v4 with save-always: true (simplest):
+  Add save-always: true to the cache step. Note that steps between restore
+  and save must use continue-on-error: true, or the save step must be placed
+  immediately after the install step (before build/test steps that might fail).
+
+  Option 2 — Explicit save step with if: always() (v3+):
+  Split into actions/cache/restore and actions/cache/save steps. Place the
+  save step immediately after the install step and mark it with if: always()
+  so it runs regardless of subsequent step outcomes.
+
+  Option 3 — Job restructuring:
+  Move dependency installation into a dedicated setup job. The build/test job
+  depends on setup succeeding. Cache is always saved because the setup job
+  only contains the install step.
+fix_code:
+  - language: yaml
+    label: "actions/cache@v4 with save-always: true (simplest fix)"
+    code: |
+      steps:
+        - uses: actions/checkout@v4
+        - name: Restore cached dependencies
+          uses: actions/cache@v4
+          with:
+            path: ~/.npm
+            key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+            restore-keys: |
+              ${{ runner.os }}-npm-
+            save-always: true   # Save cache even if a later step fails
+        - name: Install dependencies
+          run: npm ci
+        - name: Build
+          run: npm run build   # Cache is saved even if this fails
+        - name: Test
+          run: npm test        # Cache is saved even if this fails
+  - language: yaml
+    label: "Explicit save step with if: always() (works with v3+)"
+    code: |
+      steps:
+        - uses: actions/checkout@v4
+        - name: Restore cached dependencies
+          id: cache-restore
+          uses: actions/cache/restore@v4
+          with:
+            path: ~/.npm
+            key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+            restore-keys: |
+              ${{ runner.os }}-npm-
+        - name: Install dependencies
+          run: npm ci
+        - name: Save cache (always, even on build/test failure)
+          if: always()
+          uses: actions/cache/save@v4
+          with:
+            path: ~/.npm
+            key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+        - name: Build
+          run: npm run build
+        - name: Test
+          run: npm test
+prevention:
+  - "Use save-always: true on actions/cache@v4 for dependency caches that should persist regardless of build outcome."
+  - "Split cache restore/save steps and use if: always() on the save step for fine-grained control."
+  - "Place the cache save step immediately after the install step — before build/test steps that might fail."
+  - "Add a post-install verification step (e.g., node --version, pip list) to confirm install succeeded before building."
+docs:
+  - url: "https://github.com/actions/cache/issues/92"
+    label: "actions/cache#92: Cache not saved on job failure (500+ reactions, opened 2020)"
+  - url: "https://github.com/actions/cache/tree/main/save#always-save-cache"
+    label: "actions/cache: always-save-cache documentation"
+  - url: "https://stackoverflow.com/questions/60491837/saving-cache-on-job-failure-in-github-actions"
+    label: "Stack Overflow: Saving cache on job failure in GitHub Actions (28 votes, 11K views)"
+  - url: "https://github.com/actions/cache?tab=readme-ov-file#v4"
+    label: "actions/cache v4 changelog: save-always parameter"
