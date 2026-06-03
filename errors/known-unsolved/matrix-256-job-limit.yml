@@ -1,0 +1,142 @@
+id: known-unsolved-022
+title: "Job Matrix Hard Limit: Maximum 256 Jobs Per Workflow Run"
+category: known-unsolved
+severity: limitation
+tags:
+  - matrix
+  - strategy
+  - job-limit
+  - scale
+  - known-limit
+  - monorepo
+patterns:
+  - regex: "256 jobs|matrix.*256|256.*matrix"
+    flags: "i"
+  - regex: "Job matrix generate.*more than|maximum.*jobs.*workflow.*run"
+    flags: "i"
+  - regex: "matrix.*maximum.*jobs|generates more than 256"
+    flags: "i"
+error_messages:
+  - "Job matrix generates more than 256 jobs"
+  - "A job matrix can generate a maximum of 256 jobs per workflow run"
+  - "The job was not run because it would exceed the maximum number of jobs in a workflow run"
+root_cause: |
+  GitHub Actions enforces a hard limit of 256 jobs per workflow run for job matrix strategies.
+  This limit applies equally to GitHub-hosted and self-hosted runners and cannot be raised
+  via repository or organization settings.
+
+  The limit is evaluated at workflow run creation time against the total number of matrix
+  job combinations. If the computed combination count exceeds 256, the run is blocked.
+
+  Common matrix combinations that silently approach or exceed the limit:
+    - 3 OS × 4 Node.js versions × 22 packages     = 264 jobs  ❌
+    - 4 cloud regions × 4 environments × 17 services = 272 jobs  ❌
+    - 5 browsers × 4 OS × 13 test shards           = 260 jobs  ❌
+
+  This is a long-standing documented constraint. As of the GitHub Actions limits page,
+  the 256-job cap has not been increased and no per-organization override is available.
+
+  Practical impact grows over time: monorepos and test suites that start within the limit
+  gradually approach it as services and configuration dimensions are added, with no
+  warning until a push suddenly fails workflow creation.
+
+  Source: GitHub Docs — Usage limits (256 jobs / workflow run)
+  Source: cloudposse/github-action-matrix-extended (widely-used community workaround)
+  Source: huggingface/transformers PR#28773 (real-world 2-level split at scale)
+fix: |
+  There is no way to raise the 256-job limit via settings. Use one of these workarounds:
+
+  Workaround 1 — Nested matrix via reusable workflows (extends limit to 256² = 65,536):
+    Split work into "slices" at the top-level matrix (up to 256 slices), then call a
+    reusable workflow that runs its own matrix (up to 256 jobs per slice). Each slice
+    × jobs combination stays within the per-run limit.
+
+  Workaround 2 — `github-action-matrix-extended` by cloudposse:
+    Automates the nested slice pattern and supports up to 3 levels (256³ theoretical max).
+    Outputs JSON structure consumed by nested matrix strategy calls.
+
+  Workaround 3 — Path-change filtering via `dorny/paths-filter`:
+    Only generate matrix entries for packages/services that changed in the PR. Keeps
+    CI fast AND well under the job limit for most runs.
+
+  Workaround 4 — Reduce matrix dimensions with `include`/`exclude`:
+    Test all OS on the latest version; test all versions on one OS. Use `exclude:` to
+    prune uncommon OS × version combinations that rarely catch real issues.
+fix_code:
+  - language: yaml
+    label: "Nested reusable workflow split: top-level generates slices, called workflow runs sub-matrix"
+    code: |
+      # outer.yml — up to 256 slices × called workflow's matrix (256 each)
+      name: Test Suite
+      on: [push]
+
+      jobs:
+        generate-slices:
+          runs-on: ubuntu-latest
+          outputs:
+            slices: ${{ steps.gen.outputs.slices }}
+          steps:
+            - id: gen
+              run: |
+                # Generate slice IDs from your service list (split into groups)
+                python3 -c "
+                import json, math
+                services = ['svc-' + str(i) for i in range(300)]
+                slice_size = 10
+                slices = [services[i:i+slice_size] for i in range(0, len(services), slice_size)]
+                print('slices=' + json.dumps([json.dumps(s) for s in slices]))
+                " >> $GITHUB_OUTPUT
+
+        run-slice:
+          needs: generate-slices
+          strategy:
+            matrix:
+              slice: ${{ fromJSON(needs.generate-slices.outputs.slices) }}
+            fail-fast: false
+          uses: ./.github/workflows/test-slice.yml
+          with:
+            services: ${{ matrix.slice }}  # JSON string of services for this slice
+
+  - language: yaml
+    label: "Path filtering: only run matrix jobs for changed packages"
+    code: |
+      jobs:
+        detect-changes:
+          runs-on: ubuntu-latest
+          outputs:
+            matrix: ${{ steps.filter.outputs.changes }}
+          steps:
+            - uses: actions/checkout@v4
+            - id: filter
+              uses: dorny/paths-filter@v3
+              with:
+                filters: |
+                  service-a: ['services/a/**']
+                  service-b: ['services/b/**']
+                  service-c: ['services/c/**']
+                  # ... define one filter per service
+
+        test:
+          needs: detect-changes
+          if: needs.detect-changes.outputs.matrix != '[]'
+          strategy:
+            matrix:
+              service: ${{ fromJSON(needs.detect-changes.outputs.matrix) }}
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test --workspace=services/${{ matrix.service }}
+prevention:
+  - "Track total matrix job count — when exceeding 200, plan a nested split before hitting the 256 wall."
+  - "Implement path-change filtering early in the project lifecycle to prevent combinatorial explosion."
+  - "Prefer `include`/`exclude` pruning over full combinatorial matrices for OS × version coverage."
+  - "Design your CI architecture with the 256-job ceiling in mind, especially for monorepos."
+docs:
+  - url: "https://docs.github.com/en/actions/administering-github-actions/usage-limits-billing-and-administration#usage-limits"
+    label: "GitHub Docs: Usage limits — Job Matrix (256 jobs per workflow run)"
+  - url: "https://github.com/cloudposse/github-action-matrix-extended"
+    label: "cloudposse/github-action-matrix-extended — nested matrix workaround"
+  - url: "https://github.com/dorny/paths-filter"
+    label: "dorny/paths-filter — change-based matrix filtering"
+  - url: "https://github.com/huggingface/transformers/pull/28773"
+    label: "huggingface/transformers PR#28773: Real-world 2-level matrix split"
