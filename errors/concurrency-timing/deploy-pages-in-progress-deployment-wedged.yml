@@ -1,0 +1,70 @@
+id: concurrency-timing-020
+title: "deploy-pages deployment wedged after workflow cancellation — in progress forever"
+category: concurrency-timing
+severity: error
+tags:
+  - deploy-pages
+  - github-pages
+  - workflow-cancellation
+  - pages-deployment
+  - in-progress
+  - stuck
+patterns:
+  - regex: "Deployment request failed for .+ due to in progress deployment"
+    flags: "i"
+  - regex: "Please cancel .+ first or wait for it to complete"
+    flags: "i"
+  - regex: "Deployment cancellation failed"
+    flags: "i"
+error_messages:
+  - "Deployment request failed for 75152aed304ba9378fd527c226e9849ca39d5eda due to in progress deployment. Please cancel 4cb1cd27f0f1bceb7df2e4b7cb82785922dc978d first or wait for it to complete."
+  - "Error: Error: Request failed with status code 400"
+  - "Deployment cancellation failed Error: Request failed with status code 401"
+  - "Failed to create deployment (status: 400) with build version X. Responded with: Deployment request failed due to in progress deployment."
+root_cause: |
+  When an Actions workflow running actions/deploy-pages is cancelled mid-execution,
+  the action's post-step cleanup attempts to call the Pages deployment cancellation API.
+  If this cancellation API call fails (401/404, rate limit, or network timeout),
+  the Pages deployment remains permanently stuck in the "in_progress" state.
+  All subsequent deploy-pages runs fail with a 400 error because the GitHub Pages API
+  enforces a single active deployment per repo — new deployments are rejected until
+  the stuck one is explicitly cancelled or replaced.
+fix: |
+  To prevent the wedge: use a workflow-level concurrency group with cancel-in-progress: false
+  on your deploy job so cancellations cannot interrupt mid-deployment.
+
+  To recover from a stuck deployment: use the GitHub REST API to cancel or delete the
+  stuck Pages deployment. Find the stuck deployment ID from the error message, then
+  DELETE it via the deployments API.
+fix_code:
+  - language: yaml
+    label: "Prevent mid-deploy cancellation (recommended)"
+    code: |
+      jobs:
+        deploy:
+          concurrency:
+            group: pages-deploy
+            cancel-in-progress: false   # never cancel a running Pages deployment
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/deploy-pages@v4
+  - language: yaml
+    label: "Recover: cancel stuck deployment via GitHub API"
+    code: |
+      # Find stuck deployment ID from the error message, then:
+      # gh api repos/OWNER/REPO/deployments --jq '[.[] | select(.environment == "github-pages")]'
+      # gh api repos/OWNER/REPO/deployments/DEPLOYMENT_ID/statuses \
+      #   -X POST -f state=inactive
+      # gh api repos/OWNER/REPO/deployments/DEPLOYMENT_ID -X DELETE
+prevention:
+  - "Use concurrency: cancel-in-progress: false on all deploy jobs to prevent mid-deploy cancellation"
+  - "Avoid cancelling workflows while deploy-pages step is actively running"
+  - "Set up a separate deploy workflow triggered by workflow_run to decouple build from deploy"
+  - "Monitor the GitHub Pages deployment environment in your repo Settings for stuck states"
+docs:
+  - url: "https://github.com/actions/deploy-pages/issues/22"
+    label: "actions/deploy-pages#22: Workflow cancellation left pages deploy wedged"
+  - url: "https://docs.github.com/en/rest/deployments/deployments"
+    label: "GitHub REST API: Deployments (for manual cleanup)"
+  - url: "https://docs.github.com/en/actions/using-jobs/using-concurrency"
+    label: "GitHub Actions: Using concurrency"

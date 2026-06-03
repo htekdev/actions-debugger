@@ -1,0 +1,95 @@
+id: permissions-auth-027
+title: "create-github-app-token token auto-revoked in post step — cannot pass to downstream jobs"
+category: permissions-auth
+severity: silent-failure
+tags:
+  - create-github-app-token
+  - github-app
+  - token-revocation
+  - cross-job
+  - job-outputs
+  - masked-secrets
+patterns:
+  - regex: "HttpError.*401.*Bad credentials"
+    flags: "i"
+  - regex: "Token has been revoked"
+    flags: "i"
+  - regex: "RequestError.*401"
+    flags: "i"
+error_messages:
+  - "HttpError: Bad credentials"
+  - "Error: 401 Bad credentials"
+  - "RequestError: 401 Unauthorized"
+root_cause: |
+  actions/create-github-app-token automatically revokes the generated installation token
+  in the action's post step (after the job completes). This means a token generated in
+  job A and passed as a job output to job B will already be revoked by the time job B
+  runs. Additionally, GitHub Actions automatically masks any value that looks like a
+  token (matching the ghp_, ghs_, ghu_, github_pat_, etc. prefixes). Masked values
+  cannot be passed through job outputs — the runner replaces them with "***" in outputs,
+  so the downstream job receives a masked/empty string rather than the actual token value.
+  Setting skip-token-revoke: true is necessary but not sufficient: the masking mechanism
+  still prevents the token from appearing as a job output.
+fix: |
+  Recreate the token in each job that needs it by calling actions/create-github-app-token
+  as a step within each dependent job. This is the recommended pattern from the action
+  maintainers. Do not attempt to pass the token through job outputs.
+fix_code:
+  - language: yaml
+    label: "Wrong: token passed through job output (always fails)"
+    code: |
+      jobs:
+        get-token:
+          runs-on: ubuntu-latest
+          outputs:
+            token: ${{ steps.app-token.outputs.token }}  # BROKEN: masked, will be ***
+          steps:
+            - id: app-token
+              uses: actions/create-github-app-token@v1
+              with:
+                app-id: ${{ vars.APP_ID }}
+                private-key: ${{ secrets.APP_PRIVATE_KEY }}
+        use-token:
+          needs: get-token
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "token is ${{ needs.get-token.outputs.token }}"
+              # Always prints "***" — token unusable
+  - language: yaml
+    label: "Correct: recreate token in each job that needs it"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - id: app-token
+              uses: actions/create-github-app-token@v1
+              with:
+                app-id: ${{ vars.APP_ID }}
+                private-key: ${{ secrets.APP_PRIVATE_KEY }}
+            - uses: actions/checkout@v4
+              with:
+                token: ${{ steps.app-token.outputs.token }}
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - id: app-token       # recreate — do not reuse from build job
+              uses: actions/create-github-app-token@v1
+              with:
+                app-id: ${{ vars.APP_ID }}
+                private-key: ${{ secrets.APP_PRIVATE_KEY }}
+            - run: ./deploy.sh
+              env:
+                GH_TOKEN: ${{ steps.app-token.outputs.token }}
+prevention:
+  - "Never pass GitHub App tokens through job outputs — the token is masked and will be empty"
+  - "Recreate the token in every job that needs it using a dedicated create-github-app-token step"
+  - "Store APP_ID as a repository variable (vars.APP_ID) and private key as a secret"
+  - "Consider using a GitHub App with fine-grained permissions to minimize the blast radius of token exposure"
+docs:
+  - url: "https://github.com/actions/create-github-app-token/issues/66"
+    label: "actions/create-github-app-token#66: output token cannot be used across jobs"
+  - url: "https://github.com/actions/create-github-app-token#usage"
+    label: "actions/create-github-app-token: Usage documentation"
+  - url: "https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-an-intermediate-environment-to-access-secrets"
+    label: "GitHub Docs: Security hardening — intermediate environment for secrets"
