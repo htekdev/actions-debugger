@@ -1,0 +1,115 @@
+id: silent-failures-032
+title: "Undefined env/context Variable Silently Evaluates to Empty String"
+category: silent-failures
+severity: silent-failure
+tags:
+  - env-context
+  - expression
+  - undefined-variable
+  - empty-string
+  - silent-failure
+  - jenkins-migration
+patterns:
+  - regex: "\$\{\{\s*env\.[A-Za-z_][A-Za-z0-9_]*\s*\}\}"
+    flags: "i"
+  - regex: "expression.*evaluates.*empty.*string|undefined.*variable.*no.*error"
+    flags: "i"
+error_messages:
+  - "(no error shown -- undefined env/context variables produce empty strings silently)"
+  - "(step proceeds with empty value, downstream steps receive blank input)"
+root_cause: |
+  GitHub Actions expression evaluation does not throw errors when referencing
+  variables that do not exist. An expression like ${{ env.SOME_VAR }} where
+  SOME_VAR is not defined in any env: block evaluates silently to an empty string.
+
+  This behavior affects all expression contexts:
+  - ${{ env.VAR_NAME }} -- undefined env variable evaluates to empty string
+  - ${{ inputs.param }} -- undefined workflow input evaluates to empty string
+  - ${{ vars.CONFIG }} -- undefined repository variable evaluates to empty string
+  - ${{ needs.job.outputs.value }} -- missing job output evaluates to empty string
+
+  Common causes:
+  1. Jenkins migration: GitHub Actions Importer generates env references for all
+     Jenkins variables, but not all are defined in the converted workflow env block.
+  2. Variable renaming: renamed in one place but old reference still used elsewhere.
+  3. Conditional env blocks: variable only set for certain trigger events.
+  4. Copy-paste across repos where the env block differs.
+
+  Silent empty values cause cascading failures:
+  - Docker image tags resolve to empty, pushing to wrong registry path silently
+  - Build version strings empty, artifacts built without version identifier
+  - Path variables empty, steps act on current directory unexpectedly
+  - Conditional checks always false because gating variable is always empty
+  - Upload artifact path empty, upload succeeds with zero files
+fix: |
+  Add explicit variable validation using shell parameter expansion to fail fast
+  with a clear error message when required variables are empty or unset.
+
+  The POSIX ${VAR:?message} syntax causes the step to exit non-zero with a clear
+  error immediately when VAR is empty or unset.
+
+  For non-shell contexts, use the GitHub Actions || operator to provide fallback
+  values or error markers.
+fix_code:
+  - language: yaml
+    label: "Shell validation with POSIX parameter expansion -- fail fast on empty"
+    code: |
+      jobs:
+        deploy:
+          env:
+            DEPLOY_TARGET: ${{ env.DEPLOY_TARGET }}
+            IMAGE_TAG: ${{ env.IMAGE_TAG }}
+          steps:
+            - name: Validate required environment variables
+              shell: bash
+              run: |
+                : "${DEPLOY_TARGET:?DEPLOY_TARGET is required but not set}"
+                : "${IMAGE_TAG:?IMAGE_TAG is required -- check the env: block}"
+                echo "All required variables validated"
+            - name: Deploy
+              run: ./deploy.sh "$DEPLOY_TARGET" "$IMAGE_TAG"
+  - language: yaml
+    label: "Expression fallback to make undefined variables visible in logs"
+    code: |
+      steps:
+        - name: Resolve configuration
+          env:
+            DEPLOY_TARGET: ${{ env.DEPLOY_TARGET || 'MISSING_DEPLOY_TARGET' }}
+          run: |
+            if [[ "$DEPLOY_TARGET" == "MISSING_DEPLOY_TARGET" ]]; then
+              echo "::error::DEPLOY_TARGET is not set -- add it to the env: block"
+              exit 1
+            fi
+            echo "Deploying to: $DEPLOY_TARGET"
+  - language: yaml
+    label: "Bulk audit for Jenkins-migrated workflows"
+    code: |
+      steps:
+        - name: Audit required environment variables
+          shell: bash
+          run: |
+            REQUIRED=(APP_VERSION DEPLOY_ENV BUILD_TARGET REGISTRY_URL)
+            MISSING=()
+            for VAR in "${REQUIRED[@]}"; do
+              [[ -z "${!VAR}" ]] && MISSING+=("$VAR")
+            done
+            if [[ ${#MISSING[@]} -gt 0 ]]; then
+              echo "::error::Missing env vars: ${MISSING[*]} -- add them to env: block"
+              exit 1
+            fi
+            echo "All required variables are set"
+prevention:
+  - "After Jenkins migration, audit all env expression references against the workflow env: block."
+  - "Add a validation step at job start using shell parameter expansion for all required variables."
+  - "Use repository variables (vars.X) instead of env for shared config -- gaps are visible in UI."
+  - "Use the || operator to make undefined variables visible: ${{ env.X || 'MISSING' }}."
+  - "Set required: true on workflow_dispatch inputs to prevent the undefined-input variant."
+docs:
+  - url: "https://stackoverflow.com/questions/76611427/how-to-verify-if-the-github-syntax-variables-actually-exist-in-github-actions-wo"
+    label: "Stack Overflow: Verify GitHub syntax variables exist in workflow YAML"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions"
+    label: "GitHub Docs: Evaluate expressions -- operators including || for defaults"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/store-information-in-variables"
+    label: "GitHub Docs: Store information in variables -- env, vars, inputs contexts"
+  - url: "https://pubs.opengroup.org/onlinepubs/009604499/utilities/xcu_chap02.html#tag_02_06_02"
+    label: "POSIX Shell: Parameter expansion with :? for unset/empty detection"
