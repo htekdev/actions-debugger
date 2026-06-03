@@ -1,0 +1,115 @@
+id: 'silent-failures-039'
+title: '`GITHUB_STEP_SUMMARY` content silently discarded when write size approaches the 1 MiB per-step limit'
+category: silent-failures
+severity: silent-failure
+tags:
+  - step-summary
+  - github-step-summary
+  - silent-discard
+  - 1mib-limit
+  - job-summary
+  - reporting
+patterns:
+  - regex: 'GITHUB_STEP_SUMMARY'
+    flags: 'i'
+  - regex: '\$env:GITHUB_STEP_SUMMARY'
+    flags: 'i'
+error_messages:
+  - 'Summary content written to /home/runner/work/_temp/_github_workflow/step_summary_*.md'
+  - 'Summary content written to C:\Users\runneradmin\AppData\Local\Temp\_github_workflow\step_summary_*.md'
+root_cause: |
+  The GitHub Actions runner enforces a 1 MiB (1,048,576 bytes) per-step size limit on
+  GITHUB_STEP_SUMMARY content. When a step writes content that is within approximately
+  2 bytes of this limit, the runner silently discards the entire summary with no error
+  message, no warning, and no non-zero exit code.
+
+  Two distinct bugs are present (both observed on runner 2.333.1+):
+
+  Bug 1 — Off-by-one at the limit boundary: Content that is exactly (1 MiB - 1) bytes
+  is rejected as "too long" even though it is one byte below the documented limit.
+  The effective hard limit is (1 MiB - 2) bytes, not 1 MiB.
+
+  Bug 2 — Silent discard near the boundary: Content written when the running total is
+  within ~2 bytes of the effective limit is silently dropped. The write succeeds (no
+  error), the step exits 0, but the summary does not appear in the GitHub Actions UI.
+  There is no log line, annotation, or job-level error indicating the drop occurred.
+
+  This is particularly dangerous for CI workflows that rely on step summary for:
+  - Test result tables (many failed tests → large HTML tables)
+  - Build logs written to summary for easy access
+  - Deployment manifests or diff outputs
+  - Security scan results
+
+  The content is lost at job execution time; there is no way to recover it after the fact.
+  The only indication is that the summary section in the GitHub UI appears blank or shows
+  less content than expected.
+
+  Tracked in actions/runner#4337 (April 2026, open).
+fix: |
+  Truncate summary content to a safe size before writing to GITHUB_STEP_SUMMARY.
+  Leave a margin of ~5 KB below the 1 MiB limit to account for multi-step accumulation
+  and the off-by-one bug.
+
+  For multi-step workflows, track cumulative size: each step's contribution adds to the
+  total step summary for the job. The 1 MiB limit applies per step, not per job.
+
+  Always validate that critical summary content was written by checking the file size
+  after the write, not by relying on exit code alone.
+fix_code:
+  - language: yaml
+    label: 'Truncate step summary to safe size before writing (bash)'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Run tests and write summary
+              run: |
+                # Generate potentially large summary content
+                content=$(cat test-results.md 2>/dev/null || echo "No results")
+
+                # Enforce safe limit: 1 MiB minus 10 KB buffer
+                max_bytes=$(( 1048576 - 10240 ))
+                content_bytes=${#content}
+
+                if [ "$content_bytes" -gt "$max_bytes" ]; then
+                  content="${content:0:$max_bytes}"
+                  content="${content}"$'\n\n> **Note:** Summary truncated — exceeded safe 1 MiB limit.'
+                fi
+
+                printf '%s' "$content" >> "$GITHUB_STEP_SUMMARY"
+  - language: yaml
+    label: 'Truncate step summary to safe size before writing (PowerShell)'
+    code: |
+      jobs:
+        test:
+          runs-on: windows-latest
+          steps:
+            - name: Write test summary with size guard
+              shell: pwsh
+              run: |
+                $content = Get-Content test-results.md -Raw -ErrorAction SilentlyContinue
+                if (-not $content) { $content = "No test results found." }
+
+                # Safe limit: 1 MiB minus 10 KB buffer (accounts for off-by-one bug)
+                $maxBytes = 1048576 - 10240
+                $bytes = [System.Text.Encoding]::UTF8.GetByteCount($content)
+
+                if ($bytes -gt $maxBytes) {
+                  # Truncate and add warning marker
+                  $truncated = $content.Substring(0, [Math]::Min($content.Length, $maxBytes / 2))
+                  $content = $truncated + "`n`n> **Note:** Summary truncated — exceeded safe 1 MiB limit."
+                }
+
+                $content | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+prevention:
+  - 'Always apply a size guard before writing to GITHUB_STEP_SUMMARY — use (1 MiB - 10 KB) as a safe upper bound'
+  - 'For test result summaries, limit to the N most-recent or most-critical failures rather than dumping all output'
+  - 'Verify critical summary writes by checking file size after the write step, not by relying on exit code 0'
+  - 'Track actions/runner#4337 for a runner fix that either raises the limit or surfaces an error when content is discarded'
+  - 'Split large summaries across multiple steps — but note each step has its own 1 MiB budget, not a shared pool'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4337'
+    label: 'actions/runner#4337: GITHUB_STEP_SUMMARY content silently dropped when size approaches 1 MiB limit (April 2026)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions#adding-a-job-summary'
+    label: 'GitHub Docs: Adding a job summary — GITHUB_STEP_SUMMARY documentation and limits'
