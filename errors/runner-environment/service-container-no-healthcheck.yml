@@ -1,0 +1,158 @@
+id: runner-environment-066
+title: "Service Container Unhealthy — No Healthcheck Causes Job to Run Before Container Is Ready"
+category: runner-environment
+severity: error
+tags:
+  - service-container
+  - postgres
+  - mysql
+  - redis
+  - healthcheck
+  - docker
+  - connection-refused
+patterns:
+  - regex: "db service is unhealthy"
+    flags: "i"
+  - regex: "(?:postgres|mysql|redis|service).*(?:unhealthy|not ready|failed to start)"
+    flags: "i"
+  - regex: "One or more containers failed to start"
+    flags: "i"
+  - regex: "Connection refused.*(?:5432|3306|6379)"
+    flags: "i"
+  - regex: "could not connect to server.*Connection refused"
+    flags: "i"
+  - regex: "ECONNREFUSED.*(?:5432|3306|6379)"
+    flags: "i"
+error_messages:
+  - "Failed to initialize, db service is unhealthy."
+  - "One or more containers failed to start."
+  - "Error: connect ECONNREFUSED 127.0.0.1:5432"
+  - "could not connect to server: Connection refused"
+  - "Is the server running on that host and accepting TCP/IP connections on port 5432?"
+  - "ERROR 2002 (HY000): Can't connect to MySQL server on '127.0.0.1' (111)"
+root_cause: |
+  GitHub Actions starts service containers (defined under `services:`) before
+  job steps begin, but it does NOT wait for the container's internal process to
+  be fully ready unless a healthcheck is configured. The runner only waits for
+  the container to be in a running state — not for the database or service
+  inside to accept connections.
+
+  Databases like PostgreSQL, MySQL, and Redis typically take several seconds
+  after the container starts before they are ready to accept connections. Without
+  a healthcheck configured via the `options:` key, GitHub Actions proceeds to
+  run job steps immediately while the service is still initializing. The first
+  step that attempts a database connection will fail with "Connection refused"
+  or "service is unhealthy."
+
+  Common misconfiguration patterns:
+  1. No `options:` block at all — the service starts but the job doesn't wait
+     for readiness. The runner polls the healthcheck status if one is present.
+  2. Wrong healthcheck command — using `pg_isready` without the correct user/host
+     flags, or using `mysqladmin ping` without the correct credentials.
+  3. Insufficient retries/timeouts — using `--health-retries 1` means a single
+     failed attempt marks the container unhealthy immediately.
+  4. Port not mapped — the `ports:` key is optional when running steps directly
+     on the runner (accessing via 127.0.0.1), but is required when steps run
+     inside a container.
+
+  Note: Even with a healthcheck, the DB container can transiently fail the
+  healthcheck during slow GH-hosted runner provisioning. Default values of
+  `--health-interval 10s --health-timeout 5s --health-retries 5` work for
+  most cases, but MySQL/MariaDB may need longer retries during first initialization.
+fix: |
+  Add a `options:` block to your service definition with a proper Docker
+  healthcheck command. GitHub Actions reads the container's healthcheck status
+  and waits until the container reports "healthy" before starting job steps.
+
+  PostgreSQL:
+    Use `pg_isready` with `-h localhost` and the correct username.
+
+  MySQL/MariaDB:
+    Use `mysqladmin ping` with credentials matching the MYSQL_ROOT_PASSWORD.
+
+  Redis:
+    Use `redis-cli ping` — returns PONG when Redis is ready.
+
+  If the container is still failing, increase `--health-retries` and
+  `--health-start-period` to give the container more initialization time.
+  MySQL in particular needs a longer start period on its first run because it
+  initializes the data directory.
+fix_code:
+  - language: yaml
+    label: "PostgreSQL service with proper healthcheck"
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          services:
+            postgres:
+              image: postgres:16
+              env:
+                POSTGRES_USER: testuser
+                POSTGRES_PASSWORD: testpass
+                POSTGRES_DB: testdb
+              ports:
+                - 5432:5432
+              options: >-
+                --health-cmd pg_isready
+                --health-interval 10s
+                --health-timeout 5s
+                --health-retries 5
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+              env:
+                DATABASE_URL: postgresql://testuser:testpass@localhost:5432/testdb
+  - language: yaml
+    label: "MySQL service with proper healthcheck"
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          services:
+            mysql:
+              image: mysql:8.0
+              env:
+                MYSQL_ROOT_PASSWORD: rootpass
+                MYSQL_DATABASE: testdb
+              ports:
+                - 3306:3306
+              options: >-
+                --health-cmd "mysqladmin ping -h 127.0.0.1 -u root -prootpass"
+                --health-interval 10s
+                --health-timeout 5s
+                --health-retries 10
+                --health-start-period 30s
+  - language: yaml
+    label: "Redis service with proper healthcheck"
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          services:
+            redis:
+              image: redis:7
+              ports:
+                - 6379:6379
+              options: >-
+                --health-cmd "redis-cli ping"
+                --health-interval 10s
+                --health-timeout 5s
+                --health-retries 5
+prevention:
+  - "Always add a `options: --health-cmd ...` block to every service container — the runner will wait for 'healthy' status before running steps."
+  - "Use `--health-start-period 30s` for MySQL/MariaDB which initializes its data directory on the first run and takes longer than PostgreSQL or Redis."
+  - "Test your healthcheck command locally with `docker run --health-cmd ...` to verify it exits 0 when the service is ready."
+  - "Use `ports: - 5432:5432` when steps run directly on the runner host (ubuntu-latest); ports are optional when steps run in a container job."
+  - "Avoid hardcoded `sleep 30` workarounds — these waste time on fast machines and still fail on slow ones. Use healthchecks instead."
+docs:
+  - url: "https://docs.github.com/en/actions/use-cases-and-examples/creating-postgresql-service-containers"
+    label: "GitHub Docs: Creating PostgreSQL service containers"
+  - url: "https://docs.github.com/en/actions/use-cases-and-examples/creating-redis-service-containers"
+    label: "GitHub Docs: Creating Redis service containers"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/running-jobs-in-a-container"
+    label: "GitHub Docs: Running jobs in a container (services section)"
+  - url: "https://stackoverflow.com/questions/60618118/docker-postgres-image-failed-to-initialize-db-service-is-unhealthy"
+    label: "Stack Overflow #60618118: db service is unhealthy (25 votes, 8.8K views)"
+  - url: "https://github.com/orgs/community/discussions/27021"
+    label: "GitHub Community #27021: MySQL service never comes up healthy"
