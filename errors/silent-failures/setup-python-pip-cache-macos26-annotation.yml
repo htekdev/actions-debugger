@@ -1,0 +1,110 @@
+id: silent-failures-027
+title: "actions/setup-python pip Cache on macOS 26 Emits False Error Annotation"
+category: silent-failures
+severity: warning
+tags:
+  - setup-python
+  - pip
+  - cache
+  - macos-26
+  - annotation
+  - false-positive
+  - python310
+patterns:
+  - regex: "ERROR.*WARNING.*Cache entry deserialization failed.*entry ignored"
+    flags: "i"
+  - regex: "Cache entry deserialization failed.*entry ignored"
+    flags: "i"
+  - regex: "Error: WARNING:.*cache.*deserialization"
+    flags: "i"
+error_messages:
+  - "Error: WARNING: Cache entry deserialization failed, entry ignored."
+  - "WARNING: Cache entry deserialization failed, entry ignored"
+root_cause: |
+  When using `actions/setup-python@v6` with `cache: 'pip'` and an older Python version
+  (notably Python 3.10) on `macos-26` runners, the action succeeds but emits a false
+  error annotation in the GitHub Actions UI, turning the job "yellow" or showing a red
+  annotation badge.
+
+  **What happens:**
+  1. `setup-python@v6` restores the pip cache from a previous run.
+  2. pip on the current macOS 26 runner (with a newer pip version) encounters a pip
+     wheel cache entry written by an older pip version using a different serialization
+     format or metadata schema.
+  3. pip emits: `WARNING: Cache entry deserialization failed, entry ignored` to stderr.
+  4. The GitHub Actions runner's annotation parser sees the word "Error" at the start
+     of the output (because the line is rendered as `Error: WARNING: ...` in GitHub's
+     log viewer) and creates an annotation treating it as a job error.
+  5. The job itself succeeds — the dependency install works fine — but the annotation
+     makes the job appear failed or degraded in the GitHub UI.
+
+  **Platform specificity:** This is reproducible specifically on `macos-26` (ARM), not
+  on Ubuntu, Windows, or `macos-15`. The combination of macOS 26's newer system Python
+  environment and the `macos-26` Arm64 pip wheel cache schema causes the deserialization
+  mismatch.
+
+  Source: actions/setup-python#1317 (open bug, May 20 2026 — under investigation by
+  actions/setup-python maintainers).
+fix: |
+  **Option 1 — Clear the stale pip cache (immediate fix):**
+  Purge the GitHub Actions cache for the affected key via the UI or API, forcing a cache
+  rebuild on the next run. The fresh cache will be written by the current pip version on
+  macOS 26 and will deserialize cleanly on subsequent runs.
+
+  **Option 2 — Disable pip caching for macOS 26 until resolved:**
+  Use a conditional `cache` input based on the runner OS:
+
+  **Option 3 — Pin to a Python version not affected:**
+  Python 3.12 and 3.14 have not been reported to exhibit this issue on macOS 26 — only
+  3.10 is confirmed. Test whether upgrading your target Python version resolves the annotation.
+
+  **Option 4 — Wait for the upstream fix:**
+  This is an open bug in `actions/setup-python` being investigated (issue #1317). A fix
+  in `setup-python@v6` will resolve this without workflow changes.
+fix_code:
+  - language: yaml
+    label: "Disable pip cache on macOS to avoid false error annotation"
+    code: |
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+          # Disable cache on macOS 26 until setup-python#1317 is resolved
+          cache: ${{ runner.os != 'macOS' && 'pip' || '' }}
+  - language: yaml
+    label: "Clear the stale cache via GitHub API (one-time fix)"
+    code: |
+      # Delete the stale pip cache key via gh CLI (run once)
+      gh cache list --repo owner/repo --key 'setup-python-*macos-26*'
+      gh cache delete <CACHE_ID> --repo owner/repo
+      # Or delete all pip caches for macOS 26:
+      gh cache list --repo owner/repo --json id,key --jq \
+        '.[] | select(.key | test("macos-26")) | .id' \
+        | xargs -I{} gh cache delete {} --repo owner/repo
+  - language: yaml
+    label: "Matrix build: cache only on platforms where it works cleanly"
+    code: |
+      jobs:
+        test:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest, macos-26]
+          runs-on: ${{ matrix.os }}
+          steps:
+            - uses: actions/setup-python@v6
+              with:
+                python-version: "3.10"
+                # macOS 26 pip cache has deserialization issue (setup-python#1317)
+                cache: ${{ matrix.os != 'macos-26' && 'pip' || '' }}
+prevention:
+  - "Watch for `actions/setup-python` releases fixing issue #1317 — once resolved, re-enable caching on macOS 26."
+  - "When a new macOS runner label becomes `macos-latest`, clear pip caches from the old image version to avoid deserialization mismatches on the first run."
+  - "Test your workflows on new macOS runner labels before `macos-latest` transitions — catch cache format incompatibilities before they affect production CI."
+  - "Use GitHub's cache eviction API or `actions/cache@v4` with `fail-on-cache-miss: false` to gracefully handle deserialization failures."
+docs:
+  - url: "https://github.com/actions/setup-python/issues/1317"
+    label: "actions/setup-python#1317: Cache entry deserialization failed on macOS 26 (open bug)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows#managing-caches"
+    label: "GitHub Docs: Managing GitHub Actions caches"
+  - url: "https://github.com/actions/setup-python"
+    label: "actions/setup-python — official action repository"

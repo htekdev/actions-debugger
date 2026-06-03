@@ -1,0 +1,158 @@
+id: runner-environment-058
+title: "macOS 26 Homebrew LLVM Jumps 18 → 20 — Hardcoded llvm@18 Paths Fail"
+category: runner-environment
+severity: error
+tags:
+  - macos-26
+  - macos-latest
+  - llvm
+  - clang
+  - homebrew
+  - runner-image
+  - breaking-change
+  - cpp
+  - cmake
+patterns:
+  - regex: "no such file or directory.*homebrew.*opt.*llvm@(17|18)/bin"
+    flags: "i"
+  - regex: "clang(\\+\\+)?-(17|18).*command not found|No such file.*clang-(17|18)"
+    flags: "i"
+  - regex: "brew.*prefix.*llvm@(17|18).*Error.*no such keg"
+    flags: "i"
+  - regex: "Could not find.*LLVM (17|18).*Config\\.cmake"
+    flags: "i"
+  - regex: "llvm-config-(17|18).*not found"
+    flags: "i"
+error_messages:
+  - "zsh: no such file or directory: /opt/homebrew/opt/llvm@18/bin/clang++"
+  - "Error: clang-18: command not found"
+  - "Error: No such keg: /opt/homebrew/Cellar/llvm@18"
+  - "CMake Error at /opt/homebrew/lib/cmake/llvm/LLVMConfig.cmake: LLVM 18.1 required but 20.1 found"
+  - "llvm-config-18: not found"
+root_cause: |
+  When the `macos-latest` label migrated to macOS 26 Tahoe (beginning June 15, 2026),
+  the Homebrew-installed LLVM major version changed from **18.1.8** (on macOS 15) to
+  **20.1.8** (on macOS 26). This is a two-major-version jump that silently breaks any
+  workflow that hardcodes LLVM version numbers in paths, environment variables, or
+  CMake configuration.
+
+  **Affected patterns:**
+  - Shell scripts using `$(brew --prefix llvm@18)/bin/clang++` — the `llvm@18` keg no
+    longer exists on macOS 26; Homebrew returns "Error: No such keg"
+  - Workflows setting `CC=clang-18` or `CXX=clang++-18` — these binaries aren't
+    installed; the available binaries are `clang-20` and `clang++-20`
+  - CMake `find_package(LLVM 18 REQUIRED)` — succeeds on macOS 15 because Homebrew
+    LLVM 18 is present; fails on macOS 26 because only LLVM 20 is available
+  - `llvm-config-18 --version` in build scripts — the versioned binary doesn't exist
+  - `pkg-config --libs llvm-18` — the pkg-config file for llvm-18 is absent
+
+  **macOS 26 image ships with:**
+  - `llvm` formula → installs LLVM 20.x (unversioned `llvm` formula always tracks latest)
+  - `llvm@20` → available for explicit `brew install llvm@20`
+  - No `llvm@18` keg in the default image
+
+  Note: Workflows using the *unversioned* `llvm` or `clang` commands (e.g., `CC=clang`,
+  `$(brew --prefix llvm)/bin/clang++`) are NOT affected — they pick up the default
+  LLVM version on each image automatically.
+
+  Source: runner-images#14167 release diff table (Clang/LLVM 18.1.8 → 20.1.8);
+  community migration example: POCO C++ Libraries commit ff8174d (April 2026).
+fix: |
+  Replace all hardcoded `llvm@18` / `clang-18` references with either the unversioned
+  `llvm` formula path or the explicit `llvm@20` path on macOS 26.
+
+  **Option 1 — Use the unversioned Homebrew prefix (recommended):**
+  Replace `$(brew --prefix llvm@18)` with `$(brew --prefix llvm)` — this always resolves
+  to the current default LLVM, making the workflow future-proof.
+
+  **Option 2 — Explicit llvm@20 for reproducibility:**
+  Install `llvm@20` explicitly and reference it by version. This avoids future surprises
+  when `llvm` bumps to 21+.
+
+  **Option 3 — Pin to macos-15 temporarily:**
+  If the migration is not immediately feasible, pin to `macos-15` while updating your
+  build system to use the unversioned LLVM path.
+
+  **For CMake projects:** Remove the version constraint from `find_package(LLVM X REQUIRED)`
+  or use `find_package(LLVM REQUIRED)` and check the found version at configure time.
+fix_code:
+  - language: yaml
+    label: "Use unversioned llvm prefix — works across all macOS runner versions"
+    code: |
+      jobs:
+        build:
+          runs-on: macos-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Install LLVM
+              run: brew install llvm  # installs current default (llvm@20 on macOS 26)
+
+            - name: Build
+              run: |
+                # Use unversioned prefix — future-proof across LLVM major bumps
+                LLVM_PREFIX=$(brew --prefix llvm)
+                export CC="$LLVM_PREFIX/bin/clang"
+                export CXX="$LLVM_PREFIX/bin/clang++"
+                export LDFLAGS="-L$LLVM_PREFIX/lib"
+                export CPPFLAGS="-I$LLVM_PREFIX/include"
+                make -j$(sysctl -n hw.logicalcpu)
+  - language: yaml
+    label: "Explicit llvm@20 for reproducible macOS 26 builds"
+    code: |
+      jobs:
+        build:
+          runs-on: macos-latest  # macOS 26
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Install LLVM 20
+              run: brew install llvm@20
+
+            - name: Configure and build
+              run: |
+                export CC="$(brew --prefix llvm@20)/bin/clang"
+                export CXX="$(brew --prefix llvm@20)/bin/clang++"
+                cmake -B build \
+                  -DCMAKE_C_COMPILER="$CC" \
+                  -DCMAKE_CXX_COMPILER="$CXX" \
+                  -DLLVM_DIR="$(brew --prefix llvm@20)/lib/cmake/llvm"
+                cmake --build build --parallel
+  - language: yaml
+    label: "CMake: remove version constraint from find_package(LLVM)"
+    code: |
+      # CMakeLists.txt — before
+      find_package(LLVM 18 REQUIRED CONFIG)
+
+      # CMakeLists.txt — after (accepts any version)
+      find_package(LLVM REQUIRED CONFIG)
+      message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
+      # Optionally enforce a minimum version:
+      if(LLVM_VERSION_MAJOR LESS 18)
+        message(FATAL_ERROR "LLVM >= 18 required, got ${LLVM_PACKAGE_VERSION}")
+      endif()
+  - language: yaml
+    label: "Pin to macos-15 as temporary rollback while migrating"
+    code: |
+      jobs:
+        build:
+          # Temporary: macOS 15 still has llvm@18 via Homebrew
+          # TODO: migrate to unversioned llvm and switch back to macos-latest
+          runs-on: macos-15
+          steps:
+            - uses: actions/checkout@v4
+prevention:
+  - "Never hardcode LLVM version numbers in Homebrew prefix paths. Use `$(brew --prefix llvm)` for the current default or `$(brew --prefix llvm@XX)` with an explicit install step for reproducibility."
+  - "In CMakeLists.txt, use `find_package(LLVM REQUIRED CONFIG)` without a version constraint, and validate the found version at configure time instead."
+  - "Test your macOS CI against `macos-26` (or `macos-latest` after it transitions) before the migration completes — use a matrix build to run both images in parallel."
+  - "Audit all workflow files for hardcoded `clang-XX`, `llvm@XX`, or `llvm-config-XX` strings when macOS runner images announce major tool version changes."
+  - "Subscribe to runner-images releases to monitor Homebrew LLVM version changes in the release diff tables."
+docs:
+  - url: "https://github.com/actions/runner-images/issues/14167"
+    label: "runner-images#14167: macos-latest will use macos-26 in June 2026 (diff table shows LLVM 18 → 20)"
+  - url: "https://github.com/actions/runner-images/blob/main/images/macos/macos-26-arm64-Readme.md"
+    label: "macOS 26 arm64 image README — full software list including LLVM version"
+  - url: "https://docs.brew.sh/Versions"
+    label: "Homebrew Docs: Versioned formulae (llvm@18, llvm@20, etc.)"
+  - url: "https://cmake.org/cmake/help/latest/command/find_package.html"
+    label: "CMake find_package documentation"
