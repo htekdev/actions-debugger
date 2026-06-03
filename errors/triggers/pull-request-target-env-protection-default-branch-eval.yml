@@ -1,0 +1,117 @@
+id: triggers-021
+title: "pull_request_target Environment Branch Protection Now Evaluates Against Default Branch (Nov 2025 Breaking Change)"
+category: triggers
+severity: error
+tags:
+  - pull_request_target
+  - environment
+  - branch-protection
+  - deployment
+  - breaking-change
+  - default-branch
+  - evaluation-ref
+patterns:
+  - regex: "Branch 'refs/pull/\\d+/merge' is not allowed to deploy to .+ due to environment protection rules"
+    flags: "i"
+  - regex: "pull_request_target.*environment.*protection"
+    flags: "im"
+  - regex: "is not allowed to deploy to .+ due to environment protection rules"
+    flags: "i"
+error_messages:
+  - "Branch 'refs/pull/904/merge' is not allowed to deploy to prod due to environment protection rules."
+  - "Branch 'refs/pull/123/merge' is not allowed to deploy to staging due to environment protection rules."
+root_cause: |
+  In November 2025, GitHub changed how environment branch protection rules are evaluated
+  for `pull_request_target` workflows. Before the change:
+  - The evaluation ref could be the PR head SHA or the merge ref, depending on
+    how the workflow was written.
+  After the change (effective ~December 2025):
+  - `pull_request_target` workflows ALWAYS run from the **default branch** as the
+    workflow source reference (`GITHUB_REF`/`GITHUB_SHA`).
+  - Environment branch protection rules are now evaluated against the **execution
+    reference** (the default branch) rather than the PR head.
+
+  **Who is affected:**
+  Workflows using `pull_request_target` with environment deployments that have
+  branch protection rules configured to allow only specific branch patterns.
+
+  For example, if an environment's branch restriction allows `main` only, a
+  `pull_request_target` workflow that previously passed (because it matched some
+  derived ref) may now fail if GitHub evaluates a different ref. Conversely,
+  workflows that previously respected PR-branch restrictions may now bypass them
+  because the default branch is used instead.
+
+  This change was made for security: it ensures `pull_request_target` cannot be
+  used to circumvent branch-based deployment restrictions via crafted PR refs.
+
+  The `environment-protection-rules-silent-block` entry (triggers-006) covers the
+  general case of environment rules blocking deployment. This entry specifically
+  documents the November 2025 behavioral change and its migration path.
+fix: |
+  Update your environment branch protection rules to match the execution reference
+  used after the behavioral change:
+
+  1. **If deployments are now incorrectly blocked:** Add the default branch (e.g.,
+     `main`) to the environment's allowed branch patterns, since `pull_request_target`
+     now executes in the default branch context.
+
+  2. **If PR-based branch restrictions are no longer enforced:** Switch from
+     `pull_request_target` to `pull_request` (if the elevated-permissions use case
+     can be removed), which uses the PR head ref and respects branch-filter rules
+     as expected.
+
+  3. **For cross-repo PR deployments that legitimately need `pull_request_target`:**
+     Use required reviewers on the environment to gate deployments instead of
+     (or in addition to) branch restrictions — required reviewers are not affected
+     by this ref-evaluation change.
+fix_code:
+  - language: yaml
+    label: "Use pull_request instead of pull_request_target when elevated secrets not needed"
+    code: |
+      # Before (uses pull_request_target — broad access, affected by Nov 2025 change):
+      # on:
+      #   pull_request_target:
+      #     types: [opened, synchronize]
+
+      # After (use pull_request — runs in PR head context, branch filters work as expected):
+      on:
+        pull_request:
+          types: [opened, synchronize]
+          branches:
+            - main
+
+      jobs:
+        deploy-preview:
+          runs-on: ubuntu-latest
+          environment: staging
+          steps:
+            - uses: actions/checkout@v4
+            - run: echo "Deploy preview for ${{ github.head_ref }}"
+  - language: yaml
+    label: "Add required reviewers to the environment instead of relying on branch filters alone"
+    code: |
+      # In GitHub repo Settings → Environments → staging → Protection rules:
+      # ✅ Required reviewers: add team "platform-team"
+      # (branch restrictions can be kept or relaxed — human approval is the gate)
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          environment: staging         # requires approval from platform-team
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./deploy.sh
+prevention:
+  - "Prefer `pull_request` over `pull_request_target` unless your workflow specifically needs write permissions or secrets from the base repo for fork PR handling."
+  - "Use required reviewers in environments rather than relying solely on branch name patterns for deployment gating."
+  - "After enabling `pull_request_target`, validate that environment protection rules still behave as expected by reviewing which ref GitHub uses as the evaluation context."
+  - "Monitor the GitHub Actions changelog for behavioral changes to security-sensitive event types like `pull_request_target`."
+docs:
+  - url: "https://github.blog/changelog/2025-11-07-actions-pull_request_target-and-environment-branch-protections-changes/"
+    label: "GitHub Changelog: pull_request_target and environment branch protections changes (Nov 2025)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request_target"
+    label: "GitHub Docs: pull_request_target event"
+  - url: "https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment"
+    label: "GitHub Docs: Managing environments for deployment"
+  - url: "https://github.com/orgs/community/discussions/181616"
+    label: "Community Discussion: pull_request_target environment branch protection evaluation"
