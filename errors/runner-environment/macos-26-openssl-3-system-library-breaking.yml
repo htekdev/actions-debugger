@@ -1,0 +1,114 @@
+id: runner-environment-070
+title: "macOS 26 Upgrades OpenSSL from 1.1.1 to 3.x — Hardcoded openssl@1.1 Paths Break"
+category: runner-environment
+severity: error
+tags:
+  - macos
+  - openssl
+  - macos-26
+  - runner-image
+  - breaking-change
+  - homebrew
+patterns:
+  - regex: "Library not loaded.*openssl@1\\.1.*libssl\\.1\\.1\\.dylib"
+    flags: "i"
+  - regex: "ld.*library not found.*-lssl|cannot find.*libssl\\.1\\.1"
+    flags: "i"
+  - regex: "openssl@1\\.1.*not installed|brew.*openssl@1\\.1.*no longer"
+    flags: "i"
+  - regex: "Could not find OpenSSL|ssl.*version.*mismatch.*1\\.1"
+    flags: "i"
+  - regex: "OpenSSL 1\\.1\\.1.*required.*OpenSSL 3"
+    flags: "i"
+error_messages:
+  - "Library not loaded: /usr/local/opt/openssl@1.1/lib/libssl.1.1.dylib"
+  - "Library not loaded: /opt/homebrew/opt/openssl@1.1/lib/libssl.1.1.dylib"
+  - "ld: library not found for -lssl (referenced from build target)"
+  - "Could not find a package configuration file provided by 'OpenSSL'"
+  - "Could not link to OpenSSL library. Please install OpenSSL."
+root_cause: |
+  When macos-latest migrates to macos-26 (rolling out June 15 through July 15, 2026),
+  the system OpenSSL jumps from OpenSSL 1.1.1w (the last 1.x release, now EOL)
+  to OpenSSL 3.6.2. This is a major version change with breaking ABI differences.
+
+  Any workflow that hardcodes openssl@1.1 Homebrew paths or links against the
+  1.1.x shared libraries will fail because:
+
+  - Homebrew's openssl@1.1 formula is deprecated on macOS 26
+  - The shared library /opt/homebrew/opt/openssl@1.1/lib/libssl.1.1.dylib
+    no longer exists; it is replaced by openssl@3
+  - PKG_CONFIG_PATH and LDFLAGS pointing to openssl@1.1 resolve to nothing
+
+  Common breakage surfaces:
+  - Ruby gems with native extensions (openssl gem links against system OpenSSL)
+  - Python packages (pyOpenSSL, cryptography) that link against 1.x path
+  - CMake projects using find_package(OpenSSL) finding incompatible version
+  - Homebrew formulas linking transitively against openssl@1.1
+
+  Source: runner-images#14167 — macOS 15 vs macOS 26 software diff shows
+  OpenSSL jumps from 1.1.1w to 3.6.2.
+fix: |
+  Replace all openssl@1.1 references with openssl@3 (installed by default on macOS 26).
+
+  For Homebrew-based builds, use dynamic path detection:
+    OPENSSL_DIR=$(brew --prefix openssl@3)
+    export LDFLAGS="-L${OPENSSL_DIR}/lib"
+    export PKG_CONFIG_PATH="${OPENSSL_DIR}/lib/pkgconfig"
+
+  For Ruby gem compilation:
+    bundle config build.openssl --with-openssl-dir=$(brew --prefix openssl@3)
+
+  For CMake, pass OPENSSL_ROOT_DIR:
+    cmake -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3) ..
+fix_code:
+  - language: yaml
+    label: "Dynamic OpenSSL path — works on both macOS 15 and macOS 26"
+    code: |
+      jobs:
+        build:
+          runs-on: macos-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Set OpenSSL environment variables
+              run: |
+                OPENSSL_PREFIX=$(brew --prefix openssl)
+                echo "OPENSSL_DIR=$OPENSSL_PREFIX" >> $GITHUB_ENV
+                echo "LDFLAGS=-L$OPENSSL_PREFIX/lib" >> $GITHUB_ENV
+                echo "CPPFLAGS=-I$OPENSSL_PREFIX/include" >> $GITHUB_ENV
+                echo "PKG_CONFIG_PATH=$OPENSSL_PREFIX/lib/pkgconfig" >> $GITHUB_ENV
+
+            - name: Build project
+              run: cmake -B build -DOPENSSL_ROOT_DIR=$OPENSSL_DIR && cmake --build build
+  - language: yaml
+    label: "Ruby bundler — configure openssl@3 for native extension builds"
+    code: |
+      jobs:
+        ruby-build:
+          runs-on: macos-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: ruby/setup-ruby@v1
+              with:
+                ruby-version: '3.4'
+                bundler-cache: true
+
+            - name: Configure OpenSSL for bundler
+              run: |
+                OPENSSL_DIR=$(brew --prefix openssl@3)
+                bundle config build.openssl --with-openssl-dir=$OPENSSL_DIR
+
+            - name: Install gems
+              run: bundle install
+prevention:
+  - "Never hardcode openssl@1.1 paths — always use $(brew --prefix openssl) dynamically."
+  - "Test your macOS workflows on macos-26 before macos-latest migrates (June 15 to July 15, 2026)."
+  - "Use macos-15 label to pin to the older image while migrating OpenSSL dependencies."
+  - "For language setup actions, ensure you use recent versions that handle OpenSSL 3 automatically."
+docs:
+  - url: "https://github.com/actions/runner-images/issues/14167"
+    label: "GitHub Announcement: macos-latest will use macos-26 in June 2026 (includes OpenSSL diff)"
+  - url: "https://www.openssl.org/news/changelog.html"
+    label: "OpenSSL 3.x Changelog"
+  - url: "https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners"
+    label: "About GitHub-hosted runners"
