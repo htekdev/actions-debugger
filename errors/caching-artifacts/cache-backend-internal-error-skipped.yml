@@ -1,0 +1,75 @@
+id: "caching-artifacts-026"
+title: "Cache backend internal error silently skips caching"
+category: "caching-artifacts"
+severity: "warning"
+tags:
+  - "cache"
+  - "backend"
+  - "internal-error"
+  - "github-status"
+  - "intermittent"
+  - "skipped"
+patterns:
+  - regex: "An internal error has occurred in cache backend"
+    flags: "i"
+  - regex: "The runner was not able to contact the cache service\\. Caching will be skipped"
+    flags: "i"
+error_messages:
+  - "Warning: An internal error has occurred in cache backend. Please check https://www.githubstatus.com/ for any ongoing issues in actions."
+  - "Warning: The runner was not able to contact the cache service. Caching will be skipped. If you are concerned about the results of this, you can contact GitHub support."
+root_cause: |
+  GitHub's distributed cache backend occasionally returns internal errors when the runner
+  attempts to save or restore a cache entry. This is a transient platform-side failure
+  unrelated to your workflow configuration or cache key. The runner catches this error
+  and emits a warning, then continues without failing the step or the job.
+
+  As a result, the cache is silently not saved (or not restored), and downstream steps
+  that depend on the cached state will see cache misses or stale data — but the overall
+  job still succeeds. This makes the problem invisible unless you inspect logs carefully.
+
+  These errors typically coincide with GitHub Actions infrastructure incidents. Checking
+  https://www.githubstatus.com/ during an active incident will confirm whether the issue
+  is platform-wide. The problem is not reproducible locally and usually self-resolves
+  within minutes to hours.
+fix: |
+  No workflow change can prevent this — it is a transient platform issue. Mitigations:
+
+  1. Check https://www.githubstatus.com/ when you see this error repeatedly.
+  2. Always verify that a cache restore actually produced the expected files rather than
+     relying solely on the cache-hit output (backend errors return empty cache-hit).
+  3. Make build steps tolerant of cold-cache starts: do not gate your pipeline on the
+     cache being present.
+  4. Use restore-keys as a fallback so a partial match reduces the blast radius.
+  5. For critical workflows, consider a self-hosted runner with a local file-system or
+     S3-backed cache to avoid the GitHub-hosted backend entirely.
+fix_code:
+  - language: yaml
+    label: "Always reinstall when cache-hit is not exactly 'true'"
+    code: |
+      - name: Cache npm dependencies
+        id: npm-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
+      - name: Install dependencies
+        # cache-hit is empty string (not 'false') on backend errors — guard with != 'true'
+        if: steps.npm-cache.outputs.cache-hit != 'true'
+        run: npm ci
+prevention:
+  - "Never assume the cache was saved — treat each cache entry as optional and ensure the build succeeds from scratch."
+  - "Use restore-keys to allow partial cache hits; a stale partial match is better than a full miss."
+  - "Add a post-restore verification step that checks for expected files rather than relying solely on cache-hit output."
+  - "Monitor https://www.githubstatus.com/ when you see repeated intermittent cache failures."
+docs:
+  - url: "https://github.com/actions/cache/issues/1611"
+    label: "actions/cache#1611 — Internal error in cache backend (39 reactions)"
+  - url: "https://github.com/actions/cache/issues/1621"
+    label: "actions/cache#1621 — Random restore failure (231 reactions)"
+  - url: "https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows"
+    label: "GitHub Docs — Caching dependencies to speed up workflows"
+  - url: "https://www.githubstatus.com/"
+    label: "GitHub Status — active incident tracker"
