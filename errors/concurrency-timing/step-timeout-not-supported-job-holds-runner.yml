@@ -1,0 +1,101 @@
+id: concurrency-timing-025
+title: 'No step-level timeout — a hung step holds the runner slot for up to 6 hours'
+category: concurrency-timing
+severity: limitation
+tags:
+  - timeout
+  - hung-step
+  - runner-slot
+  - step
+  - limitation
+  - self-hosted-runner
+patterns:
+  - regex: 'The runner has received a shutdown signal'
+    flags: 'i'
+  - regex: 'Error: The process.*timed out after \d+ minutes'
+    flags: 'i'
+  - regex: 'Canceling since the workflow was cancelled'
+    flags: 'i'
+error_messages:
+  - "The runner has received a shutdown signal. This can happen when the runner service is stopped, or a manually started runner is canceled."
+  - "Error: The process '/usr/bin/bash' failed with exit code 124"
+  - "Canceling since the workflow was cancelled."
+root_cause: |
+  GitHub Actions supports timeout-minutes at the job level only. There is no
+  per-step timeout. A single run: step that hangs (network call blocked, test
+  suite deadlocked, subprocess waiting on stdin) holds the entire job until
+  the job-level timeout fires.
+
+  The default job timeout is 6 hours (360 minutes) for GitHub-hosted runners
+  and 35 days (unlimited in practice) for self-hosted runners. A single hung
+  step therefore silently consumes 6 hours of runner minutes and one complete
+  runner slot before GitHub kills the job.
+
+  Runner slot starvation is the secondary effect: while the hung job occupies a
+  runner, queued jobs wait. On self-hosted runners with limited capacity one
+  hung step can block an entire team's CI queue indefinitely.
+
+  This is a documented platform limitation tracked in actions/runner#1120
+  (220+ reactions, open since 2020) with no scheduled fix date.
+fix: |
+  Apply one of these workarounds depending on operating system:
+
+  Linux/macOS: Wrap the command with the system timeout utility (seconds):
+    run: timeout 300 ./integration-test.sh
+
+  Cross-platform: Use curl/Invoke-RestMethod built-in timeout options for
+  network calls, and test-runner native timeouts for test suites.
+
+  Always set timeout-minutes explicitly on every job to establish a hard upper
+  bound regardless of which step hangs.
+fix_code:
+  - language: yaml
+    label: 'Set explicit job timeout and use OS timeout for individual steps'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          timeout-minutes: 30    # explicit ceiling — never rely on 6h default
+
+          steps:
+            - uses: actions/checkout@v4
+
+            # Linux/macOS: system timeout (in seconds)
+            - name: Run integration tests
+              run: timeout 180 ./scripts/integration-test.sh
+
+            # Network call with built-in timeout
+            - name: Fetch external resource
+              run: |
+                curl --max-time 60 --retry 3 https://api.example.com/data -o data.json
+  - language: yaml
+    label: 'Self-hosted runner — conservative timeout prevents slot starvation'
+    code: |
+      jobs:
+        deploy:
+          runs-on: [self-hosted, production]
+          timeout-minutes: 45    # critical on self-hosted — hung jobs block all runners
+
+          steps:
+            - name: Deploy with timeout guard
+              shell: pwsh
+              run: |
+                $job = Start-Job { ./deploy.ps1 }
+                if (-not (Wait-Job $job -Timeout 120)) {
+                  Stop-Job $job
+                  throw "Deploy script timed out after 120s"
+                }
+                Receive-Job $job
+prevention:
+  - 'Always set explicit timeout-minutes on every job — never rely on the 6-hour GitHub-hosted default'
+  - 'Use OS-level timeout utilities (timeout on Linux/macOS) for individual network calls and scripts'
+  - 'Configure test-runner-native timeouts for test suites — they are more granular than job timeouts'
+  - 'Monitor runner queue depth on self-hosted runners — sudden growth often signals a hung step holding a slot'
+  - 'Set timeout-minutes: 5 on jobs you know should complete quickly to catch regressions early'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idtimeout-minutes'
+    label: 'GitHub Actions: jobs.<id>.timeout-minutes — job-level timeout (no step-level equivalent)'
+  - url: 'https://github.com/actions/runner/issues/1120'
+    label: 'actions/runner#1120: Feature request — step-level timeout (220+ reactions, open since 2020)'
+  - url: 'https://docs.github.com/en/actions/administering-github-actions/usage-limits-billing-and-administration#usage-limits'
+    label: 'GitHub Actions usage limits — default job timeout values per runner type'

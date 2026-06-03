@@ -1,0 +1,118 @@
+id: caching-artifacts-032
+title: 'setup-node cache: npm silently skips caching in monorepos — lockfile not at workspace root'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - setup-node
+  - npm
+  - cache
+  - monorepo
+  - lockfile
+  - cache-dependency-path
+  - silent-failure
+patterns:
+  - regex: "Warning: No file found for: package-lock\\.json"
+    flags: 'i'
+  - regex: 'No file found for.*No cache will be (saved|restored)'
+    flags: 'i'
+  - regex: 'cache-dependency-path.*not found|No lockfile found'
+    flags: 'i'
+error_messages:
+  - "Warning: No file found for: package-lock.json"
+  - "Warning: No file found for: yarn.lock"
+  - "Warning: No file found for: pnpm-lock.yaml"
+  - "No file found for: package-lock.json. No cache will be saved."
+root_cause: |
+  actions/setup-node with cache: 'npm' (or 'yarn' / 'pnpm') searches for the
+  package manager lockfile at the workspace root ($GITHUB_WORKSPACE) by default.
+
+  In monorepos where the lockfile lives in a subdirectory (apps/frontend/,
+  packages/api/, etc.), or when the workflow uses working-directory: to change
+  the build context, setup-node logs a warning and continues WITHOUT configuring
+  a cache. The step exits 0, making this a silent failure.
+
+  The result: npm ci (or yarn install / pnpm install) downloads all dependencies
+  from the network on every workflow run, as though no cache were configured.
+  Build times are identical to runs with no cache setting at all.
+
+  The warning message ("No file found for: package-lock.json") is easily missed
+  in long step logs and does not fail the step, so developers often go weeks
+  without noticing the cache was never active.
+
+  The same behavior applies when:
+  - yarn.lock is not at workspace root
+  - pnpm-lock.yaml is not at workspace root
+  - Multiple lockfiles exist across packages (only the first match is used
+    unless cache-dependency-path is explicitly set to a glob)
+fix: |
+  Use the cache-dependency-path input to specify the path to the lockfile
+  relative to the workspace root. Supports glob patterns for monorepos.
+
+  Single package in subdirectory:
+    cache-dependency-path: 'frontend/package-lock.json'
+
+  Multiple lockfiles across a monorepo:
+    cache-dependency-path: '**/package-lock.json'
+
+  Using a glob creates a combined cache key from all matched lockfiles. Any
+  change to any package lockfile invalidates the shared cache — this is
+  correct behavior for a monorepo where cross-package installs are common.
+fix_code:
+  - language: yaml
+    label: 'Single package in subdirectory — point cache-dependency-path at lockfile'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - uses: actions/setup-node@v4
+              with:
+                node-version: '22'
+                cache: 'npm'
+                # WRONG (omitted): setup-node looks at $GITHUB_WORKSPACE/package-lock.json
+                # and silently skips caching when not found there
+
+                # CORRECT: path relative to $GITHUB_WORKSPACE
+                cache-dependency-path: 'frontend/package-lock.json'
+
+            - name: Install dependencies
+              working-directory: frontend
+              run: npm ci
+  - language: yaml
+    label: 'Monorepo — cache all packages using glob pattern'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - uses: actions/setup-node@v4
+              with:
+                node-version: '22'
+                cache: 'npm'
+                # Glob matches all package-lock.json files anywhere in the repo
+                # Combined hash from all matched lockfiles forms the cache key
+                cache-dependency-path: '**/package-lock.json'
+
+            - name: Install root dependencies
+              run: npm ci
+
+            - name: Install frontend dependencies
+              working-directory: packages/frontend
+              run: npm ci
+prevention:
+  - 'Always set cache-dependency-path when the lockfile is not in the repository root'
+  - 'Use **/package-lock.json glob in monorepos to cover all packages with a single cache configuration'
+  - 'Verify caching is active by checking setup-node logs for "Cache restored successfully" or "Cache saved"'
+  - 'Check for "No file found for: package-lock.json" warnings as early signal that caching is silently disabled'
+  - 'When using working-directory: on install steps, ensure cache-dependency-path is also adjusted to match'
+docs:
+  - url: 'https://github.com/actions/setup-node#caching-global-packages-data'
+    label: 'actions/setup-node: Caching global packages data — cache-dependency-path input'
+  - url: 'https://github.com/actions/setup-node/issues/530'
+    label: 'actions/setup-node#530: cache: npm silently skips in monorepos without cache-dependency-path'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows'
+    label: 'GitHub Docs: Caching dependencies to speed up workflows — lockfile path configuration'

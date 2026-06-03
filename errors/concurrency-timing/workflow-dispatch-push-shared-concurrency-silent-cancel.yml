@@ -1,0 +1,104 @@
+id: concurrency-timing-026
+title: 'workflow_dispatch run silently cancelled when push to same branch shares the concurrency group'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - workflow-dispatch
+  - cancel-in-progress
+  - push
+  - manual-trigger
+  - silent-cancel
+patterns:
+  - regex: 'This run was cancelled because another run in the same concurrency group'
+    flags: 'i'
+  - regex: 'Canceling run due to.*concurrency group'
+    flags: 'i'
+  - regex: 'This run has been canceled'
+    flags: 'i'
+error_messages:
+  - "This run was cancelled because another run in the same concurrency group is in progress."
+  - "Canceling run due to a newer request for the same concurrency group."
+  - "This run has been canceled."
+root_cause: |
+  A common concurrency pattern groups runs by workflow name and ref:
+
+    concurrency:
+      group: "${{ github.workflow }}-${{ github.ref }}"
+      cancel-in-progress: true
+
+  workflow_dispatch and push events on the same branch share identical
+  github.workflow and github.ref values, so they are placed in the same
+  concurrency slot.
+
+  A developer manually triggers a workflow_dispatch run (e.g., to deploy to
+  staging, run a migration, or kick off a release). While it is running, any
+  push to that branch — including a small documentation fix or revert — creates
+  a new run in the same concurrency slot and immediately cancels the in-progress
+  manual dispatch with no notification.
+
+  The developer discovers this only when checking on the deployment minutes
+  later to find it was cancelled mid-run. The automatic push run that replaced
+  it may be completely irrelevant to the manual operation.
+fix: |
+  Include github.event_name in the concurrency group key to give workflow_dispatch
+  and push events separate concurrency slots:
+
+    concurrency:
+      group: "${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}"
+      cancel-in-progress: true
+
+  workflow_dispatch runs now share a slot only with other workflow_dispatch runs
+  on the same branch, and push runs share a slot only with other push runs.
+
+  For deployment or migration workflows where even manual-vs-manual cancellation
+  is undesirable, use cancel-in-progress: false and let runs queue.
+fix_code:
+  - language: yaml
+    label: 'Include event_name in concurrency group — isolates manual from automatic triggers'
+    code: |
+      on:
+        push:
+          branches: [main]
+        workflow_dispatch:
+
+      concurrency:
+        # event_name isolates push and workflow_dispatch into separate concurrency slots
+        group: '${{ github.workflow }}-${{ github.event_name }}-${{ github.ref_name }}'
+        cancel-in-progress: true
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./deploy.sh
+  - language: yaml
+    label: 'Separate workflow file for manual operations — no cancel-in-progress'
+    code: |
+      # deploy-manual.yml — only triggered by workflow_dispatch
+      on:
+        workflow_dispatch:
+          inputs:
+            environment:
+              description: 'Target environment'
+              required: true
+              type: choice
+              options: [staging, production]
+
+      # No shared concurrency group with push workflows
+      concurrency:
+        group: 'manual-deploy-${{ github.event.inputs.environment }}'
+        # cancel-in-progress defaults to false — manual deploys queue, not cancel
+prevention:
+  - 'Always include github.event_name in concurrency group keys for workflows triggered by both push and workflow_dispatch'
+  - 'Use separate workflow files for manual deployment operations to avoid shared concurrency with automated triggers'
+  - 'Add a summary step or Telegram/Slack notification in the cleanup phase to alert when a run is cancelled mid-execution'
+  - 'Audit all concurrency group patterns when adding workflow_dispatch to an existing automated workflow'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/using-concurrency'
+    label: 'GitHub Actions: Using concurrency — group patterns and cancel-in-progress'
+  - url: 'https://github.com/orgs/community/discussions/5435'
+    label: 'GitHub Community: workflow_dispatch cancelled by push with same concurrency group'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context'
+    label: 'GitHub context: github.event_name property'
