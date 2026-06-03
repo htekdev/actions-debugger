@@ -1,0 +1,124 @@
+id: runner-environment-063
+title: "PowerShell 7.4 → 7.6 LTS Upgrade Breaks ThreadJob Module Name and .NET Runtime"
+category: runner-environment
+severity: warning
+tags:
+  - powershell
+  - powershell-76
+  - threadjob
+  - dotnet10
+  - runner-images
+  - breaking-change
+  - module
+patterns:
+  - regex: "The term 'ThreadJob\\\\Start-ThreadJob' is not recognized"
+    flags: "i"
+  - regex: "CommandNotFoundException.*ThreadJob"
+    flags: "i"
+  - regex: "Cannot find module.*ThreadJob"
+    flags: "i"
+  - regex: "Join-Path.*cannot process argument transformation on parameter 'ChildPath'"
+    flags: "i"
+  - regex: "PowerShell.*7\\.4.*not found"
+    flags: "i"
+error_messages:
+  - "The term 'ThreadJob\\Start-ThreadJob' is not recognized as a name of a cmdlet, function, script file, or executable program."
+  - "Cannot find module ThreadJob"
+  - "Join-Path: Cannot process argument transformation on parameter 'ChildPath'."
+  - "Get-Module: The specified module 'ThreadJob' was not found"
+root_cause: |
+  GitHub Actions runner images are being updated from PowerShell 7.4.x to 7.6.x
+  (the latest LTS release, based on .NET 10) across all runner images between
+  June 8–15, 2026 (runner-images#14150). PowerShell 7.6 is a major.minor
+  version upgrade from 7.4 and contains several breaking changes:
+
+  1. **ThreadJob module renamed**: The `ThreadJob` module has been replaced by
+     `Microsoft.PowerShell.ThreadJob`. The `Start-ThreadJob` cmdlet itself is
+     unchanged, but any script using the module-qualified name
+     `ThreadJob\Start-ThreadJob` will throw a CommandNotFoundException because
+     the old module name no longer exists. Scripts that call `Start-ThreadJob`
+     without the module prefix continue to work.
+
+  2. **Join-Path -ChildPath is now string[]**: The `-ChildPath` parameter type
+     changed from `string` to `string[]`. In most cases this is backward-
+     compatible, but scripts with unusual argument binding patterns or that
+     pass a typed `[string]` variable explicitly may encounter parameter
+     transformation errors.
+
+  3. **.NET 10 runtime**: PowerShell 7.6 ships on .NET 10 (7.4 was on .NET 8).
+     Scripts that load .NET assemblies, use P/Invoke, or invoke .NET API
+     members that changed between .NET 8 and .NET 10 may break silently
+     or throw runtime exceptions.
+
+  4. **WildcardPattern.Escape behavior change**: `WildcardPattern.Escape` now
+     correctly escapes lone backticks. Scripts that relied on the old (incorrect)
+     no-escape behavior may produce different wildcard pattern results.
+
+  5. **Trailing space removed from event source name**: Scripts that match
+     exact event source names (e.g., for Windows Event Log) may fail to find
+     the source if they include a trailing space.
+fix: |
+  1. Replace module-qualified ThreadJob references:
+     Find all occurrences of `ThreadJob\Start-ThreadJob` in your scripts and
+     update them to `Microsoft.PowerShell.ThreadJob\Start-ThreadJob` or simply
+     use the unqualified `Start-ThreadJob`.
+
+  2. Review Join-Path usage:
+     Scripts using `Join-Path` with `-ChildPath` should continue to work in
+     most cases. If you see parameter binding errors, check that you are not
+     passing a typed `[string]` variable in a context that is now ambiguous.
+
+  3. Test .NET assembly loading:
+     If your scripts load .NET assemblies via `Add-Type -Path` or
+     `[System.Reflection.Assembly]::LoadFrom()`, test them against .NET 10
+     to catch any API compatibility issues before the upgrade rolls out.
+
+  4. Pin PowerShell version (temporary workaround):
+     Until migration is complete, you can install a specific PowerShell version
+     via the MSI/package manager in a workflow step. This is a temporary
+     workaround and should not be the long-term solution.
+fix_code:
+  - language: yaml
+    label: "Fix module-qualified ThreadJob reference"
+    code: |
+      # Before (PowerShell 7.4 — breaks on 7.6):
+      # $job = ThreadJob\Start-ThreadJob -ScriptBlock { ... }
+      #
+      # After (works on both 7.4 and 7.6):
+      - name: Run threaded job
+        shell: pwsh
+        run: |
+          # Option A: unqualified (works on all versions)
+          $job = Start-ThreadJob -ScriptBlock { Get-Process }
+          
+          # Option B: fully qualified with new module name (7.6+)
+          $job = Microsoft.PowerShell.ThreadJob\Start-ThreadJob -ScriptBlock { Get-Process }
+          
+          $result = $job | Wait-Job | Receive-Job
+          Write-Output $result
+  - language: yaml
+    label: "Verify PowerShell version in workflow to detect future upgrades early"
+    code: |
+      - name: Check PowerShell version
+        shell: pwsh
+        run: |
+          $version = $PSVersionTable.PSVersion
+          Write-Output "PowerShell version: $version"
+          if ($version.Major -lt 7 -or ($version.Major -eq 7 -and $version.Minor -lt 6)) {
+            Write-Warning "PowerShell < 7.6 detected — ensure ThreadJob references use unqualified names"
+          }
+prevention:
+  - "Use unqualified cmdlet names (Start-ThreadJob, not ThreadJob\\Start-ThreadJob) to avoid module-name dependencies."
+  - "Add a PowerShell version check step at the start of complex pwsh workflows to detect unexpected upgrades early."
+  - "Test workflows against the next PowerShell LTS version in a matrix before the runner image upgrade lands."
+  - "Subscribe to GitHub notifications on actions/runner-images to receive Announcement issues for upcoming breaking changes."
+  - "Avoid loading .NET assemblies by absolute path in runner workflows — prefer NuGet package installation to ensure .NET runtime compatibility."
+docs:
+  - url: "https://github.com/actions/runner-images/issues/14150"
+    label: "runner-images #14150: PowerShell will be updated from 7.4 to 7.6 LTS (Jun 8-15 2026)"
+  - url: "https://learn.microsoft.com/en-us/powershell/scripting/whats-new/what-s-new-in-powershell-76"
+    label: "PowerShell 7.6 Release Notes — breaking changes"
+  - url: "https://github.com/PowerShell/PowerShell/releases/tag/v7.6.0"
+    label: "PowerShell v7.6.0 GitHub release"
+  - url: "https://learn.microsoft.com/en-us/powershell/scripting/install/powershell-support-lifecycle"
+    label: "PowerShell support lifecycle"

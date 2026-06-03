@@ -1,0 +1,127 @@
+id: runner-environment-064
+title: "macos-latest Label Switching to macOS 26 — Toolchain and Brew Package Changes"
+category: runner-environment
+severity: warning
+tags:
+  - macos
+  - macos-latest
+  - macos-26
+  - runner-label
+  - homebrew
+  - toolchain
+  - migration
+patterns:
+  - regex: "macos.*26.*not supported"
+    flags: "i"
+  - regex: "No such file or directory.*clang|clang.*not found"
+    flags: "i"
+  - regex: "dyld.*Library not loaded"
+    flags: "i"
+  - regex: "Error: Cannot install in Homebrew on macOS.*without Command Line Tools"
+    flags: "i"
+  - regex: "macos-latest.*macos-26"
+    flags: "i"
+error_messages:
+  - "clang: error: no such file or directory"
+  - "dyld[12345]: Library not loaded: /usr/local/lib/libssl.1.1.dylib"
+  - "Error: Your CLT does not support macOS 26."
+  - "xcrun: error: SDK 'iphoneos' cannot be located"
+root_cause: |
+  Starting June 15, 2026, the `macos-latest` runner label is being migrated
+  from macOS 15 (Sequoia) to macOS 26 (runner-images#14167). The rollout
+  runs through July 15, 2026. Workflows pinned to `macos-latest` without
+  testing on macOS 26 may encounter failures from toolchain and package
+  differences between the two OS versions.
+
+  Key differences in macOS 26 runner images compared to macOS 15:
+
+  1. **Homebrew LLVM version bump**: LLVM jumped from 18 to 20 on macOS 26.
+     Hardcoded paths like `/opt/homebrew/opt/llvm@18/bin/clang` or env vars
+     referencing `llvm@18` binaries fail. POCO and other libraries built
+     against LLVM 18 ABI may link incorrectly.
+
+  2. **macOS SDK changes**: macOS 26 uses a newer Xcode and SDK toolchain.
+     Libraries and headers that existed in macOS 15 SDK may have moved,
+     been renamed, or removed under the macOS 26 (Tahoe) SDK.
+
+  3. **Homebrew formula versions**: Many Homebrew packages have newer
+     versions on macOS 26 images than on macOS 15. Formulas with no macOS 26
+     bottle may be built from source, increasing job time significantly.
+
+  4. **System library locations**: Dynamic library paths (e.g., for OpenSSL,
+     libpq, or other system libs installed via Homebrew) may differ between
+     macOS 15 and macOS 26 as Homebrew evolves its prefix structure.
+
+  5. **Xcode simulator SDK policy**: Only the 3 latest Xcode versions retain
+     platform tools/SDKs. Workflows using older Xcode/simulator versions
+     that worked on macOS 15 may not find the expected SDK on macOS 26.
+
+  Workflows that do not pin `macos-latest` and have never tested on macOS 26
+  may start failing after the migration completes.
+fix: |
+  1. **Pin to macOS 15 temporarily**: Replace `macos-latest` with `macos-15`
+     to preserve the current behavior while you test and migrate.
+
+  2. **Test on macOS 26 before migration**: Add a matrix job with
+     `macos-26` to identify failures before `macos-latest` switches.
+
+  3. **Fix hardcoded LLVM/Clang paths**: Update any hardcoded paths like
+     `/opt/homebrew/opt/llvm@18` to use `$(brew --prefix llvm)` or install
+     the specific version you need via `brew install llvm@18`.
+
+  4. **Update Homebrew formula pins**: Check for `@version`-pinned Homebrew
+     formulas that may no longer have macOS 26 bottles and either upgrade
+     or build from source explicitly.
+
+  5. **Audit system library dependencies**: For native extensions that link
+     against system or Homebrew libraries, verify library paths with
+     `brew --prefix <lib>` at runtime rather than hardcoding them.
+fix_code:
+  - language: yaml
+    label: "Pin to macos-15 while testing macOS 26 compatibility"
+    code: |
+      jobs:
+        build:
+          # Temporarily pin to macos-15 while migration is in progress
+          # macos-latest will point to macos-26 starting June 15, 2026
+          runs-on: macos-15
+          steps:
+            - uses: actions/checkout@v4
+            - run: make build
+  - language: yaml
+    label: "Matrix to test both macOS 15 and 26 before migration"
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              os: [macos-15, macos-26]
+            fail-fast: false
+          runs-on: ${{ matrix.os }}
+          steps:
+            - uses: actions/checkout@v4
+            - run: make build
+  - language: yaml
+    label: "Use brew --prefix to resolve dynamic LLVM/library paths"
+    code: |
+      - name: Set up LLVM paths dynamically
+        run: |
+          # Instead of hardcoded /opt/homebrew/opt/llvm@18/bin/clang:
+          LLVM_PREFIX=$(brew --prefix llvm)
+          echo "CC=${LLVM_PREFIX}/bin/clang" >> $GITHUB_ENV
+          echo "CXX=${LLVM_PREFIX}/bin/clang++" >> $GITHUB_ENV
+          echo "${LLVM_PREFIX}/bin" >> $GITHUB_PATH
+prevention:
+  - "Never use macos-latest without testing the next macOS version first — GitHub announces label migrations weeks in advance in runner-images issues."
+  - "Pin to a specific macOS version (e.g., macos-15) for production workflows; use macos-latest only in exploratory or dependency-update workflows."
+  - "Avoid hardcoding Homebrew formula paths — always use `$(brew --prefix <formula>)` to resolve paths dynamically."
+  - "Run a matrix job spanning current and next macOS versions as part of your CI to catch breakage before a label migration lands."
+docs:
+  - url: "https://github.com/actions/runner-images/issues/14167"
+    label: "runner-images #14167: macos-latest will use macos-26 starting June 15, 2026"
+  - url: "https://github.blog/changelog/2026-05-14-github-actions-upcoming-image-migrations/"
+    label: "GitHub Changelog: Upcoming image migrations (May 2026)"
+  - url: "https://github.com/actions/runner-images/issues/14167"
+    label: "runner-images announcement: macOS 14 deprecation starting July 6, 2026"
+  - url: "https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners#standard-github-hosted-runners-for-public-repositories"
+    label: "GitHub Docs: Standard GitHub-hosted runners — available runner labels"
