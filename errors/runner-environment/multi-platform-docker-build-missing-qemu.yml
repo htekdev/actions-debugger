@@ -1,0 +1,84 @@
+id: runner-environment-092
+title: "Multi-platform Docker Build Fails — Missing QEMU Setup for Cross-Architecture"
+category: runner-environment
+severity: error
+tags:
+  - docker
+  - multi-platform
+  - qemu
+  - buildx
+  - arm64
+  - cross-arch
+patterns:
+  - regex: 'failed to solve: no match for platform in manifest'
+    flags: "i"
+  - regex: 'no match for platform in manifest: linux/(arm64|arm/v[67]|riscv64|ppc64le|s390x)'
+    flags: "i"
+  - regex: 'exec format error'
+    flags: "i"
+error_messages:
+  - "ERROR: failed to solve: no match for platform in manifest: linux/arm64"
+  - "failed to solve: no match for platform in manifest: linux/arm64"
+  - "exec format error"
+  - "cannot execute binary file: Exec format error"
+root_cause: |
+  GitHub-hosted runners (ubuntu-*, macos-*, windows-*) are single-architecture machines.
+  When docker/build-push-action is configured with platforms: linux/amd64,linux/arm64 (or
+  any other non-native architecture), Docker BuildKit needs QEMU user-mode emulation to
+  execute non-native binaries during the build. Without docker/setup-qemu-action registered
+  first, BuildKit cannot emulate the target architecture and immediately fails with "no match
+  for platform in manifest" or exec format errors when a RUN instruction in the Dockerfile
+  executes a binary compiled for the wrong architecture.
+
+  This is a common mistake when adding multi-arch support to an existing single-arch workflow.
+  The amd64 platform succeeds while arm64 fails, producing confusing partial-success output.
+  Self-hosted ARM64 runners (e.g. macos-14/15, ubuntu ARM) can build their native arch without
+  QEMU but still need it for other non-native targets.
+fix: |
+  Add docker/setup-qemu-action before docker/setup-buildx-action in your workflow steps.
+  QEMU must be installed before buildx initializes so BuildKit discovers the emulators at
+  setup time. Order matters — QEMU before buildx, buildx before build-push-action.
+fix_code:
+  - language: yaml
+    label: "WRONG — buildx without QEMU (arm64 fails)"
+    code: |
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          platforms: linux/amd64,linux/arm64  # arm64 fails without QEMU
+          push: true
+          tags: myimage:latest
+  - language: yaml
+    label: "RIGHT — QEMU registered before buildx"
+    code: |
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: myimage:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+prevention:
+  - "Always add docker/setup-qemu-action before docker/setup-buildx-action when targeting non-native platforms."
+  - "Verify QEMU platform list covers your targets: linux/arm64, linux/arm/v7, linux/arm/v6, linux/riscv64, linux/ppc64le, linux/s390x."
+  - "Use a platform matrix to build and test each architecture independently for faster CI feedback loops."
+  - "Check runner architecture with 'uname -m' in a run step when debugging platform mismatches."
+docs:
+  - url: "https://github.com/docker/setup-qemu-action"
+    label: "docker/setup-qemu-action — GitHub Action"
+  - url: "https://docs.docker.com/build/building/multi-platform/"
+    label: "Docker — Multi-platform builds"
+  - url: "https://github.com/docker/build-push-action/blob/master/docs/advanced/multi-platform.md"
+    label: "docker/build-push-action — Multi-platform builds guide"
+  - url: "https://stackoverflow.com/questions/69984898/github-action-multi-arch-docker-build-failed-to-solve-no-match-for-platform-in"
+    label: "Stack Overflow — Multi-arch Docker build: no match for platform in manifest (400+ votes)"
