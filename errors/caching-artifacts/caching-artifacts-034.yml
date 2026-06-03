@@ -1,0 +1,70 @@
+id: caching-artifacts-034
+title: "Cache entries created in a PR branch are not accessible from other PR branches or the default branch"
+category: caching-artifacts
+severity: limitation
+tags:
+  - cache
+  - branch-scope
+  - pull-request
+  - isolation
+  - cache-miss
+  - known-limitation
+patterns:
+  - regex: 'cache.*miss.*pull.request|cache.*not.*found.*branch|cache.*not.*accessible.*pr'
+    flags: "i"
+  - regex: 'cache.*scope.*branch|branch.specific.*cache.*miss|pr.*branch.*no.*cache'
+    flags: "i"
+error_messages:
+  - "Cache not found for input keys"
+root_cause: |
+  GitHub Actions cache entries are strictly scoped to the branch that created them. The
+  cache lookup order during a restore operation is:
+
+  1. Exact key match on the CURRENT branch
+  2. restore-keys prefix match on the CURRENT branch
+  3. restore-keys prefix match on the BASE branch (for PRs) or the DEFAULT branch
+
+  Consequences of this scoping:
+  - A cache saved on PR branch A is NOT readable from PR branch B
+  - A cache saved on a PR branch is NOT readable from the default branch's push workflow
+  - Each new PR starts with a cold cache until it produces its own branch-scoped entry
+  - The base branch cache is only available as a fallback during a PR workflow restore
+
+  This is an intentional security isolation boundary — one PR cannot read potentially
+  sensitive build artifacts cached by another PR. There is no configuration option to
+  enable cross-PR cache sharing.
+
+  Teams migrating from shared CI caches (Jenkins, GitLab with shared runner caches) are
+  frequently surprised by persistent cache misses across parallel PRs on active repos.
+fix: |
+  Structure cache keys and restore-keys to maximize fallback hits from the default branch.
+  The strategy: save a well-keyed cache on the default branch after each merge (readable
+  by all PRs as a fallback), and include base-branch and OS-only restore-key prefixes so
+  new PR runs warm up quickly via partial matches.
+
+  For dependency caches, a lockfile-hash-keyed entry on main ensures new PRs get a
+  near-hit on first run via restore-keys, rather than a completely cold cache.
+fix_code:
+  - language: yaml
+    label: "Cache key strategy that maximizes default-branch fallback for all PRs"
+    code: |
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          # Primary: exact branch + lockfile hash (hit on repeat runs of same PR)
+          key: ${{ runner.os }}-npm-${{ github.ref_name }}-${{ hashFiles('**/package-lock.json') }}
+          # Fallbacks: base branch (for PRs) → default branch → OS-only
+          restore-keys: |
+            ${{ runner.os }}-npm-${{ github.base_ref }}-
+            ${{ runner.os }}-npm-
+prevention:
+  - "Add restore-keys with base branch and OS-only prefixes so PRs fall back to main's cache"
+  - "Ensure the default branch workflow saves a fresh cache after each merge so PRs have a warm fallback"
+  - "Be aware that parallel PRs each maintain their own independent branch-scoped cache"
+  - "For monorepos, include the workspace or package path in the cache key to prevent cross-PR key collisions"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows#restrictions-for-accessing-a-cache"
+    label: "GitHub Docs: Cache access restrictions by branch"
+  - url: "https://github.com/orgs/community/discussions/10539"
+    label: "GitHub Community: Cache access is restricted to the same branch and base branches"
