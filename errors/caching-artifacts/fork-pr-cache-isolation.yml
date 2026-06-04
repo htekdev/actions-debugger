@@ -1,0 +1,114 @@
+id: caching-artifacts-041
+title: "Fork PR workflows cannot read caches from the parent repository — always cache miss"
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - cache
+  - fork
+  - pull-request
+  - security
+  - cache-miss
+  - isolation
+patterns:
+  - regex: 'Cache not found for input keys'
+    flags: i
+  - regex: 'No cache found'
+    flags: i
+error_messages:
+  - "Cache not found for input keys:"
+  - "No cache found"
+root_cause: |
+  GitHub Actions intentionally prevents fork PR workflows from reading caches created by
+  the parent repository. This is a security measure: a malicious fork could craft a cache
+  key matching a parent repo cache, read its contents (which may contain build artifacts,
+  installed dependencies, or sensitive intermediate files), and exfiltrate them via the
+  fork workflow's logs or artifact uploads.
+
+  The restriction applies to `pull_request` events triggered by fork contributors:
+  - The fork workflow runs in a restricted sandbox with a read-only GITHUB_TOKEN
+  - `restore-keys` fallback does NOT traverse to the parent repository's cache namespace
+  - Even a perfect cache key match on the parent repo returns a miss in the fork
+  - The `actions/cache` step reports "Cache not found" with no indication that security
+    isolation is the cause — developers commonly assume misconfigured cache keys
+
+  Affected scenarios:
+  - Open source projects where external contributors submit PRs
+  - npm/pip/gem dependency caches that would accelerate fork CI significantly
+  - Docker buildx layer caches configured via `actions/cache`
+  - Turborepo and Nx remote caches backed by GitHub Actions cache
+fix: |
+  Fork PR cache isolation is intentional and cannot be disabled. Mitigations:
+
+  1. Accept cold builds for fork PRs and optimize speed without cache:
+     Use package manager offline flags (npm ci --prefer-offline, pip --no-index),
+     pre-built base Docker images, and build sharding to minimize cold-build time.
+
+  2. Use `pull_request_target` instead of `pull_request` — this event runs in the parent
+     repo context with full cache access. SECURITY WARNING: this grants the fork workflow
+     write-level GITHUB_TOKEN access. Only safe for workflows that do NOT check out and
+     execute code from the PR head branch.
+
+  3. Pre-warm fork caches via a separate trusted workflow that runs on push to the base
+     branch and stores a cache accessible by the fork's restore-keys fallback scope. This
+     works because forks CAN read the parent's default branch caches via restore-keys.
+     The fork cannot read arbitrary keys, but restore-keys prefix matching against the
+     default branch cache does work.
+fix_code:
+  - language: yaml
+    label: "Accept cold builds — optimize fork PR without relying on cache"
+    code: |
+      on:
+        pull_request:
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                node-version: '20'
+                # Cache works for non-fork PRs; fork PRs will be cold builds
+                cache: 'npm'
+            - name: Install dependencies
+              # --prefer-offline minimizes network round-trips on cold builds
+              run: npm ci --prefer-offline --no-audit
+
+  - language: yaml
+    label: "Restore-keys fallback from default branch — forks CAN match default-branch caches"
+    code: |
+      # Caches saved on the default branch (main/master) ARE accessible to fork PRs
+      # via restore-keys prefix matching. Pre-warm by saving on each push to main.
+      on:
+        push:
+          branches: [main]
+        pull_request:
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/cache@v4
+              with:
+                path: ~/.npm
+                # Exact key includes lockfile hash — will miss on forks
+                key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+                # Restore-key matches default-branch cache — forks get a partial hit
+                restore-keys: |
+                  ${{ runner.os }}-node-
+prevention:
+  - "Document that fork contributor CI will be slower due to cache isolation — set expectations"
+  - "Use restore-keys with a broad prefix to allow forks to partially match default-branch caches"
+  - "Avoid `pull_request_target` with PR head checkout and code execution — this is a high-severity security vulnerability"
+  - "Optimize cold-build speed with offline package manager flags and pre-built base images"
+  - "Consider caching at the Docker image layer level via a registry rather than GitHub Actions cache"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request"
+    label: "pull_request event — fork restrictions — GitHub Docs"
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions#using-pull_request_target"
+    label: "Security hardening — pull_request_target risks — GitHub Docs"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows#restrictions-for-accessing-a-cache"
+    label: "Cache access restrictions — GitHub Docs"
+  - url: "https://github.com/orgs/community/discussions/44783"
+    label: "Fork PR workflows cannot access parent repo cache — GitHub Community #44783"

@@ -1,0 +1,98 @@
+id: silent-failures-061
+title: "`workflow_call` boolean inputs evaluate as strings — `if: inputs.flag` is truthy even when caller passes `false`"
+category: silent-failures
+severity: silent-failure
+tags:
+  - workflow-call
+  - reusable-workflow
+  - boolean
+  - inputs
+  - if-condition
+  - type-coercion
+patterns:
+  - regex: 'inputs\.[a-z_-]+\s*(?:==\s*true|==\s*false)?'
+    flags: i
+error_messages: []
+root_cause: |
+  In `on.workflow_call` inputs, declaring `type: boolean` describes the intended type of
+  the input — it does NOT cause the value to be passed as a JSON boolean. At runtime,
+  inside the called workflow, `${{ inputs.my_flag }}` always evaluates to the string
+  `'true'` or `'false'`.
+
+  Because non-empty strings are truthy in GitHub Actions expression evaluation:
+  - `if: inputs.my_flag` evaluates the string `'false'` as TRUTHY (non-empty string = true)
+  - Steps and jobs conditioned on `if: inputs.my_flag` run even when the caller passes false
+
+  This is distinct from the `workflow_dispatch` boolean input coercion issue (silent-failures-053)
+  in that it affects all callers of a reusable workflow simultaneously. A single bug in a
+  widely-used reusable workflow can cause unintended deploys, notifications, or expensive
+  steps to run across every calling workflow.
+
+  Example of the failure:
+  Caller passes `deploy: false` intending to skip deployment.
+  Reusable workflow has `if: inputs.deploy` on its deploy job.
+  The deploy job runs because the string 'false' is non-empty and therefore truthy.
+fix: |
+  Always compare boolean inputs against the boolean literal `true` using `==`, or use
+  `fromJSON()` to parse the string to an actual boolean value:
+
+  CORRECT patterns:
+  - `if: inputs.my_flag == true`   — Actions coerces the string 'true' to boolean true for == comparison
+  - `if: fromJSON(inputs.my_flag)` — parses string 'true'/'false' to actual boolean
+
+  WRONG patterns:
+  - `if: inputs.my_flag`           — always true for non-empty strings ('false' is truthy)
+  - `if: inputs.my_flag == 'true'` — works but fragile; fails if value is boolean true not string
+fix_code:
+  - language: yaml
+    label: "Correct boolean input handling in reusable workflow"
+    code: |
+      # reusable.yml
+      on:
+        workflow_call:
+          inputs:
+            deploy:
+              type: boolean
+              default: false
+            notify:
+              type: boolean
+              default: true
+
+      jobs:
+        deploy:
+          # Correct: == true comparison handles string-to-boolean coercion
+          if: inputs.deploy == true
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying..."
+
+        notify:
+          # Alternative: fromJSON() parses string to actual boolean
+          if: fromJSON(inputs.notify)
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Notifying..."
+
+  - language: yaml
+    label: "Caller side — no change needed; fix is in the reusable workflow"
+    code: |
+      # caller.yml — calling the reusable workflow
+      jobs:
+        call-reusable:
+          uses: ./.github/workflows/reusable.yml
+          with:
+            deploy: false   # This passes as string 'false' — fix is in reusable.yml
+            notify: true
+prevention:
+  - "Audit all reusable workflows for bare `if: inputs.<name>` patterns where the input is type boolean"
+  - "Use `if: inputs.<flag> == true` consistently — never `if: inputs.<flag>` for boolean inputs"
+  - "Add a comment in reusable workflows noting that boolean inputs are strings at runtime"
+  - "Test callers with both `true` and `false` values and verify both branches execute as expected"
+  - "Consider wrapping boolean inputs in `fromJSON()` at the point of use for clarity"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#literals"
+    label: "Expressions — literals and type coercion — GitHub Docs"
+  - url: "https://docs.github.com/en/actions/sharing-automations/reusing-workflows#using-inputs-and-secrets-in-a-reusable-workflow"
+    label: "Reusable workflows — using inputs — GitHub Docs"
+  - url: "https://github.com/orgs/community/discussions/45843"
+    label: "workflow_call boolean inputs evaluated as truthy strings — GitHub Community #45843"

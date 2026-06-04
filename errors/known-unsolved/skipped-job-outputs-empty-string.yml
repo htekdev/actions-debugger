@@ -1,0 +1,109 @@
+id: known-unsolved-040
+title: "Skipped job outputs always resolve to empty string — downstream consumers receive '' silently"
+category: known-unsolved
+severity: silent-failure
+tags:
+  - outputs
+  - skipped
+  - needs
+  - conditional-jobs
+  - silent-failure
+  - limitation
+patterns:
+  - regex: 'needs\.[a-z_-]+\.outputs\.[a-z_-]+'
+    flags: i
+error_messages: []
+root_cause: |
+  When a job is skipped — because its `if:` condition evaluated to false, or because all
+  jobs in its `needs` array were skipped or failed — that job's `outputs` block never
+  executes. Any downstream job that reads `needs.<skipped-job>.outputs.<key>` receives an
+  empty string `''`.
+
+  This is completely silent: no workflow annotation, no job failure, no warning in the logs.
+  The downstream job receives `''` and continues executing as though the output was
+  legitimately set to an empty string.
+
+  Common failure scenarios:
+  - A build job is gated with `if: github.ref == 'refs/heads/main'`; a deploy job reads
+    its artifact path output and deploys with an empty path string
+  - A matrix job is conditionally skipped on a specific OS; a dependent job reads the
+    OS-specific output and silently operates on an empty value
+  - A fan-out aggregator reads outputs from multiple conditional jobs; skipped job outputs
+    silently produce empty aggregation results
+
+  There is no way to distinguish "output was deliberately set to empty string" from "job
+  was skipped and output was never set". The `needs.<job>.result` value is `'skipped'`
+  but `needs.<job>.outputs.*` is always `''` regardless of cause.
+fix: |
+  There is no built-in mechanism to throw an error when reading outputs from a skipped job.
+  This is a known GitHub Actions limitation — skipped job outputs permanently resolve to ''.
+
+  Workarounds:
+
+  1. Guard downstream jobs with a result check:
+     Add `if: needs.<job>.result == 'success'` to every job that consumes outputs from a
+     conditional job. This prevents the downstream job from running on empty outputs.
+
+  2. Provide explicit sentinel defaults in the output-setting step:
+     Use a shell default expansion in the step that sets the output:
+     `echo "path=${ARTIFACT_PATH:-UNSET}" >> $GITHUB_OUTPUT`
+     Downstream jobs check for `'UNSET'` to detect the unset case.
+
+  3. Inline null-coalescing in expressions:
+     `${{ needs.build.outputs.path != '' && needs.build.outputs.path || 'default-value' }}`
+fix_code:
+  - language: yaml
+    label: "Guard downstream job with result check — prevents execution on empty outputs"
+    code: |
+      jobs:
+        build:
+          if: github.ref == 'refs/heads/main'
+          runs-on: ubuntu-latest
+          outputs:
+            artifact-path: ${{ steps.build.outputs.path }}
+          steps:
+            - id: build
+              run: echo "path=dist/" >> $GITHUB_OUTPUT
+
+        deploy:
+          needs: [build]
+          # Only run if build actually succeeded — never run if skipped or failed
+          if: needs.build.result == 'success'
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying ${{ needs.build.outputs.artifact-path }}"
+
+  - language: yaml
+    label: "Sentinel default — detect skipped output in downstream job"
+    code: |
+      jobs:
+        build:
+          if: github.event_name == 'push'
+          runs-on: ubuntu-latest
+          outputs:
+            version: ${{ steps.ver.outputs.version }}
+          steps:
+            - id: ver
+              run: echo "version=${VERSION:-UNSET}" >> $GITHUB_OUTPUT
+
+        publish:
+          needs: [build]
+          runs-on: ubuntu-latest
+          steps:
+            - name: Abort if build was skipped
+              if: needs.build.outputs.version == 'UNSET' || needs.build.outputs.version == ''
+              run: |
+                echo "Build was skipped or version not set — aborting publish"
+                exit 1
+prevention:
+  - "Always check `needs.<job>.result == 'success'` before using that job's outputs"
+  - "Provide explicit sentinel defaults in output-setting steps for critical values"
+  - "Treat empty string outputs from conditional jobs as indicative of skip or failure"
+  - "Document which jobs are conditional and which downstream jobs depend on their outputs"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/passing-information-between-jobs"
+    label: "Passing information between jobs — GitHub Docs"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/using-conditions-to-control-job-execution"
+    label: "Using conditions to control job execution — GitHub Docs"
+  - url: "https://github.com/orgs/community/discussions/26704"
+    label: "Job outputs from skipped jobs are empty string — GitHub Community #26704"
