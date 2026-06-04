@@ -1,0 +1,110 @@
+id: caching-artifacts-039
+title: "actions/cache split save/restore: path must match exactly or restore silently reports cache miss"
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - cache
+  - actions/cache
+  - save-restore
+  - path-mismatch
+  - cache-miss
+  - split-cache
+patterns:
+  - regex: 'Cache not found for input keys'
+    flags: 'i'
+  - regex: 'cache/restore.*path.*not.*found'
+    flags: 'i'
+error_messages:
+  - "Cache not found for input keys: <key>"
+  - "No cache found for key: <key>"
+root_cause: |
+  When using the split `actions/cache/save@v4` and `actions/cache/restore@v4` actions
+  separately (rather than the combined `actions/cache@v4`), the `path:` value in the
+  restore step must exactly match the `path:` value used in the save step — including
+  relative vs absolute paths, trailing slashes, and directory names.
+
+  If the paths differ even slightly, the cache entry is stored under a hash that
+  incorporates the path value. The restore step computes a different hash and reports
+  "Cache not found for input keys" — identical to the message shown when the cache key
+  itself is wrong. Nothing in the error output indicates that a path mismatch is the
+  actual cause, making this extremely difficult to debug.
+
+  This is an intentional implementation detail of the split actions: the combined
+  `actions/cache@v4` avoids this because the same `path:` string is used for both
+  operations automatically. Developers migrating from the combined action to split
+  save/restore for more granular control frequently encounter this.
+
+  Common path mismatch pitfalls:
+  - Save uses `./node_modules`, restore uses `node_modules` (leading `./` difference)
+  - Save uses `/home/runner/.cache/pip`, restore uses `~/.cache/pip`
+  - Save uses a trailing slash `dist/`, restore uses `dist`
+  - Save in one job uses a relative path that resolves differently in another job
+fix: |
+  Ensure the `path:` value in `actions/cache/restore@v4` is the exact same string
+  as used in the corresponding `actions/cache/save@v4` step. Copy-paste the value
+  rather than retyping it to prevent subtle differences.
+
+  When using the split actions across different jobs, prefer absolute paths or paths
+  anchored from a stable workspace directory. Alternatively, use the combined
+  `actions/cache@v4` with `save-always: true` to avoid managing save/restore separately.
+fix_code:
+  - language: yaml
+    label: "Identical path values in split save and restore steps"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Restore cached build output
+              uses: actions/cache/restore@v4
+              id: cache-restore
+              with:
+                path: .cache/build-output    # Must match save step below exactly
+                key: build-${{ github.sha }}
+                restore-keys: build-
+
+            - name: Build
+              if: steps.cache-restore.outputs.cache-hit != 'true'
+              run: npm run build
+
+            - name: Save build cache
+              if: steps.cache-restore.outputs.cache-hit != 'true'
+              uses: actions/cache/save@v4
+              with:
+                path: .cache/build-output    # Copy-pasted from restore step — no differences
+                key: build-${{ github.sha }}
+
+  - language: yaml
+    label: "Combined cache action avoids path mismatch entirely"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Cache build output
+              uses: actions/cache@v4
+              with:
+                path: .cache/build-output
+                key: build-${{ github.sha }}
+                restore-keys: build-
+                save-always: true            # Always saves even when cache-hit is true
+
+            - run: npm run build
+prevention:
+  - "Copy-paste the path value between save and restore steps — never retype it"
+  - "Use the combined actions/cache@v4 with save-always: true unless you specifically need split save/restore behavior"
+  - "Prefer absolute paths (e.g., /home/runner/.cache/pip) over relative paths when save and restore are in different jobs"
+  - "When debugging cache misses, add a run: echo '${{ toJSON(steps.cache.outputs) }}' step to inspect what the cache lookup returned"
+docs:
+  - url: "https://github.com/actions/cache/blob/main/save/README.md"
+    label: "actions/cache/save — README"
+  - url: "https://github.com/actions/cache/blob/main/restore/README.md"
+    label: "actions/cache/restore — README"
+  - url: "https://github.com/actions/cache/issues/1444"
+    label: "GitHub Issue #1444 — Path mismatch causes misleading cache miss error"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows"
+    label: "GitHub Docs — Caching dependencies to speed up workflows"

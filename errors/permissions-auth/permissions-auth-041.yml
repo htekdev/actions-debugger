@@ -1,0 +1,110 @@
+id: permissions-auth-041
+title: "actions/checkout submodules fail with auth error when private submodule repos are outside the workflow repository"
+category: permissions-auth
+severity: error
+tags:
+  - checkout
+  - submodules
+  - github-token
+  - private-repo
+  - authentication
+  - pat
+  - deploy-key
+patterns:
+  - regex: 'fatal: could not read Username for.*terminal prompts disabled'
+    flags: 'i'
+  - regex: 'fatal: repository ''.*github\.com.*'' not found'
+    flags: 'i'
+  - regex: 'remote: Repository not found\.'
+    flags: 'i'
+  - regex: 'Error: The process.*git.*failed with exit code 128'
+    flags: 'i'
+error_messages:
+  - "fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+  - "fatal: repository 'https://github.com/org/private-submodule/' not found"
+  - "remote: Repository not found."
+  - "Error: The process '/usr/bin/git' failed with exit code 128"
+root_cause: |
+  `actions/checkout` uses the `GITHUB_TOKEN` (or the `token` input) to authenticate
+  git operations during checkout, including recursive submodule initialization.
+  `GITHUB_TOKEN` is automatically scoped to the repository that owns the running
+  workflow — it cannot access private repositories in other organizations, or other
+  private repositories within the same organization.
+
+  When a submodule `.gitmodules` entry points to a private repository that is different
+  from the workflow repository, git authentication fails during `submodule update`.
+  The resulting error (`fatal: could not read Username` or `repository not found`)
+  is confusing because the submodule URL is correct — the problem is authentication
+  scope, not the URL itself.
+
+  Developers upgrading from self-hosted runners (where global git credentials were
+  configured) or from `actions/checkout@v1-v2` (which had different authentication
+  behavior) frequently encounter this when moving to `actions/checkout@v4` on
+  GitHub-hosted runners.
+
+  This is a deliberate security boundary: `GITHUB_TOKEN` is intentionally limited to
+  the current repository to prevent workflows from silently reading other private repos.
+fix: |
+  Use one of two approaches:
+
+  1. **PAT approach**: Create a Personal Access Token (classic PAT with `repo` scope,
+     or a fine-grained PAT with read access to all submodule repos). Store it as a
+     repository secret and pass it via the `token` input to `actions/checkout`.
+
+  2. **Deploy key approach**: Add a read-only deploy key to each private submodule
+     repository, then use `webfactory/ssh-agent` to load the key before checkout.
+     This avoids PATs entirely and follows least-privilege principles.
+
+  For organizations, a machine account (a GitHub account created for automation) with
+  `repo` read access to all submodule repos is often easier to manage than fine-grained
+  PATs.
+fix_code:
+  - language: yaml
+    label: "PAT with repo scope passed via token input"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                submodules: recursive
+                token: ${{ secrets.SUBMODULE_PAT }}
+                # SUBMODULE_PAT: classic PAT with repo scope, or fine-grained PAT
+                # with Contents: read on all private submodule repos
+
+  - language: yaml
+    label: "SSH deploy key approach using webfactory/ssh-agent"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Configure SSH agent with submodule deploy key
+              uses: webfactory/ssh-agent@v0.9.0
+              with:
+                ssh-private-key: ${{ secrets.SUBMODULE_DEPLOY_KEY }}
+                # Add multiple keys for multiple private submodule repos:
+                # ssh-private-key: |
+                #   ${{ secrets.SUBMODULE_REPO_A_KEY }}
+                #   ${{ secrets.SUBMODULE_REPO_B_KEY }}
+
+            - uses: actions/checkout@v4
+              with:
+                submodules: recursive
+                # No token needed — SSH agent handles git authentication
+prevention:
+  - "Prefer deploy keys over PATs for submodule access — deploy keys are repo-scoped and easier to rotate"
+  - "Use fine-grained PATs scoped to specific repositories rather than classic PATs with broad repo scope"
+  - "Document which submodule repos require special secrets so new contributors can configure their forks"
+  - "Consider converting private submodule dependencies to private packages in a registry to avoid cross-repo auth complexity"
+  - "Test submodule checkout in a fresh fork or on a runner without existing git credentials to catch auth issues early"
+docs:
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#permissions-for-the-github_token"
+    label: "GitHub Docs — GITHUB_TOKEN permissions and scope"
+  - url: "https://github.com/actions/checkout#usage"
+    label: "actions/checkout — token and submodules inputs"
+  - url: "https://docs.github.com/en/authentication/connecting-to-github-with-ssh/managing-deploy-keys"
+    label: "GitHub Docs — Managing deploy keys"
+  - url: "https://github.com/webfactory/ssh-agent"
+    label: "webfactory/ssh-agent — Load SSH keys for Actions"
