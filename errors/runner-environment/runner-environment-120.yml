@@ -1,0 +1,118 @@
+id: runner-environment-120
+title: "snap install fails on GitHub-hosted runners — snapd daemon not available"
+category: runner-environment
+severity: error
+tags:
+  - snap
+  - snapd
+  - ubuntu
+  - package-manager
+  - runner-limitation
+  - apt-alternative
+patterns:
+  - regex: 'snap.*command not found|command not found.*snap'
+    flags: 'i'
+  - regex: 'cannot communicate with server.*snapd\.sock'
+    flags: 'i'
+  - regex: 'dial unix /run/snapd\.sock.*no such file or directory'
+    flags: 'i'
+  - regex: 'error: cannot connect to the snap daemon'
+    flags: 'i'
+error_messages:
+  - "sudo: snap: command not found"
+  - "error: cannot communicate with server: Post \"http://localhost/v2/snaps/...\": dial unix /run/snapd.sock: connect: no such file or directory"
+  - "error: cannot connect to the snap daemon"
+  - "/bin/sh: 1: snap: not found"
+root_cause: |
+  GitHub-hosted runner images (ubuntu-22.04, ubuntu-24.04, and ubuntu-latest) do
+  not include the snapd daemon and do not support the snap package manager.
+
+  Snapd requires a persistent background daemon (snapd.service) and specific kernel
+  configuration for confinement (AppArmor profiles, seccomp filters) that is not
+  available or not configured in the ephemeral VM environment GitHub uses for
+  hosted runners. Even if the snap binary were present, the daemon is not running,
+  causing all snap commands to fail at the IPC socket connection step.
+
+  This limitation surprises developers who routinely use snap packages on local
+  Ubuntu workstations and attempt to replicate those install commands in CI.
+  Common affected workflows:
+  - Installing tools distributed primarily or exclusively via snap (certain IoT,
+    embedded, or cross-compile toolchains; some cloud CLI tools)
+  - Reproducing local Ubuntu developer setup scripts in CI verbatim
+  - CI pipelines for snap packages themselves (snap build requires LXD or snapcraft)
+
+  The error "cannot communicate with server: dial unix /run/snapd.sock: no such
+  file or directory" is deterministic — it fails on every run, not intermittently.
+fix: |
+  Replace snap install commands with an equivalent alternative:
+
+  1. APT: Most tools available as snaps also have apt packages. Check
+     packages.ubuntu.com for the apt equivalent (the version may be older).
+
+  2. Direct binary / official releases: Many developer tools (kubectl, helm,
+     terraform, go, etc.) publish standalone binaries on GitHub Releases or
+     their official download pages.
+
+  3. Official setup-* actions: GitHub and tool vendors maintain actions/setup-go,
+     azure/setup-kubectl, hashicorp/setup-terraform, etc. that install tools
+     cleanly without snap.
+
+  4. Docker: Run the snap-packaged tool inside a Docker container if no other
+     distribution method exists (the snap itself cannot run inside Docker, but
+     the underlying tool usually has a Docker image).
+
+  For snap package development and testing (e.g., snapcraft builds), use a
+  self-hosted runner with LXD configured, or the snapcore/action-build action
+  which handles the LXD setup automatically.
+fix_code:
+  - language: yaml
+    label: "Replace snap install with apt or official action"
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            # Instead of: sudo snap install kubectl --classic
+            - name: Set up kubectl (official action)
+              uses: azure/setup-kubectl@v4
+              with:
+                version: 'v1.30.0'
+
+            # Instead of: sudo snap install terraform
+            - name: Set up Terraform (official action)
+              uses: hashicorp/setup-terraform@v3
+              with:
+                terraform_version: "1.9.0"
+
+            - run: kubectl version --client
+  - language: yaml
+    label: "Build snap packages with snapcore/action-build (handles LXD)"
+    code: |
+      jobs:
+        snapcraft:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Build snap
+              uses: snapcore/action-build@v1
+
+            - name: Upload snap artifact
+              uses: actions/upload-artifact@v4
+              with:
+                name: my-snap
+                path: '*.snap'
+prevention:
+  - "Check the GitHub Actions Marketplace for an official setup-* action before reaching for snap"
+  - "Use direct binary downloads from tool vendors' GitHub Releases when no setup-* action exists"
+  - "Avoid copying local Ubuntu setup scripts verbatim into CI — apt/brew/direct-download are the CI-safe equivalents"
+  - "Self-hosted runners on Ubuntu can have snapd installed if snap packages are genuinely required"
+docs:
+  - url: "https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners#preinstalled-software"
+    label: "GitHub Docs — Pre-installed software on GitHub-hosted runners"
+  - url: "https://github.com/snapcore/action-build"
+    label: "snapcore/action-build — official snap build action (uses LXD)"
+  - url: "https://snapcraft.io/docs/build-on-github"
+    label: "Snapcraft Docs — Building snaps on GitHub Actions"
