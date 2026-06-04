@@ -1,0 +1,100 @@
+id: runner-environment-133
+title: 'ARM64 runners: downloaded x86_64 binary fails with "Exec format error" — wrong architecture'
+category: runner-environment
+severity: error
+tags:
+  - arm64
+  - aarch64
+  - binary
+  - exec-format-error
+  - ubuntu-arm
+  - architecture
+patterns:
+  - regex: 'cannot execute binary file: Exec format error'
+    flags: 'i'
+  - regex: 'Exec format error'
+    flags: 'i'
+  - regex: 'exec.*format error'
+    flags: 'i'
+error_messages:
+  - './my-tool: cannot execute binary file: Exec format error'
+  - '/usr/local/bin/kubectl: cannot execute binary file: Exec format error'
+  - 'bash: ./tool: cannot execute binary file: Exec format error'
+root_cause: |
+  GitHub-hosted ubuntu-24.04-arm and ubuntu-22.04-arm runners use ARM64 (aarch64) CPUs.
+  The RUNNER_ARCH environment variable returns ARM64 on these runners, not X64.
+
+  Workflows that download pre-built binaries using hardcoded architecture suffixes like
+  linux-amd64, linux-x86_64, or linux-x64 download x86_64 binaries that cannot execute on
+  ARM64 hardware. The Linux kernel rejects the binary with "Exec format error" (ENOEXEC)
+  because the ELF architecture header in the binary does not match the host CPU.
+
+  Common patterns that break:
+  - Hardcoded URL: https://example.com/tool-linux-amd64.tar.gz
+  - Shell variable set once: ARCH="amd64" without checking RUNNER_ARCH
+  - Workflow matrix that includes ubuntu-24.04-arm without updating download URLs
+  - Third-party scripts that assume x86_64 without ARM64 support
+
+  This is a silent-ish failure — the binary downloads successfully (HTTP 200), extracts
+  without error, but fails only when executed.
+fix: |
+  Use the RUNNER_ARCH environment variable or uname -m to detect architecture and select
+  the correct binary:
+
+  - RUNNER_ARCH is X64 on x86_64 runners, ARM64 on ARM64 runners
+  - uname -m returns x86_64 on x86_64, aarch64 on ARM64
+
+  Normalize to the convention used by the tool's release naming (amd64/arm64 or x86_64/aarch64).
+  Where possible, prefer using setup-* actions that handle multi-architecture automatically.
+fix_code:
+  - language: yaml
+    label: 'Detect architecture and download correct binary'
+    code: |
+      jobs:
+        install-tool:
+          runs-on: ${{ matrix.runner }}
+          strategy:
+            matrix:
+              runner: [ubuntu-24.04, ubuntu-24.04-arm]
+          steps:
+            - name: Detect architecture and download tool
+              run: |
+                ARCH=$(uname -m)
+                case "$ARCH" in
+                  x86_64)  DL_ARCH="amd64" ;;
+                  aarch64) DL_ARCH="arm64" ;;
+                  *) echo "Unsupported arch: $ARCH"; exit 1 ;;
+                esac
+                curl -sSL "https://example.com/tool-linux-${DL_ARCH}.tar.gz" | tar xz
+                sudo mv tool /usr/local/bin/
+
+  - language: yaml
+    label: 'Use RUNNER_ARCH environment variable (GitHub-native)'
+    code: |
+      jobs:
+        install-tool:
+          runs-on: ubuntu-24.04-arm
+          steps:
+            - name: Install tool using RUNNER_ARCH
+              run: |
+                # RUNNER_ARCH is X64 or ARM64 (uppercase)
+                if [ "$RUNNER_ARCH" = "ARM64" ]; then
+                  DL_ARCH="arm64"
+                else
+                  DL_ARCH="amd64"
+                fi
+                curl -sSL "https://releases.example.com/tool-linux-${DL_ARCH}" -o /usr/local/bin/tool
+                chmod +x /usr/local/bin/tool
+prevention:
+  - 'Never hardcode linux-amd64 or linux-x86_64 in binary download URLs — always parameterize by architecture'
+  - 'Prefer setup-* GitHub Actions (setup-node, setup-go, setup-java) over manual binary downloads — they handle ARM64 automatically'
+  - 'Add ubuntu-24.04-arm to your test matrix to catch architecture issues before they affect users'
+  - 'Check tool release pages for ARM64 availability before migrating to ARM64 runners — not all tools provide arm64 builds'
+  - 'Use RUNNER_ARCH (GitHub variable) or uname -m (portable) to detect architecture in shell scripts'
+docs:
+  - url: 'https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners/about-github-hosted-runners#supported-runners-and-hardware-resources'
+    label: 'GitHub-hosted runners — supported runner types including ARM64'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/store-information-in-variables#default-environment-variables'
+    label: 'Default environment variables — RUNNER_ARCH values'
+  - url: 'https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2404-ARM64-Readme.md'
+    label: 'ubuntu-24.04-arm runner software report'
