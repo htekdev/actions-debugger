@@ -1,0 +1,114 @@
+id: permissions-auth-045
+title: "GITHUB_TOKEN has read-only access in pull_request workflows from forks — write operations return 403"
+category: permissions-auth
+severity: error
+tags:
+  - github-token
+  - fork
+  - pull-request
+  - read-only
+  - permissions
+  - resource-not-accessible
+  - write-access
+patterns:
+  - regex: 'Resource not accessible by integration'
+    flags: i
+  - regex: 'HttpError: Resource not accessible by integration'
+    flags: i
+  - regex: 'Error: HttpError: Not Found.*token.*forked'
+    flags: i
+  - regex: 'refused.*write.*403.*pull_request.*fork'
+    flags: i
+error_messages:
+  - "Error: Resource not accessible by integration"
+  - "RequestError [HttpError]: Resource not accessible by integration"
+  - "Error: HttpError: Resource not accessible by integration"
+root_cause: |
+  When a pull_request workflow is triggered by a PR from a forked repository, GitHub
+  automatically restricts the GITHUB_TOKEN to read-only permissions. This security measure
+  prevents malicious PRs from using the token to modify the base repository — the token
+  cannot create issues, post comments, create releases, trigger deployments, or write to
+  the repository. Workflows see a token that behaves as if all write permissions were denied.
+
+  This restriction applies even if the workflow YAML has explicit permissions: write entries.
+  The fork security boundary takes precedence. The workflow still runs (unlike pull_request_target
+  which runs with base repo permissions), but the token scope is silently reduced.
+
+  Common victims include: posting PR comments with github-script, uploading artifacts to
+  releases, creating check runs, and updating commit statuses.
+fix: |
+  Use the pull_request_target event if the workflow must write to the base repo. Be aware
+  that pull_request_target checks out the base branch by default (not the PR head) and carries
+  security implications — never checkout and execute untrusted PR code with write-permission
+  tokens (see pwn request attacks). For safe comment posting, split into two workflows:
+  a read-only pull_request workflow that uploads results as an artifact, and a
+  pull_request_target or workflow_run workflow with write access that downloads the artifact
+  and posts the comment.
+fix_code:
+  - language: yaml
+    label: "Split pattern — upload results in pull_request, post comment in workflow_run"
+    code: |
+      # Workflow 1: pr-test.yml — runs on pull_request (fork-safe, read-only token)
+      on: pull_request
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run tests and save results
+              run: npm test > test-results.txt 2>&1 || true
+            - name: Upload PR number for downstream workflow
+              uses: actions/upload-artifact@v4
+              with:
+                name: pr-results
+                path: |
+                  test-results.txt
+  - language: yaml
+    label: "Workflow 2 — post comment using workflow_run (has write token)"
+    code: |
+      # Workflow 2: pr-comment.yml — runs after pr-test.yml completes (has write token)
+      on:
+        workflow_run:
+          workflows: ["PR Tests"]
+          types: [completed]
+
+      permissions:
+        pull-requests: write
+
+      jobs:
+        comment:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Download test results artifact
+              uses: actions/download-artifact@v4
+              with:
+                name: pr-results
+                run-id: ${{ github.event.workflow_run.id }}
+                github-token: ${{ secrets.GITHUB_TOKEN }}
+            - name: Post PR comment
+              uses: actions/github-script@v7
+              with:
+                script: |
+                  const fs = require('fs');
+                  const results = fs.readFileSync('test-results.txt', 'utf8');
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: context.payload.workflow_run.pull_requests[0].number,
+                    body: '## Test Results\n```\n' + results + '\n```'
+                  });
+prevention:
+  - "Know that GITHUB_TOKEN is read-only for PR workflows from forks — this is a security feature, not a misconfiguration"
+  - "Never use pull_request_target to run PR head code with write-permission tokens — this creates a pwn request vulnerability"
+  - "Use the upload-artifact + workflow_run split pattern for safe cross-fork write operations"
+  - "Test workflows with a fork PR specifically if they perform write operations — the token scope difference won't appear in same-repo PRs"
+docs:
+  - url: https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request
+    label: "GitHub Docs: pull_request event — fork permission restrictions"
+  - url: https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#permissions-for-the-github_token
+    label: "GitHub Docs: GITHUB_TOKEN permissions"
+  - url: https://securitylab.github.com/research/github-actions-preventing-pwn-requests/
+    label: "GitHub Security Lab: Preventing pwn requests (pull_request_target risks)"
+  - url: https://stackoverflow.com/questions/70435286/resource-not-accessible-by-integration-on-github-pull-request-event
+    label: "Stack Overflow: Resource not accessible by integration on pull_request"

@@ -1,0 +1,72 @@
+id: caching-artifacts-042
+title: "Cache key containing github.sha always misses on restore — cache is saved but never reused"
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - cache
+  - cache-key
+  - github-sha
+  - cache-miss
+  - restore-keys
+  - performance
+patterns:
+  - regex: 'Cache not found for input keys: .*\b[0-9a-f]{40}\b'
+    flags: i
+  - regex: 'Warning: Cache not found for.*sha.*\.'
+    flags: i
+  - regex: 'Cache restored from key: .*\b[0-9a-f]{40}\b'
+    flags: i
+error_messages:
+  - "Cache not found for input keys: Linux-node-a3f2b1c9d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9"
+  - "Warning: Cache not found for key: ubuntu-latest-npm-abc1234def5678901234567890abcdef12345678"
+root_cause: |
+  When a cache key includes ${{ github.sha }}, every commit produces a unique key. The cache is
+  saved successfully at the end of the workflow, but on the very next run the sha is different,
+  so the restore step finds no matching cache entry and declares a miss. This pattern ensures
+  the cache is written once and thrown away — it provides no performance benefit.
+
+  This mistake is common because github.sha is a readily available context value and its use
+  in cache keys looks reasonable at first glance. The cache action's restore-keys fallback
+  mechanism would normally rescue a miss, but developers often omit restore-keys when using
+  sha-based keys, expecting the primary key to match.
+fix: |
+  Replace github.sha with a hash of the files that determine cache validity, such as
+  hashFiles('**/package-lock.json') for npm or hashFiles('**/go.sum') for Go. Use github.sha
+  only as a restore-keys fallback prefix if you want a per-commit cache layer on top of a
+  stable base cache. The cache key should be stable across commits unless the relevant
+  dependency manifest changes.
+fix_code:
+  - language: yaml
+    label: "Correct cache key using hashFiles instead of github.sha"
+    code: |
+      - name: Cache node modules
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+  - language: yaml
+    label: "Per-commit layer on top of a stable base cache (advanced)"
+    code: |
+      # Stable key hits on re-runs; sha layer saves per-commit installs
+      - name: Cache node modules
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+            ${{ runner.os }}-node-
+prevention:
+  - "Never use github.sha as a primary cache key unless you explicitly want a per-commit cache that never restores"
+  - "Use hashFiles() over the relevant lock file or manifest as the stable portion of the cache key"
+  - "Always add restore-keys with progressively broader prefixes to benefit from partial cache hits"
+  - "Check the cache hit rate in the Actions UI — 0% hit rate on restore is a sign the key is too unique"
+docs:
+  - url: https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows#using-the-cache-action
+    label: "GitHub Docs: Using the cache action"
+  - url: https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows#matching-a-cache-key
+    label: "GitHub Docs: Matching a cache key"
+  - url: https://stackoverflow.com/questions/59435153/github-actions-cache-miss-every-run
+    label: "Stack Overflow: GitHub Actions cache miss every run"
