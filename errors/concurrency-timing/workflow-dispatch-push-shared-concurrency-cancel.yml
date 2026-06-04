@@ -1,0 +1,64 @@
+id: concurrency-timing-040
+title: "workflow_dispatch and push share concurrency group, dispatch cancels in-progress CI"
+category: concurrency-timing
+severity: error
+tags:
+  - concurrency
+  - workflow-dispatch
+  - push
+  - cancel-in-progress
+  - event-name
+patterns:
+  - regex: 'This run was cancelled'
+    flags: i
+  - regex: 'concurrency.*workflow_dispatch|workflow_dispatch.*concurrency'
+    flags: ims
+error_messages:
+  - "This run was cancelled."
+  - "A run for this workflow is already in progress."
+root_cause: |
+  When a concurrency group key is built from github.workflow and github.ref alone,
+  both workflow_dispatch and push events on the same branch produce an identical key.
+  GitHub treats them as competing occupants of the same concurrency slot.
+
+  With cancel-in-progress: true, a manually dispatched run immediately cancels any
+  push-triggered CI run already in progress (or vice versa). Without cancel-in-progress,
+  the dispatch run queues behind the push run but still competes for the same slot.
+
+  This catches developers off guard when they manually trigger a workflow for
+  debugging while CI is running — the in-progress CI run is silently cancelled. Or a
+  push to the same branch during a long dispatch run causes the dispatch to be evicted.
+fix: |
+  Include github.event_name in the concurrency group key to give workflow_dispatch
+  and push events separate concurrency slots. Alternatively, use a conditional
+  cancel-in-progress expression so manual dispatches are never cancelled.
+fix_code:
+  - language: yaml
+    label: "Include event_name to separate dispatch and push slots"
+    code: |
+      # WRONG: dispatch and push on same branch share a slot and cancel each other
+      # concurrency:
+      #   group: ${{ github.workflow }}-${{ github.ref }}
+      #   cancel-in-progress: true
+
+      # CORRECT: each event type gets its own concurrency slot
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+        cancel-in-progress: true
+
+  - language: yaml
+    label: "Alternative: only cancel-in-progress for push and pull_request, not dispatch"
+    code: |
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        # Manual dispatches are never cancelled; push/PR runs are stacked-and-cancelled
+        cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+prevention:
+  - "Always include github.event_name in concurrency group keys when a workflow has multiple trigger events."
+  - "Test concurrency behavior by triggering both events in quick succession; bugs only surface under race conditions."
+  - "For release or deploy workflows, consider separate workflows for dispatch vs automated CI rather than sharing concurrency."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#concurrency"
+    label: "GitHub Actions: Concurrency syntax"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_dispatch"
+    label: "GitHub Actions: workflow_dispatch event"
