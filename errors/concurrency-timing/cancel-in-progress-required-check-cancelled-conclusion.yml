@@ -1,0 +1,84 @@
+id: concurrency-timing-035
+title: "cancel-in-progress posts 'cancelled' conclusion — required status check blocks PR merge"
+category: concurrency-timing
+severity: error
+tags:
+  - concurrency
+  - cancel-in-progress
+  - required-checks
+  - branch-protection
+  - pull-request
+  - status-checks
+patterns:
+  - regex: 'Required status checks have not passed'
+    flags: i
+  - regex: 'cancelled.*required.*check|required.*check.*cancelled'
+    flags: i
+error_messages:
+  - "Required status checks have not passed"
+  - "Branch protection rule requires status check to pass before merging"
+root_cause: |
+  When `cancel-in-progress: true` is configured in a concurrency group and that workflow
+  is a required status check on a branch protection rule, a cancelled run posts a
+  `cancelled` conclusion to the Checks API. GitHub treats `cancelled` as a non-passing
+  conclusion for required status checks — identical to `failure`.
+
+  The failure cycle:
+  1. Push A triggers run A (check posts `in_progress`)
+  2. Push B triggers run B; concurrency group cancels run A
+  3. Run A posts `cancelled` conclusion — required check is now "failed"
+  4. Run B may itself get cancelled by Push C before it completes
+  5. PR is permanently stuck: merge button blocked until a run completes with `success`
+
+  This is especially painful in fast-moving PRs where rapid pushes prevent any run from
+  completing. The `cancelled` status on the required check is indistinguishable from a
+  genuine test failure in the PR view.
+fix: |
+  Option 1 — Use a separate reporter job with `if: always()` that is NOT subject to the
+  concurrency group. The main build job can be cancelled; the reporter always runs and
+  posts the actual status. Configure branch protection to require the reporter job, not
+  the build job.
+
+  Option 2 — Set concurrency at job level instead of workflow level for the job that
+  posts the required status check. The job itself will not be cancelled mid-run; only
+  newly queued workflow runs are affected.
+
+  Option 3 — Accept the pattern and use auto-merge on PRs. Once any non-cancelled run
+  succeeds, the merge proceeds automatically without manual unblocking.
+fix_code:
+  - language: yaml
+    label: "Reporter job pattern — required check never posts 'cancelled'"
+    code: |
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: true
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm ci && npm test
+
+        # This job is NOT inside the concurrency group — it always runs.
+        # Configure branch protection to require 'report-status', not 'build'.
+        report-status:
+          runs-on: ubuntu-latest
+          needs: [build]
+          if: always()
+          steps:
+            - name: Fail if build did not succeed
+              if: needs.build.result != 'success'
+              run: exit 1
+prevention:
+  - "Test required-check + cancel-in-progress interaction on a draft PR before enabling branch protection"
+  - "Configure branch protection to require a dedicated reporter job, not the cancellable build job"
+  - "Set concurrency at job level for jobs that post required checks"
+  - "Enable auto-merge to reduce manual intervention when cancelled checks momentarily block the PR"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency"
+    label: "Using concurrency — GitHub Docs"
+  - url: "https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches"
+    label: "About protected branches — GitHub Docs"
+  - url: "https://github.com/orgs/community/discussions/13015"
+    label: "cancel-in-progress fails required status check — GitHub Community #13015"
