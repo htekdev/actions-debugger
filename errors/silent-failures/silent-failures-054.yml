@@ -1,0 +1,100 @@
+id: silent-failures-054
+title: "Windows CRLF line endings in committed scripts cause bad interpreter error on Linux runners"
+category: silent-failures
+severity: error
+tags:
+  - checkout
+  - crlf
+  - line-endings
+  - windows
+  - bash
+  - gitattributes
+  - bad-interpreter
+patterns:
+  - regex: 'bad interpreter.*No such file or directory'
+    flags: i
+  - regex: '\^M: command not found'
+    flags: ''
+  - regex: '/bin/bash\^M'
+    flags: ''
+  - regex: '\r: command not found'
+    flags: ''
+error_messages:
+  - "/bin/bash^M: bad interpreter: No such file or directory"
+  - "^M: command not found"
+  - ": /bin/sh^M: bad interpreter: No such file or directory"
+  - "syntax error: unexpected end of file"
+root_cause: |
+  Shell scripts, Python files, and other text files committed from Windows workstations
+  where core.autocrlf is false (or not configured) retain Windows CRLF (\r\n) line endings.
+  actions/checkout preserves committed bytes exactly — it does not normalize line endings.
+
+  On a Linux runner, the kernel reads the shebang line #!/bin/bash\r as the interpreter
+  path /bin/bash^M (with a literal carriage return appended). No file with that name exists,
+  so the kernel returns "bad interpreter: No such file or directory." The error message
+  looks like a missing binary or path problem, masking the true cause: CRLF line endings.
+
+  This is a classic silent failure because:
+  - The developer's Windows machine runs the script correctly
+  - The checkout step succeeds with no warnings about line endings
+  - The failure only manifests when the script is executed on a Linux runner
+  - Most text editors hide the ^M characters, so the file looks normal in review
+fix: |
+  Add a .gitattributes file to the repository root specifying LF normalization for text
+  files. This instructs Git to store files with LF endings in the repository regardless
+  of the committer's OS or local git configuration.
+
+  After adding .gitattributes, re-normalize all tracked files: stage all files with the
+  renormalize flag (e.g. `add --renormalize .` via the CLI), then commit the result.
+  Without this step, already-committed CRLF files remain unchanged.
+
+  Also add a CI detection step to catch any future regressions before they reach main.
+fix_code:
+  - language: yaml
+    label: ".gitattributes — enforce LF for scripts and text files"
+    code: |
+      # .gitattributes (add to repository root)
+
+      # Normalize all text files to LF in the repository
+      * text=auto eol=lf
+
+      # Explicitly enforce LF for scripts and config files
+      *.sh   text eol=lf
+      *.bash text eol=lf
+      *.py   text eol=lf
+      *.yml  text eol=lf
+      *.yaml text eol=lf
+      *.json text eol=lf
+
+      # Keep CRLF for Windows-specific files
+      *.bat text eol=crlf
+      *.cmd text eol=crlf
+  - language: yaml
+    label: "CI step to detect CRLF in shell and Python scripts"
+    code: |
+      - name: Check for CRLF line endings in scripts
+        runs-on: ubuntu-latest
+        steps:
+          - uses: actions/checkout@v4
+          - name: Detect CRLF
+            run: |
+              found=$(find . -name '*.sh' -o -name '*.py' -o -name '*.yml' | \
+                xargs file 2>/dev/null | grep CRLF || true)
+              if [ -n "$found" ]; then
+                echo "ERROR: CRLF line endings detected in the following files:"
+                echo "$found"
+                exit 1
+              fi
+prevention:
+  - "Add .gitattributes with `* text=auto eol=lf` to every repository that may be edited on Windows"
+  - "Re-normalize existing files after adding .gitattributes: use the CLI `add --renormalize .` flag, then commit"
+  - "Configure the autocrlf setting on Windows development machines: set core.autocrlf=input so CRLF is converted to LF on commit"
+  - "Configure your editor (VS Code, Notepad++, JetBrains) to use LF line endings for shell and YAML files by default"
+  - "Add a CRLF detection step in CI to fail PRs that introduce Windows line endings into script files"
+docs:
+  - url: "https://docs.github.com/en/get-started/getting-started-with-git/configuring-git-to-handle-line-endings"
+    label: "GitHub Docs: Configuring Git to handle line endings"
+  - url: "https://git-scm.com/docs/gitattributes"
+    label: "Git: gitattributes documentation"
+  - url: "https://github.com/actions/checkout/issues/135"
+    label: "actions/checkout Issue #135: Line ending normalization"
