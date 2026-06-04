@@ -1,0 +1,81 @@
+id: runner-environment-130
+title: 'docker/build-push-action default provenance: true pushes OCI image index for single-platform builds — breaks registries that do not support image indexes'
+category: runner-environment
+severity: silent-failure
+tags:
+  - docker
+  - build-push-action
+  - provenance
+  - oci
+  - manifest-index
+patterns:
+  - regex: 'manifest unknown'
+    flags: 'i'
+  - regex: 'unexpected status: \d{3}'
+    flags: 'i'
+error_messages:
+  - 'manifest unknown'
+  - 'unexpected status: 400'
+  - 'unexpected status: 403'
+root_cause: |
+  Starting with docker/build-push-action v4, the provenance input defaults to mode=min,
+  which attaches an SLSA provenance attestation to every pushed image. This causes the action
+  to push an OCI image index (manifest list) to the registry instead of a plain image manifest,
+  even for single-platform builds.
+
+  Registries and tools that do not support OCI image indexes may return "manifest unknown"
+  errors, return 400/403 HTTP responses, or silently resolve to an unexpected image variant.
+  Some container registries (such as older versions of GCR) display the provenance attestation
+  as a separate image entry with a creation timestamp of 0 epoch (Unix epoch), causing
+  confusion in image management dashboards.
+
+  The behavior is silent in successful-looking cases: the push completes without error, but
+  downstream 'docker pull' or 'FROM image:tag' in a Dockerfile may resolve the image index
+  instead of a plain image manifest, causing unexpected platform or size differences.
+fix: |
+  Set provenance: false in docker/build-push-action to restore plain image manifest behavior
+  for single-platform builds. If SLSA provenance is required, use actions/attest-build-provenance
+  as a separate step after the push.
+fix_code:
+  - language: yaml
+    label: 'Disable provenance to push plain image manifest for single-platform builds'
+    code: |
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          # Disable default provenance attestation to push a plain image manifest.
+          # Required for registries that do not support OCI image indexes.
+          provenance: false
+
+  - language: yaml
+    label: 'Add SLSA provenance separately using actions/attest-build-provenance'
+    code: |
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          provenance: false
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+prevention:
+  - "Set 'provenance: false' in docker/build-push-action unless your target registry explicitly supports OCI image indexes"
+  - "Test image pulling from the registry after pushing to confirm the correct manifest type was stored"
+  - "Use 'docker manifest inspect' to verify the pushed image is a plain manifest and not a manifest index when provenance is enabled"
+docs:
+  - url: 'https://github.com/docker/build-push-action/issues/755'
+    label: 'docker/build-push-action#755 — Action started to push manifest indexes instead of images for a single platform'
+  - url: 'https://docs.docker.com/build/ci/github-actions/attestations/'
+    label: 'Docker build attestations with GitHub Actions'
+  - url: 'https://docs.docker.com/reference/cli/docker/buildx/build/#provenance'
+    label: 'docker buildx build --provenance flag documentation'
