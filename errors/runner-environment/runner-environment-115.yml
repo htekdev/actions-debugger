@@ -1,0 +1,120 @@
+id: runner-environment-115
+title: "ubuntu-22.04/24.04 OpenSSL 3 disables legacy TLS renegotiation — SSL handshake failures connecting to legacy servers"
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-22.04
+  - ubuntu-24.04
+  - openssl-3
+  - tls
+  - ssl
+  - renegotiation
+  - runner-image-update
+  - networking
+patterns:
+  - regex: 'unsafe legacy renegotiation disabled'
+    flags: 'i'
+  - regex: 'SSL_ERROR_RX_UNEXPECTED_HELLO_REQUEST'
+    flags: 'i'
+  - regex: 'error:0A000179:SSL routines.*unsafe legacy renegotiation'
+    flags: 'i'
+  - regex: 'UNSAFE_LEGACY_RENEGOTIATION_DISABLED'
+    flags: 'i'
+  - regex: 'ssl.*renegotiation.*not allowed'
+    flags: 'i'
+error_messages:
+  - "error:0A000179:SSL routines::unsafe legacy renegotiation disabled"
+  - "SSL_ERROR_RX_UNEXPECTED_HELLO_REQUEST"
+  - "ssl.SSLError: [SSL: UNSAFE_LEGACY_RENEGOTIATION_DISABLED] unsafe legacy renegotiation disabled (_ssl.c:997)"
+  - "OpenSSL Error: error:0A000179:SSL routines:ssl3_read_bytes:unsafe legacy renegotiation disabled"
+  - "curl: (35) OpenSSL SSL_connect: error:0A000179:SSL routines::unsafe legacy renegotiation disabled"
+  - "java.io.IOException: Error writing to server: javax.net.ssl.SSLHandshakeException: Remote host terminated the handshake"
+root_cause: |
+  Ubuntu 22.04 and 24.04 ship OpenSSL 3.0+. OpenSSL 3.0 enforces RFC 5746 (TLS Renegotiation
+  Indication Extension) by default and rejects connections to TLS servers that do not advertise
+  support for secure renegotiation in the initial ClientHello/ServerHello handshake.
+
+  Servers compiled against older OpenSSL (< 0.9.8m) or certain embedded TLS stacks do not send
+  the `renegotiation_info` extension and are therefore rejected by OpenSSL 3.0 clients with
+  `UNSAFE_LEGACY_RENEGOTIATION_DISABLED`.
+
+  This commonly surfaces when:
+  - Workflows connect to internal/staging HTTPS servers running old TLS stacks
+  - docker-compose services use self-signed certs from outdated libraries
+  - gRPC clients compiled against old OpenSSL connect to legacy gRPC servers
+  - curl/wget calls target third-party APIs that have not updated their TLS handshake
+  - Java HTTPS tests connect to embedded Jetty/Netty servers with old SSL config
+
+  The error did not occur on ubuntu-20.04 (OpenSSL 1.1.1, which allowed legacy renegotiation
+  by default). Workflows migrating from ubuntu-20.04 to 22.04/24.04 encounter it for the first
+  time.
+fix: |
+  Option 1 (recommended for CI): Append `UnsafeLegacyRenegotiation = true` to the OpenSSL
+  config file at the start of the job. This is acceptable in CI/testing contexts where you
+  control the environment; never use this in production.
+
+  Option 2: Set OPENSSL_CONF to /dev/null to bypass the OpenSSL configuration file entirely.
+  Use only for quick diagnostics or tests against known internal servers.
+
+  Option 3 (recommended long-term): Upgrade the legacy server's TLS library so it advertises
+  RFC 5746 support. For embedded test servers, upgrade the underlying HTTP/TLS library version.
+
+  Option 4: Use `curl --no-sessionid` or `curl --legacy-renegotiation` (curl 7.83+) for
+  specific curl-based steps without affecting the whole environment.
+fix_code:
+  - language: yaml
+    label: "Enable UnsafeLegacyRenegotiation in OpenSSL config for CI (workaround)"
+    code: |
+      jobs:
+        integration-test:
+          runs-on: ubuntu-24.04
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Allow legacy TLS renegotiation (CI workaround for legacy test servers)
+              run: |
+                echo "Options = UnsafeLegacyRenegotiation" | \
+                  sudo tee -a /etc/ssl/openssl.cnf
+
+            - name: Run integration tests
+              run: npm test
+  - language: yaml
+    label: "Override OPENSSL_CONF per-step (minimal blast radius)"
+    code: |
+      jobs:
+        integration-test:
+          runs-on: ubuntu-24.04
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Test against legacy HTTPS endpoint
+              env:
+                OPENSSL_CONF: /dev/null
+              run: |
+                curl -v https://legacy-test-server.internal/health
+  - language: yaml
+    label: "Set OPENSSL_CONF at job level (affects all steps)"
+    code: |
+      jobs:
+        integration-test:
+          runs-on: ubuntu-24.04
+          env:
+            OPENSSL_CONF: /dev/null
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+prevention:
+  - "Upgrade internal/staging test servers to modern TLS libraries that support RFC 5746"
+  - "Use `openssl s_client -connect host:443` in CI to detect legacy renegotiation issues before they block builds"
+  - "Avoid pinning to ubuntu-20.04 as a permanent workaround — it reached EOL and will be removed from runner images"
+  - "When upgrading from ubuntu-20.04 to 22.04/24.04, run a connectivity smoke-test against all HTTPS endpoints the workflow touches"
+  - "Use testcontainers or modern embedded test server libraries that ship up-to-date TLS stacks"
+docs:
+  - url: "https://www.openssl.org/docs/man3.0/man3/SSL_CTX_set_options.html"
+    label: "OpenSSL 3.0 — SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION option"
+  - url: "https://github.com/actions/runner-images/issues/6399"
+    label: "runner-images #6399 — OpenSSL 3 renegotiation issues on ubuntu-22.04"
+  - url: "https://github.com/openssl/openssl/issues/17593"
+    label: "OpenSSL #17593 — Legacy renegotiation rejection in 3.0"
+  - url: "https://www.rfc-editor.org/rfc/rfc5746"
+    label: "RFC 5746 — TLS Renegotiation Indication Extension"
