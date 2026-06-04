@@ -1,0 +1,98 @@
+id: runner-environment-112
+title: "ubuntu-24.04 nftables replaces iptables — Docker bridge networking and kind/minikube cluster setup fails"
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-24.04
+  - docker
+  - networking
+  - iptables
+  - nftables
+  - kind
+  - minikube
+  - runner-image-update
+patterns:
+  - regex: 'No chain/target/match by that name'
+    flags: 'i'
+  - regex: 'iptables.*failed.*nat.*DOCKER'
+    flags: 'i'
+  - regex: 'Failed to set up iptables.*\(iptables-nft\)'
+    flags: 'i'
+  - regex: 'network.*setup.*failed.*iptables'
+    flags: 'i'
+  - regex: 'Error response from daemon.*iptables failed'
+    flags: 'i'
+error_messages:
+  - "iptables: No chain/target/match by that name."
+  - "Error response from daemon: driver failed programming external connectivity on endpoint: iptables failed: iptables --wait -t nat -A DOCKER -p tcp -d 0/0 --dport 5432 -j DNAT --to-destination 172.17.0.2:5432 ! -i docker0: iptables: No chain/target/match by that name."
+  - "Failed to set up iptables rules: iptables-nft is not supported"
+  - "Error: failed to create cluster: failed to ensure docker network: failed to set up kind CNI"
+root_cause: |
+  Ubuntu 24.04 ships with nftables as the primary packet-filtering framework. The `iptables`
+  command is now a thin wrapper around nftables (`iptables-nft`), replacing the legacy
+  `iptables-legacy` backend that was default on Ubuntu 20.04/22.04.
+
+  Docker's bridge networking writes iptables rules using legacy format assumptions. CNI plugins
+  used by Kubernetes tools (kind, minikube, k3s) also expect the legacy iptables backend to be
+  active. When these tools run on ubuntu-24.04, they encounter incompatible chain formats and
+  rule semantics that iptables-nft does not honour, causing network setup to fail with "No
+  chain/target/match by that name" errors.
+
+  The runner-images migration from ubuntu-22.04 to ubuntu-24.04 (and from ubuntu-latest pointing
+  to ubuntu-22.04 to ubuntu-24.04) silently exposes this issue for any workflow running
+  Docker-in-Docker, Kubernetes clusters, or service containers with custom networking.
+fix: |
+  Switch the `iptables` alternative back to the legacy backend before starting Docker or
+  any CNI-based tooling. Add this step at the top of your job, before any Docker or cluster
+  setup steps:
+
+    - name: Switch to legacy iptables
+      run: |
+        sudo update-alternatives --set iptables /usr/sbin/iptables-legacy
+        sudo update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
+
+  For kind clusters, the above fix is the most reliable approach.
+
+  If you cannot switch the iptables backend (e.g., you require nftables for other reasons),
+  use Docker with `--iptables=false` and manage forwarding rules manually, or use network
+  mode `host` where possible.
+
+  Long-term: upgrade to versions of kind (≥ v0.24), minikube (≥ v1.33), and Docker Engine
+  (≥ 27) that include nftables-native support.
+fix_code:
+  - language: yaml
+    label: "Switch to iptables-legacy before Docker or cluster setup (ubuntu-24.04)"
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-24.04
+          steps:
+            - name: Switch to legacy iptables
+              run: |
+                sudo update-alternatives --set iptables /usr/sbin/iptables-legacy
+                sudo update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
+
+            - name: Start kind cluster
+              uses: helm/kind-action@v1
+              with:
+                cluster_name: ci
+  - language: yaml
+    label: "Pin runs-on to ubuntu-22.04 as a temporary workaround"
+    code: |
+      jobs:
+        test:
+          # Temporary: ubuntu-22.04 uses iptables-legacy by default
+          # TODO: migrate to ubuntu-24.04 after updating kind/Docker versions
+          runs-on: ubuntu-22.04
+prevention:
+  - "Test workflows on ubuntu-24.04 explicitly before relying on ubuntu-latest switching to it"
+  - "Keep kind, minikube, and Docker Engine versions current — nftables-native support arrived in each"
+  - "Add an iptables-legacy switch step as a defensive measure in any job using Docker networking or CNI plugins"
+  - "Watch runner-images release notes (github.com/actions/runner-images) for ubuntu-latest label changes"
+docs:
+  - url: "https://docs.docker.com/network/iptables/"
+    label: "Docker — iptables and nftables networking"
+  - url: "https://github.com/actions/runner-images/issues/10636"
+    label: "runner-images #10636 — ubuntu-24.04 iptables-nft Docker incompatibility"
+  - url: "https://kind.sigs.k8s.io/docs/user/known-issues/"
+    label: "kind — Known Issues including iptables compatibility"
