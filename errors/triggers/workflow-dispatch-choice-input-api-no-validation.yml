@@ -1,0 +1,98 @@
+id: triggers-054
+title: "workflow_dispatch choice input not validated when triggered via REST API — invalid values silently accepted"
+category: triggers
+severity: silent-failure
+tags:
+  - workflow-dispatch
+  - choice-input
+  - rest-api
+  - inputs
+  - validation
+  - gh-cli
+patterns:
+  - regex: 'type:\s*choice'
+    flags: 'i'
+  - regex: 'inputs\.\w+.*choice'
+    flags: 'i'
+error_messages:
+  - "Workflow ran with input value not in declared choices list"
+root_cause: |
+  The type: choice input in on.workflow_dispatch.inputs renders a dropdown
+  selector in the GitHub Actions UI and prevents users from submitting values
+  outside the declared options list. This validation is enforced entirely
+  client-side in the browser.
+
+  When a workflow is triggered via the GitHub REST API
+  (POST /repos/{owner}/{repo}/actions/workflows/{id}/dispatches) or the GitHub
+  CLI (gh workflow run --field key=value), GitHub does NOT validate that the
+  supplied value matches any of the declared choices. Any arbitrary string is
+  accepted and forwarded as-is to the workflow.
+
+  A workflow dispatched with inputs: { environment: "PROD" } when the declared
+  choices are ["prod", "staging", "dev"] will run with inputs.environment == "PROD".
+  Every if: condition that compares against the lower-case variants evaluates to
+  false, all deployment branches are skipped, and the workflow exits successfully
+  with no indication that the value was invalid. The mistyped run is invisible
+  unless logs are inspected manually.
+fix: |
+  Add an explicit allowlist validation step at the top of the workflow that checks
+  the input value and exits with a non-zero status and a descriptive error message
+  if the value is not in the expected set. This makes API-triggered runs fail fast
+  with a clear error rather than silently no-oping.
+fix_code:
+  - language: yaml
+    label: "Validate choice input with an allowlist check"
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            environment:
+              type: choice
+              description: Target deployment environment
+              options:
+                - prod
+                - staging
+                - dev
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Validate environment input
+              run: |
+                allowed="prod staging dev"
+                input="${{ inputs.environment }}"
+                if [[ ! " $allowed " =~ " ${input} " ]]; then
+                  echo "::error::Invalid environment '${input}'. Allowed values: $allowed"
+                  exit 1
+                fi
+
+            - name: Deploy to ${{ inputs.environment }}
+              run: echo "Deploying to ${{ inputs.environment }}"
+  - language: yaml
+    label: "Case-insensitive validation with normalisation"
+    code: |
+      - name: Validate and normalise environment input
+        id: validate
+        run: |
+          input=$(echo "${{ inputs.environment }}" | tr '[:upper:]' '[:lower:]')
+          allowed=("prod" "staging" "dev")
+          valid=false
+          for v in "${allowed[@]}"; do
+            [[ "$input" == "$v" ]] && valid=true && break
+          done
+          if [[ "$valid" != "true" ]]; then
+            echo "::error::Unrecognised environment '${{ inputs.environment }}' (normalised: '$input'). Allowed: ${allowed[*]}"
+            exit 1
+          fi
+          echo "environment=$input" >> "$GITHUB_OUTPUT"
+prevention:
+  - "Treat type: choice as a UI hint only — always validate inputs programmatically inside the workflow."
+  - "Add an allowlist guard as the first step of any job that branches on a choice input."
+  - "Document valid values and casing rules in the input description field so API callers know the expected format."
+  - "Use actionlint to detect misspelled choices at authoring time before they reach production."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_dispatch"
+    label: "GitHub Actions: workflow_dispatch event — inputs"
+  - url: "https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event"
+    label: "GitHub REST API: Create a workflow dispatch event"

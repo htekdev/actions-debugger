@@ -1,0 +1,88 @@
+id: caching-artifacts-048
+title: "actions/cache lookup-only: true checks cache existence but does NOT restore files"
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - cache
+  - lookup-only
+  - cache-hit
+  - restore
+  - silent-no-op
+patterns:
+  - regex: 'lookup-only.*true'
+    flags: 'i'
+  - regex: 'Cache found and can be restored from key'
+    flags: 'i'
+error_messages:
+  - "Cache found and can be restored from key: node-modules-abc123"
+  - "lookup-only is set, skipping restore."
+root_cause: |
+  The lookup-only: true input on actions/cache@v4 instructs the action to query
+  the cache service and report whether an entry exists (via the cache-hit output)
+  without transferring any data to the runner. No files are downloaded or written
+  to disk.
+
+  Developers who add lookup-only: true hoping to get a "lightweight restore that
+  skips the upload post-step" receive a misleading green step. The cache-hit output
+  reports 'true', the step log says "Cache found and can be restored from key",
+  and everything looks successful — but the working directory is empty.
+  Subsequent build steps that depend on the cached files fail with cryptic errors
+  (missing executables, import errors, or blank node_modules) that appear unrelated
+  to caching.
+
+  The intended use case for lookup-only is a two-job pipeline: Job A checks if the
+  cache exists (lookup-only: true) and, if not, builds and saves it; Job B restores
+  normally. It is NOT a performance shortcut for regular restore-and-save workflows.
+fix: |
+  Remove lookup-only: true from any step that should actually restore cached files.
+  Use lookup-only: true only in a dedicated pre-check job that gates whether an
+  expensive build step needs to run, combined with a normal actions/cache step in
+  the subsequent job that performs the real restore.
+fix_code:
+  - language: yaml
+    label: "Remove lookup-only for normal cache restore (most cases)"
+    code: |
+      - name: Restore node_modules cache
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: ${{ runner.os }}-node-
+          # Do NOT set lookup-only: true here — files must be restored
+  - language: yaml
+    label: "Correct pattern: lookup-only in check job, real restore in build job"
+    code: |
+      jobs:
+        check-cache:
+          runs-on: ubuntu-latest
+          outputs:
+            cache-hit: ${{ steps.lookup.outputs.cache-hit }}
+          steps:
+            - id: lookup
+              uses: actions/cache@v4
+              with:
+                path: node_modules
+                key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+                lookup-only: true   # only check — no download
+
+        build:
+          needs: check-cache
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/cache@v4
+              with:
+                path: node_modules
+                key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+                # no lookup-only — restores files and saves after build
+            - if: needs.check-cache.outputs.cache-hit != 'true'
+              run: npm ci
+prevention:
+  - "Only use lookup-only: true in a dedicated cache-check job that feeds a conditional build gate."
+  - "After using lookup-only, always follow up with a standard actions/cache step (no lookup-only) in the job that needs the files."
+  - "If you want to skip the post-step cache save, use actions/cache/restore instead of setting lookup-only: true."
+docs:
+  - url: "https://github.com/actions/cache#inputs"
+    label: "actions/cache README: inputs including lookup-only"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows"
+    label: "GitHub Actions: Caching dependencies"

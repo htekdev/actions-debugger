@@ -1,0 +1,67 @@
+id: caching-artifacts-047
+title: "Re-run job fails with 'artifact already exists' when artifact name includes github.run_id"
+category: caching-artifacts
+severity: error
+tags:
+  - upload-artifact
+  - re-run
+  - run_id
+  - run_attempt
+  - artifact-name
+  - collision
+patterns:
+  - regex: 'An artifact with this name already exists on the workflow run'
+    flags: 'i'
+  - regex: 'Unable to upload artifact.*already exists'
+    flags: 'i'
+error_messages:
+  - "An artifact with this name already exists on the workflow run."
+  - "Unable to upload artifact: An artifact with this name already exists on the run."
+root_cause: |
+  github.run_id identifies a workflow run and remains the same value across all
+  re-run attempts triggered from the GitHub UI or REST API. When an artifact name
+  is constructed using github.run_id (e.g., my-build-${{ github.run_id }}), the
+  first attempt uploads successfully. If the job fails and is re-run, the re-run
+  attempt tries to create an artifact with the identical name on the same run.
+
+  actions/upload-artifact@v4 enforces unique artifact names per run as a hard
+  error (changed from v3 which silently overwrote). The re-run therefore fails
+  immediately with "artifact already exists" before any meaningful work is done.
+
+  Teams reach for run_id because it appears to be a unique-per-execution
+  identifier. It is not: it is unique per workflow trigger, stable across all
+  re-run attempts within that trigger.
+fix: |
+  Append github.run_attempt to the artifact name. run_attempt starts at 1 and
+  increments for each re-run of the same run_id, making the combined value unique
+  across attempts. Consumers of the artifact (download steps, workflow_run
+  triggers) must include run_attempt in their own references to locate the
+  correct artifact.
+fix_code:
+  - language: yaml
+    label: "Include run_attempt to make artifact name unique across re-runs"
+    code: |
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # run_attempt increments on each re-run, preventing name collision
+          name: my-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/
+  - language: yaml
+    label: "Download the matching artifact in a downstream job"
+    code: |
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: my-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/
+prevention:
+  - "Never use github.run_id alone as an artifact name uniqueness guarantee — it is stable across all re-runs of the same run."
+  - "Combine github.run_id with github.run_attempt to produce a name that is unique within a run AND across re-run attempts."
+  - "Use a matrix value or job name as the differentiator instead of run_id when the artifact is consumed by a job in the same workflow."
+  - "Check the GitHub UI Actions > Artifacts list to inspect existing artifact names before debugging re-run failures."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-workflow-data-as-artifacts"
+    label: "GitHub Actions: Storing workflow data as artifacts"
+  - url: "https://github.com/actions/upload-artifact#not-uploading-to-the-same-artifact"
+    label: "actions/upload-artifact: unique artifact names per run"

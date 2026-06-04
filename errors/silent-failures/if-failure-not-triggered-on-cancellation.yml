@@ -1,0 +1,96 @@
+id: silent-failures-075
+title: "if: failure() notification job is skipped when workflow is manually cancelled"
+category: silent-failures
+severity: silent-failure
+tags:
+  - if-condition
+  - failure
+  - cancelled
+  - always
+  - notification
+  - cleanup
+patterns:
+  - regex: 'if:\s*failure\(\)'
+    flags: 'i'
+  - regex: 'Skipping.*cancelled'
+    flags: 'i'
+error_messages:
+  - "Skipping: The job was skipped because one or more of its needs jobs was cancelled."
+root_cause: |
+  When a workflow is manually cancelled (via the GitHub UI "Cancel run" button or
+  the REST API), in-progress jobs receive a cancellation signal. Jobs that have not
+  yet started are given the conclusion "cancelled". Jobs with if: failure() are
+  only evaluated against the "failure" conclusion — "cancelled" is a distinct
+  conclusion value. Because cancelled != failure, the condition evaluates to false
+  and the notification or cleanup job is silently skipped.
+
+  This catches teams by surprise when they add an alerting job intended to fire
+  whenever CI does not succeed:
+
+    notify-on-failure:
+      needs: build
+      if: failure()
+      runs-on: ubuntu-latest
+      steps:
+        - name: Send Slack alert
+          ...
+
+  When an operator cancels a run mid-flight, the build job is marked cancelled,
+  not failed. The notify job evaluates if: failure() → false and is skipped with
+  no Slack message. The on-call team receives no signal that a run was interrupted.
+
+  The failure() function returns true only when at least one needed job has a
+  "failure" conclusion. It does NOT return true for "cancelled" conclusions.
+fix: |
+  Use if: failure() || cancelled() to catch both failure and cancellation, or use
+  if: always() combined with a conditional check on the job's outcome inside the
+  step if you only want to act on non-success outcomes.
+fix_code:
+  - language: yaml
+    label: "Catch both failure and cancellation in a notification job"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - run: make build
+
+        notify-on-failure:
+          needs: build
+          # failure() catches job failures; cancelled() catches manual cancellation
+          if: failure() || cancelled()
+          runs-on: ubuntu-latest
+          steps:
+            - name: Send failure or cancellation alert
+              run: |
+                echo "Build concluded: ${{ needs.build.result }}"
+                # Send Slack/PagerDuty notification here
+  - language: yaml
+    label: "Use always() and gate on outcome inside the step for fine-grained control"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - run: make build
+
+        notify:
+          needs: build
+          if: always()
+          runs-on: ubuntu-latest
+          steps:
+            - name: Notify only on non-success outcomes
+              if: needs.build.result != 'success'
+              run: |
+                echo "Build result: ${{ needs.build.result }}"
+                # Handles: failure, cancelled, skipped
+prevention:
+  - "Use if: failure() || cancelled() instead of if: failure() for any alert, notification, or cleanup job that must run whenever CI does not succeed."
+  - "Prefer if: always() when the downstream job should run regardless of upstream outcome (e.g., always upload test reports)."
+  - "Audit all notification and cleanup jobs after cancellation to confirm they fired as expected — cancelled runs don't generate failure alerts by default."
+  - "The cancelled() function returns true when the workflow or job has been cancelled; combine with failure() using || for comprehensive coverage."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-conditions-to-control-job-execution"
+    label: "GitHub Actions: Using conditions to control job execution"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-conditions-to-control-job-execution#available-status-check-functions"
+    label: "GitHub Actions: Available status check functions — failure(), cancelled(), always()"
