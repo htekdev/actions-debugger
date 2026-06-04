@@ -1,0 +1,81 @@
+id: caching-artifacts-046
+title: "actions/cache exact key hit skips save step — caches go stale when dependency hash doesn't change"
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - cache
+  - save-always
+  - cache-hit
+  - stale-cache
+  - cache-invalidation
+patterns:
+  - regex: 'Cache hit occurred on the primary key'
+    flags: i
+  - regex: 'Not saving cache'
+    flags: i
+error_messages:
+  - "Cache hit occurred on the primary key, not saving cache."
+  - "Not saving cache as it is not requested."
+root_cause: |
+  When actions/cache finds an exact match for the primary key, it sets
+  cache-hit: 'true' and the post-step save is skipped entirely. The rationale is
+  that since the key already exists, re-saving an identical entry would be wasteful.
+
+  However, this behaviour means that cache content changes that do NOT affect the
+  hash (e.g., transitive package security patches, tool binary updates, or
+  generated files included in the cached path) are never persisted. The cache
+  entry stays frozen at the state it was in when the key was first saved.
+
+  Common scenario: a workflow caches node_modules keyed on package-lock.json hash.
+  The lock file goes unchanged for weeks, but npm packages receive silent patch
+  updates or a cached binary becomes corrupt. Every run gets a cache hit, skips the
+  save, and the stale or corrupt content continues to be served until the lock file
+  hash finally changes.
+fix: |
+  Set save-always: true on the cache step to force a save even when the exact key
+  already exists. For finer control, split the action into separate
+  actions/cache/restore and actions/cache/save steps so the save can run
+  conditionally. To immediately invalidate a specific cache entry, delete it via
+  the GitHub REST API or the Actions UI under Repository > Actions > Caches.
+fix_code:
+  - language: yaml
+    label: "Force save on every run with save-always"
+    code: |
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: ${{ runner.os }}-node-
+          # Always save even if exact key already exists in the cache
+          save-always: true
+
+  - language: yaml
+    label: "Split restore and save for conditional save logic"
+    code: |
+      - name: Restore cache
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: ${{ runner.os }}-node-
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Save cache
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: node_modules
+          key: ${{ steps.cache-restore.outputs.cache-primary-key }}
+prevention:
+  - "Use save-always: true when cached content may diverge from the hash key (e.g., tool caches, binary downloads)."
+  - "Periodically evict stale cache entries via the GitHub REST API DELETE /repos/{owner}/{repo}/actions/caches/{cache_id}."
+  - "Include a tool version or date component in the cache key when the content should rotate on a schedule."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows"
+    label: "GitHub Actions: Caching dependencies"
+  - url: "https://github.com/actions/cache#save-always"
+    label: "actions/cache README: save-always option"
