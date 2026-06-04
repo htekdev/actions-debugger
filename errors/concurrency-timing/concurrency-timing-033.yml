@@ -1,0 +1,104 @@
+id: concurrency-timing-033
+title: "Matrix jobs silently cancel each other when concurrency group key excludes matrix dimension values"
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - matrix
+  - cancel-in-progress
+  - silent-failure
+  - matrix-strategy
+patterns:
+  - regex: 'This run was cancelled\.'
+    flags: 'i'
+  - regex: 'The operation was cancelled\.'
+    flags: 'i'
+error_messages:
+  - "This run was cancelled."
+  - "The operation was cancelled."
+root_cause: |
+  When a workflow defines a `concurrency` group that does not include any matrix-specific
+  expression values, all matrix jobs resolve to the exact same concurrency group key.
+
+  With `cancel-in-progress: true`, each queued matrix job cancels the previously queued
+  or running job with the same key. Since all matrix jobs are queued nearly simultaneously,
+  they race for the single concurrency slot and only the last-scheduled job survives.
+  All others silently show "This run was cancelled." with no further explanation.
+
+  Example problematic configuration:
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+  All three matrix jobs resolve to the same key, e.g., "test-refs/heads/main", and
+  cancel each other until only one remains.
+
+  Without `cancel-in-progress`, matrix jobs queue serially behind the single slot instead
+  of running in parallel, also incorrect and defeating the purpose of the matrix.
+fix: |
+  Include at least one matrix dimension value in the concurrency group key so each matrix
+  job gets a unique group name and can run in parallel without cancelling each other.
+
+  Place `concurrency:` at the job level and reference the matrix variable:
+
+    jobs:
+      test:
+        concurrency:
+          group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.os }}
+          cancel-in-progress: true
+
+  If the goal is to cancel ALL previous matrix jobs when a new push arrives, apply
+  workflow-level concurrency with a key unique to the entire run (e.g., github.sha),
+  but note this serializes matrix sets rather than running jobs in parallel.
+fix_code:
+  - language: yaml
+    label: "Job-level concurrency includes matrix.os — each OS runs in its own slot"
+    code: |
+      jobs:
+        test:
+          runs-on: ${{ matrix.os }}
+          concurrency:
+            group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.os }}
+            cancel-in-progress: true
+          strategy:
+            fail-fast: false
+            matrix:
+              os: [ubuntu-latest, windows-latest, macos-latest]
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm ci && npm test
+  - language: yaml
+    label: "Multi-dimension matrix — include all axis values in group key"
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          concurrency:
+            group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.node }}-${{ matrix.os }}
+            cancel-in-progress: true
+          strategy:
+            fail-fast: false
+            matrix:
+              node: ['18', '20', '22']
+              os: [ubuntu-latest, windows-latest]
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                node-version: ${{ matrix.node }}
+            - run: npm test
+prevention:
+  - "Always include at least one matrix dimension variable in the concurrency group key when combining matrix strategy with concurrency"
+  - "Use job-level concurrency (under jobs.<name>:) rather than workflow-level when matrix is involved, for per-job slot control"
+  - "Review the Actions UI — if matrix jobs show 'This run was cancelled' without an explicit failure, check for concurrency group key collisions"
+  - "Run actionlint on your workflow files to catch common concurrency and expression issues"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs"
+    label: "GitHub Docs — Controlling the concurrency of workflows and jobs"
+  - url: "https://docs.github.com/en/actions/using-jobs/using-a-matrix-for-your-jobs"
+    label: "GitHub Docs — Using a matrix for your jobs"
+  - url: "https://github.com/orgs/community/discussions/24616"
+    label: "GitHub Community — Matrix jobs cancelled unexpectedly with concurrency groups"

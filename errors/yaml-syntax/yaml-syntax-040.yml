@@ -1,0 +1,135 @@
+id: yaml-syntax-040
+title: "YAML anchors and aliases (&anchor / *alias) not supported in GitHub Actions workflow files"
+category: yaml-syntax
+severity: error
+tags:
+  - yaml-anchors
+  - yaml-aliases
+  - yaml-syntax
+  - workflow-validation
+  - reuse
+  - composite-action
+patterns:
+  - regex: 'mapping values are not allowed in this context'
+    flags: 'i'
+  - regex: 'could not find expected.*anchor'
+    flags: 'i'
+  - regex: 'Invalid workflow file'
+    flags: 'i'
+error_messages:
+  - "Invalid workflow file: .github/workflows/ci.yml"
+  - "mapping values are not allowed in this context"
+  - "could not find expected ':'"
+root_cause: |
+  GitHub Actions uses a YAML parser that does NOT support YAML anchors (&anchor_name)
+  and aliases (*anchor_name). These are standard YAML 1.1 features commonly used in
+  Docker Compose, Kubernetes manifests, and other DevOps tooling to avoid repetition.
+
+  Developers migrating from those tools often try patterns like:
+
+    .common-steps: &common-steps
+      - uses: actions/checkout@v4
+      - run: npm ci
+
+    jobs:
+      build:
+        steps: *common-steps
+      test:
+        steps: *common-steps
+
+  GitHub's workflow validator rejects these with cryptic parse errors such as
+  "mapping values are not allowed in this context" or simply "Invalid workflow file"
+  without identifying the anchor as the cause. In some parser versions, the anchor
+  definition is silently ignored while the alias (*common-steps) causes a hard failure
+  when evaluated.
+
+  The reason: GitHub validates workflow files against a strict JSON schema and uses a
+  restricted YAML subset. Anchors and merge keys (<<: *anchor) are explicitly outside
+  the supported grammar, regardless of whether they are valid YAML 1.1 per the spec.
+fix: |
+  Use GitHub Actions' native reuse mechanisms instead of YAML anchors:
+
+  1. Composite actions (.github/actions/<name>/action.yml): package shared steps into
+     a local action and reference it with `uses: ./.github/actions/<name>` from any job.
+
+  2. Reusable workflows (on.workflow_call): extract shared job sequences into a separate
+     workflow file called with `uses: ./.github/workflows/<file>.yml@<ref>`.
+
+  3. Shared shell scripts: commit scripts to the repository and call them with `run:`.
+     This avoids repeating multi-line run blocks without requiring action packaging.
+
+  4. Repository-level actions (public): publish shared logic as a public action and
+     reference it by `owner/repo@tag`.
+fix_code:
+  - language: yaml
+    label: "Composite action for shared setup steps — .github/actions/setup/action.yml"
+    code: |
+      # .github/actions/setup/action.yml
+      name: Project Setup
+      description: Install dependencies and configure environment
+      inputs:
+        node-version:
+          description: Node.js version to use
+          default: '20'
+      runs:
+        using: composite
+        steps:
+          - uses: actions/checkout@v4
+          - uses: actions/setup-node@v4
+            with:
+              node-version: ${{ inputs.node-version }}
+              cache: npm
+          - run: npm ci
+            shell: bash
+  - language: yaml
+    label: "Calling the composite action from multiple jobs — replaces *alias pattern"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: ./.github/actions/setup
+              with:
+                node-version: '20'
+            - run: npm run build
+
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: ./.github/actions/setup
+              with:
+                node-version: '20'
+            - run: npm test
+  - language: yaml
+    label: "Reusable workflow for shared job sequences"
+    code: |
+      # .github/workflows/shared-ci.yml
+      on:
+        workflow_call:
+          inputs:
+            environment:
+              type: string
+              required: true
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm ci && npm test
+              env:
+                APP_ENV: ${{ inputs.environment }}
+prevention:
+  - "Do not use YAML anchors (&) or aliases (*) or merge keys (<<:) in GitHub Actions workflow files — they are not supported"
+  - "Use composite actions (.github/actions/<name>/action.yml) for shared step sequences across jobs"
+  - "Use reusable workflows (on.workflow_call) for shared job sequences across workflow files"
+  - "Use shared shell scripts committed to the repository for repeated run blocks"
+  - "Run actionlint — it explicitly flags anchor/alias syntax as unsupported in Actions workflows"
+docs:
+  - url: "https://docs.github.com/en/actions/sharing-automations/creating-actions/creating-a-composite-action"
+    label: "GitHub Docs — Creating a composite action"
+  - url: "https://docs.github.com/en/actions/sharing-automations/reusing-workflows"
+    label: "GitHub Docs — Reusing workflows"
+  - url: "https://github.com/rhysd/actionlint/blob/main/docs/checks.md"
+    label: "actionlint — Workflow file linting checks"
+  - url: "https://github.com/orgs/community/discussions/16638"
+    label: "GitHub Community — YAML anchors not supported in Actions workflows"

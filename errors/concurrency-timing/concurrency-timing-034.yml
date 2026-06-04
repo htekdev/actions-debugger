@@ -1,0 +1,123 @@
+id: concurrency-timing-034
+title: "Job-level cancel-in-progress only cancels that job — sibling jobs from the same run continue executing"
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - cancel-in-progress
+  - job-level
+  - workflow-level
+  - deployment
+  - silent-failure
+patterns:
+  - regex: 'This run was cancelled\.'
+    flags: 'i'
+  - regex: 'cancel-in-progress.*true'
+    flags: 'i'
+error_messages:
+  - "This run was cancelled."
+root_cause: |
+  When `concurrency:` is placed at the job level (under `jobs.<job-id>:`) rather than at
+  the workflow level (top-level key), cancellation scope is limited to that single job only.
+  Other jobs in the same workflow run — whether still queued, in-progress, or already
+  completed — are not affected by the job-level concurrency signal.
+
+  Developers commonly place `concurrency:` under a single job (e.g., `deploy`) while
+  expecting it to cancel the entire previous workflow run. The result is a dangerous race:
+
+  Run 1:  build (succeeded) → deploy (running, concurrency group "deploy-prod")
+  Run 2:  build (starts)   → deploy (queued, same group)
+
+  Run 2's deploy job fires cancel-in-progress and cancels Run 1's deploy job — but only
+  if Run 1's deploy is still in-progress. If Run 1's build was slow and deploy hasn't
+  started yet, or if both runs' builds overlap, the serialization guarantee breaks down.
+
+  More critically: if `concurrency:` is absent from the build job, Run 1's build and
+  Run 2's build run simultaneously. Run 1's build (old code) may complete and trigger
+  Run 1's deploy AFTER Run 2's deploy has already deployed new code, producing a
+  rollback to old code with no warning.
+
+  Workflow-level concurrency cancels the ENTIRE run (all jobs). Job-level concurrency
+  cancels only THAT job. This distinction is frequently misunderstood.
+fix: |
+  Place `concurrency:` at the workflow level (top-level) to cancel the entire previous
+  workflow run — all jobs — when a new run starts. Use job-level concurrency only when
+  you deliberately want different cancellation granularity per job.
+
+  For CI/CD where the entire pipeline should be replaced by the latest push:
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+    jobs:
+      build: ...
+      deploy: ...
+
+  For serializing deploys while allowing parallel builds:
+    jobs:
+      build:
+        # No concurrency key — builds run in parallel
+      deploy:
+        needs: build
+        concurrency:
+          group: deploy-${{ github.ref }}
+          cancel-in-progress: false   # Queue, do not cancel in-progress deployments
+fix_code:
+  - language: yaml
+    label: "Workflow-level concurrency cancels entire run including all jobs"
+    code: |
+      name: CI/CD Pipeline
+
+      on:
+        push:
+          branches: [main]
+
+      # Top-level: cancels ALL jobs in the previous workflow run on new push
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: true
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm ci && npm run build
+
+        deploy:
+          needs: build
+          runs-on: ubuntu-latest
+          environment: production
+          steps:
+            - run: ./scripts/deploy.sh
+  - language: yaml
+    label: "Job-level concurrency for deploy serialization only (intentional pattern)"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          # No concurrency key — parallel builds are fine
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm ci && npm run build
+
+        deploy:
+          needs: build
+          runs-on: ubuntu-latest
+          # Job-level: serialize deploys, but never cancel an in-progress deployment
+          concurrency:
+            group: deploy-${{ github.ref }}
+            cancel-in-progress: false
+          steps:
+            - run: ./scripts/deploy.sh
+prevention:
+  - "Use workflow-level concurrency (top-level key, not under a job) when the entire pipeline should be replaced by the latest push"
+  - "Use job-level concurrency only when you intentionally want different cancellation behavior per job"
+  - "Set cancel-in-progress: false for deploy jobs — cancelling an in-progress deployment can leave infrastructure in a partially updated state"
+  - "Add concurrency to EVERY job in a pipeline if using job-level groups, not just the deploy job"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs"
+    label: "GitHub Docs — Controlling the concurrency of workflows and jobs"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#concurrency"
+    label: "GitHub Actions workflow syntax — concurrency"
+  - url: "https://github.com/orgs/community/discussions/57540"
+    label: "GitHub Community — Job-level vs workflow-level concurrency scoping"

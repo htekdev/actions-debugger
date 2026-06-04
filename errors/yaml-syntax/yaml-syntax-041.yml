@@ -1,0 +1,147 @@
+id: yaml-syntax-041
+title: "env context unavailable at job-level if: conditions — evaluates empty or triggers 'Context access might be invalid' warning"
+category: yaml-syntax
+severity: error
+tags:
+  - env-context
+  - job-conditions
+  - if-condition
+  - context-availability
+  - expression
+  - workflow-validation
+patterns:
+  - regex: 'Context access might be invalid.*env'
+    flags: 'i'
+  - regex: 'Unexpected value.*env\.'
+    flags: 'i'
+  - regex: 'jobs\.[a-z_-]+\.if.*env\.[A-Z_]+'
+    flags: 'i'
+error_messages:
+  - "Context access might be invalid: env"
+  - "The workflow is not valid. .github/workflows/ci.yml: Unexpected value 'env'"
+root_cause: |
+  The `env` context in GitHub Actions is NOT available at all expression locations.
+  Its availability is scoped to specific parts of the workflow file.
+
+  `env` context IS available at:
+  - Step-level `if:` conditions (steps[*].if)
+  - Step `run:` scripts (as environment variables, not expressions)
+  - Step `with:` input values
+
+  `env` context is NOT available at:
+  - Job-level `if:` conditions (jobs.<job-id>.if)
+  - Workflow-level `env:` values (cannot reference other env vars defined in the same block)
+
+  A common mistake pattern:
+    env:
+      DEPLOY_ENV: production
+
+    jobs:
+      deploy:
+        if: env.DEPLOY_ENV == 'production'   # FAILS — env not available at job level
+        runs-on: ubuntu-latest
+
+  GitHub's expression evaluator may report "Context access might be invalid: env" as
+  a workflow validation warning, OR silently evaluate env.DEPLOY_ENV as an empty string
+  causing `if:` to evaluate to false — the job is skipped with no error message, only
+  a "skipped" status in the Actions UI.
+
+  The silent skip variant is especially deceptive: the workflow validates without error,
+  the job always shows as "skipped", and the developer assumes a logic error rather than
+  a context availability limitation.
+fix: |
+  At job-level `if:` conditions, use context types that ARE available:
+
+  1. vars context (repository/environment/org variables set in GitHub Settings):
+       jobs:
+         deploy:
+           if: vars.DEPLOY_ENV == 'production'
+
+  2. inputs context (workflow_dispatch or workflow_call inputs):
+       jobs:
+         deploy:
+           if: inputs.environment == 'production'
+
+  3. github context properties (branch, event type, actor, etc.):
+       jobs:
+         deploy:
+           if: github.ref == 'refs/heads/main'
+
+  4. needs.<job>.outputs (pass values from a prior job):
+       jobs:
+         setup:
+           outputs:
+             target_env: ${{ steps.detect.outputs.env }}
+         deploy:
+           needs: setup
+           if: needs.setup.outputs.target_env == 'production'
+
+  5. Move the condition to a step-level if: where env IS available:
+       jobs:
+         deploy:
+           runs-on: ubuntu-latest
+           steps:
+             - if: env.DEPLOY_ENV == 'production'
+               run: ./scripts/deploy.sh
+fix_code:
+  - language: yaml
+    label: "Use vars context at job-level if: (set variable in GitHub Settings)"
+    code: |
+      # Set DEPLOY_ENV in GitHub Settings → Secrets and Variables → Variables → Repository variables
+      jobs:
+        deploy:
+          # vars context IS available at job-level if:
+          if: vars.DEPLOY_ENV == 'production'
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./scripts/deploy.sh
+  - language: yaml
+    label: "Move env condition to step-level if: where env context is available"
+    code: |
+      env:
+        DEPLOY_ENV: production
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          # No job-level if: — condition is evaluated at the step level instead
+          steps:
+            - uses: actions/checkout@v4
+            - name: Deploy to production only
+              # env IS available at step-level if:
+              if: env.DEPLOY_ENV == 'production'
+              run: ./scripts/deploy.sh
+  - language: yaml
+    label: "Use workflow_dispatch input and inputs context at job level"
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            environment:
+              type: choice
+              options: [staging, production]
+              required: true
+
+      jobs:
+        deploy:
+          # inputs context IS available at job-level if:
+          if: inputs.environment == 'production'
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./scripts/deploy.sh
+prevention:
+  - "Use vars, inputs, github, or needs.<job>.outputs contexts in job-level if: conditions — never env"
+  - "Reserve env context for step-level if: conditions and run: scripts where it is available"
+  - "Run actionlint — it warns about invalid context usage at each expression location, including env at job level"
+  - "GitHub workflow validation may only warn (not error) on invalid context access — always test conditions with a real workflow run before relying on them"
+  - "Consult the GitHub Docs context availability table to verify which contexts are valid at each expression location"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#context-availability"
+    label: "GitHub Docs — Context availability by expression location"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/store-information-in-variables"
+    label: "GitHub Docs — Storing information in variables (vars context)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/using-conditions-to-control-job-execution"
+    label: "GitHub Docs — Using conditions to control job execution"
+  - url: "https://github.com/orgs/community/discussions/29068"
+    label: "GitHub Community — env context not available in job-level if conditions"
