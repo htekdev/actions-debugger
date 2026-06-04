@@ -1,0 +1,115 @@
+id: permissions-auth-043
+title: 'GITHUB_TOKEN cannot dispatch workflows or events in other repositories'
+category: permissions-auth
+severity: error
+tags:
+  - GITHUB_TOKEN
+  - repository_dispatch
+  - workflow_dispatch
+  - cross-repo
+  - 404
+  - permissions
+patterns:
+  - regex: 'Resource not accessible by integration'
+    flags: 'i'
+  - regex: '404.*dispatches|dispatches.*404'
+    flags: 'i'
+  - regex: 'HttpError: Not Found'
+    flags: 'i'
+error_messages:
+  - 'Resource not accessible by integration'
+  - 'HttpError: Not Found'
+  - '{"message":"Not Found","documentation_url":"https://docs.github.com/rest/repos/repos#create-a-repository-dispatch-event"}'
+  - 'RequestError [HttpError]: Not Found'
+root_cause: |
+  GITHUB_TOKEN is automatically scoped to the repository where the workflow
+  runs. It cannot authenticate to any other repository, regardless of what is
+  declared in the workflow's permissions block. The permissions block controls
+  only the scopes of the automatically-generated token for the CURRENT repo —
+  it has no effect on access to other repositories.
+
+  Attempts to call the GitHub REST API against a different repository —
+  including POST /repos/{owner}/{other-repo}/dispatches (repository_dispatch)
+  or POST /repos/{owner}/{other-repo}/actions/workflows/{id}/dispatches
+  (workflow_dispatch) — return 404 Not Found. GitHub returns 404 rather than
+  403 to avoid leaking information about whether the target repository exists
+  or is private.
+
+  This is a hard authentication boundary enforced by GitHub's token system,
+  not a configuration issue. No amount of permissions: adjustments in the
+  workflow file can grant the automatic GITHUB_TOKEN cross-repository access.
+
+  Note: this is distinct from the GITHUB_TOKEN loopback limitation (where
+  GITHUB_TOKEN cannot trigger new workflow runs in the SAME repository). This
+  error applies to any cross-repository API call.
+fix: |
+  Replace GITHUB_TOKEN with a credential that has access to the target
+  repository: a Personal Access Token (PAT) with repo scope, or a GitHub App
+  installation token scoped to both repositories. Store the credential as an
+  encrypted repository or organization secret.
+
+  GitHub Apps with installation tokens are the recommended approach for
+  production cross-repo automation — they provide fine-grained permissions,
+  do not depend on a specific user account, and tokens are automatically
+  rotated.
+fix_code:
+  - language: yaml
+    label: 'Use a PAT secret for cross-repo repository_dispatch'
+    code: |
+      jobs:
+        trigger-downstream:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Dispatch event to other repository
+              uses: actions/github-script@v7
+              with:
+                github-token: ${{ secrets.CROSS_REPO_PAT }}
+                script: |
+                  await github.rest.repos.createDispatchEvent({
+                    owner: 'my-org',
+                    repo: 'other-repo',
+                    event_type: 'build-triggered',
+                    client_payload: {
+                      ref: context.ref,
+                      sha: context.sha
+                    }
+                  });
+  - language: yaml
+    label: 'Use a GitHub App installation token for cross-repo workflow dispatch (recommended)'
+    code: |
+      jobs:
+        trigger-downstream:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Generate GitHub App installation token
+              id: app-token
+              uses: actions/create-github-app-token@v1
+              with:
+                app-id: ${{ vars.APP_ID }}
+                private-key: ${{ secrets.APP_PRIVATE_KEY }}
+                owner: my-org
+                repositories: other-repo
+
+            - name: Dispatch workflow in other repository
+              uses: actions/github-script@v7
+              with:
+                github-token: ${{ steps.app-token.outputs.token }}
+                script: |
+                  await github.rest.actions.createWorkflowDispatch({
+                    owner: 'my-org',
+                    repo: 'other-repo',
+                    workflow_id: 'deploy.yml',
+                    ref: 'main'
+                  });
+prevention:
+  - 'Never use ${{ secrets.GITHUB_TOKEN }} in API calls targeting other repositories — it will always 404'
+  - 'Prefer GitHub Apps with installation tokens over PATs for cross-repo automation — scoped, auto-rotating, and not tied to a user account'
+  - 'Store cross-repo PATs as organization secrets so they are reusable across multiple source repositories without per-repo duplication'
+  - 'When debugging 404 on dispatch endpoints, first check whether the token is GITHUB_TOKEN vs a PAT — this is the most common cause'
+docs:
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#permissions-for-the-github_token'
+    label: 'GitHub Docs: Permissions for the GITHUB_TOKEN'
+  - url: 'https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/making-authenticated-api-requests-with-a-github-app-in-a-github-actions-workflow'
+    label: 'GitHub Docs: Authenticating with a GitHub App in GitHub Actions'
+  - url: 'https://github.com/orgs/community/discussions/26724'
+    label: 'GitHub Community: GITHUB_TOKEN cannot dispatch to another repository'

@@ -1,0 +1,95 @@
+id: silent-failures-060
+title: 'Reusable workflow outputs not declared at on.workflow_call.outputs are silently empty in callers'
+category: silent-failures
+severity: silent-failure
+tags:
+  - reusable-workflow
+  - workflow_call
+  - outputs
+  - empty-string
+  - silent-failure
+patterns:
+  - regex: 'needs\.[a-z][a-z0-9_-]*\.outputs\.[a-z][a-z0-9_-]*'
+    flags: 'i'
+error_messages:
+  - '(no error emitted — callers receive empty strings silently)'
+  - 'Error: Input required and not supplied'
+root_cause: |
+  Reusable workflows require a two-level output declaration. Developers
+  correctly declare job-level outputs under jobs.<job-id>.outputs, but omit
+  the second required declaration: the workflow-level outputs block under
+  on.workflow_call.outputs.
+
+  Without the workflow-level outputs declaration, any caller that references
+  ${{ needs.<call-job>.outputs.<name> }} receives an empty string. GitHub
+  Actions does not emit any error, warning, or annotation — downstream steps
+  silently receive empty values, producing wrong behavior or spurious failures
+  (e.g., artifact path is empty, deployment target is blank).
+
+  The root cause is that GitHub's reusable workflow output model requires two
+  separate declarations:
+    1. job.outputs: maps a step output to a job-scoped output
+    2. on.workflow_call.outputs: hoists a job output up to the workflow level
+       so external callers can reference it
+
+  Omitting level 2 is invisible — the job output exists internally but is
+  never exposed to the calling workflow.
+fix: |
+  Add an outputs block directly under on.workflow_call that maps each desired
+  workflow output name to ${{ jobs.<job-id>.outputs.<output-name> }}. This is
+  in addition to (not a replacement for) the job-level outputs block.
+fix_code:
+  - language: yaml
+    label: 'Reusable workflow: declare outputs at both job level and on.workflow_call level'
+    code: |
+      on:
+        workflow_call:
+          outputs:
+            build-version:
+              description: 'The semantic version produced by this workflow'
+              value: ${{ jobs.build.outputs.build-version }}
+            artifact-path:
+              description: 'Path to the uploaded artifact'
+              value: ${{ jobs.build.outputs.artifact-path }}
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          outputs:
+            build-version: ${{ steps.version.outputs.version }}
+            artifact-path: ${{ steps.upload.outputs.artifact-path }}
+          steps:
+            - id: version
+              run: echo "version=1.2.3" >> "$GITHUB_OUTPUT"
+              shell: bash
+            - id: upload
+              uses: actions/upload-artifact@v4
+              with:
+                name: my-artifact
+                path: dist/
+  - language: yaml
+    label: 'Calling workflow: access reusable workflow outputs via needs context'
+    code: |
+      jobs:
+        call-build:
+          uses: ./.github/workflows/build.yml
+
+        deploy:
+          needs: call-build
+          runs-on: ubuntu-latest
+          steps:
+            - name: Use build outputs
+              run: |
+                echo "Version: ${{ needs.call-build.outputs.build-version }}"
+                echo "Artifact: ${{ needs.call-build.outputs.artifact-path }}"
+              shell: bash
+prevention:
+  - 'Always declare outputs under on.workflow_call.outputs in addition to any job-level outputs blocks — they are two distinct YAML nodes'
+  - 'Immediately echo needs.<call-job>.outputs.* in the caller after wiring up to verify outputs are populated during development'
+  - 'Use actionlint locally or in CI to catch missing workflow-level output declarations before they ship'
+  - 'Treat the two-level declaration as a checklist: job outputs block + workflow_call outputs block'
+docs:
+  - url: 'https://docs.github.com/en/actions/sharing-automations/reusing-workflows#using-outputs-from-a-reusable-workflow'
+    label: 'GitHub Docs: Using outputs from a reusable workflow'
+  - url: 'https://github.com/orgs/community/discussions/17245'
+    label: 'GitHub Community: Outputs from reusable workflow missing in caller'
