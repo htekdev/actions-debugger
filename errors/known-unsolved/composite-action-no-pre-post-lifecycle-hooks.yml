@@ -1,0 +1,94 @@
+id: known-unsolved-043
+title: 'Composite actions do not support pre: and post: lifecycle hooks — no guaranteed setup or cleanup code'
+category: known-unsolved
+severity: limitation
+tags:
+  - composite-action
+  - pre-step
+  - post-step
+  - cleanup
+  - lifecycle
+patterns:
+  - regex: 'Unexpected value ''pre'''
+    flags: 'i'
+  - regex: 'Unexpected value ''post'''
+    flags: 'i'
+error_messages:
+  - "Unexpected value 'pre'"
+  - "Unexpected value 'post'"
+  - 'pre: and post: are only supported in JavaScript and Docker container actions'
+root_cause: |
+  GitHub Actions supports pre: and post: lifecycle hooks in JavaScript actions (using: node20/node24)
+  and Docker container actions (using: docker). These hooks run before and after the main action
+  step respectively, and the post: hook runs even when the workflow is cancelled or fails —
+  making them ideal for guaranteed resource cleanup.
+
+  Composite actions (using: composite) do NOT support pre: or post: hooks. Attempting to add
+  pre: or post: to an action.yml with using: composite causes a validation error. This means
+  shell-based or Python-based composite actions cannot register guaranteed cleanup code that
+  runs after the job, regardless of success, failure, or cancellation.
+
+  Common affected patterns:
+  - Database seeding in setup steps that must be torn down in post:
+  - Port forwarding or tunnel setup that must be closed after the job
+  - Temporary credential setup that must be revoked after the workflow
+  - Cloud resource creation that must be deleted to avoid cost leaks
+fix: |
+  There is no direct fix — this is a known GitHub Actions platform limitation. Common workarounds:
+
+  Option A: Add explicit cleanup steps in calling workflows using if: always().
+  Option B: Wrap the composite logic in a thin JavaScript action that shells out to scripts,
+  enabling pre:/post: hook support.
+  Option C: Use a separate cleanup job with needs: [main-job] and if: always() for teardown.
+  Note: Option C adds latency and does not run on runner process kill.
+fix_code:
+  - language: yaml
+    label: 'Workaround: use if: always() cleanup step in the calling workflow'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Setup composite action
+              uses: ./.github/actions/my-composite-action
+
+            - name: Run build
+              run: make build
+
+            # Cleanup runs even if previous steps fail or are cancelled
+            - name: Cleanup resources
+              if: always()
+              run: |
+                echo "Cleaning up resources created by composite action..."
+                # teardown commands here
+
+  - language: yaml
+    label: 'Workaround: separate cleanup job guaranteed to run after main job'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: ./.github/actions/my-composite-action
+            - run: make build
+
+        cleanup:
+          runs-on: ubuntu-latest
+          needs: [build]
+          # Runs even when the build job fails or is cancelled
+          if: always()
+          steps:
+            - name: Teardown
+              run: |
+                echo "Running post-job cleanup..."
+prevention:
+  - "Design composite actions to be stateless and idempotent when possible — avoid side effects that require guaranteed cleanup"
+  - "Document in the composite action README that callers must add if: always() cleanup steps"
+  - "For actions that require guaranteed pre:/post: lifecycle hooks, consider wrapping in a JavaScript action"
+docs:
+  - url: 'https://github.com/actions/runner/issues/1478'
+    label: 'actions/runner#1478 — Support pre and post steps in Composite Actions (393 reactions)'
+  - url: 'https://docs.github.com/en/actions/creating-actions/metadata-syntax-for-github-actions#runs-for-composite-actions'
+    label: 'Metadata syntax for composite actions — GitHub Docs'
+  - url: 'https://docs.github.com/en/actions/creating-actions/metadata-syntax-for-github-actions#runspre'
+    label: 'pre: lifecycle hook — JavaScript and Docker actions only'
