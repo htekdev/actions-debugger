@@ -1,0 +1,109 @@
+id: runner-environment-108
+title: 'Ubuntu 22.04 runner: libssl.so.1.1 missing — binaries compiled on Ubuntu 20.04 fail with cannot open shared object file'
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-22
+  - libssl
+  - openssl3
+  - shared-library
+  - binary-compatibility
+  - ubuntu-jammy
+  - dynamic-linking
+patterns:
+  - regex: 'libssl\.so\.1\.1.*cannot open shared object file|error while loading shared libraries: libssl\.so\.1\.1'
+    flags: 'i'
+  - regex: 'libcrypto\.so\.1\.1.*cannot open shared object file'
+    flags: 'i'
+error_messages:
+  - 'error while loading shared libraries: libssl.so.1.1: cannot open shared object file: No such file or directory'
+  - '/usr/lib/x86_64-linux-gnu/libssl.so.1.1: No such file or directory'
+  - 'error while loading shared libraries: libcrypto.so.1.1: cannot open shared object file: No such file or directory'
+root_cause: |
+  Ubuntu 22.04 (Jammy) ships OpenSSL 3.0, replacing OpenSSL 1.1. The shared
+  library libssl.so.1.1 is absent — the libssl1.1 package that provided it is
+  not available in the Ubuntu 22.04 (jammy) package repository at all; it was
+  a focal (Ubuntu 20.04) package only.
+
+  When ubuntu-latest transitioned from Ubuntu 20.04 to Ubuntu 22.04 in 2022,
+  CI pipelines that downloaded or shipped pre-compiled binaries started failing
+  because those binaries were dynamically linked against libssl1.1. Common
+  scenarios that trigger this error:
+
+  - Self-hosted runners migrated from Ubuntu 20.04 to 22.04 while tool cache
+    contains pre-compiled focal binaries
+  - Docker images with pre-compiled binaries using libssl1.1 run in container
+    jobs on ubuntu-22.04 hosts
+  - Ruby gems with native extensions (mysql2, pg, ruby-openssl) compiled on
+    Ubuntu 20.04 and installed from a cached bundler path
+  - Node.js native add-ons (node-gyp built) that link against libssl1.1
+  - Custom CLI tools shipped as pre-built .deb or tar.gz for Ubuntu 20.04
+  - Python C extension packages (pycurl, cryptography old versions) with
+    libssl1.1 runtime dependency
+
+  libcrypto.so.1.1 is also absent — tools linked against both libraries fail
+  with the same error on whichever library is loaded first.
+fix: |
+  Option 1 (best long-term): Recompile the affected binary for Ubuntu 22.04 or
+  later against OpenSSL 3.0 (libssl3). Ubuntu 20.04 reached end-of-standard-support
+  in April 2025 — new binaries should target OpenSSL 3.0.
+
+  Option 2: Install a libssl1.1 compatibility .deb backported from Ubuntu 20.04
+  focal. Add an install step using the focal security archive. This is a
+  temporary workaround — the package receives no security patches on 22.04.
+
+  Option 3: Use a container job with ubuntu:20.04 base image for steps that
+  require libssl1.1, isolating the dependency from the host runner OS.
+
+  Option 4: Pin runs-on: ubuntu-20.04 temporarily while planning recompile.
+  ubuntu-20.04 runners will eventually be retired — plan a migration timeline.
+fix_code:
+  - language: yaml
+    label: 'Install libssl1.1 compatibility shim from Ubuntu 20.04 focal archive (temporary workaround)'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-22.04
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Install libssl1.1 compatibility shim
+              run: |
+                wget -q http://security.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1f-1ubuntu2_amd64.deb
+                sudo dpkg -i libssl1.1_1.1.1f-1ubuntu2_amd64.deb
+              # WARNING: Temporary workaround only. Recompile binary against OpenSSL 3.0 for the permanent fix.
+
+            - name: Run legacy binary
+              run: ./vendor/legacy-tool
+
+  - language: yaml
+    label: 'Use container job with ubuntu:20.04 base image to isolate libssl1.1 dependency'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          container:
+            image: ubuntu:20.04
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Install prerequisites
+              run: |
+                apt-get update
+                apt-get install -y libssl1.1 curl
+
+            - name: Run legacy binary
+              run: ./vendor/legacy-tool
+              # Binary now runs with libssl1.1 available in container
+prevention:
+  - 'Compile release binaries against the same OpenSSL version as the target runner OS (3.0 for Ubuntu 22.04+)'
+  - 'When upgrading ubuntu-latest, audit all pre-compiled binaries with ldd to check for libssl.so.1.1 dynamic dependencies before rolling out'
+  - 'Use statically-linked binaries or distroless container images for tools that must run across multiple Ubuntu versions'
+  - 'In matrix workflows, include ubuntu-22.04 alongside ubuntu-20.04 to catch OpenSSL ABI incompatibilities before retirement deadlines'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/6399'
+    label: 'runner-images#6399: libssl.so.1.1 missing on Ubuntu 22.04'
+  - url: 'https://wiki.openssl.org/index.php/OpenSSL_3.0'
+    label: 'OpenSSL 3.0 migration guide — ABI compatibility with OpenSSL 1.1'
+  - url: 'https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners'
+    label: 'GitHub Docs: About GitHub-hosted runners'
