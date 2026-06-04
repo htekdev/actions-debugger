@@ -1,0 +1,155 @@
+id: caching-artifacts-036
+title: 'actions/cache post step skips save when job is cancelled — cache never populated after cancellation'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - actions-cache
+  - job-cancellation
+  - post-step
+  - cache-save
+  - cancel-in-progress
+  - concurrency
+  - always
+patterns:
+  - regex: 'Post\s+Run\s+actions/cache.*skipped|Cache\s+save\s+skipped'
+    flags: 'i'
+  - regex: 'uses:\s*actions/cache@'
+    flags: 'i'
+error_messages:
+  - 'Post Run actions/cache@v4 skipped'
+  - 'Cache save skipped'
+  - '##[warning]Cache save skipped.'
+  - 'Warning: Cache save failed.'
+root_cause: |
+  The actions/cache action saves the cache in a lifecycle "post" step that runs
+  automatically after the main job steps complete. When a job is cancelled — via
+  the Actions UI, concurrency cancel-in-progress, or exceeding job timeout-minutes
+  — post steps do NOT execute.
+
+  This creates a cache starvation loop:
+  1. Job starts with cache miss — slow dependency installation begins (minutes)
+  2. A new push triggers another workflow run while the first is still installing
+  3. concurrency: cancel-in-progress terminates the first run mid-install
+  4. The first run never reaches its post step — cache is not saved
+  5. The second run also sees a cache miss — the same slow install repeats
+  6. Repeated cancellations mean the cache is never populated
+
+  This is invisible in workflow logs: cancelled jobs simply show as cancelled with
+  no specific warning about the cache post step being skipped. Teams diagnose it
+  as "caching isn't working" without realizing cancellation is the root cause.
+
+  Affected workflows:
+  - Any workflow with concurrency: cancel-in-progress that also uses actions/cache
+  - Workflows with aggressive job timeout-minutes that expire during installs
+  - Flaky workflows that are frequently manually cancelled and re-run
+  - Matrix workflows where one failing matrix branch cancels siblings
+
+  When a job fails (but is not cancelled), post steps DO run normally — the issue
+  is specific to cancellations and hard timeouts.
+fix: |
+  Use the split actions/cache/restore + actions/cache/save pattern with
+  if: always() on the save step. This gives explicit control over cache saving
+  independent of the job lifecycle hooks:
+
+    - uses: actions/cache/restore@v4
+      id: cache-restore
+      with:
+        key: ...
+        path: ...
+
+    # ... install and build steps ...
+
+    - uses: actions/cache/save@v4
+      if: always()
+      with:
+        key: ${{ steps.cache-restore.outputs.cache-primary-key }}
+        path: ...
+
+  The split restore/save pattern (available since actions/cache v3.3.0 in 2023)
+  runs the save as an explicit step with if: always(), which executes during the
+  graceful shutdown window even when the job is being cancelled.
+
+  Important caveat: if the runner process is killed with SIGKILL (hard preemption,
+  host failure), no steps including if: always() will run — this is a
+  platform-level constraint outside GitHub Actions' control.
+fix_code:
+  - language: yaml
+    label: 'Split restore/save pattern with unconditional save to survive cancellation'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          # Even with cancel-in-progress, the explicit save step will run
+          concurrency:
+            group: ${{ github.workflow }}-${{ github.ref }}
+            cancel-in-progress: true
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Restore cached dependencies
+              uses: actions/cache/restore@v4
+              id: cache-restore
+              with:
+                path: ~/.npm
+                key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+                restore-keys: |
+                  ${{ runner.os }}-npm-
+
+            - name: Install dependencies
+              if: steps.cache-restore.outputs.cache-hit != 'true'
+              run: npm ci
+
+            - name: Run tests
+              run: npm test
+
+            - name: Save cache
+              uses: actions/cache/save@v4
+              if: always()   # Runs during graceful cancellation shutdown window
+              with:
+                path: ~/.npm
+                key: ${{ steps.cache-restore.outputs.cache-primary-key }}
+
+  - language: yaml
+    label: 'Python pip cache with split save pattern'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Restore pip cache
+              uses: actions/cache/restore@v4
+              id: pip-cache
+              with:
+                path: ~/.cache/pip
+                key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
+                restore-keys: |
+                  ${{ runner.os }}-pip-
+
+            - name: Install Python dependencies
+              run: pip install -r requirements.txt
+
+            - name: Run pytest
+              run: pytest
+
+            - name: Save pip cache
+              uses: actions/cache/save@v4
+              if: always()
+              with:
+                path: ~/.cache/pip
+                key: ${{ steps.pip-cache.outputs.cache-primary-key }}
+prevention:
+  - 'Prefer the split actions/cache/restore + actions/cache/save pattern over the combined actions/cache action for any workflow using concurrency: cancel-in-progress'
+  - 'Always add if: always() to explicit cache save steps so they execute regardless of upstream step failure or cancellation signal'
+  - 'Monitor workflow logs for "Post Run actions/cache skipped" messages — this is a reliable indicator that cache is never being populated after cancellations'
+  - 'Use actions/cache v3.3.0 or later — the split restore/save subactions were introduced in that release'
+docs:
+  - url: 'https://github.com/actions/cache/blob/main/save/README.md'
+    label: 'actions/cache: Explicit save action documentation'
+  - url: 'https://github.com/actions/cache#save-action'
+    label: 'actions/cache: Split restore and save usage pattern'
+  - url: 'https://github.com/orgs/community/discussions/47469'
+    label: 'GitHub Community #47469: Cache not saved when workflow is cancelled'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-syntax-for-github-actions#jobsjob_idstepsif'
+    label: 'GitHub Docs: Using conditions to control job execution'

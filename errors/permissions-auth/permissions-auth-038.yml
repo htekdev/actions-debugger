@@ -1,0 +1,148 @@
+id: permissions-auth-038
+title: 'secrets: inherit does not propagate environment-scoped secrets to reusable workflows'
+category: permissions-auth
+severity: silent-failure
+tags:
+  - secrets-inherit
+  - reusable-workflows
+  - environment-secrets
+  - workflow-call
+  - empty-secret
+  - deployment-environment
+patterns:
+  - regex: 'secrets:\s*inherit'
+    flags: 'i'
+  - regex: 'uses:\s*[./\w@-]+\.ya?ml\b'
+    flags: 'i'
+error_messages:
+  - 'Error: Input required and not supplied'
+  - 'Secret value is empty in reusable workflow'
+  - '##[error]The secret variable name is invalid'
+root_cause: |
+  When a caller workflow uses secrets: inherit to call a reusable workflow
+  (on.workflow_call), GitHub passes repository-level and organization-level
+  secrets to the called workflow. However, environment-scoped secrets are NOT
+  inherited — they arrive as empty strings with no error or warning.
+
+  Environment secrets are tied to a named deployment environment (e.g.,
+  "production", "staging") and are only accessible to jobs that declare
+  environment: <name> in their configuration. The secrets: inherit mechanism
+  operates at the repository/org secret scope level. It cannot bridge environment
+  context to a called workflow's jobs because those jobs run in a separate
+  workflow execution context and do not inherit the caller job's environment
+  declaration.
+
+  Failure scenario:
+  1. Caller job declares environment: production (activates env secrets in the caller)
+  2. Caller job uses secrets: inherit to call ./reusable.yml
+  3. Reusable workflow job reads secrets.PROD_DB_PASSWORD (an environment secret)
+  4. Reusable workflow job sees PROD_DB_PASSWORD as empty string
+  5. No error is thrown — the secret silently resolves to ""
+
+  This is documented as a GitHub platform limitation in the reusable workflows
+  documentation. GitHub Community discussion #26671 has many reports of this
+  surprising behavior.
+
+  Distinction from permissions-auth-037 (environment-secrets-job-scope):
+  - permissions-auth-037 covers jobs in the SAME workflow that lack environment:
+    declarations failing to access environment secrets.
+  - This entry covers the cross-workflow boundary where secrets: inherit does not
+    transfer environment secrets from caller to called workflow at all.
+fix: |
+  Explicitly declare and map environment secrets at the workflow_call boundary.
+  In the reusable workflow, declare each secret in the on.workflow_call.secrets
+  block. At the call site, explicitly pass each environment secret using the
+  secrets: mapping block (not secrets: inherit):
+
+  In the reusable workflow (workflow_call trigger):
+    on:
+      workflow_call:
+        secrets:
+          db_password:
+            required: true
+          api_key:
+            required: false
+
+  In the calling workflow:
+    jobs:
+      deploy:
+        environment: production
+        uses: ./.github/workflows/deploy.yml
+        secrets:
+          db_password: ${{ secrets.PROD_DB_PASSWORD }}
+          api_key: ${{ secrets.PROD_API_KEY }}
+
+  Alternatively, if the reusable workflow is in the same repository and the
+  environment name is fixed, you can declare environment: production on the job
+  inside the reusable workflow directly. This makes environment secrets accessible
+  in the called workflow at the cost of coupling it to a specific environment name.
+
+  Note: secrets: inherit and explicit secrets: mapping cannot be combined on the
+  same uses: step. Choose one approach: either inherit all repo/org secrets, or
+  map explicitly (which also allows passing environment secrets).
+fix_code:
+  - language: yaml
+    label: 'Reusable workflow — declare required secrets in workflow_call trigger'
+    code: |
+      # .github/workflows/deploy-reusable.yml
+      on:
+        workflow_call:
+          secrets:
+            db_password:
+              required: true
+            api_key:
+              required: true
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Deploy application
+              env:
+                DB_PASSWORD: ${{ secrets.db_password }}
+                API_KEY: ${{ secrets.api_key }}
+              run: ./scripts/deploy.sh
+
+  - language: yaml
+    label: 'Caller workflow — explicitly map environment secrets (not secrets: inherit)'
+    code: |
+      # .github/workflows/deploy-caller.yml
+      jobs:
+        call-deploy:
+          environment: production       # Activates environment secrets in this calling job
+          uses: ./.github/workflows/deploy-reusable.yml
+          # WRONG: secrets: inherit     -- passes repo/org secrets but NOT environment secrets
+          secrets:
+            db_password: ${{ secrets.PROD_DB_PASSWORD }}    # Environment secret — must be explicit
+            api_key: ${{ secrets.PROD_API_KEY }}            # Environment secret — must be explicit
+
+  - language: yaml
+    label: 'Alternative — declare environment inside the reusable workflow job'
+    code: |
+      # .github/workflows/deploy-reusable.yml (alternative approach)
+      on:
+        workflow_call: {}
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          environment: production       # Directly activates environment secrets here
+          steps:                        # Couples reusable workflow to environment name
+            - name: Deploy application
+              env:
+                DB_PASSWORD: ${{ secrets.PROD_DB_PASSWORD }}
+              run: ./scripts/deploy.sh
+prevention:
+  - 'Never rely on secrets: inherit to pass environment-scoped secrets — always map them explicitly in the secrets: block of the workflow_call invocation'
+  - 'In reusable workflows, declare all required secrets in on.workflow_call.secrets with required: true so missing secrets fail loudly rather than silently resolving to empty strings'
+  - 'Document which secrets in your reusable workflow are environment-scoped vs repository-scoped so callers know the correct passing strategy'
+  - 'Test reusable workflows end-to-end from a caller workflow before deploying to production — secrets: inherit working in testing does not guarantee environment secrets work correctly'
+docs:
+  - url: 'https://docs.github.com/en/actions/sharing-automations/reusing-workflows#passing-secrets-to-called-workflows'
+    label: 'GitHub Docs: Passing secrets to called workflows'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/using-secrets-in-github-actions#creating-secrets-for-an-environment'
+    label: 'GitHub Docs: Creating secrets for an environment'
+  - url: 'https://github.com/orgs/community/discussions/26671'
+    label: 'GitHub Community #26671: secrets: inherit not passing environment secrets'
+  - url: 'https://docs.github.com/en/actions/sharing-automations/reusing-workflows#limitations'
+    label: 'GitHub Docs: Reusable workflows — limitations'
