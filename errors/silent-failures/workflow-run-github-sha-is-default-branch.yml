@@ -1,0 +1,78 @@
+id: silent-failures-064
+title: "workflow_run Trigger: github.sha Points to Default Branch HEAD, Not Triggering Workflow's Commit"
+category: silent-failures
+severity: silent-failure
+tags:
+  - workflow_run
+  - github-sha
+  - checkout
+  - wrong-commit
+  - cross-workflow
+patterns:
+  - regex: 'on\s*:\s*\n\s+workflow_run'
+    flags: 'im'
+  - regex: 'github\.sha'
+    flags: 'i'
+error_messages:
+  - "Unexpected checkout SHA — does not match pull request head commit"
+  - "Tests passing on default branch but failing on PR commit"
+root_cause: |
+  When a workflow is triggered by `on: workflow_run`, the `github.sha` and `github.ref`
+  context variables point to the HEAD of the **default branch** at the time the trigger
+  fires, NOT to the commit that triggered the upstream workflow. This is by design: the
+  `workflow_run` event executes in the context of the base repository's default branch.
+
+  Workflows that use `actions/checkout` without specifying a `ref` will silently check
+  out the default branch — running against entirely different code than the PR or branch
+  that triggered the original CI workflow. CI results, security scans, and deployments
+  end up referencing the wrong commit with no visible error.
+
+  The correct commit SHA from the triggering workflow is available in the event payload
+  as `github.event.workflow_run.head_sha`.
+fix: |
+  Use `github.event.workflow_run.head_sha` as the `ref` in `actions/checkout` within
+  any `workflow_run` triggered workflow. When the triggering workflow originates from a
+  fork PR, also supply `github.event.workflow_run.head_repository.full_name` as the
+  `repository` input so the correct fork is checked out.
+fix_code:
+  - language: yaml
+    label: "Wrong: default checkout uses github.sha (default branch HEAD)"
+    code: |
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+
+      jobs:
+        process:
+          runs-on: ubuntu-latest
+          steps:
+            # Silently checks out default branch, NOT the triggering commit
+            - uses: actions/checkout@v4
+  - language: yaml
+    label: "Correct: use workflow_run event payload for the right commit"
+    code: |
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+
+      jobs:
+        process:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                repository: ${{ github.event.workflow_run.head_repository.full_name }}
+                ref: ${{ github.event.workflow_run.head_sha }}
+                token: ${{ secrets.GITHUB_TOKEN }}
+prevention:
+  - "Always set `ref: ${{ github.event.workflow_run.head_sha }}` in checkout steps inside workflow_run triggered workflows"
+  - "Log both `github.sha` and `github.event.workflow_run.head_sha` at workflow start to verify they match when expected"
+  - "For fork-originated PRs, also set `repository: ${{ github.event.workflow_run.head_repository.full_name }}`"
+  - "Add a comment in the workflow explaining why head_sha is used instead of github.sha to avoid future confusion"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run"
+    label: "GitHub Docs: workflow_run event (context behavior)"
+  - url: "https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/"
+    label: "GitHub Security Lab: Preventing pwn requests (workflow_run checkout patterns)"
