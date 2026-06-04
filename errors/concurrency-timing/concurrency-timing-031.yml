@@ -1,0 +1,102 @@
+id: concurrency-timing-031
+title: 'cancel-in-progress: false does not create a FIFO queue — only one run can be pending'
+category: concurrency-timing
+severity: warning
+tags:
+  - concurrency
+  - cancel-in-progress
+  - queue
+  - pending-run
+  - fifo
+  - workflow-queuing
+patterns:
+  - regex: 'cancel-in-progress:\s*false'
+    flags: 'i'
+error_messages:
+  - 'Queued workflow run was cancelled unexpectedly even though cancel-in-progress is false'
+  - 'Expected runs to queue up but intermediate runs are being dropped'
+  - 'Second queued run cancelled when a third run was triggered'
+root_cause: |
+  When cancel-in-progress: false is set, many developers expect GitHub Actions to
+  maintain a FIFO queue of pending runs: Run 1 active → Run 2 queued → Run 3 waits
+  behind Run 2. This is not how it works.
+
+  GitHub Actions maintains at most ONE pending (queued) run per concurrency group.
+  The behavior with cancel-in-progress: false is:
+
+  1. Run 1: active (running)
+  2. Run 2 arrives: Run 2 enters pending state
+  3. Run 3 arrives: Run 2 is CANCELLED, Run 3 becomes the new pending run
+  4. Run 1 completes: Run 3 (latest) starts — Run 2 was silently dropped
+
+  This means: with three or more rapid commits, only the first (currently running)
+  and the last (most recently pushed) will ever execute. All intermediate runs are
+  cancelled and lost — even though cancel-in-progress is explicitly false.
+
+  This behavior is documented in GitHub Docs ("only the latest queued run will
+  start") but is widely misunderstood. The cancel-in-progress: false setting only
+  prevents cancelling the ACTIVE run — it does not prevent intermediate pending
+  runs from being replaced by newer ones.
+
+  Source: GitHub Docs concurrency documentation. Discussed in GitHub Community
+  discussions and multiple Stack Overflow questions about "runs being unexpectedly
+  cancelled with cancel-in-progress: false".
+fix: |
+  There is no built-in FIFO queue in GitHub Actions concurrency. To process every
+  run without dropping intermediates:
+
+  1. For pull requests: use GitHub's merge queue — it processes PRs sequentially
+  2. For deployments: use a separate queuing action (e.g., softprops/turnstyle) to
+     serialize runs without skipping intermediates
+  3. For simple "don't cancel active, run latest after": accept that cancel-in-progress:
+     false means intermediates are dropped and design accordingly
+  4. If every commit must be processed: remove the concurrency block entirely and
+     accept parallel runs, or implement idempotent jobs that can run concurrently
+fix_code:
+  - language: yaml
+    label: 'Misunderstood: cancel-in-progress: false does NOT queue all runs'
+    code: |
+      # MISUNDERSTOOD: developers expect runs 1, 2, 3 to all execute sequentially
+      # ACTUAL behavior: run 2 is cancelled when run 3 arrives
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: false   # protects ACTIVE run only; pending run is replaced
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: echo "Deploying..."
+
+  - language: yaml
+    label: 'Explicit: accept one-pending semantics and design for idempotent jobs'
+    code: |
+      # If intermediate commits can be skipped (e.g., deploy only latest):
+      # cancel-in-progress: false ensures the active deploy finishes, then
+      # only the LATEST pending commit deploys next (intermediates dropped)
+      concurrency:
+        group: deploy-${{ github.ref }}
+        cancel-in-progress: false
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Deploy latest commit
+              run: |
+                echo "Deploying ${{ github.sha }}"
+                # Idempotent: deploying latest SHA is always safe
+prevention:
+  - 'Understand that cancel-in-progress: false only protects the active run — the pending slot still holds at most one run'
+  - 'Do not rely on concurrency groups for FIFO queuing — they are a deduplication mechanism, not a queue'
+  - 'For sequential processing of every commit, use merge queues or external serialization tooling'
+  - 'If every commit must be processed, either remove the concurrency block or use an event-based queue (e.g., repository_dispatch)'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs'
+    label: 'GitHub Docs: Controlling concurrency of workflows and jobs'
+  - url: 'https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue'
+    label: 'GitHub Docs: Managing a merge queue'
+  - url: 'https://github.com/softprops/turnstyle'
+    label: 'softprops/turnstyle: Wait for in-progress workflows'
