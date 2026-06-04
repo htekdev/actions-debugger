@@ -1,0 +1,124 @@
+id: runner-environment-135
+title: 'ubuntu-24.04: no swap memory — memory-intensive builds killed with exit code 137 (OOM)'
+category: runner-environment
+severity: error
+tags:
+  - oom
+  - memory
+  - swap
+  - ubuntu-24
+  - exit-137
+  - killed
+patterns:
+  - regex: 'Error 137'
+    flags: 'i'
+  - regex: 'exit code 137'
+    flags: 'i'
+  - regex: '^Killed\s*$'
+    flags: 'm'
+  - regex: 'out of memory|OOM|oom.killer'
+    flags: 'i'
+error_messages:
+  - 'make: *** [Makefile:42: build] Error 137'
+  - 'Killed'
+  - 'Process exited with code 137'
+  - 'error Command failed with exit code 137'
+  - 'npm ERR! code 137'
+root_cause: |
+  GitHub-hosted ubuntu-24.04 runners provide approximately 29GB RAM but have no swap space.
+  Ubuntu 22.04 runners provided about 6GB of swap as overflow capacity. When a job exhausts
+  physical RAM, the Linux OOM killer terminates the offending process with SIGKILL (signal 9),
+  producing exit code 137 (128 + 9).
+
+  The killed process may be:
+  - Node.js during webpack/esbuild/rollup bundle generation for large frontend projects
+  - Gradle during Android AAB/APK build or large multi-module Java projects
+  - Electron Forge/Builder packaging step
+  - C/C++ linker (ld) linking large binaries with many object files
+  - Cargo (Rust) compiling with high parallelism or many dependencies
+
+  The failure is often hard to diagnose because:
+  - No explicit "Out of Memory" message appears in the workflow log
+  - The step log simply shows "Killed" and exit code 137
+  - The runner does not report memory usage in the workflow summary
+
+  If the same workflow runs on ubuntu-22.04 without issues, missing swap is the likely cause.
+fix: |
+  Option A — Add a swap file manually before the memory-intensive step. This adds ~30 seconds
+  to job setup but provides 8GB of overflow capacity:
+
+  Option B — Reduce peak memory usage:
+  - Node.js: pass --max-old-space-size=N (MB) to node or set NODE_OPTIONS env var
+  - Gradle: reduce org.gradle.jvmargs heap in gradle.properties
+  - Cargo: set CARGO_BUILD_JOBS=2 to reduce parallel compilation
+  - webpack: use --parallel false or reduce splitChunks settings
+
+  Option C — Use a larger GitHub-hosted runner with more RAM (requires paid plan):
+  ubuntu-24.04 with 64GB RAM is available as a larger runner.
+fix_code:
+  - language: yaml
+    label: 'Add 8GB swap file before memory-intensive build step'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-24.04
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Add swap space
+              run: |
+                sudo fallocate -l 8G /swapfile
+                sudo chmod 600 /swapfile
+                sudo mkswap /swapfile
+                sudo swapon /swapfile
+                swapon --show
+                free -h
+
+            - name: Build (memory-intensive)
+              run: npm run build
+
+  - language: yaml
+    label: 'Reduce Node.js memory usage with --max-old-space-size'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-24.04
+          env:
+            NODE_OPTIONS: '--max-old-space-size=6144'
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                node-version: '20'
+            - run: npm ci
+            - run: npm run build
+
+  - language: yaml
+    label: 'Reduce Gradle heap for Android/Java builds'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-24.04
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Set Gradle memory limits
+              run: |
+                mkdir -p ~/.gradle
+                echo 'org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m' >> ~/.gradle/gradle.properties
+
+            - name: Build APK
+              run: ./gradlew assembleRelease
+prevention:
+  - 'Test builds on ubuntu-24.04 explicitly — do not assume ubuntu-22.04 memory behavior transfers'
+  - 'Add a swap file as a build step when migrating large builds to ubuntu-24.04'
+  - 'Set NODE_OPTIONS=--max-old-space-size as a job-level env var for Node.js heavy workflows'
+  - 'Monitor build memory usage locally: /usr/bin/time -v npm run build shows peak RSS'
+  - 'Exit code 137 with no explicit error is the canonical indicator of OOM kill — add this as a diagnostic check'
+docs:
+  - url: 'https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners/about-github-hosted-runners#supported-runners-and-hardware-resources'
+    label: 'GitHub-hosted runner hardware specs — RAM and storage per runner type'
+  - url: 'https://github.com/actions/runner-images/issues'
+    label: 'runner-images issues — search "OOM" or "exit 137" for community reports'
+  - url: 'https://nodejs.org/api/cli.html#--max-old-space-sizesize-in-megabytes'
+    label: 'Node.js CLI docs — --max-old-space-size option'
