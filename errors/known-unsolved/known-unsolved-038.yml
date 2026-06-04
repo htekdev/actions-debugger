@@ -1,0 +1,124 @@
+id: known-unsolved-038
+title: "workflow_dispatch 'Run workflow' button invisible until workflow file merges to default branch"
+category: known-unsolved
+severity: limitation
+tags:
+  - workflow-dispatch
+  - ui
+  - default-branch
+  - known-limitation
+  - feature-branch
+  - testing
+patterns:
+  - regex: 'run workflow.*not.*appear'
+    flags: 'i'
+  - regex: 'workflow_dispatch.*button.*missing'
+    flags: 'i'
+  - regex: 'workflow.*not.*present.*default.*branch'
+    flags: 'i'
+error_messages:
+  - "This workflow has a workflow_dispatch event trigger, however a workflow_dispatch event workflow run cannot be created as this workflow is not present in the default branch."
+root_cause: |
+  The "Run workflow" button in the GitHub Actions UI only appears when the workflow file
+  containing `on.workflow_dispatch` exists on the repository's default branch (e.g., main).
+
+  When you add a new `on.workflow_dispatch` workflow to a feature branch:
+  - The workflow file exists in the branch and can be referenced
+  - The "Run workflow" button does NOT appear in the GitHub Actions UI for that branch
+  - The GitHub REST API returns an error if you attempt to dispatch it
+
+  The REST API error message is:
+    "This workflow has a workflow_dispatch event trigger, however a workflow_dispatch event
+    workflow run cannot be created as this workflow is not present in the default branch."
+
+  This creates a catch-22: you want to validate the workflow before merging, but the trigger
+  mechanism (UI button and REST API dispatch) only activates after merging to the default branch.
+
+  The limitation applies consistently across:
+  - GitHub web UI "Run workflow" button
+  - REST API create_workflow_dispatch endpoint
+  - GitHub CLI: gh workflow run (requires workflow on default branch)
+
+  Contrast this with `on.push` and `on.pull_request` which fire correctly from any branch
+  that contains the workflow file.
+fix: |
+  There is no way to trigger workflow_dispatch from the GitHub UI or standard API before
+  the workflow file reaches the default branch. Use these workarounds:
+
+  Option 1 (recommended): Add `on.push` temporarily during development alongside
+  `on.workflow_dispatch`. Push triggers fire from any branch. Remove push trigger before
+  merging to avoid unintended production runs.
+
+  Option 2: Use `act` (nektos/act) locally to simulate workflow_dispatch with custom inputs
+  before pushing to GitHub:
+    act workflow_dispatch -e event.json
+
+  Option 3: Merge the workflow file to a long-lived integration branch first, use it as a
+  staging default, then promote to main after validation.
+
+  Option 4: Commit the workflow directly to the default branch with a no-op body (echo "test"),
+  validate the dispatch mechanism works, then iterate in place on the default branch.
+
+  Note: Using gh api with a specific ref pointing to a branch that has the file does NOT
+  bypass the default-branch requirement for workflow_dispatch. The REST API enforces this
+  server-side regardless of ref parameter.
+fix_code:
+  - language: yaml
+    label: "Temporary on.push alongside workflow_dispatch for feature-branch testing"
+    code: |
+      on:
+        # Production trigger (only works after merge to default branch)
+        workflow_dispatch:
+          inputs:
+            environment:
+              description: 'Target environment'
+              required: true
+              type: choice
+              options: [staging, production]
+
+        # DEVELOPMENT ONLY: allows testing from feature branch via push
+        # Remove this push trigger before merging to main
+        push:
+          branches: ['feature/my-new-dispatch-workflow']
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Deploy
+              env:
+                TARGET: ${{ inputs.environment || 'staging' }}
+              run: ./scripts/deploy.sh "$TARGET"
+  - language: yaml
+    label: "Minimal no-op workflow — merge first, iterate after to unlock dispatch button"
+    code: |
+      # Step 1: Merge this minimal workflow to main first to unlock the Run Workflow button
+      # Step 2: Iterate on the job steps on main or in a branch
+      on:
+        workflow_dispatch:
+          inputs:
+            dry_run:
+              description: 'Dry run mode'
+              type: boolean
+              default: true
+
+      jobs:
+        placeholder:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Workflow dispatch confirmed working. Replace this with real steps."
+prevention:
+  - "When creating new workflow_dispatch workflows, plan to merge a minimal skeleton to main first before adding full logic"
+  - "Add on.push with a branch filter during development of any workflow_dispatch workflow — remove before merging"
+  - "Use act locally (nektos/act) to test workflow_dispatch input handling before pushing"
+  - "Document in the PR description that the Run Workflow button will appear only after merge"
+docs:
+  - url: "https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#workflow_dispatch"
+    label: "GitHub Docs — workflow_dispatch event"
+  - url: "https://docs.github.com/en/rest/actions/workflows?apiVersion=2022-11-28#create-a-workflow-dispatch-event"
+    label: "GitHub REST API — Create a workflow dispatch event"
+  - url: "https://github.com/orgs/community/discussions/24357"
+    label: "GitHub Community — workflow_dispatch button not showing in feature branch"
+  - url: "https://github.com/nektos/act"
+    label: "nektos/act — Run Actions locally including workflow_dispatch simulation"
