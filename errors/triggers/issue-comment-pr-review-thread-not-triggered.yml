@@ -1,0 +1,105 @@
+id: triggers-050
+title: 'on.issue_comment does not fire for PR review thread comments — requires pull_request_review_comment'
+category: triggers
+severity: silent-failure
+tags:
+  - issue_comment
+  - pull_request_review_comment
+  - pr-review
+  - comment-event
+  - trigger
+  - chatops
+patterns:
+  - regex: 'on:\s*\n\s+issue_comment'
+    flags: 'im'
+  - regex: 'github\.event_name\s*==\s*[''"]issue_comment[''"]'
+    flags: 'i'
+error_messages:
+  - "workflow never triggered when commenting on a PR review thread"
+  - "issue_comment workflow fires on issue comments but not PR inline review comments"
+root_cause: |
+  GitHub Actions has two distinct comment event types that developers frequently confuse:
+
+  1. issue_comment — fires when a comment is posted on:
+     - The main conversation thread of an issue
+     - The main conversation thread of a pull request (PR-as-issue comments)
+     It does NOT fire for inline PR code review comments or review summary comments.
+
+  2. pull_request_review_comment — fires when a comment is posted on:
+     - A specific line of code in a PR diff (inline review comment)
+     It does NOT fire for comments on the main PR conversation thread.
+
+  3. pull_request_review — fires when:
+     - A complete PR review is submitted (including review body, approval, or request-changes)
+
+  Chatops bots and automation that listen to issue_comment expecting to catch all PR comment
+  activity will silently miss all PR code review thread comments. There is no error — the
+  workflow simply never fires for that comment type.
+
+  Similarly, on.pull_request_review_comment will miss all main thread comments on the same PR.
+fix: |
+  Choose the correct trigger based on what type of comment you want to react to:
+
+  - For commands in PR main conversation (/deploy, /approve, etc.): use issue_comment
+  - For reactions to inline code review comments: use pull_request_review_comment
+  - For reactions to full review submissions (approve, request changes): use pull_request_review
+  - For all PR comment activity: use both issue_comment AND pull_request_review_comment
+
+  Note: on.issue_comment has access to github.event.issue.number for the PR number,
+  while on.pull_request_review_comment has access to github.event.pull_request.number.
+fix_code:
+  - language: yaml
+    label: 'Listen to all PR comment types (main thread + review thread)'
+    code: |
+      on:
+        issue_comment:
+          types: [created]
+        pull_request_review_comment:
+          types: [created]
+        pull_request_review:
+          types: [submitted]
+
+      jobs:
+        handle-comment:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Handle comment
+              run: |
+                if [ "${{ github.event_name }}" = "issue_comment" ]; then
+                  echo "Main thread comment: ${{ github.event.comment.body }}"
+                  echo "PR number: ${{ github.event.issue.number }}"
+                elif [ "${{ github.event_name }}" = "pull_request_review_comment" ]; then
+                  echo "Review thread comment: ${{ github.event.comment.body }}"
+                  echo "PR number: ${{ github.event.pull_request.number }}"
+                fi
+
+  - language: yaml
+    label: 'Chatops bot — listen for slash commands on main PR thread only'
+    code: |
+      on:
+        issue_comment:
+          types: [created]
+
+      jobs:
+        chatops:
+          # Only run for PR comments (issue_comment also fires on plain issues)
+          if: github.event.issue.pull_request != null
+          runs-on: ubuntu-latest
+          steps:
+            - name: Check for slash command
+              run: |
+                echo "Comment body: ${{ github.event.comment.body }}"
+prevention:
+  - 'Distinguish issue_comment (main PR thread) from pull_request_review_comment (inline code review thread) — they never overlap'
+  - 'If building a PR chatops bot, filter to PR-only comments by checking github.event.issue.pull_request != null'
+  - 'Use pull_request_review for reactions to full review submissions (approve/reject), not pull_request_review_comment'
+  - 'Test your trigger by posting comments in BOTH places (main conversation and code review thread) to verify expected behavior'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#issue_comment'
+    label: 'GitHub Docs — issue_comment event'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request_review_comment'
+    label: 'GitHub Docs — pull_request_review_comment event'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request_review'
+    label: 'GitHub Docs — pull_request_review event'
+  - url: 'https://github.com/orgs/community/discussions/21929'
+    label: 'GitHub Community: issue_comment vs pull_request_review_comment confusion'
