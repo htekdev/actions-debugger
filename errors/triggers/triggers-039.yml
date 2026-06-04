@@ -1,0 +1,115 @@
+id: triggers-039
+title: "'github.sha' in pull_request_target points to base branch HEAD, not the PR's head commit"
+category: triggers
+severity: silent-failure
+tags:
+  - pull_request_target
+  - github-sha
+  - base-branch
+  - pr-head
+  - checkout
+  - security
+  - silent
+patterns:
+  - regex: 'pull_request_target'
+    flags: i
+  - regex: 'github\.event\.pull_request\.head\.sha'
+    flags: i
+  - regex: 'github\.sha.*pull_request_target'
+    flags: i
+error_messages:
+  - "Tests passed but PR code was never executed (checked out base branch at github.sha)"
+root_cause: |
+  The pull_request_target event fires in the context of the BASE branch of a pull request,
+  not the PR's head branch. Consequently, github.sha inside a pull_request_target workflow
+  is the HEAD commit SHA of the BASE branch — typically main or master — not the PR
+  contributor's changes.
+
+  This design is intentional: pull_request_target runs with repository secrets and write
+  permissions available, so GitHub restricts it to trusted base-branch code to prevent
+  malicious PR code from exfiltrating secrets. However, it causes a silent logic error when
+  developers expect github.sha (or the default actions/checkout behaviour, which checks out
+  github.sha) to build and test the PR's changes.
+
+  The result is a CI run that appears to succeed — but it compiled and tested the base
+  branch code, not the pull request's changes. The PR author sees green CI even though
+  their changes were never executed.
+fix: |
+  To work with PR head code in a pull_request_target workflow, explicitly specify the PR
+  head SHA using github.event.pull_request.head.sha in the checkout step's ref: input.
+
+  SECURITY WARNING: checking out untrusted PR code in a workflow that has access to secrets
+  creates a pwn-request vulnerability. Only check out PR head code in jobs with minimal
+  permissions and no secret exposure.
+
+  For most CI use cases — building, linting, testing — use the standard pull_request event
+  instead of pull_request_target. The pull_request event correctly checks out PR changes
+  but runs without repository secrets, which is the safe and intended design.
+fix_code:
+  - language: yaml
+    label: "Problem: default checkout in pull_request_target checks out base branch"
+    code: |
+      on: pull_request_target
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              # No ref specified — uses github.sha which is BASE branch HEAD, not PR code
+            - run: npm test   # Tests base branch, not the PR changes
+  - language: yaml
+    label: "Explicit PR head checkout (only when no secrets are exposed)"
+    code: |
+      on: pull_request_target
+
+      jobs:
+        label-and-check:
+          runs-on: ubuntu-latest
+          permissions:
+            pull-requests: write   # Minimal permissions — no secrets
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.pull_request.head.sha }}
+                # Only safe because this job has no secret access
+                # Do NOT add secrets: or environment: to jobs that do this
+  - language: yaml
+    label: "Recommended: use pull_request for testing, pull_request_target only for privileged operations"
+    code: |
+      # Standard PR testing — pull_request has no secrets but correctly checks out PR changes
+      on: pull_request
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              # github.sha is the PR merge commit — correct for testing PR changes
+            - run: npm test
+
+      ---
+      # Separate privileged workflow for labeling/commenting — uses pull_request_target
+      # This one works with base-branch context (github.sha = base HEAD) — which is correct
+      # for privileged operations that should only run trusted code
+      on: pull_request_target
+
+      jobs:
+        label:
+          runs-on: ubuntu-latest
+          permissions:
+            pull-requests: write
+          steps:
+            - uses: actions/labeler@v5
+prevention:
+  - "Default to 'pull_request' event for building and testing PR code — it correctly checks out PR changes and has no secrets"
+  - "Use 'pull_request_target' only for privileged operations that genuinely need secrets or write permissions (labeling, commenting, deployment approval)"
+  - "Never expose repository secrets in the same job that checks out untrusted PR head code via github.event.pull_request.head.sha"
+  - "Add a comment next to any pull_request_target checkout step documenting which ref is used and why it is safe"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request_target"
+    label: "GitHub Docs: pull_request_target event"
+  - url: "https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/"
+    label: "GitHub Security Lab: Preventing pwn requests"
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions"
+    label: "GitHub Docs: Security hardening for GitHub Actions"

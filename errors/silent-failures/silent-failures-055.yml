@@ -1,0 +1,99 @@
+id: silent-failures-055
+title: "'github.event_name' is 'workflow_call' inside reusable workflows — not the caller's event"
+category: silent-failures
+severity: silent-failure
+tags:
+  - reusable-workflow
+  - workflow_call
+  - event_name
+  - github-context
+  - conditional
+  - silent
+patterns:
+  - regex: 'github\.event_name\s*==\s*[''"]push[''"]'
+    flags: i
+  - regex: 'github\.event_name\s*==\s*[''"]pull_request[''"]'
+    flags: i
+  - regex: 'github\.event_name\s*==\s*[''"]workflow_dispatch[''"]'
+    flags: i
+error_messages:
+  - "Evaluating: github.event_name == 'push' => false"
+  - "Step skipped: if condition 'github.event_name == \"push\"' was false"
+root_cause: |
+  When a workflow is called as a reusable workflow via on: workflow_call, GitHub Actions
+  sets github.event_name to "workflow_call" inside that workflow — NOT to the triggering
+  event from the caller workflow.
+
+  A common mistake is to write conditional logic in a reusable workflow that checks
+  github.event_name expecting the caller's event (push, pull_request, workflow_dispatch,
+  etc.). These conditions always evaluate to false when the workflow is invoked via
+  workflow_call, silently skipping the affected steps or entire jobs.
+
+  The behaviour is especially confusing because developers often test the reusable workflow
+  in isolation via workflow_dispatch — in which case github.event_name IS correct. The
+  silent skip only appears when the workflow is called from another workflow, and the skipped
+  step or job disappears from the run summary with no error message.
+fix: |
+  Pass the caller's event name as an explicit input to the reusable workflow. The caller
+  reads github.event_name from its own context (where it is correct) and passes it as a
+  string input. Inside the reusable workflow, check inputs.caller_event (or whatever name
+  you choose) instead of github.event_name.
+
+  Alternatively, restructure so that event-specific logic stays in the caller workflow and
+  the reusable workflow only receives final parameters — not the raw event name.
+fix_code:
+  - language: yaml
+    label: "Problem: event_name check always false in reusable workflow"
+    code: |
+      # reusable.yml — WRONG: event_name is always "workflow_call" here
+      on:
+        workflow_call:
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Deploy only on push
+              if: github.event_name == 'push'   # Always false — event_name is "workflow_call"
+              run: echo "Deploying..."
+  - language: yaml
+    label: "Fix: accept caller_event as an explicit input"
+    code: |
+      # reusable.yml — CORRECT: accept the caller's event as an input
+      on:
+        workflow_call:
+          inputs:
+            caller_event:
+              type: string
+              required: true
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Deploy only on push
+              if: inputs.caller_event == 'push'   # Correct — uses the passed-in value
+              run: echo "Deploying..."
+  - language: yaml
+    label: "Caller workflow: pass github.event_name as input"
+    code: |
+      # caller.yml — pass the caller's event name to the reusable workflow
+      on: [push, pull_request]
+
+      jobs:
+        call-reusable:
+          uses: ./.github/workflows/reusable.yml
+          with:
+            caller_event: ${{ github.event_name }}   # "push" or "pull_request"
+prevention:
+  - "Never use 'github.event_name' in a reusable workflow to detect the caller's event — it will always be 'workflow_call'"
+  - "Pass event-specific data as explicit inputs; document expected values in the input description field"
+  - "When testing a reusable workflow via workflow_dispatch, simulate the production caller_event value via inputs to catch conditional errors early"
+  - "The same rule applies to github.event.* properties — many will be empty or refer to the workflow_call event, not the caller's event"
+docs:
+  - url: "https://docs.github.com/en/actions/sharing-automations/reusing-workflows"
+    label: "GitHub Docs: Reusing workflows"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context"
+    label: "GitHub Docs: github context reference"
+  - url: "https://docs.github.com/en/actions/sharing-automations/reusing-workflows#limitations"
+    label: "GitHub Docs: Reusable workflow limitations"
