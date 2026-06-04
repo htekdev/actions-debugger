@@ -1,0 +1,120 @@
+id: silent-failures-057
+title: "needs.<job>.outputs empty when upstream job failed — if: always() downstream job silently receives empty strings"
+category: silent-failures
+severity: silent-failure
+tags:
+  - needs
+  - job-outputs
+  - always
+  - failure
+  - silent-failure
+  - job-dependencies
+  - error-handling
+patterns:
+  - regex: 'needs\.\w+\.outputs\.\w+'
+    flags: 'i'
+  - regex: 'if.*always.*needs.*result.*failure'
+    flags: 'i'
+error_messages: []
+root_cause: |
+  GitHub Actions job outputs are only populated when the upstream job completes successfully
+  (exit code 0). If an upstream job fails, its outputs are never set in the workflow context
+  — even if the job partially executed and wrote to $GITHUB_OUTPUT before the failure.
+
+  When a downstream job uses `if: always()` or `if: needs.upstream.result == 'failure'`
+  to run after a failed upstream job, all `needs.<upstream>.outputs.*` values resolve to
+  empty strings. No warning is emitted in the logs. The downstream job runs without any
+  indication that it received empty output values instead of the expected data.
+
+  This silently causes:
+  - Notification steps sending messages with blank context (empty SHA, branch, artifact path)
+  - Conditional steps skipping because a non-empty string check evaluates to false
+  - Upload or deploy steps using empty or incorrectly-derived paths
+  - Downstream matrix jobs running with no dimension values
+
+  The pattern is valid YAML — `needs.upstream.outputs.my_value` passes schema validation.
+  The failure only manifests at runtime after the upstream job has failed, and the symptoms
+  look unrelated to the empty output (e.g., "artifact not found" rather than "output was empty").
+fix: |
+  Option 1 (recommended): Set outputs as early as possible in the upstream job, before any
+  step that might fail. Use a dedicated first step to write context values to $GITHUB_OUTPUT
+  before running builds or tests that could fail.
+
+  Option 2: Add `|| 'fallback'` expressions to all `needs.*.outputs.*` references in
+  if:always() downstream jobs to make empty values visible:
+    env:
+      ARTIFACT_PATH: ${{ needs.build.outputs.artifact_path || 'unknown' }}
+
+  Option 3: In notification/cleanup jobs, use `github.*` context values directly rather
+  than relying on upstream job outputs for data that is always available:
+    github.sha, github.ref_name, github.actor, github.run_id
+
+  Option 4: Use a `result` check before accessing outputs and provide explicit fallbacks
+  when result is not 'success':
+    ${{ needs.build.result == 'success' && needs.build.outputs.artifact || 'build-failed' }}
+fix_code:
+  - language: yaml
+    label: "Set outputs in a first step before any step that might fail"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          outputs:
+            artifact_path: ${{ steps.init.outputs.artifact_path }}
+            commit_sha: ${{ steps.init.outputs.commit_sha }}
+          steps:
+            # Set outputs FIRST before any step that might fail
+            - name: Initialize outputs
+              id: init
+              run: |
+                echo "artifact_path=dist/" >> $GITHUB_OUTPUT
+                echo "commit_sha=${{ github.sha }}" >> $GITHUB_OUTPUT
+
+            - uses: actions/checkout@v4
+
+            - name: Build (may fail)
+              run: npm run build
+
+        notify:
+          needs: build
+          if: always()
+          runs-on: ubuntu-latest
+          steps:
+            - name: Send build notification
+              run: |
+                RESULT="${{ needs.build.result }}"
+                # Use || fallback since outputs are empty when build failed
+                ARTIFACT="${{ needs.build.outputs.artifact_path || 'N/A' }}"
+                SHA="${{ needs.build.outputs.commit_sha || github.sha }}"
+                echo "Build: $RESULT | Artifact: $ARTIFACT | SHA: $SHA"
+  - language: yaml
+    label: "Use github context directly in failure-handling jobs instead of upstream outputs"
+    code: |
+      jobs:
+        notify-on-failure:
+          needs: [build, test]
+          if: failure()
+          runs-on: ubuntu-latest
+          steps:
+            - name: Notify failure
+              run: |
+                # Use github context — always available regardless of upstream failure
+                echo "Repository: ${{ github.repository }}"
+                echo "Branch: ${{ github.ref_name }}"
+                echo "Commit: ${{ github.sha }}"
+                echo "Actor: ${{ github.actor }}"
+                echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+prevention:
+  - "Write all critical values to GITHUB_OUTPUT in the very first step of a job, before any step that might fail"
+  - "Add || 'fallback' to every needs.*.outputs.* expression in if:always() or if:failure() downstream jobs"
+  - "Use github.* context values for data always available (sha, ref_name, actor, run_id) rather than upstream outputs"
+  - "Test failure paths by adding a workflow_dispatch that intentionally fails the upstream job and verify downstream output"
+docs:
+  - url: "https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#jobsjob_idoutputs"
+    label: "GitHub Docs — Job outputs"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#needs-context"
+    label: "GitHub Docs — needs context"
+  - url: "https://github.com/orgs/community/discussions/18163"
+    label: "GitHub Community — needs outputs empty when job failed"
+  - url: "https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#jobsjob_idif"
+    label: "GitHub Docs — if conditions with always()"
