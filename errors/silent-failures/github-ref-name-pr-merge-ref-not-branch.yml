@@ -1,0 +1,102 @@
+id: silent-failures-070
+title: 'github.ref_name returns N/merge on pull_request events, not the head branch name'
+category: silent-failures
+severity: silent-failure
+tags:
+  - github-ref-name
+  - github-head-ref
+  - pull-request
+  - merge-ref
+  - branch-name
+  - context
+patterns:
+  - regex: 'github\.ref_name'
+    flags: 'i'
+  - regex: '\d+/merge'
+    flags: ''
+error_messages:
+  - "branch name is '15/merge' instead of 'feature/my-branch'"
+  - "invalid branch: 45/merge"
+  - "ref_name evaluates to 23/merge on pull_request trigger"
+root_cause: |
+  On pull_request events, GitHub creates a synthetic merge commit ref at refs/pull/N/merge
+  representing the result of merging the head branch into the base branch. This is the ref
+  that the runner checks out by default.
+
+  github.ref resolves to 'refs/pull/N/merge' and github.ref_name resolves to 'N/merge'
+  (e.g., '15/merge') — not the human-readable head branch name.
+
+  Developers who use github.ref_name expecting the PR head branch name receive the synthetic
+  merge ref slug instead, which breaks:
+  - Branch-based deployment logic
+  - Conditional workflow steps that check the branch name
+  - Tag/release workflows incorrectly applied to PR builds
+  - Docker image tags derived from the branch name
+
+  To get the actual PR head branch name on pull_request events, use github.head_ref.
+  To get the base branch name, use github.base_ref.
+
+  Note: On push events, github.ref_name correctly returns the branch name (e.g., 'main').
+  The discrepancy only affects pull_request (and pull_request_target) events.
+fix: |
+  Use github.head_ref instead of github.ref_name when you need the PR head branch name.
+
+  For robust multi-event workflows, use a conditional expression:
+  - On pull_request: github.head_ref contains the branch name
+  - On push: github.ref_name contains the branch name
+
+  Or use a ternary-style expression to normalize:
+  ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
+fix_code:
+  - language: yaml
+    label: 'Use github.head_ref for PR branch name, github.ref_name for push'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Get branch name
+              run: |
+                if [ "${{ github.event_name }}" = "pull_request" ]; then
+                  BRANCH="${{ github.head_ref }}"
+                else
+                  BRANCH="${{ github.ref_name }}"
+                fi
+                echo "Branch: $BRANCH"
+                echo "BRANCH=$BRANCH" >> $GITHUB_ENV
+
+  - language: yaml
+    label: 'Normalize branch name in Docker image tag (works for push and PR)'
+    code: |
+      on:
+        push:
+          branches: [main, develop]
+        pull_request:
+
+      jobs:
+        docker:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Set branch slug
+              id: branch
+              run: |
+                # Use head_ref for PRs, ref_name for push events
+                BRANCH="${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}"
+                # Slugify: replace / with - for Docker tag compatibility
+                SLUG=$(echo "$BRANCH" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
+                echo "slug=$SLUG" >> $GITHUB_OUTPUT
+
+            - name: Build Docker image
+              run: docker build -t myapp:${{ steps.branch.outputs.slug }} .
+prevention:
+  - 'On pull_request events, always use github.head_ref for the PR head branch and github.base_ref for the target base branch'
+  - 'github.ref_name is only reliable as a branch name on push events — never use it unconditionally'
+  - 'When writing multi-event workflows (push + pull_request), add an event-conditional expression to normalize the branch name'
+  - 'Test workflows triggered by both push and pull_request events to catch context differences early'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context'
+    label: 'GitHub context — github.ref_name, github.head_ref, github.base_ref'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request'
+    label: 'pull_request event context and merge ref behavior'
+  - url: 'https://github.com/orgs/community/discussions/25722'
+    label: 'GitHub Community: github.ref_name returns N/merge on pull_request'
