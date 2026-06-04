@@ -1,0 +1,114 @@
+id: known-unsolved-047
+title: "Reusable workflow uses: ./local-action resolves relative to the called repo, not the calling repo"
+category: known-unsolved
+severity: limitation
+tags:
+  - reusable-workflow
+  - composite-action
+  - path-resolution
+  - local-action
+  - cross-repo
+  - limitation
+patterns:
+  - regex: 'Can''t find ''action\.ya?ml'''
+    flags: 'i'
+  - regex: 'Unable to resolve action.*\.\/'
+    flags: 'i'
+  - regex: 'action\.ya?ml.*does not exist'
+    flags: 'i'
+error_messages:
+  - "Can't find 'action.yml', 'action.yaml' or 'Dockerfile' under '/home/runner/work/repo/repo/local-action'"
+  - "Unable to resolve action `./local-action`, unable to find 'action.yaml' or 'action.yml'"
+  - "Error: Can't find 'action.yml' for step uses: ./shared-actions/deploy"
+root_cause: |
+  When a reusable workflow file (stored in org/shared-workflows) contains steps that
+  reference local composite actions using relative paths (uses: ./path/to/action), the
+  path resolves relative to the CALLED (reusable) repository — not the CALLING
+  repository.
+
+  Resolution rule: In any workflow file, uses: ./path always resolves to the root of
+  the repository that CONTAINS the workflow YAML file.
+
+  So in org/shared-workflows/.github/workflows/ci.yml:
+    - uses: ./actions/lint  →  looks in org/shared-workflows/actions/lint/action.yml
+    - Does NOT look in org/app-repo/actions/lint/ (the calling repo)
+
+  This means teams cannot:
+  - Share a reusable workflow that calls composite actions defined in the CALLING repo
+  - Have callers "inject" local actions into a shared reusable workflow via relative paths
+  - Centralize reusable workflows in one repo while composite actions stay in team repos
+
+  This limitation is by design and has been acknowledged by the GitHub Actions team as
+  a fundamental architectural constraint. The calling repository's workspace may be
+  checked out during the job, but action path resolution happens at workflow evaluation
+  time using the workflow file's own repository root, not the runtime workspace.
+fix: |
+  There is no direct fix — this is a platform-level path resolution limitation.
+
+  Option 1 (recommended) — Co-locate composite actions in the same repository as the
+  reusable workflow and reference them with uses: ./path (resolves correctly).
+
+  Option 2 — Publish shared composite actions to a dedicated standalone repository
+  (e.g., org/shared-actions) and reference them with the full path:
+    uses: org/shared-actions/path/to-action@main
+
+  Option 3 — Pass all data that the local action would have computed as inputs to the
+  reusable workflow, removing the need for the caller's local action inside the callee.
+fix_code:
+  - language: yaml
+    label: "Co-locate composite action in the same repo as the reusable workflow"
+    code: |
+      # Repository: org/shared-workflows
+      # Structure:
+      #   .github/
+      #     workflows/
+      #       ci.yml              <- reusable workflow
+      #     actions/
+      #       shared-lint/
+      #         action.yml        <- composite action lives HERE (same repo)
+
+      # In org/shared-workflows/.github/workflows/ci.yml:
+      on:
+        workflow_call:
+          inputs:
+            source-directory:
+              type: string
+              required: true
+
+      jobs:
+        lint:
+          runs-on: ubuntu-latest
+          steps:
+            # Resolves to org/shared-workflows/.github/actions/shared-lint
+            - uses: ./.github/actions/shared-lint
+              with:
+                src-path: ${{ inputs.source-directory }}
+
+  - language: yaml
+    label: "Reference composite action from a standalone shared repo"
+    code: |
+      # Instead of: uses: ./local-action (broken — resolves to reusable workflow's repo)
+      # Use the full repo reference pointing to org/shared-actions:
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: org/shared-actions/deploy@v2
+              with:
+                environment: ${{ inputs.environment }}
+            - uses: org/shared-actions/notify@v2
+              with:
+                status: ${{ job.status }}
+
+prevention:
+  - "Keep reusable workflow files and their local composite action dependencies in the same repository"
+  - "Publish composite actions shared across many repositories to a dedicated org/shared-actions repo"
+  - "Test reusable workflows by calling them from a different repository early in development"
+  - "Document which composite actions a reusable workflow depends on and where they must be located"
+docs:
+  - url: "https://docs.github.com/en/actions/sharing-automations/reusing-workflows"
+    label: "GitHub docs — Reusing workflows"
+  - url: "https://docs.github.com/en/actions/sharing-automations/creating-actions/about-custom-actions#choosing-a-location-for-your-action"
+    label: "GitHub docs — Choosing a location for your action"
+  - url: "https://github.com/orgs/community/discussions/17244"
+    label: "GitHub Community discussion — local composite action reference from reusable workflow"

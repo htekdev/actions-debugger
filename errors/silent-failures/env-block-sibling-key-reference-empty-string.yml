@@ -1,0 +1,92 @@
+id: silent-failures-071
+title: "${{ env.VAR }} in a step's env: block evaluates to empty string when VAR is a sibling key in the same block"
+category: silent-failures
+severity: silent-failure
+tags:
+  - env-context
+  - expression
+  - env-block
+  - sibling-reference
+  - empty-string
+  - configuration
+patterns:
+  - regex: 'env\.\w+\}\}.*\{\{\s*env\.\w+'
+    flags: 'i'
+error_messages:
+  - "(no error message — step runs successfully but env var is assigned an incorrect partial value)"
+root_cause: |
+  When multiple environment variables are defined in the same step (or job) env: block
+  and one attempts to compose a value from a sibling key using ${{ env.X }}, the
+  reference silently evaluates to an EMPTY STRING.
+
+  GitHub Actions evaluates all expressions in an env: block BEFORE the step runs, using
+  the env context that exists at that point in time. That context includes:
+    - Variables defined in the workflow-level env: block
+    - Variables defined in the job-level env: block (jobs.<id>.env)
+    - Variables added by previous steps via $GITHUB_ENV
+
+  It does NOT include sibling keys defined elsewhere in the SAME env: block being
+  evaluated. The block is evaluated atomically — each value is expanded using only
+  the env context from BEFORE the block, not from within it.
+
+  Example of the mistake:
+    env:
+      BASE_URL: https://api.example.com    # this is fine
+      FULL_URL: ${{ env.BASE_URL }}/v2     # SILENTLY wrong: evaluates to "/v2"
+
+  FULL_URL becomes "/v2" (not "https://api.example.com/v2") because BASE_URL is not
+  in the env context at the time the step's env: block expressions are evaluated —
+  it is only available AFTER the step starts executing.
+
+  This is a silent failure: no warning is produced, the step succeeds, and the
+  misconfigured variable is silently assigned the wrong value.
+fix: |
+  Option 1 (recommended) — Move the "base" variable to the workflow-level or job-level
+  env: block so it is already in the env context when the step's env: block is evaluated.
+
+  Option 2 — Compose the derived value inside the run: step using shell variable
+  expansion, which operates at runtime when all variables are already set.
+
+  Option 3 — Use an expression based on inputs, vars, or secrets contexts which ARE
+  fully available during env: block evaluation.
+fix_code:
+  - language: yaml
+    label: "Hoist base variable to workflow-level env so it's in context"
+    code: |
+      # Define BASE_URL at workflow level — it will be in the env context
+      env:
+        BASE_URL: https://api.example.com
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Call API
+              run: curl "$FULL_URL"
+              env:
+                # env.BASE_URL is available here because it's defined at workflow level
+                FULL_URL: ${{ env.BASE_URL }}/v2/endpoint
+
+  - language: yaml
+    label: "Compose the value inside run: using shell variable expansion"
+    code: |
+      steps:
+        - name: Call API endpoint
+          run: |
+            # Shell variable composition works at runtime when BASE_URL is already set
+            FULL_URL="${BASE_URL}/v2/endpoint"
+            curl "$FULL_URL"
+          env:
+            BASE_URL: https://api.example.com
+            # FULL_URL built in shell — no need to compose in env: block
+
+prevention:
+  - "Define 'base' env vars at workflow or job level when they need to be referenced by step-level env: blocks"
+  - "Use shell variable composition inside run: steps rather than ${{ env.X }} in the same env: block"
+  - "Verify composed env var values by printing them with echo before use in critical steps"
+  - "Review GitHub Actions context availability documentation when authoring env: blocks"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/variables#using-the-env-context-to-access-environment-variable-values"
+    label: "GitHub docs — Using the env context to access environment variable values"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#context-availability"
+    label: "GitHub docs — Context availability table"
