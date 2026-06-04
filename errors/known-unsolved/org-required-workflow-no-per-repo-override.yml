@@ -1,0 +1,88 @@
+id: known-unsolved-048
+title: 'Organization required workflows block all repo PRs with no per-repo override'
+category: known-unsolved
+severity: limitation
+tags:
+  - required-workflows
+  - organization
+  - branch-protection
+  - enterprise
+  - admin
+patterns:
+  - regex: 'Required status checks have not passed for this branch'
+    flags: 'i'
+  - regex: 'required workflows? are not complete'
+    flags: 'i'
+error_messages:
+  - 'Required status checks have not passed for this branch'
+  - 'The following required workflows are not complete: .github/workflows/required-check.yml'
+  - 'Required workflow failed: org-name/.github/.github/workflows/security-scan.yml'
+root_cause: |
+  GitHub Enterprise Cloud allows org admins to configure "Required workflows"
+  under Org Settings → Actions → Required workflows. These workflows run on
+  every push and pull_request event across every repository in the organization
+  and are automatically added as required status checks on all branches.
+
+  When a required workflow fails — due to a misconfiguration, missing secret,
+  incompatibility with a specific repository's structure, or a transient error
+  — all open PRs in every affected repository are blocked from merging. There
+  is no mechanism for repo admins or developers to bypass or exempt their
+  repository from the org-level required workflow. Only the org admin can fix
+  the required workflow or remove the requirement.
+
+  This creates an org-wide single point of failure: a bug in the centralized
+  required workflow instantly blocks all engineering teams from shipping.
+fix: |
+  There is no per-repository exemption for org required workflows. Mitigation
+  strategies for org admins:
+
+  1. Use `if:` conditions in the required workflow to skip gracefully for
+     incompatible repositories instead of failing.
+  2. Set `continue-on-error: true` on non-critical jobs within the required
+     workflow so that optional checks do not block merges.
+  3. Maintain a staging version of the required workflow tested on a canary
+     repo before rolling changes org-wide.
+  4. Set up alerting on required workflow failure rates to catch regressions
+     before they block the whole org.
+fix_code:
+  - language: yaml
+    label: 'Use if: conditions to gracefully skip incompatible repos'
+    code: |
+      # In org's .github repo: .github/workflows/required-check.yml
+      name: Required Security Scan
+      on: [push, pull_request]
+      jobs:
+        security-scan:
+          runs-on: ubuntu-latest
+          # Skip repos that are explicitly opted out
+          if: >-
+            !contains(
+              fromJSON('["org/legacy-repo", "org/infra-repo"]'),
+              github.repository
+            )
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run scan
+              run: ./scripts/security-scan.sh
+
+  - language: yaml
+    label: 'Use continue-on-error for non-blocking checks'
+    code: |
+      jobs:
+        lint:
+          runs-on: ubuntu-latest
+          continue-on-error: true   # Won't block the required status check
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm run lint
+prevention:
+  - 'Test required workflows in a canary repository before enabling org-wide'
+  - 'Use `if:` guards to skip repos that cannot satisfy the required checks'
+  - 'Monitor required workflow failure rates with org-level Actions dashboards'
+  - 'Prefer `continue-on-error: true` for advisory checks that should not hard-block PRs'
+  - 'Keep required workflows minimal — only truly mandatory gates belong here'
+docs:
+  - url: 'https://docs.github.com/en/actions/administering-github-actions/required-workflows'
+    label: 'Required workflows — GitHub Docs'
+  - url: 'https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-status-checks-before-merging'
+    label: 'Required status checks — GitHub Docs'
