@@ -1,0 +1,113 @@
+id: runner-environment-110
+title: 'actions/checkout default fetch-depth:1 shallow clone breaks git describe and changelog generation'
+category: runner-environment
+severity: error
+tags:
+  - checkout
+  - fetch-depth
+  - shallow-clone
+  - git-describe
+  - versioning
+  - changelog
+  - tags
+  - release
+patterns:
+  - regex: 'fatal:\s*No names found.*cannot describe|No tag can describe'
+    flags: 'i'
+  - regex: 'fetch-depth:\s*[01]\b'
+    flags: 'i'
+error_messages:
+  - 'fatal: No names found, cannot describe anything.'
+  - 'fatal: No tags can describe ''HEAD''.'
+  - 'error: No annotated tags can describe'
+  - '##[error]fatal: no tag exactly matches'
+root_cause: |
+  actions/checkout defaults to fetch-depth: 1 — a shallow clone that downloads
+  only the single most recent commit. This optimizes CI download speed but breaks
+  any operation that requires commit history or reachable tag ancestry:
+
+  - git describe --tags: requires a tag somewhere in the commit ancestry chain.
+    With depth 1, no ancestor commits exist, so no tags are reachable unless the
+    HEAD commit IS exactly the tagged commit. Returns "fatal: No names found,
+    cannot describe anything."
+
+  - Changelog generators (conventional-changelog, release-please, git-cliff,
+    semantic-release): need commit history to determine what changed since the
+    last release. With depth 1, they see zero commits and produce empty changelogs.
+
+  - Semantic versioning tools that count commits since last tag always return 0
+    because no prior commits (and thus no tags) are in the shallow history.
+
+  - Branch comparison and merge-base operations: git merge-base fails or produces
+    incorrect results with no shared history available.
+
+  A common workaround attempt — using fetch-tags: true with fetch-depth: 1 —
+  fetches tag objects but NOT the commits they point to in history, so
+  git describe still fails. The tags exist as objects but are not reachable from
+  HEAD via the commit graph.
+
+  This is one of the most-discussed GitHub Community topics: the checkout step
+  looks correct, CI succeeds, but release version numbers or changelogs are
+  unexpectedly empty or wrong, often discovered only after a real release attempt.
+fix: |
+  Set fetch-depth: 0 to fetch complete commit history including all tags:
+
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+  For large repositories where full history is prohibitively slow, use targeted
+  approaches:
+  - fetch-depth: 50 covers the last 50 commits — sufficient for active repos
+    that tag frequently, but risky for repos with infrequent tagging.
+  - fetch-depth: 0 combined with --filter=blob:none (partial clone) gets history
+    metadata without full file blobs — not directly configurable in the action but
+    achievable via fetch options in post-checkout scripts for advanced cases.
+
+  For changelog and release tools (release-please, git-cliff, semantic-release,
+  conventional-changelog), always use fetch-depth: 0. These tools explicitly
+  require full history and their documentation states this requirement.
+fix_code:
+  - language: yaml
+    label: 'Full history checkout for git describe and changelog generation tools'
+    code: |
+      jobs:
+        release:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                fetch-depth: 0   # Full history required for version detection and changelogs
+                # Default fetch-depth: 1 (shallow) causes "No names found, cannot describe"
+
+            - name: Generate changelog
+              uses: orhun/git-cliff-action@v3
+              with:
+                config: cliff.toml
+
+  - language: yaml
+    label: 'Partial depth with fetch-tags for large repos — use with caution'
+    code: |
+      jobs:
+        version:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                fetch-depth: 100   # Last 100 commits — sufficient for frequently-tagged repos
+                fetch-tags: true   # Fetch tag objects so they appear in tag list
+                # WARNING: fetch-tags: true with a shallow clone fetches tag OBJECTS
+                # but NOT their commit ancestors — git describe may still fail if
+                # the tag is older than fetch-depth commits. Use fetch-depth: 0 to be safe.
+prevention:
+  - 'Set fetch-depth: 0 in any workflow that uses git describe, generates a changelog, or computes a semantic version from commit history'
+  - 'Document in your workflow why fetch-depth: 0 is required so future maintainers do not revert it to the shallow default'
+  - 'Do not assume fetch-tags: true solves shallow clone limitations for git describe — the tag objects must be reachable in the commit graph'
+  - 'Keep the default fetch-depth: 1 only for workflows that never need commit history — pure build and test jobs with no versioning or history analysis'
+docs:
+  - url: 'https://github.com/actions/checkout#usage'
+    label: 'actions/checkout: fetch-depth parameter documentation'
+  - url: 'https://github.com/orgs/community/discussions/25702'
+    label: 'GitHub Community: git describe fails with actions/checkout shallow clone'
+  - url: 'https://github.com/actions/checkout/issues/701'
+    label: 'actions/checkout #701: fetch-tags does not help with git describe on shallow clone'

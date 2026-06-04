@@ -1,0 +1,111 @@
+id: silent-failures-053
+title: 'workflow_dispatch boolean inputs arrive as strings — if: inputs.flag is always truthy'
+category: silent-failures
+severity: silent-failure
+tags:
+  - workflow-dispatch
+  - boolean-inputs
+  - type-coercion
+  - inputs-context
+  - string-comparison
+  - if-condition
+patterns:
+  - regex: 'inputs\.\w+\s*==\s*true\b'
+    flags: 'i'
+  - regex: 'if:\s*inputs\.\w+'
+    flags: 'i'
+error_messages:
+  - 'Step always runs even when boolean input is set to false'
+  - 'Boolean workflow_dispatch input behaves as truthy regardless of value'
+root_cause: |
+  GitHub Actions workflow_dispatch inputs defined with type: boolean are passed
+  to the workflow as strings ("true" or "false"), not as JavaScript/YAML booleans.
+
+  This means three common patterns silently misbehave:
+  - if: inputs.dry_run                      evaluates to always truthy (non-empty string)
+  - if: inputs.dry_run == true              always false (string "true" != boolean true)
+  - if: inputs.dry_run == false             always false (string "false" != boolean false)
+
+  The GitHub Actions expression evaluator converts the inputs context to strings
+  at the boundary between the event payload and the workflow context. Even though
+  the UI renders a checkbox, the underlying value is the literal string "true" or
+  "false". This behavior is consistent across workflow_dispatch and workflow_call
+  inputs of type boolean.
+
+  GitHub Community discussion #51504 documents this as expected behavior, but
+  thousands of developers are surprised by the mismatch between the checkbox UI
+  and the string runtime value.
+
+  Affected patterns:
+  - if: inputs.dry_run (truthy check — always true for any non-empty string value)
+  - if: inputs.flag == true (boolean comparison — always false for string "true")
+  - Ternary: ${{ inputs.flag && 'yes' || 'no' }} returns "yes" even when flag is "false"
+fix: |
+  Always compare workflow_dispatch boolean inputs to the string literal 'true'
+  or 'false':
+
+  - if: inputs.dry_run == 'true'       correct
+  - if: inputs.dry_run != 'true'       correct negation (catches "false" and "")
+  - if: inputs.dry_run == true         WRONG — string never equals boolean
+  - if: inputs.dry_run                 WRONG — always truthy for non-empty string
+
+  For workflow_call with boolean inputs, the same string coercion applies when
+  the calling workflow passes the value via the inputs: block.
+
+  The fromJSON() function converts the string to a real boolean if needed for
+  complex conditions: fromJSON(inputs.dry_run) returns actual true/false booleans.
+fix_code:
+  - language: yaml
+    label: 'Correct boolean input comparison using string equality'
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            dry_run:
+              description: 'Run without making changes'
+              type: boolean
+              default: false
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Deploy (skip if dry run)
+              # WRONG: if: inputs.dry_run          -- always truthy (non-empty string)
+              # WRONG: if: inputs.dry_run == true   -- string never equals boolean
+              if: inputs.dry_run != 'true'
+              run: echo "Deploying..."
+
+            - name: Dry run notice
+              if: inputs.dry_run == 'true'
+              run: echo "Dry run mode — no changes made"
+
+  - language: yaml
+    label: 'Use fromJSON() to convert to real boolean for complex conditions'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Conditional step using fromJSON conversion
+              if: fromJSON(inputs.dry_run) == false
+              run: echo "Not a dry run — proceeding"
+
+            - name: Set environment variable from boolean input
+              env:
+                # fromJSON converts "true"/"false" string to actual boolean
+                DRY_RUN: ${{ fromJSON(inputs.dry_run) }}
+              run: |
+                echo "Dry run mode: $DRY_RUN"
+prevention:
+  - 'Always compare workflow_dispatch boolean inputs to the string literal ''true'' or ''false'', not to boolean true/false'
+  - 'Never use ''if: inputs.flag'' alone as a boolean check — the non-empty string "false" is truthy in GitHub Actions expressions'
+  - 'Use fromJSON(inputs.flag) when you need a real boolean value in expressions or env: context'
+  - 'Add a comment in your workflow noting that boolean dispatch inputs are strings at runtime to warn future maintainers'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-syntax-for-github-actions#onworkflow_dispatchinputs'
+    label: 'GitHub Docs: workflow_dispatch inputs syntax'
+  - url: 'https://github.com/orgs/community/discussions/51504'
+    label: 'GitHub Community #51504: Boolean inputs in workflow_dispatch are strings'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#fromjson'
+    label: 'GitHub Docs: fromJSON expression function'
