@@ -1,0 +1,87 @@
+id: silent-failures-063
+title: "actions/cache cache-hit output is empty string on miss, not 'false' — equality checks silently never match"
+category: silent-failures
+severity: silent-failure
+tags:
+  - actions-cache
+  - cache-hit
+  - output
+  - empty-string
+  - if-condition
+  - false-comparison
+patterns:
+  - regex: 'steps\.\w+\.outputs\.cache-hit\s*==\s*[''"]false[''"]'
+    flags: i
+  - regex: "cache-hit.*==.*'false'"
+    flags: i
+error_messages:
+  - "cache-hit output comparison to 'false' always evaluates to false — use != 'true' instead"
+root_cause: |
+  The actions/cache action sets the cache-hit output to the string 'true' when a cache is
+  restored from an exact key match, and to an empty string '' when the cache is not found
+  (including when restored from a restore-keys fallback, which returns '' for cache-hit in v3
+  and 'false' only in some v4 configurations). This means that
+  `if: steps.cache.outputs.cache-hit == 'false'` evaluates to false on a cache miss because
+  '' != 'false', so the step or job it guards is silently skipped.
+
+  This is one of the most upvoted GitHub Actions questions on Stack Overflow. Developers
+  naturally expect a boolean-like output to be 'true' or 'false', but the cache action uses
+  'true' vs '' (empty) semantics. The step appears to run successfully; nothing in the logs
+  indicates the if condition did not match as expected.
+fix: |
+  Check for cache miss using != 'true' instead of == 'false'. An empty string and 'false'
+  both evaluate to not-equal-to-'true', so this pattern correctly handles all cache miss
+  cases across cache action versions. Alternatively, use the boolean expression
+  `steps.cache.outputs.cache-hit != 'true'` or omit the check and rely on the cache action's
+  lookup-only: true parameter combined with a separate save step.
+fix_code:
+  - language: yaml
+    label: "Use != 'true' to reliably detect cache miss (works across all cache action versions)"
+    code: |
+      - name: Cache dependencies
+        id: cache-deps
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+
+      # WRONG — silently never runs on cache miss:
+      # - name: Install deps
+      #   if: steps.cache-deps.outputs.cache-hit == 'false'
+
+      # CORRECT — matches both '' and 'false':
+      - name: Install dependencies
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        run: npm ci
+  - language: yaml
+    label: "Lookup-only + explicit save pattern (cache@v4) to avoid output ambiguity"
+    code: |
+      - name: Restore cache (lookup only, no auto-save)
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+
+      - name: Install dependencies
+        if: steps.cache-restore.outputs.cache-hit != 'true'
+        run: npm ci
+
+      - name: Save cache
+        if: steps.cache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+prevention:
+  - "Always use != 'true' to check for cache miss — never use == 'false' on cache action outputs"
+  - "Review the cache action version changelog: v3 uses '' on miss, v4 behavior depends on exact/partial hit"
+  - "Add a debug step that echoes cache-hit output to make cache behavior visible in logs during development"
+  - "Consult the cache action README for the exact semantics of cache-hit, cache-primary-key, and cache-matched-key"
+docs:
+  - url: https://github.com/actions/cache#outputs
+    label: "actions/cache README: Outputs"
+  - url: https://stackoverflow.com/questions/62754195/github-actions-cache-hit-is-true-but-id-expect-false
+    label: "Stack Overflow: cache-hit is empty string, not 'false'"
+  - url: https://github.com/actions/cache/issues/1699
+    label: "actions/cache#1699: cache-hit output '' vs 'false' confusion"
