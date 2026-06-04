@@ -1,0 +1,84 @@
+id: silent-failures-076
+title: "Job outputs: block missing — needs.job.outputs.key is always empty string in downstream jobs"
+category: silent-failures
+severity: silent-failure
+tags:
+  - job-outputs
+  - needs-context
+  - GITHUB_OUTPUT
+  - outputs-block
+  - empty-string
+  - downstream-jobs
+patterns:
+  - regex: 'needs\.[a-z_][a-z0-9_-]*\.outputs\.[a-z_][a-z0-9_-]*'
+    flags: 'i'
+error_messages:
+  - ""
+root_cause: |
+  Writing to $GITHUB_OUTPUT inside a step only makes the value available within that job
+  via steps.<step_id>.outputs.<key>. To expose an output to downstream jobs via
+  needs.<job>.outputs.<key>, the job must explicitly declare an outputs: block that maps
+  key names to step output expressions using ${{ steps.<id>.outputs.<key> }}.
+
+  Without the job-level outputs: mapping, $GITHUB_OUTPUT writes are silently ignored by
+  downstream consumers — needs.<job>.outputs.<key> evaluates to an empty string with no
+  warning, error, or annotation. The step that wrote to $GITHUB_OUTPUT exits with code 0
+  and no indication of the problem.
+
+  This two-step mechanism is required: the step writes to $GITHUB_OUTPUT (job-internal),
+  and the job's outputs: block re-exports selected values to the workflow's needs graph.
+fix: |
+  Add an outputs: block at the job level (as a sibling of runs-on:, steps:, etc.)
+  that maps the desired key names to the corresponding step output expressions.
+  Every key you want accessible via needs.<job>.outputs.<key> must appear in this block.
+fix_code:
+  - language: yaml
+    label: "Correct: job outputs: block declares which step outputs to expose"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          outputs:
+            artifact-version: ${{ steps.version.outputs.value }}
+            build-sha: ${{ steps.hash.outputs.sha }}
+          steps:
+            - name: Compute version
+              id: version
+              run: echo "value=1.2.3" >> $GITHUB_OUTPUT
+            - name: Compute hash
+              id: hash
+              run: echo "sha=$(sha256sum dist/app | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+
+        deploy:
+          needs: build
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying ${{ needs.build.outputs.artifact-version }}"
+  - language: yaml
+    label: "Wrong: outputs: block absent — needs.build.outputs.* is always empty"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          # No outputs: block — step writes are invisible to downstream jobs
+          steps:
+            - name: Compute version
+              id: version
+              run: echo "value=1.2.3" >> $GITHUB_OUTPUT
+
+        deploy:
+          needs: build
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "${{ needs.build.outputs.artifact-version }}"  # Always ''
+prevention:
+  - "Any job that produces values for downstream jobs MUST have a matching outputs: block"
+  - "Use actionlint — it warns when needs.<job>.outputs.<key> references an undeclared key"
+  - "Debug by printing ${{ toJSON(needs) }} in a downstream step to see all available outputs"
+  - "Note: steps.<id>.outputs.<key> within the same job does NOT require an outputs: block"
+  - "Composite action outputs and reusable workflow outputs have separate but analogous declaration requirements"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/passing-information-between-jobs"
+    label: "GitHub Docs: Passing information between jobs"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idoutputs"
+    label: "GitHub Docs: jobs.<job_id>.outputs syntax"

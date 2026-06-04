@@ -1,0 +1,91 @@
+id: concurrency-timing-041
+title: "Workflow-level concurrency cancels entire workflow — job-level concurrency only gates that specific job"
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - cancel-in-progress
+  - workflow-level
+  - job-level
+  - scope
+  - deployment
+  - test-cancellation
+patterns:
+  - regex: '^concurrency:\s*$'
+    flags: 'm'
+  - regex: 'jobs\.[a-zA-Z_][a-zA-Z0-9_-]*:\s*\n(\s+.*\n)*\s+concurrency:'
+    flags: 'm'
+error_messages:
+  - ""
+root_cause: |
+  The concurrency: key in GitHub Actions behaves fundamentally differently depending on
+  where it is placed in the workflow file:
+
+  WORKFLOW-LEVEL (top-level key, outside jobs:):
+  Cancels or queues the ENTIRE workflow run. When a new run starts for the same concurrency
+  group, all pending or in-progress jobs in the workflow are affected — including build,
+  test, lint, and deploy jobs. The full workflow run is treated as the atomic unit.
+
+  JOB-LEVEL (inside jobs.<job_id>: as a sibling of runs-on: and steps:):
+  Only gates THAT SPECIFIC JOB. Other jobs in the same workflow run execute concurrently
+  without restriction. Serialization or cancellation applies only to the job that declares
+  the concurrency block.
+
+  Common mistake #1: developer adds workflow-level concurrency intending to prevent
+  duplicate deployments, but accidentally causes active test/build jobs to be cancelled
+  on every new push — wasting compute and breaking CI feedback.
+
+  Common mistake #2: developer adds job-level concurrency expecting the whole workflow
+  to be serialized, but parallel test runs from multiple pushes execute simultaneously.
+fix: |
+  Use job-level concurrency on only the deploy job when you want to serialize
+  deployments without interrupting parallel test runs. Use workflow-level concurrency
+  only when you intend for the entire workflow to serialize or cancel on new push.
+fix_code:
+  - language: yaml
+    label: "Correct: job-level concurrency on deploy only — tests run freely"
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          # No concurrency — multiple test runs execute in parallel across pushes
+          steps:
+            - run: npm test
+
+        deploy:
+          needs: test
+          runs-on: ubuntu-latest
+          concurrency:
+            group: deploy-${{ github.ref_name }}
+            cancel-in-progress: false  # Queue deploys, never cancel in-flight
+          steps:
+            - run: ./deploy.sh
+  - language: yaml
+    label: "Caution: workflow-level concurrency cancels test and build jobs too"
+    code: |
+      # This cancels the ENTIRE workflow on new push — tests, build, and deploy all stop
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: true
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - run: npm test  # Also cancelled when a new push arrives
+
+        deploy:
+          needs: test
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./deploy.sh
+prevention:
+  - "For deploy-only serialization, use job-level concurrency on only the deploy job"
+  - "Avoid cancel-in-progress: true at workflow level for deployment workflows — an interrupted deploy may leave infrastructure in an inconsistent state"
+  - "Use cancel-in-progress: ${{ github.event_name == 'pull_request' }} to cancel PR runs but preserve default-branch deployments"
+  - "Verify scope: if concurrency: is indented under a specific jobs.<id>: block it is job-level; if it is at the same indentation as jobs: it is workflow-level"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency"
+    label: "GitHub Docs: Using concurrency"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#concurrency"
+    label: "GitHub Docs: concurrency syntax reference"
