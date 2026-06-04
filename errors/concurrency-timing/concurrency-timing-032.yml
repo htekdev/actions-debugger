@@ -1,0 +1,147 @@
+id: concurrency-timing-032
+title: 'Reusable workflow concurrency: is not inherited from caller — parallel instances can run simultaneously'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - reusable-workflow
+  - workflow-call
+  - parallel-runs
+  - concurrency-inheritance
+  - deployment
+patterns:
+  - regex: 'jobs\.\w+\.uses:\s*'
+    flags: 'i'
+  - regex: '^concurrency:'
+    flags: 'im'
+error_messages:
+  - 'Multiple simultaneous deployments triggered despite concurrency group on caller workflow'
+  - 'Reusable workflow running in parallel when caller has cancel-in-progress: true'
+  - 'Concurrency group on calling workflow does not prevent parallel reusable workflow runs'
+root_cause: |
+  When a workflow defines concurrency: at the workflow level and calls a reusable
+  workflow via jobs.<id>.uses:, the concurrency configuration is NOT propagated
+  to the called (callee) workflow. The reusable workflow runs with its own
+  independent concurrency context.
+
+  This means:
+  - Workflow A has concurrency: group: deploy-${{ github.ref }}
+  - Workflow A calls Reusable-Deploy.yml via jobs.deploy.uses
+  - If two branches both trigger Workflow A simultaneously, each instance of Workflow A
+    serializes itself via its own concurrency group — but both instances of
+    Reusable-Deploy.yml run in parallel with no concurrency restriction
+
+  The concurrency group defined in the CALLER protects the caller's run from
+  duplicate callers on the same ref. It does NOT create any concurrency group for
+  the callee. The callee executes as a distinct workflow run with no inherited
+  concurrency settings.
+
+  This is especially problematic for shared deployment reusable workflows:
+  - Multiple repos or branches can call the same reusable deployment workflow
+  - Each caller serializes itself per its own ref, but the shared callee runs
+    multiple parallel instances simultaneously
+  - Parallel deploys to the same environment proceed without conflict detection
+
+  Source: GitHub Docs explicitly states concurrency groups are scoped to the
+  specific workflow run. GitHub Community confirmed expected behavior in multiple
+  discussions about parallel reusable workflow instances.
+fix: |
+  Define concurrency: inside the reusable workflow itself, or accept a
+  concurrency-key input and use it within the callee:
+
+  Option 1 — Static group in reusable workflow:
+    Add concurrency: group: deploy-reusable to the callee workflow. This serializes
+    ALL calls to that reusable workflow globally.
+
+  Option 2 — Dynamic group via input:
+    Add a concurrency-key input to the reusable workflow. The caller passes
+    its own group key. The callee uses it: group: ${{ inputs.concurrency_key }}.
+    This gives callers control over which callee instances serialize against each other.
+
+  Option 3 — Environment-level protection:
+    Use GitHub deployment environments with required reviewers. Only one deployment
+    to an environment can be in progress at a time (pending review blocks others).
+fix_code:
+  - language: yaml
+    label: 'Caller: concurrency here only protects the caller — not the callee'
+    code: |
+      # caller-workflow.yml
+      # This concurrency group only prevents duplicate CALLERS for the same ref.
+      # It does NOT propagate to the reusable workflow.
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: true
+
+      jobs:
+        deploy:
+          uses: ./.github/workflows/reusable-deploy.yml
+          with:
+            environment: production
+          secrets: inherit
+
+  - language: yaml
+    label: 'Fix option 1: define concurrency inside the reusable workflow'
+    code: |
+      # reusable-deploy.yml
+      on:
+        workflow_call:
+          inputs:
+            environment:
+              type: string
+              required: true
+
+      # Add concurrency here to serialize all calls to this reusable workflow
+      concurrency:
+        group: reusable-deploy-${{ inputs.environment }}
+        cancel-in-progress: false   # let active deploy finish; queue latest
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          environment: ${{ inputs.environment }}
+          steps:
+            - uses: actions/checkout@v4
+            - run: echo "Deploying to ${{ inputs.environment }}"
+
+  - language: yaml
+    label: 'Fix option 2: caller passes concurrency key as input'
+    code: |
+      # reusable-deploy.yml — accepts caller-controlled concurrency key
+      on:
+        workflow_call:
+          inputs:
+            concurrency_key:
+              type: string
+              required: false
+              default: 'reusable-deploy'
+
+      concurrency:
+        group: ${{ inputs.concurrency_key }}
+        cancel-in-progress: false
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: echo "Deploying..."
+
+      ---
+      # caller-workflow.yml — passes its own ref as the key
+      jobs:
+        deploy:
+          uses: ./.github/workflows/reusable-deploy.yml
+          with:
+            concurrency_key: deploy-${{ github.ref }}
+prevention:
+  - 'Never assume the caller''s concurrency: group propagates to called reusable workflows — it does not'
+  - 'Define concurrency: inside every reusable workflow that manages shared resources (deployments, releases, package publishes)'
+  - 'Use deployment environments with required reviewers as an additional serialization layer for production deploys'
+  - 'Test reusable workflows by triggering two parallel calls and verifying only one runs at a time'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs'
+    label: 'GitHub Docs: Controlling concurrency of workflows and jobs'
+  - url: 'https://docs.github.com/en/actions/sharing-automations/reusing-workflows'
+    label: 'GitHub Docs: Reusing workflows'
+  - url: 'https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment'
+    label: 'GitHub Docs: Managing environments for deployment'
