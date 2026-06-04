@@ -1,0 +1,127 @@
+id: caching-artifacts-044
+title: 'actions/cache post step skipped when job fails — cache not saved on failure (post-if: success() default)'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - actions-cache
+  - cache-save
+  - job-failure
+  - post-if
+  - save-always
+  - silent-skip
+patterns:
+  - regex: 'Post\s+Run\s+actions/cache'
+    flags: 'i'
+  - regex: 'save-always'
+    flags: 'i'
+  - regex: 'Cache\s+not\s+found'
+    flags: 'i'
+error_messages:
+  - "Cache was not saved. Exiting with failure."
+  - "Post Run actions/cache@v4 skipped"
+  - "Cache miss on subsequent run after failed job"
+  - "cache-hit: false even though previous run had cache action"
+root_cause: |
+  actions/cache (v3 and v4) uses a `post-if: success()` condition on the cache save post step
+  by default. This means the cache save step only runs when ALL preceding steps in the job
+  succeeded. When any step fails:
+  - The job transitions to "failure" state
+  - The cache post step is SKIPPED silently — no warning, annotation, or error is logged
+  - The next run gets a cache miss and must re-download/rebuild from scratch
+
+  This is commonly discovered when:
+  - A test suite installs dependencies (cached) then runs tests (which fail)
+  - The cache works on the first run but never again after a flaky failure
+  - A build step fails, wasting all compilation work that could have been cached
+  - CI is slow because each failed run discards the cache and rebuilds from zero
+
+  Note: This is DIFFERENT from caching-artifacts-036 which covers the case where the job
+  is CANCELLED (via concurrency cancel-in-progress). Cancellation also skips the post step,
+  but for a different reason — cancellation interrupts all runners immediately.
+
+  The failure case is separate: the job runs to completion (with a failure), the post step
+  lifecycle still runs, but the post-if condition evaluates to false and skips it silently.
+fix: |
+  Option 1 (recommended): Set `save-always: true` on the restore step (actions/cache v3.3.3+ and v4+):
+    - uses: actions/cache@v4
+      with:
+        path: ~/.npm
+        key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+        save-always: true   # Save cache even if job fails
+
+  Option 2: Use the standalone cache/save action in an explicit cleanup step:
+    - uses: actions/cache/restore@v4
+      id: cache-restore
+      with:
+        path: ~/.npm
+        key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+    - run: npm ci
+    - uses: actions/cache/save@v4
+      if: always()   # Explicit save even on failure
+      with:
+        path: ~/.npm
+        key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+
+  Option 3 (v3 only): Use `cache-v3-save-always-unexpected-input` — note that `save-always`
+  was not available before v3.3.3. On older versions, use the split restore/save approach.
+fix_code:
+  - language: yaml
+    label: 'Save cache on job failure using save-always: true (v4)'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - uses: actions/cache@v4
+              with:
+                path: ~/.npm
+                key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+                restore-keys: |
+                  ${{ runner.os }}-npm-
+                save-always: true   # Cache saves even if subsequent steps fail
+
+            - run: npm ci
+            - run: npm test         # If this fails, cache is still saved
+  - language: yaml
+    label: 'Explicit restore then save with if: always() (works on all versions)'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Restore cache
+              id: npm-cache
+              uses: actions/cache/restore@v4
+              with:
+                path: ~/.npm
+                key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+                restore-keys: |
+                  ${{ runner.os }}-npm-
+
+            - run: npm ci
+            - run: npm test
+
+            - name: Save cache (always, even on failure)
+              uses: actions/cache/save@v4
+              if: always()
+              with:
+                path: ~/.npm
+                key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+prevention:
+  - 'Add save-always: true to actions/cache when partial installs (e.g., npm ci with an error) are still worth caching'
+  - 'Consider whether caching a partial/failed state is desirable — for compiled artifacts, only cache on success'
+  - 'Use the split restore/save action pattern for fine-grained control over when the cache is saved'
+  - 'Monitor cache hit rates in the Actions UI — consistently low rates after failures indicate post-if skips'
+docs:
+  - url: 'https://github.com/actions/cache#save-cache-even-if-the-build-fails'
+    label: 'actions/cache — save-always: true option'
+  - url: 'https://github.com/actions/cache/blob/main/save/README.md'
+    label: 'actions/cache/save — standalone save action'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows'
+    label: 'GitHub Docs — Caching dependencies to speed up workflows'
+  - url: 'https://github.com/actions/cache/issues/92'
+    label: 'actions/cache#92 — Feature request: save cache on failure (highly voted)'
