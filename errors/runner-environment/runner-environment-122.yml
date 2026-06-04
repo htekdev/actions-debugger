@@ -1,0 +1,134 @@
+id: runner-environment-122
+title: "ubuntu-24.04 cgroup v2 only — Docker containers and JVMs built for cgroup v1 fail"
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-24
+  - cgroup-v2
+  - docker
+  - systemd-in-container
+  - java
+  - kubernetes
+  - breaking-change
+patterns:
+  - regex: 'cgroup.*v1.*not supported|v1.*cgroup.*not available'
+    flags: 'i'
+  - regex: 'failed to create.*cgroup|cgroup.*permission denied'
+    flags: 'i'
+  - regex: 'write.*cgroup.*read-only file system|cgroup.*read.only'
+    flags: 'i'
+  - regex: 'OCI runtime create failed.*cgroup'
+    flags: 'i'
+error_messages:
+  - "OCI runtime create failed: cgroup v1 not supported on this system"
+  - "Error response from daemon: failed to create shim task: cgroup v1 is not available"
+  - "failed to create cgroup: write /sys/fs/cgroup/memory/docker/...: read-only file system"
+  - "cannot enter cgroupv2 namespace: invalid argument"
+root_cause: |
+  ubuntu-24.04 GitHub-hosted runners use Linux kernel 6.5+ with cgroup v2 (the
+  unified hierarchy) exclusively. cgroup v1 subsystems are not mounted and not
+  available. ubuntu-22.04 runners supported both cgroup v1 and v2 simultaneously
+  (the hybrid mode enabled in the 5.x kernel era), so containers built for v1
+  worked without modification.
+
+  This affects four main workflow categories:
+
+  1. systemd-in-container testing: Docker images using systemd as PID 1 (Ansible
+     role tests, Molecule, infrastructure integration tests) require cgroup v2
+     support in the container's systemd version. Images based on older base images
+     (Ubuntu 18.04, CentOS 7/8, RHEL 7) with systemd < 248 fail to start because
+     their systemd was compiled for the cgroup v1 hierarchy.
+
+  2. Old JVM containers: JVM releases before JDK 11u16, JDK 17u4, and JDK 19+
+     do not correctly detect container memory and CPU limits under cgroup v2.
+     These JVMs either crash with OutOfMemoryError (using the host memory limit
+     instead of the container limit) or report the wrong available processor count.
+
+  3. Kubernetes-in-Docker (kind, k3d): older versions of kind (pre-v0.17) and k3d
+     fail to initialize cluster nodes due to cgroup v2 incompatibility in the
+     bundled containerd or runc version.
+
+  4. eBPF and networking tools: eBPF programs that attach to cgroup v1 BPF program
+     type (BPF_PROG_TYPE_CGROUP_SOCK, etc.) using the v1 subsystem hierarchy fail
+     because the v1 cgroup paths (/sys/fs/cgroup/memory/, /sys/fs/cgroup/cpu/)
+     are not present.
+
+  The ubuntu-latest label resolved to ubuntu-24.04 in 2025. Workflows that relied
+  on ubuntu-latest and had cgroup v1 dependent containers are now affected.
+fix: |
+  1. Update base images to cgroup v2 compatible versions:
+     - systemd: use Ubuntu 22.04+ or Debian Bookworm base images (systemd 249+)
+     - Java: update to JDK 11.0.16+, JDK 17.0.4+, or JDK 19+ (full cgroup v2 support)
+     - kind: use v0.17.0+ which ships containerd 1.7+ with cgroup v2 support
+     - k3d: use v5.6.0+
+
+  2. For systemd containers: mount /sys/fs/cgroup with rw access and use
+     --cgroupns=host if the container requires the host cgroup namespace
+
+  3. Pin to ubuntu-22.04 as a short-term workaround while updating container images.
+     ubuntu-22.04 will eventually be retired from GitHub-hosted runners.
+fix_code:
+  - language: yaml
+    label: "Run systemd containers with cgroup v2 compatible mounts"
+    code: |
+      jobs:
+        ansible-test:
+          runs-on: ubuntu-24.04
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Start systemd container (cgroup v2 compatible)
+              run: |
+                docker run -d \
+                  --name test-node \
+                  --cgroupns=host \
+                  --tmpfs /tmp \
+                  --tmpfs /run \
+                  -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+                  ubuntu:22.04
+
+            - name: Run Ansible role test
+              run: docker exec test-node ansible-playbook site.yml
+  - language: yaml
+    label: "Use kind v0.17+ for Kubernetes-in-Docker on ubuntu-24.04"
+    code: |
+      jobs:
+        k8s-test:
+          runs-on: ubuntu-24.04
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Create kind cluster (v0.17+ required for cgroup v2)
+              uses: helm/kind-action@v1
+              with:
+                version: v0.23.0
+                cluster_name: test-cluster
+
+            - run: kubectl cluster-info
+  - language: yaml
+    label: "Pin to ubuntu-22.04 temporarily for cgroup v1 dependent workflows"
+    code: |
+      jobs:
+        integration-test:
+          # TODO: update container images to cgroup v2 compatible versions
+          runs-on: ubuntu-22.04
+          steps:
+            - uses: actions/checkout@v4
+            - run: docker compose up -d
+prevention:
+  - "Test Docker container images on ubuntu-24.04 before migrating — check cgroup v2 compatibility with `docker run --rm ubuntu:24.04 ls /sys/fs/cgroup/`"
+  - "Use JDK 17.0.4+ or JDK 21+ in all containerized Java workloads for correct cgroup v2 memory/CPU detection"
+  - "Audit Dockerfiles for hardcoded cgroup v1 subsystem paths (/sys/fs/cgroup/memory/, /sys/fs/cgroup/cpu/)"
+  - "Use kind v0.17+ and k3d v5.6+ for Kubernetes-in-Docker CI on ubuntu-24.04"
+  - "Base images on Ubuntu 22.04+ or Debian Bookworm for any container running systemd as PID 1"
+docs:
+  - url: "https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html"
+    label: "Linux kernel — cgroup v2 unified hierarchy documentation"
+  - url: "https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2404-Readme.md"
+    label: "ubuntu-24.04 runner image — kernel version and installed software"
+  - url: "https://kind.sigs.k8s.io/docs/user/known-issues/#pod-errors-due-to-too-many-open-files"
+    label: "kind known issues — cgroup v2 and containerd requirements"
+  - url: "https://docs.docker.com/engine/security/userns-remap/"
+    label: "Docker — cgroup v2 compatibility and container isolation"
+  - url: "https://bugs.openjdk.org/browse/JDK-8230305"
+    label: "OpenJDK — JDK-8230305: Container Metrics: Support cgroup v2 (fixed in JDK 15, backported 11u16/17u4)"
