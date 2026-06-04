@@ -1,0 +1,102 @@
+id: known-unsolved-039
+title: "on.schedule minimum interval is 5 minutes — sub-5-minute cron patterns silently run every 5 minutes"
+category: known-unsolved
+severity: limitation
+tags:
+  - schedule
+  - cron
+  - on.schedule
+  - rate-limit
+  - interval
+  - minimum-frequency
+patterns:
+  - regex: '^\s*-\s*cron:\s*[''"]?\*\/[1-4]\s'
+    flags: 'm'
+  - regex: 'schedule.*cron.*every\s+(?:1|2|3|4)\s+minute'
+    flags: 'i'
+error_messages:
+  - "*/1 * * * *"
+  - "*/2 * * * *"
+  - "*/3 * * * *"
+  - "*/4 * * * *"
+root_cause: |
+  GitHub Actions enforces a minimum cron schedule interval of 5 minutes. Cron
+  expressions that would trigger more frequently — such as */1, */2, */3, or */4
+  in the minutes field — are silently capped and run every 5 minutes instead of
+  the configured interval.
+
+  There is no validation error, no warning in workflow run logs, and no annotation
+  on the workflow YAML file. The workflow appears correctly configured in the GitHub
+  UI, but runs execute every 5 minutes regardless of the specified granularity.
+
+  This limitation is enforced server-side by GitHub's scheduler and cannot be
+  overridden via any workflow configuration. It applies to all hosted runners and
+  self-hosted runners triggered via GitHub's scheduler.
+
+  Additionally, even at the 5-minute minimum, scheduled workflows on busy
+  repositories may be delayed further during periods of high GitHub Actions load.
+  Under heavy load, schedules are queued and run as capacity allows — not
+  necessarily at the exact scheduled time. The schedule event documentation notes
+  that schedules may be delayed "up to hours" when load is high.
+
+  Common developer mental model mismatch: developers migrating from cron daemons
+  (systemd, cron, AWS EventBridge) where sub-minute schedules are routine expect
+  GitHub Actions to support the same granularity.
+fix: |
+  Use a minimum interval of 5 minutes in your cron expression — replace */1,
+  */2, */3, or */4 in the minutes field with */5.
+
+  If sub-5-minute polling or execution is required, use an external trigger
+  mechanism instead of on.schedule:
+
+  - External scheduler (AWS EventBridge, Azure Logic Apps, GCP Cloud Scheduler)
+    that calls the workflow_dispatch REST API
+  - A self-hosted runner with a local cron daemon (systemd timer, Linux cron)
+    that invokes the GitHub API to dispatch the workflow
+  - Move the time-sensitive logic out of GitHub Actions entirely and run it
+    in a dedicated service that can be triggered at any frequency
+fix_code:
+  - language: yaml
+    label: "Minimum supported interval — every 5 minutes"
+    code: |
+      on:
+        schedule:
+          # Minimum supported interval is every 5 minutes
+          - cron: '*/5 * * * *'
+          # The following are silently capped to every 5 minutes:
+          # - cron: '*/1 * * * *'
+          # - cron: '*/2 * * * *'
+          # - cron: '*/3 * * * *'
+          # - cron: '*/4 * * * *'
+  - language: yaml
+    label: "workflow_dispatch trigger for external scheduler integration"
+    code: |
+      # Trigger via REST API from an external scheduler at any frequency:
+      # POST https://api.github.com/repos/OWNER/REPO/actions/workflows/WORKFLOW.yml/dispatches
+      # Body: {"ref": "main"}
+      on:
+        workflow_dispatch:
+          inputs:
+            triggered_by:
+              description: 'Trigger source identifier'
+              type: string
+              default: 'external-scheduler'
+
+      jobs:
+        scheduled-task:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Run task
+              run: echo "Triggered by ${{ inputs.triggered_by }}"
+prevention:
+  - "Always use */5 or higher in the cron minutes field for on.schedule expressions"
+  - "Add a comment next to every cron expression documenting the intended frequency and the 5-minute minimum"
+  - "Test schedule behavior by temporarily adding an on.push trigger during development rather than waiting for scheduled runs"
+  - "For sub-5-minute needs, design the solution with an external scheduler calling workflow_dispatch from the start — do not plan to reduce the interval later"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#schedule"
+    label: "GitHub Docs — Schedule event (on.schedule)"
+  - url: "https://stackoverflow.com/questions/63612471/run-github-actions-every-x-minutes-cron-job"
+    label: "Stack Overflow — Run GitHub Actions every X minutes (highly voted)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#schedule"
+    label: "GitHub Docs — Note on schedule delays under high load"

@@ -1,0 +1,125 @@
+id: triggers-043
+title: "on.push with both branches and paths filters uses AND logic — push must match BOTH to trigger"
+category: triggers
+severity: silent-failure
+tags:
+  - on.push
+  - branches
+  - paths
+  - filter
+  - and-logic
+  - trigger
+  - paths-ignore
+patterns:
+  - regex: 'on:\s*\n\s*push:\s*\n(?:\s+.*\n)*\s+branches:'
+    flags: 'i'
+  - regex: 'push:.*branches.*paths|branches.*paths.*push'
+    flags: 'si'
+error_messages:
+  - "on:\n  push:\n    branches:"
+  - "on:\n  push:\n    paths:"
+root_cause: |
+  When a push trigger specifies BOTH a branches filter AND a paths filter, GitHub
+  Actions evaluates them using AND logic: the push event must match a listed branch
+  AND must include changes to a listed path. If either condition is not satisfied,
+  the workflow does not trigger — silently, with no log output or explanation.
+
+  Developers frequently expect OR logic: "trigger when pushing to main, OR when
+  any file in src/ changes." In reality, the behavior is: "trigger only when
+  pushing to main AND a file in src/ changed."
+
+  This means:
+  - A push to 'main' that only modifies 'README.md' does NOT trigger a workflow
+    configured with branches: [main] and paths: ['src/**']
+  - A push to a feature branch that modifies 'src/app.ts' does NOT trigger the
+    same workflow because the branch filter is not satisfied
+  - The workflow only runs when both conditions are simultaneously true
+
+  The same AND logic applies to other filter combinations:
+  - branches + tags: AND (a ref must match a branch pattern AND a tag pattern —
+    which is always false since a push cannot be both a branch and tag push)
+  - branches + paths-ignore: push must match a listed branch AND must NOT touch
+    any ignored path
+  - tags + paths: push must match a tag pattern AND include changes to listed paths
+
+  A particularly confusing case: using both on.push.branches and on.push.tags in
+  the same push trigger block creates an unsatisfiable AND condition (a push cannot
+  simultaneously target a branch AND create a tag). To trigger on either, use
+  two separate on: entries or separate workflow files.
+fix: |
+  If you want OR logic (trigger on main branch OR on changes to src/), you have
+  two options:
+
+  Option 1 — Use only one filter and handle the other in job-level if: conditions:
+    Push with paths filter only, then use: if: github.ref == 'refs/heads/main'
+    on the job to restrict execution to main.
+
+  Option 2 — Accept that both conditions must be true (the correct model for
+  "only run expensive tests when the right branch AND relevant files change").
+
+  For truly independent OR triggers, use separate workflow files.
+fix_code:
+  - language: yaml
+    label: "AND logic (default) — trigger only when branch AND path both match"
+    code: |
+      on:
+        push:
+          branches:
+            - main
+            - 'release/**'
+          paths:
+            - 'src/**'
+            - 'package.json'
+      # This workflow runs ONLY when:
+      # - Push is to 'main' or a 'release/*' branch
+      # AND
+      # - The push includes changes to src/ or package.json
+      # A push to main that only changes README.md will NOT trigger this workflow.
+  - language: yaml
+    label: "Separate workflow files for OR logic between independent trigger conditions"
+    code: |
+      # File 1: .github/workflows/deploy-main.yml
+      # Triggers on any push to main (regardless of changed paths)
+      on:
+        push:
+          branches:
+            - main
+
+      # File 2: .github/workflows/test-src.yml
+      # Triggers on any push that changes src/ (regardless of branch)
+      on:
+        push:
+          paths:
+            - 'src/**'
+            - 'tests/**'
+  - language: yaml
+    label: "Paths filter only — restrict by path in job if: conditions"
+    code: |
+      on:
+        push:
+          paths:
+            - 'src/**'
+            - 'package.json'
+            - 'package-lock.json'
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          # Additional branch restriction handled in job condition
+          if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+prevention:
+  - "Read the GitHub docs note: 'If both branches and paths filters are used, the workflow will only run when both filters are satisfied'"
+  - "When debugging a workflow that doesn't trigger, temporarily remove one filter at a time to isolate whether the branch OR path filter is blocking the trigger"
+  - "Add a comment above combined branch+paths filters explicitly stating 'AND logic — both must match' to prevent future maintainers from misunderstanding"
+  - "Use actionlint or GitHub's workflow syntax checker which surfaces filter logic warnings"
+  - "Prefer paths-ignore over paths when you want 'run on everything except these files' — it's less likely to cause accidental AND-logic surprises"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#using-filters"
+    label: "GitHub Docs — Using filters with push and pull_request events"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#push"
+    label: "GitHub Docs — push event filters (branches, tags, paths)"
+  - url: "https://stackoverflow.com/questions/63822219/github-actions-workflow-not-triggered-with-branch-and-path-filter"
+    label: "Stack Overflow — Workflow not triggered with branch and path filter (highly voted)"
