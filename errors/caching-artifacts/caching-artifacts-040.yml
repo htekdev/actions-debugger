@@ -1,0 +1,112 @@
+id: caching-artifacts-040
+title: "actions/download-artifact@v4 cross-workflow download silently returns no artifacts without actions: read permission"
+category: caching-artifacts
+severity: error
+tags:
+  - download-artifact
+  - v4
+  - cross-workflow
+  - permissions
+  - actions-read
+  - run-id
+  - breaking-change
+patterns:
+  - regex: 'Unable to find any artifacts for the associated workflow'
+    flags: 'i'
+  - regex: 'No artifacts found for the associated workflow run'
+    flags: 'i'
+  - regex: 'run-id:.*\d+'
+    flags: 'i'
+  - regex: 'Resource not accessible by integration'
+    flags: 'i'
+error_messages:
+  - "Unable to find any artifacts for the associated workflow"
+  - "No artifacts found for the associated workflow run"
+  - "Resource not accessible by integration"
+  - "Error: Artifact download failed: 403 Forbidden"
+root_cause: |
+  actions/download-artifact@v4 introduced the ability to download artifacts produced
+  by a *different* workflow run (not just the current run) by specifying the `run-id`
+  input. This cross-workflow download requires the `actions: read` permission on the
+  GITHUB_TOKEN.
+
+  Workflows that do not explicitly declare `permissions: actions: read` will use the
+  default GITHUB_TOKEN permissions. In repositories where the default token permissions
+  are set to "read for all" at the org level, `actions` read may be granted by default
+  — but in repositories with restrictive default permissions or when only specific
+  permissions are declared in the workflow, `actions: read` is NOT automatically
+  included.
+
+  The misleading aspect is the error message: "Unable to find any artifacts for the
+  associated workflow" suggests the artifact does not exist, when in fact the issue is
+  a 403 permission denial. The action does not distinguish between "artifact not found"
+  and "access denied" in its error output.
+
+  This is a new permission requirement introduced in v4 that did not exist in v3
+  (which only supported downloading from the current workflow run and did not need
+  `actions` read access).
+
+  Common trigger scenario: a workflow that processes artifacts from a different trigger
+  (e.g., a deployment workflow that downloads build artifacts from a build workflow run)
+  is upgraded from download-artifact@v3 to @v4 and the `run-id` input is added — but
+  the required `permissions: actions: read` block is not added.
+fix: |
+  Add `actions: read` to the permissions block of the job or workflow that uses
+  `actions/download-artifact@v4` with a `run-id` input referencing a different workflow.
+
+  If the workflow or job already has a `permissions` block, add `actions: read` to it.
+  If there is no `permissions` block, add one with the minimum required permissions
+  including `actions: read` and `contents: read`.
+fix_code:
+  - language: yaml
+    label: "Add actions: read permission for cross-workflow artifact download"
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          permissions:
+            actions: read    # Required for download-artifact@v4 with run-id
+            contents: read
+          steps:
+            - name: Download build artifacts from build workflow
+              uses: actions/download-artifact@v4
+              with:
+                name: build-output
+                run-id: ${{ github.event.inputs.build_run_id }}
+                github-token: ${{ secrets.GITHUB_TOKEN }}
+  - language: yaml
+    label: "Workflow-level permissions for cross-workflow download"
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            build_run_id:
+              description: 'Run ID of the build workflow'
+              required: true
+              type: string
+
+      permissions:
+        actions: read
+        contents: read
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/download-artifact@v4
+              with:
+                name: dist
+                run-id: ${{ inputs.build_run_id }}
+                github-token: ${{ secrets.GITHUB_TOKEN }}
+prevention:
+  - "Whenever `run-id` is added to a download-artifact@v4 step, immediately add `actions: read` to the job permissions block"
+  - "Do not rely on default token permissions for cross-workflow operations — always declare explicit permission blocks"
+  - "Test cross-workflow downloads in a feature branch before merging — the permission error is deterministic, not flaky"
+  - "Add `github-token: ${{ secrets.GITHUB_TOKEN }}` explicitly to download-artifact@v4 steps that use run-id, as it clarifies the token in use"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-workflow-data-as-artifacts#downloading-artifacts-from-a-previous-workflow-run"
+    label: "GitHub Docs — Downloading artifacts from a previous workflow run"
+  - url: "https://github.com/actions/download-artifact/releases/tag/v4.0.0"
+    label: "actions/download-artifact v4.0.0 release notes — cross-workflow download"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/controlling-permissions-for-github_token#defining-access-for-the-github_token-scopes"
+    label: "GitHub Docs — GITHUB_TOKEN permission scopes"
