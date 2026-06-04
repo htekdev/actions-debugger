@@ -1,0 +1,77 @@
+id: silent-failures-074
+title: "fromJSON() object or array stored in env: block silently becomes '[object Object]'"
+category: silent-failures
+severity: silent-failure
+tags:
+  - fromjson
+  - env-context
+  - type-coercion
+  - json-parsing
+  - stringification
+patterns:
+  - regex: 'env\s*:.*\$\{\{\s*fromJSON\('
+    flags: ims
+error_messages:
+  - "[object Object]"
+  - "Unexpected token 'o', \"[object O\"... is not valid JSON"
+root_cause: |
+  The fromJSON() function in GitHub Actions expressions parses a JSON string
+  into a typed value — object, array, boolean, or number. However, when the
+  result is assigned to an env: variable, the Actions runner coerces the value
+  to a string using JavaScript's default toString(). For objects this produces
+  the literal string [object Object]; for arrays it produces a comma-joined
+  string (e.g., a,b,c).
+
+  The step exits with code 0 and the env variable appears set, but its value is
+  the stringified form rather than the JSON structure the developer expected.
+  Subsequent steps that reference ${{ env.CONFIG }} or echo the variable and
+  pipe it through jq will receive [object Object] and fail to parse — or silently
+  produce wrong results.
+
+  Booleans and numbers survive correctly: fromJSON('true') in env: produces the
+  string 'true', and fromJSON('42') produces '42' — these are the only safe uses.
+fix: |
+  Pass structured JSON data between steps via GITHUB_OUTPUT (as a raw JSON
+  string), then consume the stored string with fromJSON() in downstream
+  expression contexts. Never store objects or arrays via fromJSON() in env: blocks.
+fix_code:
+  - language: yaml
+    label: "Store JSON in GITHUB_OUTPUT, consume via fromJSON in expressions"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            # WRONG: fromJSON object in env: becomes '[object Object]'
+            # - name: Bad config
+            #   env:
+            #     CONFIG: ${{ fromJSON(inputs.config_json) }}
+            #   run: echo "$CONFIG" | jq .host  # fails: '[object Object]' is not JSON
+
+            # CORRECT: store raw JSON string in GITHUB_OUTPUT
+            - name: Store config
+              id: cfg
+              run: echo 'config=${{ inputs.config_json }}' >> $GITHUB_OUTPUT
+
+            # Access fields with fromJSON() directly in expression context
+            - name: Use config
+              run: |
+                echo "Host: ${{ fromJSON(steps.cfg.outputs.config).host }}"
+                echo "Port: ${{ fromJSON(steps.cfg.outputs.config).port }}"
+
+            # Scalar fromJSON values are safe in env: (boolean, number)
+            - name: Scalar fromJSON is fine
+              env:
+                IS_PROD: ${{ fromJSON(inputs.is_prod) }}
+                TIMEOUT: ${{ fromJSON(inputs.timeout) }}
+              run: echo "prod=$IS_PROD timeout=$TIMEOUT"
+prevention:
+  - "Never assign fromJSON() results that produce objects or arrays to env: variables."
+  - "Use fromJSON() inline in expression contexts (${{ fromJSON(x).field }}) rather than materializing into env vars."
+  - "Store JSON blobs as raw strings in GITHUB_OUTPUT and parse with jq in shell or fromJSON() in expressions."
+  - "For object env vars, keep the value as a raw JSON string and parse in shell with jq or python -c."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#fromjson"
+    label: "GitHub Actions: fromJSON expression function"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/passing-information-between-jobs"
+    label: "GitHub Actions: Passing information between jobs"

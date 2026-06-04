@@ -1,0 +1,67 @@
+id: concurrency-timing-039
+title: "Manual re-run cancels original run when concurrency group omits github.run_attempt"
+category: concurrency-timing
+severity: error
+tags:
+  - concurrency
+  - re-run
+  - cancel-in-progress
+  - run-attempt
+  - manual-rerun
+patterns:
+  - regex: 'This run was cancelled'
+    flags: i
+  - regex: 'run_attempt'
+    flags: i
+error_messages:
+  - "This run was cancelled."
+  - "A run for this workflow is already in progress."
+root_cause: |
+  When cancel-in-progress: true is set and the concurrency group key does not
+  include github.run_attempt, every manual re-run of a workflow is treated as a
+  duplicate of the original run (since run_id and ref are the same). The re-run
+  immediately cancels the still-executing original attempt, or the concurrency
+  group queues the re-run and cancels any pending run — which may be the active
+  original.
+
+  The run_id is stable across re-runs but run_attempt increments (1, 2, 3...).
+  Without run_attempt in the concurrency group key, GitHub has no way to
+  distinguish re-run attempt 2 from the still-running attempt 1.
+
+  This produces confusing CI failures: a developer clicks "Re-run jobs" on a
+  failed workflow and immediately sees the original (or the re-run itself)
+  cancelled by the concurrency system.
+fix: |
+  Include github.run_attempt in the concurrency group key so each attempt is
+  treated as a distinct slot. This allows re-runs to coexist with or cleanly
+  supersede the original without unexpected cancellations.
+fix_code:
+  - language: yaml
+    label: "Include run_attempt in concurrency group key"
+    code: |
+      # WRONG: re-runs and originals share the same concurrency slot
+      # concurrency:
+      #   group: ${{ github.workflow }}-${{ github.ref }}
+      #   cancel-in-progress: true
+
+      # CORRECT: each attempt gets its own slot, preventing cross-attempt cancellation
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}-${{ github.run_attempt }}
+        cancel-in-progress: true
+
+  - language: yaml
+    label: "Alternative: cancel-in-progress only for push/PR, not re-runs"
+    code: |
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        # Only cancel-in-progress for first attempt; re-runs are never cancelled
+        cancel-in-progress: ${{ github.run_attempt == 1 }}
+prevention:
+  - "Always include github.run_attempt in concurrency group keys when cancel-in-progress: true is set."
+  - "Test re-run behavior explicitly — concurrency cancellation bugs only surface when you manually re-run."
+  - "Consider using cancel-in-progress: ${{ github.run_attempt == 1 }} to preserve re-run integrity."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#concurrency"
+    label: "GitHub Actions: Concurrency syntax"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#github-context"
+    label: "GitHub Actions: github.run_attempt context"

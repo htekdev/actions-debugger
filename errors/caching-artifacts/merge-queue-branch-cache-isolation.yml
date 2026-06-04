@@ -1,0 +1,80 @@
+id: caching-artifacts-045
+title: "Merge queue (merge_group) runs cannot restore cache saved by pull_request runs"
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - merge-queue
+  - merge_group
+  - cache-isolation
+  - branch-scoping
+  - cache-miss
+patterns:
+  - regex: 'Cache not found for input keys'
+    flags: i
+  - regex: 'gh-readonly-queue'
+    flags: i
+error_messages:
+  - "Cache not found for input keys:"
+  - "No cache found for key: Linux-node-"
+root_cause: |
+  GitHub Actions caches are branch-scoped. When the merge_group trigger fires,
+  GitHub creates a temporary branch named
+  gh-readonly-queue/main/pr-<number>-<sha> with a fresh merge commit. This
+  temporary branch has no prior cache entries, so every cache lookup is a cache
+  miss — even if the identical hashFiles() key was successfully saved during the
+  preceding pull_request run on the feature branch.
+
+  Branch-scoped cache fallback rules allow access to the base branch (e.g., main)
+  but NOT to arbitrary feature branches. The gh-readonly-queue/* branch is treated
+  as a new branch with no cache history and no access to feature-branch caches.
+  Only caches saved directly to main (or the configured merge target) are accessible
+  in merge queue runs.
+
+  The result: CI times effectively double. The pull_request run warms the cache
+  but the merge queue run cannot use it and must rebuild from scratch.
+fix: |
+  Seed caches on the base branch via push-triggered or scheduled workflows so
+  merge queue runs can restore from main's cache. Use restore-keys with a
+  branch-agnostic prefix to maximize fallback hit rate.
+fix_code:
+  - language: yaml
+    label: "Use restore-keys for base branch fallback"
+    code: |
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          # Exact key includes lock file hash — works for push/PR
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          # restore-keys fall back to base branch cache (accessible in merge_group)
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+  - language: yaml
+    label: "Seed base branch cache via push workflow"
+    code: |
+      # Separate workflow to warm cache on main after every merge
+      on:
+        push:
+          branches: [main]
+
+      jobs:
+        warm-cache:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                node-version: '20'
+                cache: npm
+            - run: npm ci
+prevention:
+  - "Seed caches on your base branch (main) so merge queue runs can restore from it."
+  - "Use branch-agnostic restore-keys prefixes — they survive the gh-readonly-queue/* branch context."
+  - "Avoid cache keys that include branch name or github.head_ref — they will never match in merge queue."
+  - "setup-node/setup-python cache: integration automatically includes restore-keys and handles this gracefully."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#merge_group"
+    label: "GitHub Actions: merge_group trigger"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows#restrictions-for-accessing-a-cache"
+    label: "GitHub Actions: Cache branch access restrictions"
