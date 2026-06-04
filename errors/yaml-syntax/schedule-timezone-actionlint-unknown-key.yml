@@ -1,0 +1,135 @@
+id: yaml-syntax-046
+title: 'on.schedule timezone field causes actionlint and third-party parsers to report "expected cron key" syntax error'
+category: yaml-syntax
+severity: warning
+tags:
+  - schedule
+  - cron
+  - timezone
+  - actionlint
+  - linting
+  - scorecard-action
+patterns:
+  - regex: 'expected "cron" key for element of "schedule" section but got "timezone"'
+    flags: 'i'
+  - regex: 'unable to parse github workflow.*timezone'
+    flags: 'i'
+  - regex: 'workflow verification failed.*timezone.*syntax-check'
+    flags: 'i'
+  - regex: '\[syntax-check\].*timezone'
+    flags: 'i'
+error_messages:
+  - 'expected "cron" key for element of "schedule" section but got "timezone" [syntax-check]'
+  - 'error sending scorecard results to webapp: http response 400, status: 400 Bad Request, error: {"code":400,"message":"workflow verification failed: unable to parse github workflow: [:9:7: expected \"cron\" key for element of \"schedule\" section but got \"timezone\" [syntax-check]]"}'
+  - 'on.schedule[0]: unexpected key "timezone"'
+root_cause: |
+  GitHub Actions added IANA timezone support for scheduled workflows in March 2026
+  (announced in the Late March 2026 changelog). The new syntax allows specifying a timezone
+  alongside the cron expression:
+
+    on:
+      schedule:
+        - cron: '30 5 * * 1-5'
+          timezone: "America/New_York"
+
+  However, this feature was not immediately recognized by external workflow-parsing tools:
+
+  1. **actionlint** — The widely-used GitHub Actions linting tool (used in many CI pipelines
+     as a pre-commit or CI check) did not support the timezone key until version 0.7.4
+     (released March 30, 2026). Earlier versions report the error:
+       expected "cron" key for element of "schedule" section but got "timezone" [syntax-check]
+     This causes actionlint-based CI checks to fail even though the workflow is valid.
+
+  2. **ossf/scorecard-action** — The OpenSSF Scorecard action verifies workflow structure
+     using an internal parser that did not recognize the timezone key. When scorecard-action
+     runs on a workflow that contains `timezone:`, it returns HTTP 400 from the Scorecard API:
+       workflow verification failed: unable to parse github workflow: [...timezone [syntax-check]]
+     This causes the scorecard CI job to fail on otherwise-valid workflows.
+
+  3. **GitHub VS Code extension** — The vscode-github-actions extension (v0.29.1 and earlier)
+     marks timezone as an "unexpected value" in the schema validation overlay, producing
+     squiggly underlines even though the workflow runs correctly.
+
+  The root issue is that the new timezone key was added to GitHub's workflow syntax faster
+  than third-party tooling could update their schema definitions.
+fix: |
+  Upgrade the affected tools to versions that support the timezone key:
+
+  1. **actionlint**: Upgrade to version 0.7.4 or later. Pin the actionlint version in your
+     CI workflow to avoid surprise failures on future schema changes.
+
+  2. **ossf/scorecard-action**: Upgrade to the latest version. The Scorecard API was updated
+     to recognize the timezone key. If you cannot upgrade, temporarily remove the timezone
+     field from your schedule — or use the @latest tag to stay on the most recent release.
+
+  3. **GitHub VS Code extension**: Upgrade to the latest version from the VS Code marketplace.
+     The false-positive schema warning has no runtime effect and does not affect workflow
+     execution.
+
+  If you are blocked from upgrading tools (e.g., in a corporate environment), you can work
+  around the linting error by keeping the cron in UTC and removing the timezone field,
+  adjusting the cron expression offset manually for the desired local time.
+fix_code:
+  - language: yaml
+    label: 'Pin actionlint to v0.7.4+ in CI to support the timezone key'
+    code: |
+      jobs:
+        lint:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            # Pin actionlint to v0.7.4+ which supports timezone in on.schedule
+            - name: Lint GitHub Actions workflows
+              uses: rhysd/actionlint@v0.7.4
+              with:
+                shellcheck: 'false'
+
+  - language: yaml
+    label: 'Valid on.schedule with timezone (requires actionlint 0.7.4+ and updated scorecard-action)'
+    code: |
+      on:
+        schedule:
+          # Run at 9 AM Eastern (UTC-5 in winter, UTC-4 in summer)
+          # With timezone support: specify local time directly
+          - cron: '0 9 * * 1-5'
+            timezone: "America/New_York"
+
+      jobs:
+        scheduled-job:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: echo "Running at 9 AM Eastern"
+
+  - language: yaml
+    label: 'Workaround — use UTC offset in cron expression (no timezone key, works with all tool versions)'
+    code: |
+      on:
+        schedule:
+          # 9 AM Eastern Standard Time = 14:00 UTC (winter)
+          # Adjust manually for DST when needed
+          - cron: '0 14 * * 1-5'
+
+      jobs:
+        scheduled-job:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: echo "Running at approximately 9 AM Eastern"
+prevention:
+  - 'When adopting new GitHub Actions syntax features, check that your CI linting tools (actionlint, mega-linter, super-linter) support the new key before adding it to workflows'
+  - 'Pin actionlint to a specific version in CI and bump intentionally — use rhysd/actionlint@v0.7.4 or later for timezone support'
+  - 'The vscode-github-actions extension schema squiggly-underline for "timezone" is cosmetic only — the workflow runs correctly on GitHub regardless'
+  - 'If using ossf/scorecard-action, always pin to a tagged release rather than @main to avoid unexpected parser failures from scorecard API schema changes'
+docs:
+  - url: 'https://github.blog/changelog/2026-03-19-github-actions-late-march-2026-updates/#github-actions-timezone-support-for-scheduled-workflows'
+    label: 'GitHub Changelog: Timezone support for scheduled workflows (March 2026)'
+  - url: 'https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onschedule'
+    label: 'GitHub Docs: on.schedule syntax including timezone field'
+  - url: 'https://github.com/rhysd/actionlint/issues/638'
+    label: 'actionlint #638 — Add support for timezone for schedule triggers (13 reactions, fixed in 0.7.4)'
+  - url: 'https://github.com/ossf/scorecard-action/issues/1645'
+    label: 'scorecard-action #1645 — Upload fails if schedule:timezone is used in a workflow'
+  - url: 'https://github.com/github/vscode-github-actions/issues/577'
+    label: 'vscode-github-actions #577 — schedule timezone marked as unknown in VS Code extension'
