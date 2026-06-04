@@ -1,0 +1,105 @@
+id: silent-failures-056
+title: "'continue-on-error: true' makes a failed job report success in required status checks"
+category: silent-failures
+severity: silent-failure
+tags:
+  - continue-on-error
+  - required-status-checks
+  - branch-protection
+  - checks-api
+  - silent
+  - branch-protection-bypass
+patterns:
+  - regex: 'continue-on-error:\s*true'
+    flags: i
+error_messages:
+  - "Job succeeded (continue-on-error)"
+  - "Required status check passed (job actually failed but continue-on-error: true)"
+root_cause: |
+  When a job has continue-on-error: true set, GitHub Actions converts the job's conclusion
+  from failure to success before writing the result to the Checks API. The branch
+  protection system only sees the API-level conclusion — which is "success" — and allows
+  the pull request to merge.
+
+  The job timeline in the GitHub UI shows a yellow icon with "(Cancelled)" or similar
+  wording, but the Checks API and branch protection treat it as passed. Developers
+  relying on required status checks to enforce quality gates unknowingly lose that
+  protection for any job marked continue-on-error: true.
+
+  This is particularly dangerous on jobs that run security scans, license checks, or
+  integration tests where the team deliberately added them as required checks to block
+  broken or risky changes from merging.
+fix: |
+  Avoid using continue-on-error: true on jobs that are configured as required status
+  checks in branch protection rules. Instead, handle acceptable failure conditions
+  explicitly inside the job using if: steps.*.outcome == 'failure' logic.
+
+  If you need to always continue a workflow past a flaky or optional step but still
+  surface failures in status checks, use a separate sentinel job that:
+  1. Depends on the real job with needs:
+  2. Runs with if: always()
+  3. Fails explicitly if the upstream job failed
+
+  This pattern separates "keep the workflow running" from "record the real outcome".
+fix_code:
+  - language: yaml
+    label: "Problem: continue-on-error silently hides failures from status checks"
+    code: |
+      jobs:
+        security-scan:
+          runs-on: ubuntu-latest
+          continue-on-error: true   # DANGER: required status check will PASS even if scan fails
+          steps:
+            - name: Run security scan
+              run: ./run-scan.sh
+  - language: yaml
+    label: "Fix: use a sentinel job to preserve the real outcome"
+    code: |
+      jobs:
+        security-scan:
+          runs-on: ubuntu-latest
+          # No continue-on-error here
+          steps:
+            - name: Run security scan
+              run: ./run-scan.sh
+
+        # This is the job to set as the required status check
+        security-gate:
+          runs-on: ubuntu-latest
+          needs: [security-scan]
+          if: always()
+          steps:
+            - name: Check security scan result
+              if: needs.security-scan.result != 'success'
+              run: |
+                echo "Security scan did not pass (result: ${{ needs.security-scan.result }})"
+                exit 1
+  - language: yaml
+    label: "Alternative: handle acceptable failures inside the step, not the job"
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Run optional extended tests
+              id: extended
+              run: ./run-extended-tests.sh
+              continue-on-error: true   # Step-level is safer than job-level
+
+            - name: Fail job if extended tests failed unexpectedly
+              if: steps.extended.outcome == 'failure'
+              run: |
+                echo "Extended tests failed — blocking merge"
+                exit 1
+prevention:
+  - "Never set continue-on-error: true at the job level for jobs that are required status checks"
+  - "Use continue-on-error: true at the step level instead — it does not affect the Checks API job conclusion"
+  - "Audit your branch protection required checks against all jobs that have continue-on-error: true"
+  - "Use the sentinel job pattern to separate workflow continuation from status reporting"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idcontinue-on-error"
+    label: "GitHub Docs: continue-on-error syntax"
+  - url: "https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-status-checks-before-merging"
+    label: "GitHub Docs: Required status checks before merging"
+  - url: "https://docs.github.com/en/rest/checks/runs"
+    label: "GitHub REST API: Checks runs"
