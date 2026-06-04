@@ -1,0 +1,93 @@
+id: silent-failures-069
+title: 'workflow_call: caller env vars not forwarded to reusable workflow — silently unavailable'
+category: silent-failures
+severity: silent-failure
+tags:
+  - reusable-workflow
+  - workflow_call
+  - env-context
+  - caller-env
+  - inputs
+  - environment-variables
+patterns:
+  - regex: 'env\.\w+ is not defined'
+    flags: 'i'
+  - regex: '\$\{\{\s*env\.\w+\s*\}\}\s*$'
+    flags: 'im'
+error_messages:
+  - "env.API_URL is not defined"
+  - "The template is not valid. .github/workflows/deploy.yml: env.BASE_URL is not defined"
+root_cause: |
+  GitHub Actions reusable workflows (on.workflow_call) run in a completely isolated environment.
+  The caller workflow's env: context — whether defined at the top-level workflow scope or at the
+  calling job scope — is NOT automatically forwarded to the called reusable workflow.
+
+  Only two mechanisms exist for passing data into a reusable workflow:
+  - inputs: (on.workflow_call.inputs) for plain values
+  - secrets: (on.workflow_call.secrets) for sensitive values
+
+  A common mistake is defining env: vars at the caller workflow level and assuming they will be
+  visible inside the reusable workflow. They are not. The called workflow has its own empty env:
+  context (unless vars.* or env: is set within the reusable workflow itself).
+
+  Example that breaks silently:
+  - Caller sets: env: { API_URL: 'https://api.example.com' }
+  - Caller calls: uses: ./.github/workflows/deploy.yml
+  - Inside deploy.yml: run: curl ${{ env.API_URL }}  # evaluates to empty string, no error
+fix: |
+  Pass values explicitly via the inputs: mechanism on the reusable workflow call.
+  Define the input on on.workflow_call.inputs and reference it as inputs.<name> inside the
+  called workflow.
+
+  If many env vars need forwarding, consider using a JSON-encoded input and fromJSON() inside
+  the called workflow, or use repository variables (vars.*) which are available in all workflows.
+fix_code:
+  - language: yaml
+    label: 'Pass caller env var as explicit input to reusable workflow'
+    code: |
+      # Caller workflow
+      jobs:
+        deploy:
+          uses: ./.github/workflows/deploy.yml
+          with:
+            api_url: ${{ vars.API_URL }}   # or hardcoded value
+          secrets: inherit
+
+      # Reusable workflow: .github/workflows/deploy.yml
+      on:
+        workflow_call:
+          inputs:
+            api_url:
+              required: true
+              type: string
+
+      jobs:
+        run:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Deploy
+              run: curl ${{ inputs.api_url }}
+
+  - language: yaml
+    label: 'Use repository variables (vars.*) accessible in all workflows'
+    code: |
+      # Set API_URL as a repository variable in Settings → Secrets and variables → Actions → Variables
+      # Then reference it in the reusable workflow directly:
+      jobs:
+        run:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Deploy
+              run: curl ${{ vars.API_URL }}
+prevention:
+  - 'Never rely on env: vars defined in a caller workflow being available inside a reusable workflow — they are not forwarded'
+  - 'Declare all cross-workflow values as on.workflow_call.inputs or on.workflow_call.secrets'
+  - 'Use repository/org-level variables (vars.*) for configuration that many workflows need without explicit passing'
+  - 'Run actionlint on caller and callee separately — it will flag undefined env references in reusable workflows'
+docs:
+  - url: 'https://docs.github.com/en/actions/sharing-automations/reusing-workflows#passing-inputs-and-secrets-to-a-reusable-workflow'
+    label: 'Passing inputs and secrets to a reusable workflow'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/store-information-in-variables#using-the-vars-context-to-access-configuration-variable-values'
+    label: 'Using repository variables with the vars context'
+  - url: 'https://github.com/orgs/community/discussions/26671'
+    label: 'GitHub Community: env vars not accessible in reusable workflows'
