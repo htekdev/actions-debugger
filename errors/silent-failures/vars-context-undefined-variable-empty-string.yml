@@ -1,0 +1,84 @@
+id: silent-failures-073
+title: "vars. Context Returns Empty String for Undefined Organization or Repository Variables — No Error Raised"
+category: silent-failures
+severity: silent-failure
+tags:
+  - vars
+  - configuration-variables
+  - context
+  - empty-string
+  - organization
+  - repository
+patterns:
+  - regex: 'vars\.[A-Z_][A-Z0-9_]* (?:is empty|not set|missing|undefined|not defined)'
+    flags: 'i'
+error_messages:
+  - "Error: REGISTRY_URL is empty — check that vars.REGISTRY_URL is defined in repository variables"
+  - "Error: docker tag '' is not valid"
+  - "fatal: repository '' does not exist"
+root_cause: |
+  GitHub Actions configuration variables (the `vars` context, introduced 2023) provide a
+  non-secret key/value store at the organization, repository, or environment level. When
+  a `${{ vars.MY_VARIABLE }}` expression references a variable that has not been defined
+  at any applicable scope, the expression evaluates to `""` (empty string) without
+  raising any error, warning, or annotation in the Actions run UI.
+
+  Unlike missing secrets (which also silently return empty string), `vars` variables are
+  user-visible and frequently forgotten when:
+  1. A workflow is used in a new repository that hasn't had its variables configured.
+  2. A variable is defined at the repository level but the job targets an environment
+     that doesn't inherit repo-level variables (environment-scoped variables override
+     but do not merge with repo-scoped variables of the same name).
+  3. A variable is defined only at the organization level but the repository is
+     a fork — forked repositories cannot access parent org variables.
+  4. The variable name has a typo in the workflow file.
+
+  Silent empty values cascade into confusing downstream errors: Docker tags become `":latest"`
+  instead of `"ghcr.io/org/image:latest"`, API endpoints receive empty base URLs, and
+  notification webhooks silently fail with HTTP 400.
+
+  Environment-scoped variables are ONLY available when the job specifies `environment:`.
+  If a job has no `environment:` key, env-scoped variables are not available even if
+  the env-scoped variable has the same name as a repo-scoped variable.
+fix: |
+  Use the `||` fallback operator to provide safe defaults, and add an explicit
+  validation step for variables that are required for the workflow to succeed.
+fix_code:
+  - language: yaml
+    label: "Use || fallback for optional vars"
+    code: |
+      env:
+        REGISTRY: ${{ vars.REGISTRY_URL || 'ghcr.io' }}
+        LOG_LEVEL: ${{ vars.LOG_LEVEL || 'info' }}
+        API_BASE: ${{ vars.API_BASE_URL || 'https://api.example.com' }}
+  - language: yaml
+    label: "Validate required vars at workflow start with fail-fast"
+    code: |
+      jobs:
+        preflight:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Validate required configuration variables
+              env:
+                REGISTRY_URL: ${{ vars.REGISTRY_URL }}
+                DEPLOY_ENV: ${{ vars.DEPLOY_ENV }}
+              run: |
+                missing=()
+                [ -z "$REGISTRY_URL" ] && missing+=("vars.REGISTRY_URL")
+                [ -z "$DEPLOY_ENV" ]   && missing+=("vars.DEPLOY_ENV")
+                if [ ${#missing[@]} -gt 0 ]; then
+                  echo "::error::Missing required variables: ${missing[*]}"
+                  echo "Set them at: Settings → Secrets and Variables → Variables"
+                  exit 1
+                fi
+prevention:
+  - "Document all required `vars.*` variables in the repository README or CONTRIBUTING guide — unlike required inputs, they have no built-in validation."
+  - "Add a preflight validation job that checks for required variables and fails immediately with a clear error message."
+  - "Use `${{ vars.SETTING || 'sensible-default' }}` consistently to make empty-variable behavior explicit."
+  - "For environment-scoped variables, ensure the job specifies `environment:` — variables defined only on an environment are not available to jobs that omit the environment key."
+  - "Use repository variable naming conventions (UPPER_SNAKE_CASE) and check for typos in workflow YAML against the variables defined in Settings."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/store-information-in-variables"
+    label: "GitHub Actions: configuration variables (vars context)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#vars-context"
+    label: "vars context reference"

@@ -1,0 +1,96 @@
+id: silent-failures-072
+title: "inputs Context Empty on Non-Dispatch Events — Multi-Trigger Workflows Leave inputs.* as Empty String"
+category: silent-failures
+severity: silent-failure
+tags:
+  - inputs
+  - workflow-dispatch
+  - push
+  - multi-trigger
+  - context
+  - empty-string
+patterns:
+  - regex: 'inputs\.[a-zA-Z_][a-zA-Z0-9_-]* (?:is empty|not set|undefined|was null)'
+    flags: 'i'
+error_messages:
+  - "Deploy target is empty — expected inputs.environment to be non-empty"
+  - "Error: Input required and not supplied: environment"
+root_cause: |
+  The `inputs` context in GitHub Actions is ONLY populated when a workflow is triggered
+  by a `workflow_dispatch` or `workflow_call` event. When the same workflow is triggered
+  by any other event — push, pull_request, schedule, release, workflow_run, etc. — the
+  entire `inputs` context is empty. Every `${{ inputs.anything }}` expression evaluates
+  to `""` (empty string) without raising an error or printing a warning.
+
+  This commonly affects developers who:
+  1. Add `on: workflow_dispatch` with inputs to an existing push-triggered workflow
+     to enable manual override capability.
+  2. Reference `${{ inputs.environment }}` or `${{ inputs.deploy_target }}` in `run:`
+     steps, `with:` parameters, or `env:` blocks — expecting a sensible default when
+     triggered automatically by push.
+  3. Use `if: inputs.skip_tests == 'true'` — on push events this is effectively
+     `if: '' == 'true'` which evaluates to false silently.
+  4. Pass `${{ inputs.version }}` to an action's `with: version:` parameter — the
+     action receives an empty string and may silently use its own default or fail
+     with an opaque "invalid version" message.
+
+  The `inputs` context is distinct from `github.event.inputs` (legacy alias, same
+  empty behavior on non-dispatch events) and from the `vars` context (org/repo
+  configuration variables which are always populated).
+fix: |
+  Use the `||` fallback operator to provide defaults for all inputs in workflows
+  that support multiple triggers. This guarantees non-dispatch triggers receive
+  a sensible default instead of an empty string.
+
+  Guard dispatch-only logic blocks with `if: github.event_name == 'workflow_dispatch'`
+  to explicitly skip input-dependent steps on automated trigger runs.
+fix_code:
+  - language: yaml
+    label: "Provide fallback defaults for all inputs in multi-event workflows"
+    code: |
+      on:
+        push:
+          branches: [main]
+        workflow_dispatch:
+          inputs:
+            environment:
+              type: choice
+              options: [staging, production]
+              default: staging
+            skip_tests:
+              type: boolean
+              default: false
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          env:
+            # Use || to fall back to defaults when triggered by push
+            DEPLOY_ENV: ${{ inputs.environment || 'staging' }}
+            SKIP_TESTS: ${{ inputs.skip_tests || 'false' }}
+          steps:
+            - name: Deploy
+              run: echo "Deploying to $DEPLOY_ENV (skip_tests=$SKIP_TESTS)"
+  - language: yaml
+    label: "Guard input-dependent logic with event_name check"
+    code: |
+      steps:
+        - name: Apply manual override (dispatch only)
+          if: github.event_name == 'workflow_dispatch'
+          run: echo "Manual dispatch with environment=${{ inputs.environment }}"
+
+        - name: Default automated deploy
+          if: github.event_name != 'workflow_dispatch'
+          run: echo "Automated push deploy to staging"
+prevention:
+  - "Always use `${{ inputs.param || 'default' }}` when a workflow supports more than one trigger — never assume inputs will be populated."
+  - "Log `github.event_name` at the start of the workflow to trace which trigger fired and aid debugging of empty-input behavior."
+  - "Use the 'Context availability' table in GitHub Actions documentation to verify which contexts are populated for each event type before referencing them."
+  - "Consider splitting dispatch workflows (with inputs) from automated trigger workflows — combining both in one file with shared input-referencing code is a common source of subtle bugs."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#inputs-context"
+    label: "GitHub Actions: inputs context"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_dispatch"
+    label: "workflow_dispatch event"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#context-availability"
+    label: "Context availability by event type"

@@ -1,0 +1,117 @@
+id: runner-environment-139
+title: "Binaries Built on ubuntu-24.04 Require GLIBC 2.39 — Fail to Execute on ubuntu-22.04 Targets"
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-24.04
+  - ubuntu-latest
+  - glibc
+  - binary-compatibility
+  - linker
+  - distribution
+patterns:
+  - regex: 'version ''GLIBC_2\.3[6-9]'' not found'
+    flags: 'i'
+  - regex: 'libc\.so\.[0-9]+: version ''GLIBC_'
+    flags: 'i'
+  - regex: 'GLIBC_2\.3[6-9] not found \(required by'
+    flags: 'i'
+error_messages:
+  - "/lib/x86_64-linux-gnu/libc.so.6: version 'GLIBC_2.38' not found (required by ./myapp)"
+  - "/lib/x86_64-linux-gnu/libc.so.6: version 'GLIBC_2.39' not found (required by ./myapp)"
+  - "GLIBC_2.39 not found (required by /usr/local/bin/app)"
+  - "version 'GLIBC_2.38' not found"
+root_cause: |
+  GitHub Actions ubuntu-24.04 runners ship with GLIBC 2.39 (GNU C Library). When a
+  binary is compiled or dynamically linked on ubuntu-24.04, the resulting ELF binary
+  records minimum GLIBC version requirements based on the newest symbol version used —
+  either directly or via a linked shared library. If any symbol first introduced in
+  GLIBC 2.36–2.39 is referenced, the binary will fail to load on older systems.
+
+  GLIBC versions by runner image:
+  - ubuntu-20.04: GLIBC 2.31
+  - ubuntu-22.04: GLIBC 2.35
+  - ubuntu-24.04: GLIBC 2.39
+
+  This affects workflows that:
+  1. Build release binaries on ubuntu-latest (which resolved to ubuntu-24.04 in mid-2025)
+     and distribute them for Linux users on ubuntu-22.04 or older.
+  2. Produce binaries in one job on ubuntu-24.04 and run them in a matrix job on
+     ubuntu-22.04 — the artifact fails to execute in the older-runner job.
+  3. Build Docker images using ubuntu-24.04 as the build stage but target a
+     FROM ubuntu:22.04 or FROM debian:bookworm base image in the runtime stage.
+
+  The error only surfaces at execution time, not at compile or link time. The
+  binary appears healthy; only when it is actually run on the older system does
+  the dynamic linker report the missing GLIBC version.
+fix: |
+  Option 1 — Pin the build runner to the oldest supported OS:
+    Use ubuntu-22.04 as the build runner to ensure binaries link against GLIBC 2.35,
+    which is compatible with both ubuntu-22.04 and ubuntu-24.04 targets.
+
+  Option 2 — Build inside a container matching the target OS:
+    Use a Docker container (e.g., ubuntu:22.04) in the build job so the compiler
+    links against the correct GLIBC version regardless of the host runner.
+
+  Option 3 — Cross-compile with musl-libc (static, no GLIBC dependency):
+    For Rust, use the x86_64-unknown-linux-musl target. For C/C++, use musl-gcc or
+    musl-cross. The resulting binary has no GLIBC dependency and runs anywhere.
+
+  Option 4 — Verify GLIBC requirement in CI:
+    Add a validation step that runs objdump or readelf to assert the binary's
+    minimum GLIBC requirement before it reaches distribution.
+fix_code:
+  - language: yaml
+    label: "Pin build runner to ubuntu-22.04 for GLIBC 2.35 compatibility"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-22.04   # GLIBC 2.35 — compatible with ubuntu-22.04 targets
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build binary
+              run: cargo build --release
+            - uses: actions/upload-artifact@v4
+              with:
+                name: my-binary
+                path: target/release/myapp
+  - language: yaml
+    label: "Build inside a Docker container targeting ubuntu:22.04"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          container:
+            image: ubuntu:22.04
+          steps:
+            - name: Install build tools
+              run: |
+                apt-get update
+                apt-get install -y build-essential curl
+            - uses: actions/checkout@v4
+            - name: Build binary
+              run: make release
+  - language: yaml
+    label: "Rust: build static binary with musl (no GLIBC dependency)"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Add musl target
+              run: rustup target add x86_64-unknown-linux-musl
+            - name: Build static binary
+              run: cargo build --release --target x86_64-unknown-linux-musl
+prevention:
+  - "Pin the build runner to the oldest Linux OS your users run when distributing compiled binaries."
+  - "Test binary artifacts in a matrix that includes the oldest supported runner (ubuntu-22.04) as a separate job."
+  - "Use `objdump -T myapp | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1` to check the minimum GLIBC version before release."
+  - "For maximum portability, use musl-libc or static linking to eliminate the GLIBC runtime dependency entirely."
+docs:
+  - url: "https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners"
+    label: "GitHub-hosted runners: available images"
+  - url: "https://wiki.ubuntu.com/Releases"
+    label: "Ubuntu release versions and GLIBC versions"
+  - url: "https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2404-Readme.md"
+    label: "ubuntu-24.04 runner image readme"
