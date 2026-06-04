@@ -1,0 +1,111 @@
+id: triggers-057
+title: "on.schedule ignores paths: filter — scheduled workflows always run"
+category: triggers
+severity: silent-failure
+tags:
+  - schedule
+  - paths
+  - cron
+  - trigger
+  - filter
+  - paths-ignore
+patterns:
+  - regex: 'schedule.*paths:|paths:.*cron:'
+    flags: 'si'
+error_messages:
+  - "Scheduled workflow runs even when no matching files changed"
+  - "paths: filter has no effect on scheduled events"
+root_cause: |
+  The `paths:` and `paths-ignore:` filters are only evaluated for `push` and `pull_request`
+  events, where GitHub can compare the changed files in the triggering commit against the
+  filter patterns. `on.schedule` events are time-based and have no associated commit or
+  changeset — there are no paths to compare. GitHub silently ignores any `paths:` or
+  `paths-ignore:` configuration placed under a `schedule:` trigger.
+
+  This commonly happens when a developer copies a `push:` trigger block that includes
+  `paths:` filtering and applies it to a `schedule:` block expecting the same filtering
+  behavior. The workflow runs on every scheduled interval regardless of what files have
+  changed. The `paths:` keys are not flagged as invalid — they are simply ignored without
+  any warning in the workflow or run logs.
+fix: |
+  Remove `paths:` and `paths-ignore:` from `on.schedule:` blocks — they have no effect.
+
+  If you need the scheduled workflow to skip execution when certain conditions are not
+  met, implement gate logic inside the workflow:
+
+  - Use an early job that checks file modification times or an external flag and sets
+    an output. Downstream jobs use `if: needs.check.outputs.should_run == 'true'`.
+  - Use the `dorny/paths-filter` action to detect file changes since a known reference
+    (e.g., the last successful run's commit SHA stored in a cache or artifact).
+  - If the schedule purpose is unrelated to file changes (e.g., dependency audits,
+    health checks), no conditional gate is needed — let it run on schedule.
+fix_code:
+  - language: yaml
+    label: "Wrong — paths: under schedule: is silently ignored"
+    code: |
+      on:
+        schedule:
+          - cron: '0 2 * * *'
+        paths:               # silently ignored — schedule always runs
+          - 'src/**'
+          - 'package.json'
+        push:
+          branches: [main]
+          paths:             # this paths: applies only to the push: trigger
+            - 'src/**'
+            - 'package.json'
+  - language: yaml
+    label: "Correct — paths: filter on push only; schedule unconditional or gated in-workflow"
+    code: |
+      on:
+        schedule:
+          - cron: '0 2 * * *'    # no paths: here — schedule always runs
+        push:
+          branches: [main]
+          paths:                  # paths: filter applies to push trigger only
+            - 'src/**'
+            - 'package.json'
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm run build
+
+      # To conditionally skip a scheduled run, use an in-workflow gate:
+      # jobs:
+      #   check-changes:
+      #     runs-on: ubuntu-latest
+      #     outputs:
+      #       changed: ${{ steps.filter.outputs.src }}
+      #     steps:
+      #       - uses: actions/checkout@v4
+      #         with:
+      #           fetch-depth: 2
+      #       - uses: dorny/paths-filter@v3
+      #         id: filter
+      #         with:
+      #           filters: |
+      #             src:
+      #               - 'src/**'
+      #
+      #   build:
+      #     needs: check-changes
+      #     if: needs.check-changes.outputs.changed == 'true' || github.event_name == 'push'
+      #     runs-on: ubuntu-latest
+      #     steps:
+      #       - uses: actions/checkout@v4
+      #       - run: npm run build
+prevention:
+  - "Only use paths: and paths-ignore: under push: and pull_request: trigger blocks"
+  - "Verify which filters apply to which events using the GitHub Actions syntax reference"
+  - "actionlint reports a warning when paths: is used under schedule: — run it in CI"
+  - "For scheduled conditional logic, gate using job if: conditions on in-workflow checks"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#onpushpull_requestpull_request_targetpaths"
+    label: "Workflow syntax: paths filter (applies to push and pull_request only)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#schedule"
+    label: "Events that trigger workflows: schedule"
+  - url: "https://github.com/dorny/paths-filter"
+    label: "dorny/paths-filter — detect file changes inside a scheduled workflow"

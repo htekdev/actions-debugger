@@ -1,0 +1,101 @@
+id: known-unsolved-049
+title: "workflow_dispatch REST API dispatch returns 204 No Content — triggered run_id unavailable"
+category: known-unsolved
+severity: limitation
+tags:
+  - workflow_dispatch
+  - rest-api
+  - run-id
+  - polling
+  - automation
+  - cd-pipeline
+patterns:
+  - regex: 'POST.*dispatches.*204|dispatches.*No Content'
+    flags: 'i'
+error_messages:
+  - "204 No Content"
+  - "Unable to correlate triggered workflow run"
+  - "no run_id in dispatch response"
+root_cause: |
+  The GitHub Actions REST API endpoint
+  `POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches`
+  always returns HTTP 204 No Content on success — there is no run_id or any identifier
+  in the response body. GitHub creates the workflow run asynchronously after the API call
+  returns, so the run may not exist in the system for several seconds. There is no built-in
+  way to correlate a `workflow_dispatch` API call to the resulting run_id.
+
+  This is a persistent limitation reported since 2020 on the GitHub feedback forum with
+  thousands of upvotes. Developers building CD pipelines that need to trigger a workflow
+  and then monitor or gate on its result are forced to use fragile polling heuristics.
+fix: |
+  No direct fix — this is a GitHub platform limitation. Use one of these workarounds:
+
+  1. **Inject a correlation ID via inputs**: Pass a unique value (e.g., UUID) as a
+     `workflow_dispatch` input. After dispatch, poll `GET /repos/.../actions/runs?event=workflow_dispatch&branch=<branch>`
+     and match runs whose `inputs` contain the correlation ID.
+
+  2. **Use workflow_run event callback**: Design the triggered workflow to complete and
+     then fire a `workflow_run` event that your orchestrating workflow listens for.
+
+  3. **Switch to repository_dispatch**: `repository_dispatch` with a unique `client_payload`
+     field lets you include a correlation ID. The triggered workflow can write it to an artifact
+     or output for later retrieval.
+
+  4. **Third-party action**: Use `peter-evans/workflow-dispatch@v3` which implements polling
+     heuristics to approximate the run_id after dispatch.
+fix_code:
+  - language: yaml
+    label: "Inject correlation ID via workflow_dispatch input — then poll to find run"
+    code: |
+      # Triggering workflow or script passes a unique correlation ID:
+      # POST /repos/{owner}/{repo}/actions/workflows/deploy.yml/dispatches
+      # { "ref": "main", "inputs": { "correlation_id": "abc-123-uuid" } }
+
+      # Triggered workflow (deploy.yml) writes ID to output artifact:
+      on:
+        workflow_dispatch:
+          inputs:
+            correlation_id:
+              description: 'Unique ID for run correlation'
+              required: false
+              default: ''
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "run_id=${{ github.run_id }}" >> correlation.txt
+            - uses: actions/upload-artifact@v4
+              with:
+                name: correlation-${{ inputs.correlation_id }}
+                path: correlation.txt
+  - language: yaml
+    label: "Use repository_dispatch with client_payload for reliable correlation"
+    code: |
+      # Trigger with unique client_payload via API:
+      # POST /repos/{owner}/{repo}/dispatches
+      # { "event_type": "deploy", "client_payload": { "job_id": "build-789" } }
+
+      on:
+        repository_dispatch:
+          types: [deploy]
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - run: |
+                echo "Triggered by job: ${{ github.event.client_payload.job_id }}"
+                echo "This run ID: ${{ github.run_id }}"
+prevention:
+  - "Design CD pipelines using workflow_run event callbacks instead of polling after dispatch"
+  - "Include a unique correlation_id input in all workflow_dispatch-triggered workflows"
+  - "Track the GitHub public roadmap — run_id in dispatch response is a long-requested feature"
+  - "Consider repository_dispatch for machine-to-machine triggers needing reliable correlation"
+docs:
+  - url: "https://docs.github.com/en/rest/actions/workflows?apiVersion=2022-11-28#create-a-workflow-dispatch-event"
+    label: "REST API: Create a workflow dispatch event (returns 204 No Content)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run"
+    label: "workflow_run event — callback pattern for monitoring triggered workflows"
+  - url: "https://github.com/peter-evans/workflow-dispatch"
+    label: "peter-evans/workflow-dispatch — community action with polling heuristics"
