@@ -1,0 +1,115 @@
+id: yaml-syntax-039
+title: "'type: choice' not supported for workflow_call inputs — validation error when combining with workflow_dispatch"
+category: yaml-syntax
+severity: error
+tags:
+  - workflow_call
+  - workflow_dispatch
+  - inputs
+  - type-choice
+  - validation
+  - combined-triggers
+patterns:
+  - regex: 'Input type .choice. is not supported'
+    flags: i
+  - regex: 'Unexpected value .choice.'
+    flags: i
+  - regex: 'Invalid workflow file.*type.*choice'
+    flags: i
+error_messages:
+  - "Invalid workflow file: Input type 'choice' is not supported for workflow_call triggers. Allowed types: boolean, number, string"
+  - "Unexpected value 'choice', expected one of: boolean, number, string"
+  - "Invalid value for inputs.*.type: 'choice'"
+root_cause: |
+  GitHub Actions supports different input types depending on the trigger:
+  - workflow_dispatch supports: boolean, choice, environment, number, string
+  - workflow_call supports only: boolean, number, string
+
+  When developers combine both triggers in the same workflow file (a common pattern for
+  workflows that can be called by other workflows AND dispatched manually), they define a
+  shared inputs: block. If those shared inputs use type: choice — valid for workflow_dispatch
+  but not workflow_call — the workflow fails schema validation with a cryptic error.
+
+  The error message does not always clearly indicate which trigger is rejecting the type,
+  causing developers to search for choice support across GitHub Actions documentation rather
+  than recognising it as a trigger-specific limitation. The same restriction applies to
+  type: environment.
+fix: |
+  For inputs shared between workflow_dispatch and workflow_call, use type: string and
+  document the allowed values in the description field. The GitHub UI renders a free-text
+  field for manual dispatch instead of a dropdown, but callers still pass controlled values.
+
+  For strict input validation, add a shell step at the start of the job that fails if the
+  input value is not in the allowed set.
+
+  If the dropdown UI is essential for manual dispatch, create a thin dispatcher workflow
+  (workflow_dispatch only with type: choice) that calls the main reusable workflow passing
+  the validated value as a string.
+fix_code:
+  - language: yaml
+    label: "Problem: type: choice breaks workflow_call validation"
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            environment:
+              type: choice           # Valid for workflow_dispatch only
+              options: [dev, staging, prod]
+        workflow_call:
+          inputs:
+            environment:
+              type: choice           # INVALID for workflow_call — causes validation error
+  - language: yaml
+    label: "Fix: use type: string with documented allowed values"
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            environment:
+              type: string
+              description: "Target environment. Allowed values: dev, staging, prod"
+              default: dev
+        workflow_call:
+          inputs:
+            environment:
+              type: string
+              description: "Target environment. Allowed values: dev, staging, prod"
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Validate environment input
+              run: |
+                case "${{ inputs.environment }}" in
+                  dev|staging|prod) echo "Environment: ${{ inputs.environment }}" ;;
+                  *) echo "Invalid environment: ${{ inputs.environment }}"; exit 1 ;;
+                esac
+  - language: yaml
+    label: "Alternative: dispatcher wrapper preserves dropdown UI for manual runs"
+    code: |
+      # dispatcher.yml — manual dispatch wrapper with choice dropdown
+      on:
+        workflow_dispatch:
+          inputs:
+            environment:
+              type: choice
+              options: [dev, staging, prod]
+
+      jobs:
+        dispatch:
+          uses: ./.github/workflows/deploy.yml    # calls the reusable workflow
+          with:
+            environment: ${{ inputs.environment }}  # passes as string
+prevention:
+  - "workflow_call inputs support only: boolean, number, string — not choice or environment"
+  - "Use type: string with a description listing allowed values when an input is shared across both triggers"
+  - "Add input validation as the first job step to fail fast when an unexpected value is passed via workflow_call"
+  - "Run actionlint locally before pushing — it catches unsupported input types at development time"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#onworkflow_callinputs"
+    label: "GitHub Docs: on.workflow_call.inputs syntax"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#onworkflow_dispatchinputs"
+    label: "GitHub Docs: on.workflow_dispatch.inputs syntax"
+  - url: "https://rhysd.github.io/actionlint/"
+    label: "actionlint: static checker for GitHub Actions workflow files"
