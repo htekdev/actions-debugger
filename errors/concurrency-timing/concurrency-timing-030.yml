@@ -1,0 +1,102 @@
+id: concurrency-timing-030
+title: 'github.sha concurrency group key makes every run unique — cancel-in-progress never fires'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - cancel-in-progress
+  - github-sha
+  - unique-key
+  - workflow-cancellation
+  - silent-failure
+patterns:
+  - regex: 'group:\s*.*\$\{\{[^}]*github\.sha[^}]*\}\}'
+    flags: 'i'
+  - regex: 'cancel-in-progress:\s*true'
+    flags: 'i'
+error_messages:
+  - 'Old workflow runs are not being cancelled despite cancel-in-progress: true'
+  - 'All workflow runs queue independently instead of cancelling previous runs'
+  - 'Concurrent workflows are running in parallel when they should be cancelled'
+root_cause: |
+  github.sha is unique per commit. When used as (any part of) the concurrency group
+  key, every workflow run gets a different group name. Because no two runs ever share
+  the same group, the cancel-in-progress mechanism has nothing to act on — all runs
+  proceed independently and simultaneously.
+
+  This is the inverse of the intended behavior. Developers add ${{ github.sha }}
+  thinking "this will identify runs for the same commit and cancel old ones," but
+  since each commit produces a unique SHA, each run is placed in its own group with
+  no overlap. The result is effectively no concurrency control at all.
+
+  Common mistake patterns:
+    group: ${{ github.workflow }}-${{ github.sha }}        # unique per commit — never cancels
+    group: ${{ github.ref }}-${{ github.sha }}             # unique per commit — never cancels
+    group: deploy-${{ github.sha }}                        # unique per commit — never cancels
+
+  The correct key for "cancel older runs on the same branch" is a value that stays
+  constant across pushes to the same branch — github.ref, github.head_ref (for PRs),
+  or a composite like github.workflow-github.ref.
+
+  Source: Frequently reported on Stack Overflow [github-actions] tag and GitHub
+  Community discussions. GitHub Docs concurrency examples explicitly use github.ref,
+  not github.sha.
+fix: |
+  Replace github.sha with github.ref (or github.head_ref for pull request workflows)
+  in the concurrency group key. Use a composite that stays constant for all pushes
+  to the same branch:
+
+  - For branch workflows: ${{ github.workflow }}-${{ github.ref }}
+  - For PR workflows:     ${{ github.workflow }}-${{ github.head_ref }}
+  - For global uniqueness: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+
+  Only use github.sha in the group key when you explicitly want every run to be
+  isolated (e.g., no cancellation ever — but then cancel-in-progress: true is meaningless).
+fix_code:
+  - language: yaml
+    label: 'Wrong: github.sha makes every run unique — cancel-in-progress never fires'
+    code: |
+      # WRONG: every push creates a new unique group — nothing is ever cancelled
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.sha }}
+        cancel-in-progress: true   # dead code — no prior run shares this group
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+  - language: yaml
+    label: 'Correct: github.ref stays constant per branch — prior runs are cancelled'
+    code: |
+      # CORRECT: all pushes to the same branch share one group
+      # cancel-in-progress: true cancels any in-flight run when a new push arrives
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: true
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+  - language: yaml
+    label: 'PR-specific: use github.head_ref to scope to the PR branch'
+    code: |
+      # For pull_request workflows, head_ref is the PR branch name (stable per PR)
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+        cancel-in-progress: true
+prevention:
+  - 'Never use github.sha in a concurrency group key when the goal is to cancel old runs — it makes every run unique'
+  - 'For branch-scoped cancellation use github.ref; for PR-scoped cancellation use github.head_ref'
+  - 'If cancel-in-progress: true is set, verify the group key stays constant across multiple pushes to the same branch'
+  - 'Use actionlint to catch unreachable concurrency group patterns'
+  - 'Read the GitHub Docs concurrency examples — they all use github.ref, not github.sha'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs'
+    label: 'GitHub Docs: Controlling concurrency of workflows and jobs'
+  - url: 'https://stackoverflow.com/questions/66335225/how-to-cancel-previous-runs-in-the-pr-when-you-push-new-commitschanges'
+    label: 'Stack Overflow: How to cancel previous runs when you push new commits'
