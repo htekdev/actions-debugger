@@ -1,0 +1,103 @@
+id: runner-environment-142
+title: "macOS-15 Sequoia Removes system python and python2 Stubs — Command Not Found in Workflows"
+category: runner-environment
+severity: error
+tags:
+  - macos
+  - macos-15
+  - macos-latest
+  - python2
+  - python
+  - sequoia
+  - setup-python
+patterns:
+  - regex: 'python[23]?: command not found'
+    flags: 'i'
+  - regex: '/usr/bin/python.*[Nn]o such file'
+    flags: ''
+  - regex: 'xcrun: error:.*python.*not a developer tool'
+    flags: 'i'
+  - regex: 'env: python: No such file or directory'
+    flags: ''
+error_messages:
+  - "python: command not found"
+  - "python2: command not found"
+  - "/usr/bin/python: No such file or directory"
+  - "env: python: No such file or directory"
+  - "xcrun: error: unable to find utility 'python', not a developer tool or in PATH"
+root_cause: |
+  Apple removed all Python stubs from macOS in macOS 15 (Sequoia). On macOS 12 through 14,
+  running `python` or `python2` would show a dialog prompting users to install Command Line
+  Tools, but the stub binary was present in /usr/bin/python so the command was technically
+  found (it just exited non-zero in CI where dialogs are suppressed). macOS 15 removed
+  these stubs entirely — /usr/bin/python and /usr/bin/python2 no longer exist.
+
+  GitHub Actions macos-15 runners and macos-latest (which resolves to macos-15 on 2025+
+  runners) have no `python` or `python2` in PATH unless explicitly installed via
+  actions/setup-python or Homebrew.
+
+  Affected workflow patterns:
+  - `run: python script.py` without a preceding setup-python step
+  - Build tools that internally call `python` (node-gyp, certain CMake scripts,
+    legacy Makefiles, scons, gyp-based builds)
+  - Shell scripts with `#!/usr/bin/env python` shebangs
+  - `pip` commands (also absent without setup-python)
+
+  Python 2 is also fully removed from Homebrew — `brew install python@2` is no longer
+  available. Any remaining Python 2 dependency must be ported to Python 3.
+fix: |
+  Use actions/setup-python to install Python explicitly on macOS runners.
+  Set the python-version to the version your workflow needs (3.12 or higher recommended).
+
+  For node-gyp or native module builds that internally call `python`, set the
+  npm_config_python environment variable to point to the Python 3 binary from
+  setup-python.
+
+  For shell scripts with `#!/usr/bin/env python` shebangs, update the shebang to
+  `#!/usr/bin/env python3` or call the script explicitly with `python3 script.py`.
+fix_code:
+  - language: yaml
+    label: "Add actions/setup-python before any step that needs python"
+    code: |
+      jobs:
+        build:
+          runs-on: macos-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-python@v5
+              with:
+                python-version: '3.12'
+            - name: Run script
+              run: python script.py       # resolves to Python 3.12 from setup-python
+  - language: yaml
+    label: "Fix node-gyp calling python internally (native npm modules)"
+    code: |
+      steps:
+        - uses: actions/setup-python@v5
+          with:
+            python-version: '3.12'
+        - name: Install native modules
+          env:
+            npm_config_python: ${{ env.pythonLocation }}/bin/python3
+          run: npm ci
+  - language: yaml
+    label: "Cache Python between runs on macOS for faster CI"
+    code: |
+      steps:
+        - uses: actions/setup-python@v5
+          with:
+            python-version: '3.12'
+            cache: 'pip'           # caches pip downloads automatically
+        - run: pip install -r requirements.txt
+prevention:
+  - "Always use actions/setup-python on macOS jobs — never rely on system Python."
+  - "Search workflow files for bare `python` calls (without `3` suffix) and update to `python3` or add setup-python."
+  - "When migrating from macos-13 or macos-14 to macos-15, audit all steps invoking build tools (node-gyp, CMake, scons) that may call `python` internally."
+  - "Pin macos runner versions (e.g., macos-14) and plan an explicit upgrade window when testing macOS version bumps."
+docs:
+  - url: "https://github.com/actions/runner-images/blob/main/images/macos/macos-15-Readme.md"
+    label: "macOS-15 runner image readme"
+  - url: "https://github.com/actions/setup-python"
+    label: "actions/setup-python"
+  - url: "https://developer.apple.com/documentation/xcode-release-notes/xcode-16-release-notes"
+    label: "Xcode 16 Release Notes (ships with macOS-15 runners)"
