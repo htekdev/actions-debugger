@@ -1,0 +1,113 @@
+id: runner-environment-138
+title: "npm ci Cross-Platform Lockfile Missing Optional Native Binaries (esbuild, rollup, vite)"
+category: runner-environment
+severity: error
+tags:
+  - npm
+  - npm-ci
+  - esbuild
+  - rollup
+  - vite
+  - optional-dependencies
+  - cross-platform
+  - lockfile
+  - native-binary
+patterns:
+  - regex: 'Cannot find module @rollup/rollup-linux-x64'
+    flags: 'i'
+  - regex: 'You installed esbuild (on|for) another platform'
+    flags: 'i'
+  - regex: 'Cannot find module @esbuild/linux'
+    flags: 'i'
+  - regex: 'npm has a bug related to optional dependencies'
+    flags: 'i'
+error_messages:
+  - "Cannot find module @rollup/rollup-linux-x64-gnu"
+  - "Cannot find module @rollup/rollup-linux-x64-musl"
+  - "You installed esbuild on another platform than the one you're currently using"
+  - "Cannot find module @esbuild/linux-x64"
+  - "npm has a bug related to optional dependencies (https://github.com/npm/cli/issues/4828). Please try `npm i` again after removing both package-lock.json and node_modules directory."
+root_cause: |
+  Modern JavaScript bundlers (rollup, vite, esbuild, SWC, Turbopack) ship platform-
+  specific optional native binaries as separate npm packages — e.g.,
+  `@rollup/rollup-linux-x64-gnu`, `@esbuild/darwin-arm64`, `@esbuild/linux-x64`.
+
+  When a developer runs `npm install` on macOS (darwin-arm64 or darwin-x64), the
+  generated `package-lock.json` records the macOS-specific optional packages but NOT
+  the Linux equivalents. GitHub-hosted runners run on Linux. When `npm ci` uses
+  this macOS-generated lockfile in CI:
+
+  1. `npm ci` correctly installs exactly what's in the lockfile — only the macOS
+     native binary entries are present.
+  2. The Linux-specific optional dependency (`@rollup/rollup-linux-x64-gnu`) is
+     absent from the lockfile, so `npm ci` never installs it.
+  3. The build step then fails because the required native binary is missing.
+
+  This was a long-standing npm bug (npm/cli#4828) that was fixed in npm 11.3.0
+  (shipped with Node.js 24.0.2). On older npm versions the issue must be worked around.
+
+  Note: `npm ci` itself succeeds — the failure occurs downstream during the build/test
+  step that imports the native module.
+fix: |
+  Option 1 (recommended for npm 11.3.0+ / Node.js 24.0.2+):
+  Update Node.js to 24.0.2 or npm to 11.3.0+, then regenerate the lockfile with
+  `npm install` from scratch. The bug is fixed in this version.
+
+  Option 2 — Explicitly list the Linux optional dependencies in `package.json`:
+  Add all required platform-native packages to the `optionalDependencies` section.
+  npm will then include them in the lockfile regardless of the OS where it was generated.
+
+  Option 3 — Regenerate the lockfile in CI using `npm install --package-lock-only`
+  before running `npm ci`. This is slow but guarantees the lockfile matches the runner OS.
+
+  Option 4 — Use a Linux environment locally (Docker, WSL2, or devcontainer) to
+  generate the lockfile so it contains Linux-specific entries.
+fix_code:
+  - language: yaml
+    label: "Option 2 — Add Linux optional native packages to package.json optionalDependencies"
+    code: |
+      # In package.json, add the Linux optional dependency explicitly:
+      # "optionalDependencies": {
+      #   "@rollup/rollup-linux-x64-gnu": "*"
+      # }
+      # Then run npm install locally to regenerate the lockfile.
+      # In your workflow, npm ci will now install it on Linux runners.
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                node-version: '20'
+                cache: 'npm'
+            - run: npm ci
+            - run: npm run build
+  - language: yaml
+    label: "Option 1 — Use Node.js 24+ where the bug is fixed"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                node-version: '24'   # npm 11.3.0+ ships with Node 24.0.2+
+                cache: 'npm'
+            - run: npm ci
+            - run: npm run build
+prevention:
+  - "Pin your team's lockfile generation to Linux (use devcontainers, Docker, or WSL2 on Windows)."
+  - "Upgrade to Node.js 24.0.2+ or npm 11.3.0+ where the optional dependency platform bug is fixed."
+  - "If cross-platform lockfiles are unavoidable, explicitly add platform-specific packages to `optionalDependencies` in `package.json`."
+  - "After adding `optionalDependencies`, regenerate the lockfile from scratch — delete `package-lock.json` and `node_modules`, then run `npm install`."
+docs:
+  - url: "https://stackoverflow.com/questions/79048814/github-action-is-failing-due-to-rollup-rollup-linux-x64-gnu"
+    label: "SO: Github Action failing due to @rollup/rollup-linux-x64-gnu (13 votes, 8k views)"
+  - url: "https://stackoverflow.com/questions/73139649/you-installed-esbuild-on-another-platform-than-the-one-youre-currently-using"
+    label: "SO: You installed esbuild on another platform (36 votes, 51k views)"
+  - url: "https://github.com/npm/cli/issues/4828"
+    label: "npm/cli#4828 — Optional dependencies not installed for different platform"
+  - url: "https://vitejs.dev/guide/troubleshooting#vite-cjs-node-api-deprecated"
+    label: "Vite troubleshooting — esbuild platform mismatch"

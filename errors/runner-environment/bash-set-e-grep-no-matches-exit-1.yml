@@ -1,0 +1,103 @@
+id: runner-environment-137
+title: "bash -eo pipefail Default Causes grep Exit Code 1 (No Matches) to Fail the Step"
+category: runner-environment
+severity: error
+tags:
+  - bash
+  - grep
+  - pipefail
+  - set-e
+  - shell
+  - exit-code
+patterns:
+  - regex: 'Error: Process completed with exit code 1\.'
+    flags: 'i'
+  - regex: 'grep.*exit code 1'
+    flags: 'i'
+root_cause: |
+  GitHub Actions `run:` steps on Linux/macOS use `bash -e {0}` by default when no
+  `shell:` is specified. When `shell: bash` is explicitly set, the shell is invoked
+  as `bash --noprofile --norc -eo pipefail {0}`, adding `-o pipefail`.
+
+  The key behavior:
+  - `-e` (set -e) — any command that exits non-zero immediately aborts the whole step.
+  - `grep` returns exit code 1 when it finds zero matches (not an error in the shell
+    sense, but a non-zero exit). Combined with `-e`, a `grep` that matches nothing
+    kills the step with "Error: Process completed with exit code 1."
+  - The issue is silent — the step log shows the grep command output (or no output)
+    and then suddenly fails. Developers who test locally (where `set -e` is not the
+    default interactive shell setting) never reproduce the failure.
+
+  Common triggers:
+  - `grep -c pattern file` when pattern not found → exits 1
+  - `git log | grep "pattern"` in CI where the pattern is absent
+  - Variable assignment: `COUNT=$(echo "$LIST" | grep -c "value")` — if grep exits 1,
+    the subshell exits 1, and `-e` aborts the parent step
+error_messages:
+  - "Error: Process completed with exit code 1."
+  - "##[error]Process completed with exit code 1."
+fix: |
+  Several options depending on your use case:
+
+  Option 1 — Disable fail-fast for a specific command using `|| true`:
+  Append `|| true` to any grep command where zero matches is acceptable. The `|| true`
+  ensures the overall expression always exits 0.
+
+  Option 2 — Disable `set -e` for the entire step with `shell: bash {0}`:
+  Using `{0}` as the script placeholder removes the `-e` flag. Use this when you need
+  full control over exit codes throughout the step.
+
+  Option 3 — Use `set +e` at the top of the run block to disable fail-fast for all
+  subsequent commands, then selectively handle errors manually.
+
+  Option 4 — Use grep's `--quiet` / `-q` flag and evaluate with an `if` statement,
+  never relying on exit code propagation.
+fix_code:
+  - language: yaml
+    label: "WRONG — grep exit code 1 kills step when no match found"
+    code: |
+      - name: Count matches
+        run: |
+          COUNT=$(echo "$DIFF" | grep -c "src/my_folder")
+          echo "Changed files: $COUNT"
+  - language: yaml
+    label: "CORRECT — append || true to grep commands where zero matches is valid"
+    code: |
+      - name: Count matches
+        run: |
+          COUNT=$(echo "$DIFF" | grep -c "src/my_folder" || true)
+          echo "Changed files: $COUNT"
+  - language: yaml
+    label: "CORRECT — disable set -e for entire step with shell: bash {0}"
+    code: |
+      - name: Count matches
+        shell: bash {0}
+        run: |
+          COUNT=$(echo "$DIFF" | grep -c "src/my_folder")
+          echo "Changed files: $COUNT"
+          # now exit codes must be checked manually
+  - language: yaml
+    label: "CORRECT — use grep -q with explicit if for boolean presence check"
+    code: |
+      - name: Check for changes
+        run: |
+          if echo "$DIFF" | grep -q "src/my_folder"; then
+            echo "Changes detected in src/my_folder"
+          else
+            echo "No changes in src/my_folder"
+          fi
+prevention:
+  - "Append `|| true` to any `grep`, `awk`, or other command where a non-zero exit is not an error."
+  - "Use `shell: bash {0}` (no `-e`) for steps that need fine-grained exit code handling."
+  - "Prefer `grep -q` with `if/else` blocks instead of relying on grep exit codes for flow control."
+  - "Test CI scripts locally with `bash -e script.sh` to reproduce the fail-fast behavior."
+  - "Use `set -o pipefail` explicitly when you need pipeline failures to surface, and document it."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idstepsshell"
+    label: "jobs.<job_id>.steps[*].shell — default shell invocation"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#exit-codes-and-error-action-preference"
+    label: "Exit codes and error action preference"
+  - url: "https://stackoverflow.com/questions/73066461/github-actions-why-an-intermediate-command-failure-in-shell-script-would-cause"
+    label: "SO: Why an intermediate command failure causes the whole step to fail (17 votes)"
+  - url: "https://stackoverflow.com/questions/75419587/does-a-github-action-step-use-set-e-semantics-by-default"
+    label: "SO: Does a GitHub action step use set -e semantics by default? (13 votes)"

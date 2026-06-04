@@ -1,0 +1,115 @@
+id: triggers-052
+title: "Required Status Check Not Appearing in Branch Protection Dropdown"
+category: triggers
+severity: limitation
+tags:
+  - branch-protection
+  - required-status-check
+  - check-name
+  - job-name
+  - workflow-name
+  - protected-branch
+patterns:
+  - regex: 'status check.*not found'
+    flags: 'i'
+  - regex: 'waiting for status to be reported'
+    flags: 'i'
+error_messages:
+  - "Waiting for status to be reported"
+  - "Required status check is expected — check name not found in the dropdown"
+root_cause: |
+  Branch protection required status checks have several constraints that cause them
+  to silently not appear in the "Status checks that are required" search dropdown:
+
+  1. **Wrong name searched** — The check name in branch protection is the job's
+     `name:` field (if set) or the job's YAML key (ID) — NOT the workflow's `name:`
+     field. Developers often search for the workflow name and can't find the check.
+     For matrix jobs, the check name includes matrix values:
+     e.g., `build (ubuntu-latest, 20.x)` not just `build`.
+
+  2. **Check must have run recently** — A status check only appears in the dropdown
+     after it has completed successfully at least once on that repository within the
+     past 7 days. Brand-new workflows that have never been triggered won't show up.
+
+  3. **Workflow must target the protected branch** — For PR-triggered checks, the
+     workflow must have `on: pull_request: branches: [main]` (or the target branch).
+     A workflow that only runs on `push` to feature branches never posts a status
+     to main's pull requests.
+
+  4. **Paths filters suppressing the check** — If the workflow has `paths:` filters,
+     PRs that don't change filtered files never trigger the workflow, so the check
+     is absent (causing PRs to be permanently stuck as "Waiting"). This is covered
+     separately in `required-status-check-paths-filter-pr-stuck.yml`.
+
+  All of these issues are silent — no error is shown. The dropdown simply doesn't
+  include the expected check name.
+fix: |
+  Step 1 — Confirm the exact check name:
+  Go to any recently-merged or open PR in the repository. Find the check in the
+  PR's "Checks" tab. Copy the exact displayed name — it is the job's `name:` field
+  or the YAML job key, not the workflow `name:` at the top of the file.
+  For matrix jobs, include the matrix combination: `build (ubuntu-latest, 20.x)`.
+
+  Step 2 — Trigger the workflow at least once on a PR against the protected branch:
+  The check must have a successful run within the past 7 days to appear.
+  Create a test PR or push a temporary commit to get the first run.
+
+  Step 3 — Add a descriptive `name:` to each job that will be a required check.
+  This makes the check name human-readable and stable even if you rename the job key.
+
+  Step 4 — For matrix workflows, consider adding a fanout job (a job that `needs:`
+  all matrix jobs) with a simple pass/fail step, and set THAT as the required check.
+  This avoids needing to list every matrix combination individually in branch protection.
+fix_code:
+  - language: yaml
+    label: "Add explicit job name for a stable, searchable required status check name"
+    code: |
+      jobs:
+        build:
+          name: "CI Build"   # This is the check name in branch protection, NOT 'build'
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm ci && npm test
+  - language: yaml
+    label: "Matrix jobs — add a fanout job to use as the single required check"
+    code: |
+      jobs:
+        test:
+          name: "Test (${{ matrix.os }}, Node ${{ matrix.node }})"
+          runs-on: ${{ matrix.os }}
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest]
+              node: ['18', '20']
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                node-version: ${{ matrix.node }}
+            - run: npm ci && npm test
+
+        all-tests-pass:
+          name: "All Tests Pass"   # Set THIS as the required status check
+          needs: test
+          runs-on: ubuntu-latest
+          if: always()
+          steps:
+            - name: Verify all matrix jobs passed
+              run: |
+                if [[ "${{ needs.test.result }}" != "success" ]]; then
+                  echo "One or more test matrix jobs failed"
+                  exit 1
+                fi
+prevention:
+  - "Always add a `name:` to jobs that will be required status checks — job IDs change when refactoring."
+  - "Trigger the workflow at least once before setting up branch protection, so the check appears in the dropdown."
+  - "For matrix jobs, add a dedicated fanout job that passes only when all matrix jobs pass; set it as the required check."
+  - "Avoid `paths:` filters on required-check workflows — use them on optional checks only, or use `required-status-check-paths-filter-pr-stuck.yml` workaround."
+docs:
+  - url: "https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/troubleshooting-required-status-checks"
+    label: "GitHub Docs — Troubleshooting required status checks"
+  - url: "https://stackoverflow.com/questions/68554735/github-action-status-check-missing-from-the-list-of-checks-in-protected-branch-s"
+    label: "SO: Github Action Status check missing from Protected branch settings (75 votes, 29k views)"
+  - url: "https://stackoverflow.com/questions/61989951/github-action-workflow-not-running"
+    label: "SO: GitHub Action workflow not running (158 votes, 202k views)"
