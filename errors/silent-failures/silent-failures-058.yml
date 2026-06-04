@@ -1,0 +1,126 @@
+id: silent-failures-058
+title: "workflow_dispatch type:choice inputs bypass validation via REST API — arbitrary strings accepted silently"
+category: silent-failures
+severity: silent-failure
+tags:
+  - workflow_dispatch
+  - inputs
+  - choice
+  - rest-api
+  - validation
+  - type-checking
+patterns:
+  - regex: 'type:\s*choice'
+    flags: 'i'
+  - regex: 'workflow.*dispatch.*inputs.*choice'
+    flags: 'i'
+error_messages:
+  - "type: choice"
+root_cause: |
+  The workflow_dispatch event supports an input type of 'choice' which presents
+  a dropdown menu in the GitHub UI, restricting the user to a predefined list of
+  valid values. However, this validation is enforced only in the GitHub web UI —
+  it is NOT enforced by the GitHub Actions API.
+
+  When a workflow is triggered via the REST API (POST /repos/{owner}/{repo}/actions/
+  workflows/{workflow_id}/dispatches), any string value can be supplied for a
+  choice-type input, including values not in the defined options list. The workflow
+  accepts and runs with the unsanitized value without error or warning.
+
+  This means:
+  - CI/CD scripts calling workflow_dispatch via REST API can accidentally pass
+    the wrong environment name (typos, case differences, wrong string)
+  - Automation systems that construct the dispatch payload dynamically may pass
+    a value that was valid at construction time but is no longer a valid choice
+  - Malicious actors with repository write access can trigger unexpected code paths
+    by dispatching with unexpected values
+
+  Steps using 'if: inputs.environment == "production"' may silently skip or
+  silently run depending on whether the API-supplied string matches exactly.
+  No error is raised — the workflow just behaves unexpectedly.
+
+  Example: inputs.environment options are ['dev', 'staging', 'production'] but
+  API call passes 'prod' — all condition checks against 'production' silently
+  fail, causing the deployment step to be skipped with no indication of why.
+fix: |
+  Explicitly validate choice-type inputs at the start of the workflow using a
+  validation step that fails fast with a clear error message when an invalid
+  value is supplied.
+
+  For critical path decisions (environment selection, deployment targets), use
+  a validation step before any consequential operations:
+
+    - name: Validate environment input
+      run: |
+        case "${{ inputs.environment }}" in
+          dev|staging|production) ;;
+          *) echo "Invalid environment: ${{ inputs.environment }}" && exit 1 ;;
+        esac
+
+  This approach works regardless of how the workflow was triggered (UI or API)
+  and produces a clear failure message instead of a silent wrong-path execution.
+fix_code:
+  - language: yaml
+    label: "Validate choice input before using it — fails fast with clear error"
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            environment:
+              description: 'Target environment'
+              type: choice
+              required: true
+              options:
+                - dev
+                - staging
+                - production
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Validate environment input
+              run: |
+                valid_envs="dev staging production"
+                if ! echo "$valid_envs" | grep -qw "${{ inputs.environment }}"; then
+                  echo "ERROR: Invalid environment '${{ inputs.environment }}'"
+                  echo "Valid options: $valid_envs"
+                  exit 1
+                fi
+
+            - name: Deploy to ${{ inputs.environment }}
+              run: echo "Deploying to ${{ inputs.environment }}"
+  - language: yaml
+    label: "Use environment-scoped deployment for automatic protection"
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            environment:
+              description: 'Target environment'
+              type: choice
+              required: true
+              options:
+                - dev
+                - staging
+                - production
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          environment: ${{ inputs.environment }}  # Invalid names cause job failure
+          steps:
+            - name: Deploy
+              run: echo "Deploying to ${{ inputs.environment }}"
+prevention:
+  - "Never rely solely on type:choice validation — always add an explicit validation step for inputs that affect deployment targets or security-sensitive code paths"
+  - "Use environment: ${{ inputs.environment }} on jobs to leverage GitHub's environment protection rules as a secondary validation layer"
+  - "Document that API dispatch bypasses choice validation in your workflow's comments so future maintainers know validation is needed"
+  - "In automation scripts that call workflow_dispatch via API, validate the environment string against the allowed list before making the API call"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_dispatch"
+    label: "GitHub Docs — workflow_dispatch inputs"
+  - url: "https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event"
+    label: "GitHub REST API — Create a workflow dispatch event"
+  - url: "https://stackoverflow.com/questions/69578241/github-actions-workflow-dispatch-with-choices"
+    label: "Stack Overflow — workflow_dispatch with choice inputs (highly voted)"
