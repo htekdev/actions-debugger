@@ -1,0 +1,110 @@
+id: runner-environment-128
+title: "ubuntu-22.04/24.04: apt-key Deprecated — Third-Party Repo Keys Cause NO_PUBKEY Errors"
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-22
+  - ubuntu-24
+  - apt
+  - apt-key
+  - gpg
+  - package-signing
+  - third-party-repo
+patterns:
+  - regex: 'apt-key\s+is\s+deprecated'
+    flags: 'i'
+  - regex: 'NO_PUBKEY\s+[0-9A-F]{16}'
+    flags: 'i'
+  - regex: 'W:\s*Key\s+is\s+stored\s+in\s+legacy\s+trusted\.gpg\s+keyring'
+    flags: 'i'
+  - regex: 'The following signatures couldn''t be verified because the public key is not available'
+    flags: 'i'
+error_messages:
+  - "W: apt-key is deprecated. Manage keyring files in trusted.gpg.d instead (see apt-key(8))."
+  - "W: Key is stored in legacy trusted.gpg keyring (/etc/apt/trusted.gpg), see the DEPRECATION section in apt-key(8) for details."
+  - "The following signatures couldn't be verified because the public key is not available: NO_PUBKEY A1715D88E1DF1F24"
+  - "W: http://ppa.launchpad.net/...: NO_PUBKEY"
+  - "GPG error: ... NO_PUBKEY"
+root_cause: |
+  `apt-key` was deprecated in Ubuntu 22.04 and is scheduled for removal in future Ubuntu
+  versions. On ubuntu-22.04 and ubuntu-24.04 GitHub-hosted runner images, workflows that
+  add third-party repository GPG keys using `apt-key add -` or `apt-key adv --keyserver`
+  emit deprecation warnings and, in some configurations, fail to authenticate packages.
+
+  The old method stored keys in `/etc/apt/trusted.gpg` — a global keyring trusted for ALL
+  repositories. Ubuntu 22.04 began phasing this out in favor of per-repository keyrings
+  stored as `.gpg` files under `/usr/share/keyrings/`, referenced via `signed-by=` in
+  the sources list entry.
+
+  Common symptoms:
+  - `apt-get update` emits "NO_PUBKEY" warnings followed by package authentication failures
+  - Installing packages from third-party PPAs (e.g., Google Chrome, Hashicorp, NodeSource)
+    fails with "The following packages cannot be authenticated"
+  - Steps that use `add-apt-repository ppa:...` work on ubuntu-20.04 but produce warnings
+    or fail on ubuntu-22.04/24.04
+
+  Workflows that pipe curl output directly into `apt-key add -` (a historically common
+  pattern in CI setup scripts) will produce warnings on ubuntu-22.04 and may fail silently
+  on ubuntu-24.04 if the key is not recognized by the new keyring mechanism.
+fix: |
+  Replace `apt-key add` with the modern pattern: download the GPG key as a dearmored `.gpg`
+  file into `/usr/share/keyrings/`, then reference it with `signed-by=` in the apt sources
+  list entry. This is the Ubuntu 22.04+ recommended approach.
+fix_code:
+  - language: yaml
+    label: "Old pattern (deprecated) vs new signed-by pattern"
+    code: |
+      jobs:
+        setup:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            # ❌ Deprecated: apt-key add — produces warnings on 22.04, may fail on 24.04
+            # - name: Add Hashicorp repo (old way)
+            #   run: |
+            #     curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo apt-key add -
+            #     sudo apt-add-repository "deb [arch=amd64] https://apt.releases.hashicorp.com $(lsb_release -cs) main"
+
+            # ✅ Modern pattern: signed-by= with per-repo keyring file
+            - name: Add Hashicorp repo (modern way)
+              run: |
+                curl -fsSL https://apt.releases.hashicorp.com/gpg \
+                  | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+                echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] \
+                  https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
+                  | sudo tee /etc/apt/sources.list.d/hashicorp.list
+
+            - name: Install Terraform
+              run: |
+                sudo apt-get update
+                sudo apt-get install -y terraform
+  - language: yaml
+    label: "NodeSource / NVM repo setup using modern keyring pattern"
+    code: |
+      jobs:
+        setup:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            # Modern NodeSource setup (replaces legacy curl | bash installer)
+            - name: Add NodeSource repo
+              run: |
+                curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+                  | sudo gpg --dearmor -o /usr/share/keyrings/nodesource.gpg
+                echo "deb [signed-by=/usr/share/keyrings/nodesource.gpg] \
+                  https://deb.nodesource.com/node_20.x nodistro main" \
+                  | sudo tee /etc/apt/sources.list.d/nodesource.list
+            - run: sudo apt-get update && sudo apt-get install -y nodejs
+prevention:
+  - "Replace all `apt-key add -` calls with the `gpg --dearmor` + `signed-by=` pattern — it works on ubuntu-20.04 through ubuntu-24.04"
+  - "Third-party vendors (Hashicorp, Google, Microsoft, NodeSource) have updated their installation docs to use the modern pattern — follow vendor docs rather than old blog posts"
+  - "For PPA repositories, use `add-apt-repository --no-update` with the modern key format, or switch to the vendor's official deb repo"
+  - "Audit CI scripts for `curl ... | apt-key add -` pipelines — these are the most common source of this error"
+docs:
+  - url: "https://manpages.ubuntu.com/manpages/jammy/man8/apt-key.8.html"
+    label: "Ubuntu apt-key(8) manpage — DEPRECATION section"
+  - url: "https://wiki.debian.org/DebianRepository/UseThirdParty"
+    label: "Debian Wiki: Using Third-Party Repositories (modern signed-by pattern)"
+  - url: "https://github.com/actions/runner-images/issues/7213"
+    label: "runner-images GitHub Issue: apt-key deprecation warnings on ubuntu-22.04"
