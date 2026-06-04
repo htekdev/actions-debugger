@@ -1,0 +1,113 @@
+id: concurrency-timing-038
+title: 'push and pull_request events use different github.ref formats — concurrency slots never shared between event types'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - github-ref
+  - pull-request
+  - push
+  - cancel-in-progress
+  - slot-sharing
+patterns:
+  - regex: 'group:\s+\$\{\{\s*github\.workflow\s*\}\}-\$\{\{\s*github\.ref\s*\}\}'
+    flags: 'i'
+  - regex: 'refs/pull/\d+/merge'
+    flags: ''
+error_messages:
+  - "Push deploy and PR deploy run in parallel despite same concurrency group"
+  - "concurrency group does not prevent push and pull_request from running simultaneously"
+  - "Both workflows triggered at the same time even with concurrency group set"
+root_cause: |
+  When concurrency group uses `${{ github.ref }}`, the ref value differs by event type:
+  - `on: push` to main → github.ref = 'refs/heads/main'
+  - `on: pull_request` targeting main → github.ref = 'refs/pull/123/merge' (synthetic merge ref)
+
+  These produce different concurrency group keys, so push and pull_request runs NEVER share
+  a concurrency slot. Developers who want "one deploy at a time" across push and PR events
+  are surprised when both run in parallel.
+
+  Common scenario:
+  - Deploy workflow triggers on both push (to main) and pull_request (for preview)
+  - A push to main is deploying
+  - A new PR triggers a deploy
+  - Both run simultaneously because their github.ref values are different strings
+  - Race condition or resource contention on the deployment target
+
+  This is distinct from the `github.head_ref` empty-on-push issue (which over-cancels).
+  Here, using `github.ref` under-cancels by never sharing slots between event types.
+fix: |
+  To serialize push and pull_request deploys into one slot, use a ref-agnostic key
+  or normalize the ref to a shared value.
+
+  Option 1: Use a static concurrency key scoped to just the workflow name (one slot total):
+    group: ${{ github.workflow }}
+    cancel-in-progress: true
+
+  Option 2: Normalize to the target/base branch using head_ref for PRs and ref_name for push:
+    group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+    cancel-in-progress: true
+
+  For github.head_ref || github.ref_name:
+  - pull_request: github.head_ref = 'feature/my-branch' (PR source branch)
+  - push:        github.ref_name = 'main' (pushed branch name)
+  - Both give meaningful branch names, but they still differ — PRs use source branch, push uses target
+  - For "one deploy to main at a time" across both events, use github.base_ref || github.ref_name
+
+  Option 3: Use the target/base branch for both:
+    group: ${{ github.workflow }}-${{ github.base_ref || github.ref_name }}
+    cancel-in-progress: true
+  - pull_request: github.base_ref = 'main' (target branch)
+  - push:        github.ref_name = 'main' (pushed branch)
+  - Both produce the same key for operations targeting main — serializes push and PR deploys
+fix_code:
+  - language: yaml
+    label: 'Serialize push and pull_request deploys to the same target branch'
+    code: |
+      on:
+        push:
+          branches: [main]
+        pull_request:
+          branches: [main]
+
+      concurrency:
+        # Use base_ref (PR target) or ref_name (push branch) — both equal 'main'
+        # when targeting main, so push and PR deploys share one slot
+        group: ${{ github.workflow }}-${{ github.base_ref || github.ref_name }}
+        cancel-in-progress: true
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Deploy
+              run: echo "Deploying to ${{ github.base_ref || github.ref_name }}"
+  - language: yaml
+    label: 'One global slot for the entire workflow (simplest serialization)'
+    code: |
+      on:
+        push:
+          branches: [main]
+        pull_request:
+
+      concurrency:
+        group: ${{ github.workflow }}
+        cancel-in-progress: true
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Only one run at a time, any trigger"
+prevention:
+  - 'Understand that github.ref differs between push (refs/heads/BRANCH) and pull_request (refs/pull/N/merge) events'
+  - 'Use github.base_ref || github.ref_name to get the target/base branch name for both event types'
+  - 'Test concurrency behavior with simultaneous push and PR triggers before relying on it for deploy serialization'
+  - 'Use github.head_ref for the PR source branch or github.ref_name for push branch — never github.ref directly in concurrency keys unless same-event-type serialization is the goal'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/controlling-concurrency'
+    label: 'GitHub Actions — Controlling concurrency'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context'
+    label: 'GitHub context — github.ref, github.head_ref, github.base_ref, github.ref_name'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request'
+    label: 'pull_request event — github.ref is refs/pull/N/merge'
