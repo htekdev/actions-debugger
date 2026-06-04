@@ -1,0 +1,124 @@
+id: known-unsolved-037
+title: "Skipped jobs show as 'skipped' — branch protection required status checks block PR merge"
+category: known-unsolved
+severity: limitation
+tags:
+  - required-status-checks
+  - branch-protection
+  - skipped
+  - conditional-job
+  - merge-blocked
+  - known-limitation
+patterns:
+  - regex: 'if:\s+github\.event_name\s+!=\s+'
+    flags: i
+  - regex: 'if:\s+\$\{\{\s*github\.event_name\s*!=\s*'
+    flags: i
+error_messages:
+  - "Required status check 'ci/test' was not successful — status: skipped"
+  - "Branch protection rule requires passing status checks before merging"
+root_cause: |
+  When a job's if: condition evaluates to false, GitHub Actions marks that job as
+  "Skipped" in the Checks API. Branch protection rules that require a specific check
+  to pass only accept a conclusion of "success" — not "skipped", "cancelled", or
+  "neutral".
+
+  This creates a practical trap: a team sets up a required check for a job like
+  ci/test, then later adds an if: condition to skip that job on certain events
+  (for example, to avoid running tests on tag pushes or documentation-only changes).
+  The conditional logic is correct for workflow execution, but the skipped conclusion
+  permanently blocks all PRs where that condition evaluates to false.
+
+  GitHub has documented this as intentional: a skipped job is not a successful job.
+  There is no configuration option to treat "skipped" as equivalent to "success" for
+  branch protection purposes as of 2026. The workaround requires a structural change
+  to the workflow.
+fix: |
+  This is a known limitation with no direct fix. The recommended workarounds are:
+
+  1. ALWAYS-PASS WRAPPER JOB: Create a wrapper job that always runs and reports
+     the real outcome. The wrapper job becomes the required status check instead of
+     the real CI job. If CI was skipped (e.g., docs-only change), the wrapper passes.
+     If CI ran and failed, the wrapper fails.
+
+  2. MOVE THE CONDITION INSIDE THE JOB: Instead of using if: at the job level, keep
+     the job always running and use if: at the step level. An empty job always
+     succeeds, so the required status check passes.
+
+  3. PATHS FILTER PATTERN (dorny/paths-filter): Use a separate filtering job and
+     pass its output as a condition parameter to downstream jobs while keeping a
+     pass-through job for status check reporting.
+
+  4. RE-EVALUATE THE REQUIRED CHECK: If the check is truly optional for some events,
+     consider removing it from required status checks and instead enforce it only at
+     the merge queue level.
+fix_code:
+  - language: yaml
+    label: "Problem: conditional job is skipped, blocking required status check"
+    code: |
+      on: [push, pull_request]
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          # This job is required in branch protection, but gets skipped on push to main
+          if: github.event_name == 'pull_request'
+          steps:
+            - run: npm test
+            # On push events, this job is SKIPPED, blocking required status check
+  - language: yaml
+    label: "Fix: always-pass wrapper job becomes the required status check"
+    code: |
+      on: [push, pull_request]
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          if: github.event_name == 'pull_request'
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+
+        # Set THIS job as the required status check in branch protection
+        ci-status:
+          runs-on: ubuntu-latest
+          needs: [test]
+          if: always()
+          steps:
+            - name: Report CI result
+              run: |
+                result="${{ needs.test.result }}"
+                if [[ "$result" == "success" || "$result" == "skipped" ]]; then
+                  echo "CI passed or was intentionally skipped — OK to merge"
+                else
+                  echo "CI failed (result: $result)"
+                  exit 1
+                fi
+  - language: yaml
+    label: "Alternative: move condition inside job so job always runs and passes when empty"
+    code: |
+      on: [push, pull_request]
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          # No if: at job level — job always runs and always produces a conclusion
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Run tests (pull_request only)
+              if: github.event_name == 'pull_request'
+              run: npm test
+              # If step is skipped, job still succeeds — required check passes
+prevention:
+  - "Never add an if: condition to a job that is a required status check — use a wrapper job instead"
+  - "Use the always-pass wrapper pattern from the start when adding new required status checks"
+  - "Test required check behavior by creating a draft PR that intentionally triggers the skip condition"
+  - "Document which jobs are required status checks in a comment at the top of the workflow file"
+docs:
+  - url: "https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/troubleshooting-required-status-checks"
+    label: "GitHub Docs: Troubleshooting required status checks"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idif"
+    label: "GitHub Docs: Job-level if conditions"
+  - url: "https://github.com/dorny/paths-filter"
+    label: "dorny/paths-filter: Conditional execution with status reporting"
