@@ -1,0 +1,142 @@
+id: permissions-auth-040
+title: "GITHUB_TOKEN is read-only by default in new repositories — write operations fail with 403"
+category: permissions-auth
+severity: error
+tags:
+  - GITHUB_TOKEN
+  - read-only
+  - permissions
+  - 403
+  - new-repo
+  - workflow-permissions
+patterns:
+  - regex: 'remote:\s*Permission to .* denied to github-actions\[bot\]'
+    flags: i
+  - regex: 'Error:\s*Resource not accessible by integration'
+    flags: i
+  - regex: 'HttpError:\s*Resource not accessible by integration'
+    flags: i
+  - regex: '403.*github-actions\[bot\]'
+    flags: i
+error_messages:
+  - "remote: Permission to org/repo.git denied to github-actions[bot]"
+  - "Error: Resource not accessible by integration"
+  - "HttpError: Resource not accessible by integration"
+  - "fatal: unable to access 'https://github.com/org/repo/': The requested URL returned error: 403"
+  - "GitHub Actions is not permitted to create or approve pull requests"
+root_cause: |
+  In February 2023 (GitHub Changelog), GitHub changed the default GITHUB_TOKEN
+  permissions for all new repositories and new organizations from read-write to
+  read-only. Repositories created before this change retain their original default
+  (read-write) unless an administrator explicitly changes the org-level setting.
+
+  This creates two failure scenarios:
+
+  1. COPIED WORKFLOWS: A developer copies a workflow from an older repo or a public
+     template that relies on the default read-write GITHUB_TOKEN (for example, to push
+     a build artifact, create a release, comment on a PR, or open a pull request). In a
+     new repo, that same workflow fails with 403 or "Resource not accessible by
+     integration" because the token only has read permissions.
+
+  2. ORG POLICY CHANGE: An organization administrator enables the read-only default
+     at the organization level (Settings > Actions > General > Workflow permissions).
+     All repos in the org immediately start failing any workflow that performs write
+     operations without an explicit permissions block.
+
+  The failure message is typically cryptic and does not mention that the root cause is
+  the workflow permissions default — it only says the token was denied.
+fix: |
+  Add explicit permissions blocks to workflows or jobs that perform write operations.
+  GitHub recommends the principle of least privilege: grant only the specific write
+  permission needed, not blanket read-write access.
+
+  At the workflow level, a top-level permissions: block sets defaults for all jobs.
+  At the job level, a permissions: block overrides the workflow-level default for that
+  job only. Job-level is preferred — it minimises the blast radius if a job is
+  compromised.
+
+  Common permissions needed:
+  - contents: write — push commits, create releases, upload release assets
+  - pull-requests: write — create/comment on pull requests
+  - issues: write — create/comment on issues
+  - packages: write — publish to GitHub Packages
+  - pages: write — deploy to GitHub Pages (also needs id-token: write for OIDC)
+
+  Alternatively, change the default at repo level: Settings > Actions > General >
+  Workflow permissions > Read and write permissions. Not recommended for security-
+  conscious teams.
+fix_code:
+  - language: yaml
+    label: "Problem: workflow relies on default write token, fails in new repos"
+    code: |
+      # No permissions block — relies on default, which is READ-ONLY in new repos
+      on: push
+
+      jobs:
+        release:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build
+              run: npm run build
+            - name: Create GitHub Release
+              uses: softprops/action-gh-release@v2
+              with:
+                files: dist/**
+              # Fails with 403 in new repos — needs contents:write
+  - language: yaml
+    label: "Fix: explicit job-level permissions (least privilege)"
+    code: |
+      on: push
+
+      jobs:
+        release:
+          runs-on: ubuntu-latest
+          permissions:
+            contents: write    # Required to create releases and upload assets
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build
+              run: npm run build
+            - name: Create GitHub Release
+              uses: softprops/action-gh-release@v2
+              with:
+                files: dist/**
+  - language: yaml
+    label: "Workflow-level permissions (when multiple jobs all need write access)"
+    code: |
+      on: push
+
+      # Set workflow-level default — overridden per job as needed
+      permissions:
+        contents: write
+        pull-requests: write
+
+      jobs:
+        build-and-release:
+          runs-on: ubuntu-latest
+          # Inherits workflow-level permissions
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm run build
+
+        comment-on-pr:
+          runs-on: ubuntu-latest
+          permissions:
+            pull-requests: write   # Job-level — more restrictive than workflow default
+            contents: read
+          steps:
+            - uses: actions/checkout@v4
+prevention:
+  - "Always declare explicit permissions blocks in workflows that push, create releases, comment, or deploy — never rely on defaults"
+  - "Run 'actionlint' locally — it warns when a workflow uses write-requiring actions without corresponding permissions"
+  - "Use the minimum permissions required: grant 'contents: write' only on jobs that need it, not at workflow level"
+  - "When copying a workflow from another repo, check whether it has a permissions block — add one if missing"
+  - "Review the GitHub Actions audit log when a workflow fails with 403 to confirm the token permissions in use"
+docs:
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#permissions-for-the-github_token"
+    label: "GitHub Docs: GITHUB_TOKEN permissions"
+  - url: "https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository#setting-the-permissions-of-the-github_token-for-your-repository"
+    label: "GitHub Docs: Setting default workflow permissions"
+  - url: "https://github.blog/changelog/2023-02-02-github-actions-updating-the-default-github_token-permissions-to-read-only/"
+    label: "GitHub Changelog: Default GITHUB_TOKEN permissions changed to read-only (Feb 2023)"
