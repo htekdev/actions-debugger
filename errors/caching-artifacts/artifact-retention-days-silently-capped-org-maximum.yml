@@ -1,0 +1,69 @@
+id: caching-artifacts-043
+title: "upload-artifact retention-days silently capped at organization maximum — artifact expires earlier than configured"
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - upload-artifact
+  - retention-days
+  - artifacts
+  - organization-policy
+  - expiry
+patterns:
+  - regex: 'Artifact will be retained for \d+ days'
+    flags: "i"
+error_messages:
+  - "Artifact will be retained for"
+root_cause: |
+  When actions/upload-artifact is configured with a retention-days value that exceeds the
+  organization's or repository's maximum artifact retention setting, GitHub silently caps
+  the retention period to the configured maximum without emitting any error or warning.
+  The upload step completes successfully, the workflow shows green, and the artifact is
+  created — but it expires sooner than the workflow author intended.
+
+  This is particularly dangerous for:
+  - Compliance workflows that retain build artifacts for audits
+  - Release workflows where binaries must survive for customer download periods
+  - Security scanning workflows that need artifacts for post-incident review
+
+  The only way to discover the cap is to inspect the artifact's expiration date in the
+  repository's Actions UI after upload, or query the REST API. Developers who set
+  retention-days: 365 expecting one-year retention will find artifacts disappearing after
+  90 days (the default org maximum) with no log evidence of the cap.
+fix: |
+  Check your organization's artifact retention maximum under Organization Settings → Actions
+  → General → Artifact and log retention, and ensure retention-days in upload-artifact is
+  set to a value at or below this limit. If you need retention beyond the org maximum
+  (e.g., for compliance), use GitHub Releases for tagged builds, or an external artifact
+  store (S3, Azure Blob, GCS). You can also query the artifact API to assert the actual
+  expiry date and fail the workflow if it doesn't match expectations.
+fix_code:
+  - language: yaml
+    label: "Cap retention-days to org maximum and use GitHub Releases for long-term storage"
+    code: |
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output-${{ github.sha }}
+          path: dist/
+          # Must be <= your org's maximum retention setting
+          # Check: Org Settings → Actions → General → Artifact and log retention
+          retention-days: 30
+
+      # For artifacts requiring retention beyond the org maximum (e.g., release binaries),
+      # attach them to a GitHub Release instead:
+      - name: Create GitHub Release with artifact
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dist/**
+          # Release assets are NOT subject to the artifact retention policy
+prevention:
+  - "Check your organization's artifact retention maximum before setting retention-days in upload-artifact"
+  - "For artifacts requiring long-term storage, use GitHub Releases or an external object store (S3, GCS, Azure Blob)"
+  - "Add a workflow step that queries the artifact expiry via the REST API and fails if it doesn't match the intended retention"
+  - "Document the org retention limit in a comment next to retention-days to alert future editors"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-workflow-data-as-artifacts"
+    label: "Storing workflow data as artifacts — GitHub Docs"
+  - url: "https://docs.github.com/en/organizations/managing-organization-settings/configuring-the-retention-period-for-github-actions-artifacts-and-logs-in-your-organization"
+    label: "Configuring artifact retention period for your organization — GitHub Docs"

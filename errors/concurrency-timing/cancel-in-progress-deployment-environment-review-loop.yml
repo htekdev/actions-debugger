@@ -1,0 +1,76 @@
+id: concurrency-timing-036
+title: "cancel-in-progress: true cancels pending deployment environment reviews — deployment never completes"
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - deployment
+  - environment
+  - cancel-in-progress
+  - required-reviewers
+patterns:
+  - regex: 'waiting for a required environment'
+    flags: "i"
+  - regex: 'Deployment to .+ was cancelled'
+    flags: "i"
+error_messages:
+  - "This workflow run is waiting for a required environment"
+  - "Deployment to production was cancelled"
+root_cause: |
+  When a deployment job targets an environment with required reviewers (protection rules)
+  and cancel-in-progress: true is set on the concurrency group, every new push cancels the
+  pending workflow run — including the one awaiting reviewer approval. The reviewer is
+  notified, starts the review process, but before they approve a new commit arrives and
+  cancels the run. The cycle repeats indefinitely: deployments queue, reviewers are
+  interrupted, and nothing ever reaches production. No diagnostic error is surfaced; the
+  workflow simply shows "Cancelled" with no indication that a required-reviewer gate was
+  involved.
+fix: |
+  Remove cancel-in-progress: true from the concurrency group used by the deployment job.
+  Use cancel-in-progress: false (the default) so pending approval runs survive new commits.
+  To still get fast feedback on CI, split the workflow into two separate files: a fast CI
+  workflow with cancel-in-progress: true, and a deployment workflow (triggered on CI success)
+  with cancel-in-progress: false so approval gates are preserved.
+fix_code:
+  - language: yaml
+    label: "Split CI and deploy workflows with separate concurrency policies"
+    code: |
+      # .github/workflows/ci.yml — cancel old CI runs freely
+      on: [push, pull_request]
+      concurrency:
+        group: ci-${{ github.ref }}
+        cancel-in-progress: true
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+
+      # .github/workflows/deploy.yml — preserve pending deployment approvals
+      on:
+        workflow_run:
+          workflows: [CI]
+          types: [completed]
+          branches: [main]
+      concurrency:
+        group: deploy-${{ github.ref }}
+        cancel-in-progress: false   # preserves pending required-reviewer approval
+      jobs:
+        deploy:
+          if: ${{ github.event.workflow_run.conclusion == 'success' }}
+          environment: production   # has required reviewers
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: echo "Deploying..."
+prevention:
+  - "Never combine cancel-in-progress: true with deployment jobs that have required-reviewer environment protection rules"
+  - "Use separate workflow files for CI and deployment to apply different concurrency policies"
+  - "Set cancel-in-progress: false (or omit it) on any concurrency group that wraps a deployment environment job"
+  - "Test the deployment approval flow explicitly after adding or changing concurrency settings"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency"
+    label: "Using concurrency — GitHub Docs"
+  - url: "https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/reviewing-deployments"
+    label: "Reviewing deployments — GitHub Docs"
