@@ -1,0 +1,78 @@
+id: triggers-046
+title: "github.event.commits Array Truncated to 20 Commits on Large Pushes"
+category: triggers
+severity: silent-failure
+tags:
+  - push
+  - commits
+  - github-event
+  - truncated
+  - commit-messages
+patterns:
+  - regex: 'github\.event\.commits'
+    flags: 'i'
+error_messages:
+  - "Only processing 20 of N commits"
+  - "Missing commits in push event payload"
+root_cause: |
+  When a push event triggers a workflow, the `github.event.commits` array is capped at
+  a maximum of 20 commit objects, regardless of how many commits were included in the
+  push. This limit applies to the webhook payload that populates the `github.event`
+  context and is documented in the GitHub webhook specification.
+
+  Workflows that iterate over `github.event.commits` to extract commit messages for
+  changelog generation, enforce commit message formatting (Conventional Commits, etc.),
+  or trigger conditional logic based on commit content will silently miss any commits
+  beyond the 20th. The job completes successfully with no indication that commits were
+  dropped from the payload.
+
+  Commonly affected use cases:
+  - Automated changelog or release note generation from push commit messages
+  - Commit message linting or conventional commits enforcement
+  - Workflows triggered by specific keywords in commit messages
+  - Security scanning workflows that enumerate all modified files from commit diffs
+fix: |
+  Use `git log` with the push SHA range (`github.event.before..github.event.after`) to
+  enumerate all commits in the push, regardless of count. This requires checking out
+  the repository with `fetch-depth: 0` (full history) or at minimum enough depth to
+  span the push range. Guard against the `before` SHA being all zeros (first push to
+  a new branch).
+fix_code:
+  - language: yaml
+    label: "Wrong: iterating github.event.commits silently misses commits beyond 20"
+    code: |
+      - name: Lint commit messages
+        run: |
+          # Silently processes only up to 20 commits even on large pushes
+          echo '${{ toJSON(github.event.commits) }}' \
+            | jq -r '.[].message' \
+            | npx commitlint --from stdin
+  - language: yaml
+    label: "Correct: use git log with push range to enumerate all commits"
+    code: |
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history required for git log range
+
+      - name: Lint all commit messages in push
+        run: |
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.event.after }}"
+
+          # Guard: first push to a new branch has before = 000...000
+          if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            echo "First push to new branch — scanning tip commit only"
+            git log -1 --format="%s" "$AFTER"
+          else
+            git log --format="%s" "${BEFORE}..${AFTER}"
+          fi | npx commitlint --from stdin
+prevention:
+  - "Never rely on `github.event.commits` for exhaustive commit enumeration on pushes — use `git log` with the SHA range instead"
+  - "Always add `fetch-depth: 0` to checkout when your workflow needs to enumerate commits from the push range"
+  - "Guard against `github.event.before` being all zeros (new branch first push) before running `git log BEFORE..AFTER`"
+  - "If commit count matters, log a warning when `github.event.commits | length == 20` to detect truncation"
+docs:
+  - url: "https://docs.github.com/en/webhooks/webhook-events-and-payloads#push"
+    label: "GitHub Docs: Push webhook payload (20 commit limit)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#push"
+    label: "GitHub Docs: push event trigger"
