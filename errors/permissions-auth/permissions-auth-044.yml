@@ -1,0 +1,82 @@
+id: permissions-auth-044
+title: "OIDC token sub claim format changes inside reusable workflow jobs, breaking cloud provider trust policies"
+category: permissions-auth
+severity: error
+tags:
+  - oidc
+  - reusable-workflow
+  - aws
+  - gcp
+  - trust-policy
+  - sub-claim
+  - job-workflow-ref
+patterns:
+  - regex: 'Not authorized to perform sts:AssumeRoleWithWebIdentity'
+    flags: i
+  - regex: 'failed to generate Google Cloud federated token'
+    flags: i
+  - regex: 'Credentials could not be loaded.*Could not load credentials from any providers'
+    flags: i
+error_messages:
+  - "An error occurred (AccessDenied) when calling the AssumeRoleWithWebIdentity operation: Not authorized to perform sts:AssumeRoleWithWebIdentity"
+  - "Error: google-github-actions/auth failed to generate Google Cloud federated token for..."
+  - "Error: Credentials could not be loaded, please check your action inputs: Could not load credentials from any providers"
+root_cause: |
+  When a job runs inside a reusable workflow (called via uses:), GitHub changes the format of
+  the OIDC token sub claim to include the calling workflow's path. For a direct job the sub is:
+    repo:ORG/REPO:ref:refs/heads/main
+  For a job inside a reusable workflow the sub becomes:
+    repo:ORG/REPO:job_workflow_ref:ORG/REPO/.github/workflows/reusable.yml@refs/heads/main
+  AWS IAM OIDC trust policies and GCP Workload Identity Federation attribute conditions that
+  were configured to match the simpler ref-based sub format now reject the OIDC token with an
+  AccessDenied error. The error message gives no indication that the sub claim format changed —
+  it looks identical to any other OIDC trust policy mismatch.
+fix: |
+  Update the cloud provider's OIDC trust policy to match the new sub claim format used by
+  reusable workflow jobs. For AWS, update the IAM trust policy StringLike condition to match
+  job_workflow_ref instead of ref. For GCP, update the attribute condition in the Workload
+  Identity Pool provider. Alternatively, use GitHub's OIDC subject claim customization feature
+  (repo Settings → Actions → General → OIDC subject claims) to define a consistent sub claim
+  template that works for both caller and reusable workflow jobs.
+fix_code:
+  - language: yaml
+    label: "Reusable workflow with id-token permission declared (required)"
+    code: |
+      # In the reusable workflow file (.github/workflows/reusable.yml):
+      on:
+        workflow_call:
+
+      permissions:
+        id-token: write
+        contents: read
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Configure AWS credentials
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-to-assume: arn:aws:iam::123456789:role/my-role
+                aws-region: us-east-1
+  - language: yaml
+    label: "AWS IAM trust policy StringLike condition for reusable workflow sub claim"
+    code: |
+      # Update AWS IAM role trust policy Condition block to match reusable workflow sub format.
+      # Old (direct job):   "repo:ORG/REPO:ref:refs/heads/main"
+      # New (reusable job): "repo:ORG/REPO:job_workflow_ref:ORG/REPO/.github/workflows/reusable.yml@refs/heads/main"
+      #
+      # Use a wildcard to allow both patterns:
+      # "token.actions.githubusercontent.com:sub": "StringLike": ["repo:ORG/REPO:*"]
+prevention:
+  - "When refactoring direct jobs into reusable workflows, update cloud OIDC trust policies before deploying"
+  - "Use GitHub subject claim customization to define a consistent sub format that works across direct and reusable jobs"
+  - "Document the expected OIDC sub claim format in the reusable workflow README alongside cloud policy requirements"
+  - "Test OIDC authentication in a staging cloud environment when moving jobs into reusable workflows"
+docs:
+  - url: https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/using-openid-connect-with-reusable-workflows
+    label: "GitHub Docs: Using OIDC with reusable workflows"
+  - url: https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect#customizing-the-subject-claims-for-an-organization-or-repository
+    label: "GitHub Docs: Customizing OIDC subject claims"
+  - url: https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_oidc.html
+    label: "AWS Docs: Creating IAM OIDC identity providers"
