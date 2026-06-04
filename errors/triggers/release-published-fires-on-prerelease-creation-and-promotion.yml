@@ -1,0 +1,106 @@
+id: triggers-049
+title: 'on.release types: [published] fires for pre-release creation AND pre-release-to-full promotion — deploy workflows run twice'
+category: triggers
+severity: silent-failure
+tags:
+  - release
+  - published
+  - prerelease
+  - on-release
+  - double-trigger
+  - deploy
+patterns:
+  - regex: 'github\.event\.action.*prereleased'
+    flags: 'i'
+  - regex: 'github\.event\.release\.prerelease.*true'
+    flags: 'i'
+error_messages:
+  - 'github.event.action: prereleased'
+  - 'github.event.action: released'
+  - 'github.event.release.prerelease: true'
+root_cause: |
+  The GitHub `release` event supports multiple activity types: `created`, `published`,
+  `prereleased`, `released`, `edited`, `deleted`, and `unpublished`. The `published` type
+  is frequently misunderstood:
+
+  - `published` fires whenever ANY release is made public — this includes both pre-releases
+    (action=prereleased) and full releases (action=released). It is a superset, not a
+    specific activity type for "final" releases.
+
+  A typical release lifecycle that triggers `on.release.types: [published]` twice:
+  1. Developer creates a pre-release (e.g., v1.2.0-rc.1) and clicks "Publish release"
+     → workflow fires (github.event.action=prereleased, github.event.release.prerelease=true)
+  2. Developer edits the release and unchecks "Set as a pre-release" to promote it to a
+     full release → workflow fires again (github.event.action=released, github.event.release.prerelease=false)
+
+  Additionally, the GitHub docs note that `prereleased` does NOT fire for pre-releases
+  published from a draft release, but `published` DOES fire — creating another asymmetry.
+
+  Workflows using `on.release.types: [published]` for deployment, package publishing,
+  or Docker image tagging will run twice for the same version tag, potentially creating
+  duplicate deployments, duplicate npm/PyPI publishes, or conflicting artifact versions.
+fix: |
+  For production deploy workflows that should only run on final (non-pre-release) releases,
+  add an `if:` condition to check `github.event.release.prerelease == false`. Alternatively,
+  use `types: [released]` — which fires only when a stable release is published directly
+  or when a pre-release is promoted to full release, but NOT on initial pre-release creation.
+
+  To target pre-releases explicitly, use `types: [prereleased]`, but note it does not fire
+  for pre-releases published from drafts (use `published` + `if: github.event.release.prerelease == true`
+  in that case).
+fix_code:
+  - language: yaml
+    label: 'Guard with if condition to skip pre-release publishes'
+    code: |
+      on:
+        release:
+          types: [published]
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          # Only deploy for final (non-pre-release) releases
+          if: github.event.release.prerelease == false
+          steps:
+            - name: Deploy release
+              run: echo "Deploying ${{ github.event.release.tag_name }}"
+
+  - language: yaml
+    label: 'Use released type to target only final releases (not pre-release creation)'
+    code: |
+      on:
+        release:
+          # released: fires when a release is published as final, OR when a pre-release
+          # is promoted to a full release. Does NOT fire on initial pre-release creation.
+          types: [released]
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Deploy release
+              run: echo "Deploying ${{ github.event.release.tag_name }}"
+
+  - language: yaml
+    label: 'Log release event fields at the start of release workflows for debugging'
+    code: |
+      jobs:
+        release-info:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Debug release event
+              run: |
+                echo "action: ${{ github.event.action }}"
+                echo "prerelease: ${{ github.event.release.prerelease }}"
+                echo "tag: ${{ github.event.release.tag_name }}"
+                echo "draft: ${{ github.event.release.draft }}"
+prevention:
+  - "Prefer types: [released] over types: [published] for production deployment workflows"
+  - "Always guard release deploy steps with: if: github.event.release.prerelease == false"
+  - "Make deployment and publish workflows idempotent so accidental double-runs cannot cause irreversible side effects"
+  - "Log github.event.action and github.event.release.prerelease at workflow start when debugging unexpected runs"
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#release'
+    label: 'release event activity types — published fires for both prereleased and released (GitHub Docs)'
+  - url: 'https://stackoverflow.com/questions/78085080/how-to-limit-a-github-action-to-fire-only-once-on-a-release-trigger'
+    label: 'Stack Overflow: release action triggered 3 times for pre-release — limit using types and if conditions'
