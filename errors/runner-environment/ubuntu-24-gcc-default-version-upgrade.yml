@@ -1,0 +1,113 @@
+id: runner-environment-127
+title: "ubuntu-24.04 Runner: GCC 13 Default Breaks Workflows Hardcoding gcc-12 or gcc-11"
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-24
+  - gcc
+  - compiler
+  - c-cpp
+  - breaking-change
+  - runner-image
+patterns:
+  - regex: 'gcc-1[012]:\s*(command not found|not found)'
+    flags: 'i'
+  - regex: '/usr/bin/gcc-1[012]:\s*No such file or directory'
+    flags: 'i'
+  - regex: 'update-alternatives.*gcc.*no alternatives'
+    flags: 'i'
+  - regex: 'gcc: error: unrecognized command-line option.*std=c\+\+20'
+    flags: 'i'
+error_messages:
+  - "gcc-12: command not found"
+  - "gcc-11: command not found"
+  - "/usr/bin/gcc-12: No such file or directory"
+  - "g++-12: command not found"
+  - "cc1plus: error: unrecognized command line option"
+root_cause: |
+  Ubuntu 24.04 (Noble Numbat) ships GCC 13 as its default and only pre-installed compiler
+  version. The ubuntu-24.04 GitHub-hosted runner image follows this: `gcc` and `g++` point
+  to GCC 13, and older versions (`gcc-12`, `gcc-11`, `gcc-10`) are not installed by default.
+
+  Workflows that hardcode a specific compiler version — `gcc-12`, `g++-12`, `gcc-11`, or
+  set `CC=gcc-12` / `CXX=g++-12` in environment variables — will fail immediately with
+  "command not found" when the runner image is ubuntu-24.04.
+
+  This commonly breaks:
+  - C/C++ projects that pin a specific GCC version for ABI stability or reproducibility
+  - CMake projects with `CMAKE_C_COMPILER=gcc-12` in toolchain files or workflow env vars
+  - Projects testing against specific GCC versions using a matrix
+  - Makefile-based builds with `CC := gcc-12` hard-coded
+
+  GCC 13 has improved standards compliance, stricter warnings-as-errors behavior, and
+  changed default `-std` values for C and C++. Code that compiled cleanly on GCC 12 may
+  emit new warnings or errors on GCC 13 even after installing the right package.
+fix: |
+  Update compiler references to use GCC 13 on ubuntu-24.04, or install the specific GCC
+  version needed via apt before building. For multi-version testing, use a runner matrix
+  pairing the Ubuntu version with the GCC version.
+fix_code:
+  - language: yaml
+    label: "Update to GCC 13 on ubuntu-24.04 or install older version"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            # ❌ GCC 12 not pre-installed on ubuntu-24.04
+            # env:
+            #   CC: gcc-12
+            #   CXX: g++-12
+
+            # ✅ Option 1: use the default GCC 13 on ubuntu-24.04
+            - name: Build with GCC 13 (default on ubuntu-24.04)
+              env:
+                CC: gcc
+                CXX: g++
+              run: make -j$(nproc)
+
+            # ✅ Option 2: install a specific GCC version
+            - name: Install GCC 12
+              run: sudo apt-get install -y gcc-12 g++-12
+
+            - name: Build with GCC 12
+              env:
+                CC: gcc-12
+                CXX: g++-12
+              run: make -j$(nproc)
+  - language: yaml
+    label: "Matrix strategy to test multiple GCC versions across Ubuntu versions"
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              include:
+                - os: ubuntu-22.04
+                  gcc: '12'
+                - os: ubuntu-24.04
+                  gcc: '13'
+          runs-on: ${{ matrix.os }}
+          steps:
+            - uses: actions/checkout@v4
+            - name: Install GCC ${{ matrix.gcc }}
+              run: sudo apt-get install -y gcc-${{ matrix.gcc }} g++-${{ matrix.gcc }}
+            - name: Build
+              env:
+                CC: gcc-${{ matrix.gcc }}
+                CXX: g++-${{ matrix.gcc }}
+              run: make -j$(nproc)
+prevention:
+  - "Avoid hardcoding specific GCC versions (`gcc-12`, `gcc-11`) in workflow env vars — use the default `gcc` and pin the Ubuntu version instead"
+  - "When upgrading to ubuntu-24.04, audit all `CC=`, `CXX=`, `CMAKE_C_COMPILER=`, and `CMAKE_CXX_COMPILER=` references in workflows and CMakeLists.txt"
+  - "Use a matrix to explicitly pair OS version with GCC version to make the GCC dependency visible and testable"
+  - "GCC 13 introduced stricter warnings for C23 and C++23 features — review `-Werror` builds carefully after upgrading"
+docs:
+  - url: "https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2404-Readme.md"
+    label: "ubuntu-24.04 runner image README (installed compilers section)"
+  - url: "https://gcc.gnu.org/gcc-13/changes.html"
+    label: "GCC 13 release notes — breaking changes from GCC 12"
+  - url: "https://packages.ubuntu.com/noble/gcc"
+    label: "Ubuntu 24.04 Noble: gcc package (default version 13)"
