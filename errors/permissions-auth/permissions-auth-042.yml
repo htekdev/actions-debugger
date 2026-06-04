@@ -1,0 +1,125 @@
+id: permissions-auth-042
+title: "actions/attest-build-provenance requires both id-token: write AND attestations: write — missing attestations permission causes 403"
+category: permissions-auth
+severity: error
+tags:
+  - attestations
+  - attest-build-provenance
+  - id-token
+  - permissions
+  - supply-chain
+  - sigstore
+  - 403
+patterns:
+  - regex: 'attestations.*write.*required|write.*attestations.*required'
+    flags: 'i'
+  - regex: 'Resource not accessible by integration.*attest'
+    flags: 'i'
+  - regex: 'Error: Failed to create attestation'
+    flags: 'i'
+  - regex: 'permissions.*attestations.*write'
+    flags: 'i'
+error_messages:
+  - "Error: Failed to create attestation: Resource not accessible by integration"
+  - "Error: Failed to create attestation: 403 Forbidden"
+  - "RequestError [HttpError]: Resource not accessible by integration"
+  - "Error: Attestation creation failed: must have `attestations: write` permission"
+root_cause: |
+  GitHub's artifact attestation feature (GA May 2024, https://github.blog/changelog/2024-05-02-github-artifact-attestations-is-generally-available/)
+  allows workflows to generate Sigstore-compatible provenance attestations for build
+  artifacts using `actions/attest-build-provenance` or `actions/attest`.
+
+  These actions require TWO permissions on the GITHUB_TOKEN:
+  1. `id-token: write` — to fetch an OIDC token from GitHub's identity provider
+     (used to sign the attestation with Sigstore)
+  2. `attestations: write` — to store the attestation in GitHub's attestation store
+     (new permission introduced with the attestation feature)
+
+  Most early documentation examples, blog posts, and quickstarts only show
+  `id-token: write`, omitting `attestations: write`. Developers following these
+  examples get a cryptic 403 "Resource not accessible by integration" error when
+  the attest step runs, with no clear indication that a second permission is missing.
+
+  The error is consistent and not environment-specific — it will fail on every run
+  until the `attestations: write` permission is added.
+
+  Additionally, organization-level policies may restrict the use of attestations.
+  If the organization has disabled artifact attestations, the 403 will occur even
+  with both permissions present — the error message does not distinguish between
+  "missing permission" and "feature disabled by org policy".
+fix: |
+  Add BOTH `id-token: write` AND `attestations: write` to the permissions block
+  of the job that runs the attest-build-provenance action.
+
+  If your workflow or job already declares a `permissions` block, add both entries
+  to it. If your workflow has no permissions block, add one with both required
+  permissions plus any other permissions your workflow needs (e.g., `contents: read`
+  for checkout).
+
+  Note: `attestations: write` is only available on github.com. GitHub Enterprise
+  Server (GHES) requires GHES 3.12+ for attestation support.
+fix_code:
+  - language: yaml
+    label: "Correct permissions for actions/attest-build-provenance"
+    code: |
+      jobs:
+        build-and-attest:
+          runs-on: ubuntu-latest
+          permissions:
+            id-token: write      # Required: OIDC token for Sigstore signing
+            attestations: write  # Required: write attestation to GitHub store
+            contents: read       # Required: checkout
+
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Build artifact
+              run: |
+                npm ci
+                npm run build
+                tar -czf dist.tar.gz dist/
+
+            - name: Generate build provenance attestation
+              uses: actions/attest-build-provenance@v2
+              with:
+                subject-path: dist.tar.gz
+  - language: yaml
+    label: "Attest multiple subjects (container image + artifact)"
+    code: |
+      jobs:
+        release:
+          runs-on: ubuntu-latest
+          permissions:
+            id-token: write
+            attestations: write
+            contents: read
+            packages: write  # If pushing to GHCR
+
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Attest binary
+              uses: actions/attest-build-provenance@v2
+              with:
+                subject-path: bin/myapp
+
+            - name: Attest container image
+              uses: actions/attest-build-provenance@v2
+              with:
+                subject-name: ghcr.io/${{ github.repository }}/myapp
+                subject-digest: ${{ steps.push.outputs.digest }}
+                push-to-registry: true
+prevention:
+  - "Always include BOTH `id-token: write` and `attestations: write` in the permissions block — neither alone is sufficient"
+  - "Copy the permissions block from the official actions/attest-build-provenance README examples, not from third-party blog posts"
+  - "Use `gh attestation verify <artifact>` locally to test that attestations were created successfully after the workflow runs"
+  - "For GHES deployments, verify the GHES version is 3.12+ before adding attestation steps to workflows"
+docs:
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds"
+    label: "GitHub Docs — Using artifact attestations to establish provenance"
+  - url: "https://github.blog/changelog/2024-05-02-github-artifact-attestations-is-generally-available/"
+    label: "GitHub Changelog — Artifact attestations GA (May 2024)"
+  - url: "https://github.com/actions/attest-build-provenance"
+    label: "actions/attest-build-provenance — README and required permissions"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/controlling-permissions-for-github_token"
+    label: "GitHub Docs — GITHUB_TOKEN permission scopes (attestations: write)"
