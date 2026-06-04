@@ -1,0 +1,90 @@
+id: silent-failures-068
+title: 'steps.<id>.conclusion is always success when continue-on-error: true — using conclusion to detect step failure never triggers'
+category: silent-failures
+severity: silent-failure
+tags:
+  - continue-on-error
+  - steps-context
+  - outcome
+  - conclusion
+  - if-condition
+  - step-failure
+patterns:
+  - regex: 'steps\.\w+\.conclusion\s*==\s*[''"]failure[''"]'
+    flags: 'i'
+  - regex: 'continue-on-error.*true'
+    flags: 'i'
+error_messages:
+  - 'steps.<id>.conclusion == ''failure'' never evaluates to true'
+  - 'cleanup step silently skipped despite step failure'
+root_cause: |
+  GitHub Actions provides two properties on the `steps` context for inspecting a completed step:
+
+  - `steps.<id>.outcome` — the raw result BEFORE `continue-on-error` is applied. Values:
+    `success`, `failure`, `cancelled`, `skipped`.
+  - `steps.<id>.conclusion` — the final result AFTER `continue-on-error` is applied. When
+    `continue-on-error: true` and the step fails, `conclusion` is `success` (not `failure`).
+
+  When a step has `continue-on-error: true` set, a step failure does NOT propagate to
+  `conclusion`. Developers who write:
+
+    if: steps.my-step.conclusion == 'failure'
+
+  expecting to detect when `my-step` failed will find that this condition is NEVER true — even
+  when the step actually failed — because `continue-on-error` overwrites the conclusion to
+  `success`. The downstream step silently never runs.
+
+  This commonly affects:
+  - Cleanup steps that should run when a flaky test step fails (continue-on-error: true)
+  - Notification steps that should alert on specific step failures in a pipeline
+  - Conditional logic that differentiates between "step was skipped" and "step failed"
+fix: |
+  Use `steps.<id>.outcome` (not `conclusion`) to detect the raw result of a step that has
+  `continue-on-error: true`. The `outcome` property reflects the actual step result before
+  the error suppression is applied and correctly returns `failure` even when the final
+  conclusion is `success`.
+fix_code:
+  - language: yaml
+    label: 'WRONG: conclusion is always success when continue-on-error is true — cleanup never runs'
+    code: |
+      steps:
+        - name: Run flaky tests
+          id: tests
+          continue-on-error: true
+          run: pytest tests/
+
+        - name: Send failure notification
+          # NEVER RUNS — conclusion is 'success' even when tests fail
+          if: steps.tests.conclusion == 'failure'
+          run: echo "Tests failed — notifying team"
+
+  - language: yaml
+    label: 'CORRECT: use outcome to detect the raw step result before continue-on-error'
+    code: |
+      steps:
+        - name: Run flaky tests
+          id: tests
+          continue-on-error: true
+          run: pytest tests/
+
+        - name: Send failure notification
+          # CORRECT — outcome reflects the raw result before continue-on-error override
+          if: steps.tests.outcome == 'failure'
+          run: echo "Tests failed — notifying team"
+
+        - name: Always-run cleanup
+          # For cleanup that must run regardless, use always() + outcome check
+          if: always() && steps.tests.outcome != 'success'
+          run: echo "Running cleanup after non-success outcome"
+prevention:
+  - "When a step has continue-on-error: true, always use steps.<id>.outcome (not conclusion) to detect failures in downstream if conditions"
+  - "steps.<id>.conclusion == 'success' is always true when continue-on-error: true — it is safe for 'did this step not skip?' checks only"
+  - "The failure() status function is also bypassed by continue-on-error — use steps.<id>.outcome != 'success' instead"
+  - "Review GitHub Docs context reference table to understand outcome vs conclusion semantics before writing conditional cleanup steps"
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#steps-context'
+    label: 'steps context — outcome vs conclusion properties with continue-on-error (GitHub Docs)'
+  - url: 'https://github.com/actions/runner/blob/main/docs/adrs/0274-step-outcome-and-conclusion.md'
+    label: 'actions/runner ADR: outcome vs conclusion design — why two separate properties exist'
+  - url: 'https://stackoverflow.com/questions/71433926/how-do-to-run-the-next-github-action-step-even-if-the-previous-step-failed-whil'
+    label: 'Stack Overflow: using steps.outcome vs steps.conclusion with continue-on-error'
