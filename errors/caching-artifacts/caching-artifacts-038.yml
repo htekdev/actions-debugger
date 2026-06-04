@@ -1,0 +1,95 @@
+id: caching-artifacts-038
+title: "hashFiles() returns empty string when no matching files found — constant cache key causes cross-branch cache pollution"
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - cache
+  - hashFiles
+  - cache-key
+  - silent-failure
+  - cross-branch
+  - lock-file
+patterns:
+  - regex: 'hashfiles\s*\(.*\)\s*==\s*''"""'
+    flags: 'i'
+  - regex: 'cache-hit.*true.*hashfiles.*empty'
+    flags: 'i'
+error_messages:
+  - "Cache restored successfully"
+  - "Cache hit: true"
+root_cause: |
+  The `hashFiles()` expression function returns an empty string when no files match the
+  provided glob pattern. It does NOT throw an error or fail the step.
+
+  A common pattern is:
+    key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+
+  If `package-lock.json` does not exist (e.g., using yarn, pnpm, or no lock file present),
+  `hashFiles('**/package-lock.json')` returns `""` and the key becomes:
+    "Linux-node-"
+
+  This constant key means every workflow run hits the same cache entry regardless of
+  dependency changes or branch. The first job saves its node_modules under this key, and
+  every subsequent run on every branch restores those same cached modules. This silently
+  masks dependency update failures or serves stale packages from a different branch's state.
+
+  The failure is invisible: `cache-hit: true` appears in logs and the job succeeds, hiding
+  the fact that no lock file was actually hashed. Developers notice only when flaky test
+  failures or "wrong version installed" errors occur.
+fix: |
+  Use the correct lock file for your package manager, or add a fallback to prevent a
+  constant key when hashFiles returns empty.
+
+  Option 1: Use the correct lock file:
+    - npm: **/package-lock.json
+    - yarn: **/yarn.lock
+    - pnpm: **/pnpm-lock.yaml
+    - pip: **/requirements.txt or **/poetry.lock
+
+  Option 2: Add a github.run_id fallback to ensure key uniqueness when files are missing:
+    key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') || github.run_id }}
+
+  Option 3: Use hashFiles with multiple patterns so at least one matches:
+    key: ${{ runner.os }}-deps-${{ hashFiles('**/package-lock.json', '**/yarn.lock', '**/pnpm-lock.yaml') }}
+
+  Option 4: Add a validation step to fail fast if no lock file is found rather than
+  silently using a constant cache key.
+fix_code:
+  - language: yaml
+    label: "run_id fallback prevents constant cache key when lock file is absent"
+    code: |
+      - name: Cache node modules
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          # hashFiles returns "" if no lock file found; run_id fallback prevents constant key
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') || github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+  - language: yaml
+    label: "Multi-ecosystem lock file glob — matches whichever lock file is present"
+    code: |
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            ~/.yarn/cache
+            ~/.pnpm-store
+          key: ${{ runner.os }}-deps-${{ hashFiles('**/package-lock.json', '**/yarn.lock', '**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-deps-
+prevention:
+  - "Verify your lock file glob matches an actual file before relying on it for cache key uniqueness"
+  - "Add || github.run_id fallback: hashFiles('...') || github.run_id prevents silent constant-key caching"
+  - "Use restore-keys as a fallback strategy rather than depending on an exact key hit"
+  - "In setup steps, validate the expected lock file exists before caching (e.g., Test-Path package-lock.json)"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#hashfiles"
+    label: "GitHub Docs — hashFiles() expression function"
+  - url: "https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows"
+    label: "GitHub Docs — Caching dependencies to speed up workflows"
+  - url: "https://github.com/actions/cache/blob/main/tips-and-workarounds.md"
+    label: "actions/cache — Tips and workarounds"
+  - url: "https://github.com/orgs/community/discussions/25064"
+    label: "GitHub Community — hashFiles returns empty when no files match"
