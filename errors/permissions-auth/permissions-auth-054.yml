@@ -1,0 +1,99 @@
+id: permissions-auth-054
+title: "OIDC sub claim format changes when environment: block added — IdP trust policy breaks"
+category: permissions-auth
+severity: error
+tags:
+  - oidc
+  - environment
+  - aws
+  - gcp
+  - azure
+  - sub-claim
+  - trust-policy
+  - deployment-protection
+patterns:
+  - regex: 'Not authorized to perform sts:AssumeRoleWithWebIdentity'
+    flags: 'i'
+  - regex: 'Error: Credentials could not be loaded'
+    flags: 'i'
+  - regex: 'Permission.*denied.*generateAccessToken|WorkloadIdentityPool.*rejected'
+    flags: 'i'
+error_messages:
+  - "Not authorized to perform sts:AssumeRoleWithWebIdentity"
+  - "Error: Credentials could not be loaded, please check your action inputs: Could not load credentials from any providers"
+  - "Permission 'iam.serviceAccounts.getOpenIdToken' denied on resource"
+  - "The provided token could not be validated"
+root_cause: |
+  GitHub Actions OIDC token `sub` (subject) claim format depends on whether the
+  job has an `environment:` key. Without an environment, the subject is:
+    `repo:OWNER/REPO:ref:refs/heads/BRANCH`
+
+  When `environment: production` is present on the job, the format changes to:
+    `repo:OWNER/REPO:environment:production`
+
+  The branch/ref component is replaced entirely by the environment name. AWS IAM
+  role trust policies, GCP Workload Identity Federation conditions, and Azure
+  federated credential filters that matched the branch-ref format now receive a
+  token with a different sub claim and reject the OIDC exchange with a 403 or
+  permission-denied error.
+
+  This commonly occurs when a team adds environment protection rules (required
+  reviewers, wait timers) to an existing workflow that already had OIDC
+  credentials working. CI passes before adding `environment:` but fails after.
+fix: |
+  Update the IdP trust policy to match the new subject format containing the
+  environment name. Options:
+  1. Narrow to environment: change the condition to match
+     `repo:OWNER/REPO:environment:production`.
+  2. Use a wildcard: match `repo:OWNER/REPO:*` to accept both formats (less secure).
+  3. GitHub subject claim customization (Enterprise): define a consistent sub
+     claim format that does not change based on environment presence.
+fix_code:
+  - language: yaml
+    label: "Workflow: annotate environment and required OIDC permissions"
+    code: |
+      permissions:
+        id-token: write
+        contents: read
+
+      jobs:
+        deploy:
+          # Adding this key changes the OIDC sub claim format — update IdP trust policy
+          environment: production
+          runs-on: ubuntu-latest
+          steps:
+            - uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-to-assume: arn:aws:iam::123456789012:role/DeployRole
+                aws-region: us-east-1
+                # AWS trust policy must now use:
+                # "token.actions.githubusercontent.com:sub":
+                #   "StringEquals": "repo:org/repo:environment:production"
+                # (not "repo:org/repo:ref:refs/heads/main")
+  - language: yaml
+    label: "AWS IAM trust policy: match environment sub claim"
+    code: |
+      # AWS IAM Role Trust Policy — update Condition after adding environment:
+      # Before (no environment):
+      #   "token.actions.githubusercontent.com:sub": "repo:org/repo:ref:refs/heads/main"
+      #
+      # After (with environment: production):
+      #   "token.actions.githubusercontent.com:sub": "repo:org/repo:environment:production"
+      #
+      # Wildcard to accept both (less restrictive):
+      #   "token.actions.githubusercontent.com:sub":
+      #     StringLike: "repo:org/repo:*"
+      #
+      # GCP: update attribute.repository_environment or use attribute mapping
+prevention:
+  - "Before adding `environment:` to a job using OIDC, audit and update all IdP trust policies"
+  - "Document the expected sub claim format in trust policy comments to avoid future confusion"
+  - "Use GitHub's OIDC token debugger step to inspect the actual sub claim at runtime"
+  - "For consistent sub format across environment and non-environment jobs, consider subject claim customization"
+docs:
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect#filtering-for-a-specific-environment"
+    label: "GitHub Docs: OIDC filtering for a specific environment"
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect#customizing-the-subject-claims-for-an-organization-or-repository"
+    label: "GitHub Docs: Customizing subject claims"
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services"
+    label: "GitHub Docs: Configuring OIDC in AWS"

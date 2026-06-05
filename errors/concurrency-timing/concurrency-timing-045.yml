@@ -1,0 +1,70 @@
+id: concurrency-timing-045
+title: "workflow_run-triggered workflows run concurrently — no upstream concurrency linkage"
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - workflow_run
+  - concurrency
+  - deployment
+  - build-deploy-pipeline
+  - downstream-workflow
+patterns:
+  - regex: 'on:\s+workflow_run:'
+    flags: 'si'
+error_messages:
+  - "Multiple deployments triggered simultaneously for the same branch"
+  - "Deploy workflow triggered concurrently"
+root_cause: |
+  Workflows triggered via `on: workflow_run:` do not inherit any concurrency
+  group from the triggering (upstream) workflow. If multiple upstream runs
+  complete in quick succession — for example, two commits pushed rapidly — each
+  `completed` event spawns an independent downstream run. All downstream runs
+  execute concurrently with no serialization or cancellation, even when the
+  upstream workflow had a concurrency group that serialized upstream runs.
+
+  The downstream workflow runs in the context of the default branch and receives
+  the triggering run's metadata via `github.event.workflow_run.*`, but GitHub
+  does not propagate any concurrency scope from upstream to downstream.
+
+  For build-then-deploy pipelines this creates a race condition: two deploy runs
+  may begin simultaneously, with whichever finishes last determining the final
+  deployed state regardless of commit order.
+fix: |
+  Add an explicit `concurrency:` block to the `workflow_run`-triggered workflow,
+  keyed on `github.event.workflow_run.head_branch` to scope per branch.
+
+  Use `cancel-in-progress: true` for idempotent deploys (only the latest commit
+  matters) or `cancel-in-progress: false` for non-idempotent operations that
+  must complete once queued.
+fix_code:
+  - language: yaml
+    label: "Add explicit concurrency group to workflow_run-triggered deploy workflow"
+    code: |
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+          branches: [main]
+
+      # Without this block, concurrent CI completions spawn concurrent deploys
+      concurrency:
+        group: deploy-${{ github.event.workflow_run.head_branch }}
+        cancel-in-progress: true
+
+      jobs:
+        deploy:
+          if: github.event.workflow_run.conclusion == 'success'
+          runs-on: ubuntu-latest
+          steps:
+            - name: Deploy
+              run: echo "Deploying ${{ github.event.workflow_run.head_sha }}"
+prevention:
+  - "Always define an explicit `concurrency:` block in `workflow_run`-triggered workflows"
+  - "Key the concurrency group on `github.event.workflow_run.head_branch` to scope by branch"
+  - "For CI-to-deploy pipelines, use `cancel-in-progress: true` so only the latest commit deploys"
+  - "Consider consolidating CI and deploy into a single workflow using `needs:` if elevated permissions are not required"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run"
+    label: "GitHub Docs: workflow_run event"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/controlling-workflow-and-job-execution"
+    label: "GitHub Docs: Controlling workflow and job execution (concurrency)"

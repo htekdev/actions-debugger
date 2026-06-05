@@ -1,0 +1,90 @@
+id: caching-artifacts-053
+title: "download-artifact@v4 finds no artifacts in workflow_run context without run-id"
+category: caching-artifacts
+severity: error
+tags:
+  - download-artifact
+  - workflow_run
+  - run-id
+  - cross-workflow
+  - artifact
+patterns:
+  - regex: 'No artifacts found'
+    flags: 'i'
+  - regex: 'Unable to find any artifacts for the associated workflow'
+    flags: 'i'
+error_messages:
+  - "No artifacts found for the associated workflow run"
+  - "Unable to find any artifacts for the associated workflow"
+  - "Error: Unable to find any artifacts for the associated workflow run"
+root_cause: |
+  `actions/download-artifact@v4` defaults to downloading artifacts from the
+  CURRENT workflow run (`github.run_id`). In a `workflow_run`-triggered
+  workflow, the current run is the downstream (deploy) workflow — which has
+  produced no artifacts. The upstream (build) workflow's artifacts belong to
+  the triggering run, identified by `github.event.workflow_run.id`.
+
+  Without setting `run-id: ${{ github.event.workflow_run.id }}`, the download
+  step searches the current run's artifacts, finds nothing, and either fails
+  with "No artifacts found" or silently exits (depending on `if-no-files-found`
+  setting). No artifact was ever associated with the downstream run, so the
+  error can be confusing — the artifact clearly exists in the Actions UI under
+  the upstream run.
+
+  This is a distinct issue from the cross-run permissions error (ca-040):
+  that occurs when `run-id` IS set but `actions: read` permission is missing.
+  This issue occurs when `run-id` is simply not set at all.
+fix: |
+  Set `run-id: ${{ github.event.workflow_run.id }}` on the download step to
+  target the triggering workflow's run. Also provide `github-token` (required
+  for cross-run downloads) and ensure `actions: read` permission is set.
+fix_code:
+  - language: yaml
+    label: "Correct: set run-id from triggering workflow in workflow_run context"
+    code: |
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+
+      permissions:
+        actions: read
+        contents: read
+
+      jobs:
+        deploy:
+          if: github.event.workflow_run.conclusion == 'success'
+          runs-on: ubuntu-latest
+          steps:
+            - name: Download build artifacts
+              uses: actions/download-artifact@v4
+              with:
+                name: build-output
+                # Required: point to the upstream run, not the current run
+                run-id: ${{ github.event.workflow_run.id }}
+                github-token: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Deploy
+              run: echo "Deploying from artifact"
+  - language: yaml
+    label: "Incorrect: missing run-id causes 'No artifacts found'"
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Download build artifacts
+              uses: actions/download-artifact@v4
+              with:
+                name: build-output
+                # Missing run-id — searches the CURRENT run, which has no artifacts
+prevention:
+  - "In any `workflow_run`-triggered workflow, always set `run-id: ${{ github.event.workflow_run.id }}`"
+  - "Pair with `github-token: ${{ secrets.GITHUB_TOKEN }}` and `permissions: actions: read`"
+  - "Verify artifacts exist under the triggering run via the Actions UI before debugging download steps"
+  - "Name artifacts consistently between upload (in CI) and download (in deploy) workflows"
+docs:
+  - url: "https://github.com/actions/download-artifact?tab=readme-ov-file#download-artifacts-from-other-workflow-runs-or-repositories"
+    label: "actions/download-artifact: Downloading from other workflow runs"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run"
+    label: "GitHub Docs: workflow_run event"
