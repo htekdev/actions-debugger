@@ -1,0 +1,98 @@
+id: runner-environment-184
+title: "setup-python free-threaded Python (3.13t/3.14t) on windows-11-arm64 installs broken 0-byte python.exe symlink"
+category: runner-environment
+severity: error
+tags:
+  - setup-python
+  - free-threaded
+  - python
+  - windows-11-arm64
+  - symlink
+  - arm64
+  - reparse-point
+patterns:
+  - regex: 'Fatal Python error: Failed to import encodings module'
+    flags: 'i'
+  - regex: 'ModuleNotFoundError: No module named .encodings.'
+    flags: 'i'
+  - regex: 'Remove-Item.*python\.exe.*does not exist'
+    flags: 'i'
+error_messages:
+  - "Fatal Python error: Failed to import encodings module"
+  - "ModuleNotFoundError: No module named 'encodings'"
+  - "Remove-Item : Cannot find path '...\\arm64-freethreaded\\python.exe' because it does not exist."
+  - "Error happened during pip installation / upgrade"
+root_cause: |
+  The `win32-arm64-freethreaded` distribution zip for Python 3.13t and 3.14t packages
+  `python.exe` and `python3.exe` as Windows reparse points (symlinks) pointing to
+  `python3.13t.exe` / `python3.14t.exe`.
+
+  When actions/setup-python extracts and copies the zip contents to the tool cache on
+  `windows-11-arm64`, the symlink target is not found at the expected relative path —
+  the copy operation leaves a dangling 0-byte reparse point (`-a---l 0 python.exe`)
+  instead of a real executable.
+
+  `setup.ps1:131` then fails to Remove-Item the dangling reparse point (PowerShell
+  cannot delete it because the path resolves as non-existent), and the tool cache
+  entry has no working Python interpreter. When the action invokes the installed
+  python, it immediately crashes with "Fatal Python error: Failed to import encodings
+  module" because the 0-byte stub cannot locate its stdlib.
+
+  Non-free-threaded arm64 builds (3.11, 3.12, 3.13, 3.14) are not affected — only
+  the `*t` (free-threaded / GIL-free) variants hit this issue on windows-11-arm64.
+fix: |
+  1. Workaround: Use the non-free-threaded variant (3.13 instead of 3.13t) unless
+     the GIL-free runtime is explicitly required.
+  2. Workaround for arm64 only: Install free-threaded Python from NuGet, which
+     ships real executables instead of symlinks. Gate on runner.arch == 'ARM64'.
+  3. Wait for actions/setup-python to land a fix that correctly resolves Windows
+     reparse points in free-threaded zip distributions (tracked in setup-python#1307).
+fix_code:
+  - language: yaml
+    label: "Workaround: use non-free-threaded Python on windows-11-arm64"
+    code: |
+      - uses: actions/setup-python@v5
+        with:
+          # Avoid '3.13t' / '3.14t' on windows-11-arm64 — use standard variant
+          python-version: '3.13'
+
+  - language: yaml
+    label: "Workaround: install free-threaded Python via NuGet on ARM64"
+    code: |
+      - name: Setup Python (non-ARM64)
+        if: runner.arch != 'ARM64'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13t'
+
+      - name: Install free-threaded Python via NuGet (windows-11-arm64 workaround)
+        if: runner.os == 'Windows' && runner.arch == 'ARM64'
+        run: |
+          nuget install python -Version 3.13.3t -OutputDirectory "$env:RUNNER_TEMP\nuget" -NonInteractive
+          $pythonDir = Get-ChildItem "$env:RUNNER_TEMP\nuget" -Filter "python.3*" | Select-Object -First 1
+          Add-Content $env:GITHUB_PATH "$($pythonDir.FullName)\tools"
+          Add-Content $env:GITHUB_PATH "$($pythonDir.FullName)\tools\Scripts"
+
+  - language: yaml
+    label: "Verification step: confirm Python works after setup"
+    code: |
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13t'
+
+      - name: Verify Python installation
+        run: |
+          python --version
+          python -c "import sys; print(sys.version, sys._is_gil_enabled())"
+prevention:
+  - "Do not use free-threaded Python variants (3.13t, 3.14t) on windows-11-arm64 until setup-python#1307 is resolved"
+  - "Gate free-threaded Python tests: run on ubuntu-latest or windows-latest (x64), avoid windows-11-arm64 for *t variants"
+  - "Add a verification step (python -c 'import sys') after setup-python to catch broken installs before test steps"
+  - "Follow setup-python#1307 for the official fix — upgrade as soon as a patched version is released"
+docs:
+  - url: "https://github.com/actions/setup-python/issues/1307"
+    label: "setup-python fails for free-threaded Python (3.13t/3.14t) on windows-11-arm64 (setup-python#1307)"
+  - url: "https://github.com/onnx/onnx/pull/7869"
+    label: "Install free-threaded Python from NuGet on windows-11-arm (workaround reference)"
+  - url: "https://docs.python.org/3.13/whatsnew/3.13.html#free-threaded-cpython"
+    label: "Python 3.13 — Free-threaded CPython documentation"

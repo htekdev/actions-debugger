@@ -1,0 +1,90 @@
+id: silent-failures-101
+title: "upload-artifact/download-artifact fails silently with no error message on Windows (exit -1073740791)"
+category: silent-failures
+severity: error
+tags:
+  - upload-artifact
+  - download-artifact
+  - windows
+  - silent-failure
+  - node-crash
+  - heap-corruption
+patterns:
+  - regex: 'Node Action run completed with exit code -1073740791'
+    flags: 'i'
+  - regex: '^Finalizing artifact upload\s*$'
+    flags: 'im'
+  - regex: '^Downloading single artifact\s*$'
+    flags: 'im'
+error_messages:
+  - "##[debug]Node Action run completed with exit code -1073740791"
+  - "Finalizing artifact upload"
+  - "Downloading single artifact"
+root_cause: |
+  A Promise rejection during blob upload (upload-artifact) or HTTP chunk download
+  (download-artifact) causes the Node.js process to terminate abruptly on Windows
+  with exit code -1073740791 (STATUS_HEAP_CORRUPTION / 0xC0000409). Node exits
+  before the catch handler runs, so no error message is ever logged — the step
+  fails silently with no diagnostic output.
+
+  The underlying race was in actions/toolkit's HTTP client: when a blob transfer
+  encounters a network blip or ABS latency spike, an unhandled promise rejection
+  aborts the Node process on Windows. The bug manifests more frequently on Windows
+  runners, on large artifacts (>100MB), and during periods of elevated Azure Blob
+  Storage latency.
+
+  Typical log signatures:
+  - upload-artifact: logs stop after "Finalizing artifact upload" — the
+    "Artifact ... successfully finalized. Artifact ID ..." confirmation line
+    is absent.
+  - download-artifact: logs stop after "Downloading single artifact" — the
+    "Artifact download completed successfully" line is absent, and debug logs
+    show "Node Action run completed with exit code -1073740791".
+fix: |
+  1. Re-run the failed job — the bug is transient and sporadic; most reruns succeed.
+  2. Upgrade to upload-artifact v4.6.0+ and download-artifact v4.2.0+ / v8.0.2+
+     which include the fix from actions/toolkit#2406 (deferred promise creation
+     in chunk loops and propagated download errors).
+  3. If using a Windows runner and seeing frequent failures, split large artifacts
+     into smaller named chunks to reduce per-blob transfer time.
+fix_code:
+  - language: yaml
+    label: "Upgrade artifact actions to fixed versions"
+    code: |
+      # upload-artifact v4.6.0+ includes fix for silent heap corruption exit
+      - uses: actions/upload-artifact@v4
+        with:
+          name: my-artifact
+          path: dist/
+
+      # download-artifact v4.2.0+ / v8.0.2+ includes fix
+      - uses: actions/download-artifact@v4
+        with:
+          name: my-artifact
+  - language: yaml
+    label: "Workaround: split large artifacts to reduce per-blob transfer failures"
+    code: |
+      # Upload separate chunks instead of one large artifact
+      - uses: actions/upload-artifact@v4
+        with:
+          name: my-artifact-binaries
+          path: dist/binaries/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: my-artifact-assets
+          path: dist/assets/
+prevention:
+  - "Pin upload-artifact to v4.6.0+ and download-artifact to v4.2.0+/v8.0.2+ which include the heap corruption fix"
+  - "Monitor Windows runner jobs for sporadic step failures with no error output — a rerun is the immediate workaround"
+  - "Prefer uploading many smaller artifacts over one large artifact to reduce per-blob transfer window"
+  - "Enable debug logging (ACTIONS_RUNNER_DEBUG=true) to surface the exit code -1073740791 diagnostic line"
+docs:
+  - url: "https://github.com/actions/upload-artifact/issues/806"
+    label: "[bug] Upload failed without an error output (upload-artifact#806)"
+  - url: "https://github.com/actions/download-artifact/issues/475"
+    label: "[bug] Action failed without any error message (download-artifact#475)"
+  - url: "https://github.com/actions/toolkit/pull/2406"
+    label: "Fix: Propagate download error and verify length (toolkit#2406)"
+  - url: "https://github.com/actions/download-artifact/pull/479"
+    label: "Fix: Defer promise creation into chunk loop to prevent unhandled rejections on Windows (download-artifact#479)"
