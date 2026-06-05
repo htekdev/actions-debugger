@@ -1,0 +1,81 @@
+id: caching-artifacts-061
+title: "setup-java cache: 'gradle' Silently Corrupts Cache on Windows — Gradle Lock Files Device or Resource Busy"
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - setup-java
+  - gradle
+  - windows
+  - cache
+  - lock-files
+  - device-busy
+patterns:
+  - regex: '\.lock.*Read error.*Device or resource busy'
+    flags: i
+  - regex: 'fileContent\.lock.*Device or resource busy'
+    flags: i
+  - regex: '\.gradle/caches.*Read error.*byte 0'
+    flags: i
+error_messages:
+  - "/usr/bin/tar: C\\:/Users/runneradmin/.gradle/caches/8.7/fileContent/fileContent.lock: Read error at byte 0, while reading 38 bytes: Device or resource busy"
+  - "/usr/bin/tar: Exiting with failure status due to previous errors"
+  - "Warning: Failed to save: ... failed with exit code 2"
+root_cause: |
+  On Windows runners, actions/setup-java with cache: 'gradle' triggers a cache save in its
+  post-job step. At that point, the Gradle daemon process started during the build step may
+  still be running and holding open file locks on these cache directories:
+    - .gradle/caches/*/fileContent.lock
+    - .gradle/caches/*/fileHashes.lock
+    - .gradle/caches/*/generated-gradle-jars.lock
+    - .gradle/caches/*/javaCompile.lock
+    - .gradle/caches/journal-1/journal-1.lock
+    - .gradle/caches/modules-*/modules-*.lock
+
+  The GNU tar bundled with Git for Windows (used by the GitHub Actions runner) cannot read
+  Windows-locked files and exits with code 2. Despite this failure, setup-java logs
+  "Cache saved with the key: ..." because the cache service accepted a partial archive.
+
+  The silent failure: subsequent runs restore the partial cache, missing the locked files.
+  Gradle then redownloads dependencies on every run, and the cache save repeats the same
+  error. Cache size appears normal in the UI but the archive contents are incomplete.
+  Reported in actions/setup-java#633.
+fix: |
+  Stop the Gradle daemon explicitly before the post-job step fires. The setup-java
+  post-step runs after all workflow steps complete, so stopping the daemon in the last
+  step ensures no lock files are held when the post-step archives the cache:
+fix_code:
+  - language: yaml
+    label: "Fix: stop Gradle daemon before post-step cache save"
+    code: |
+      jobs:
+        build:
+          runs-on: windows-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-java@v4
+              with:
+                java-version: '21'
+                distribution: 'temurin'
+                cache: 'gradle'
+            - name: Build with Gradle
+              run: ./gradlew build
+            - name: Stop Gradle daemon before cache save
+              if: always()
+              run: ./gradlew --stop
+  - language: yaml
+    label: "Alternative: build with --no-daemon (no daemon started, no lock files)"
+    code: |
+      - name: Build with Gradle (no daemon)
+        run: ./gradlew build --no-daemon
+prevention:
+  - "Always add a './gradlew --stop' step (with if: always()) after your build step on Windows runners"
+  - "Use --no-daemon for Gradle builds in CI to avoid daemon lock file issues entirely"
+  - "Verify cache usefulness by checking whether Gradle redownloads dependencies on runs after cache save"
+  - "Consider using the official gradle/actions/setup-gradle action which handles daemon lifecycle better"
+docs:
+  - url: "https://github.com/actions/setup-java/issues/633"
+    label: "actions/setup-java#633 — Gradle caching post-task fails on Windows with 'device or resource busy'"
+  - url: "https://docs.gradle.org/current/userguide/gradle_daemon.html"
+    label: "Gradle Daemon documentation — stopping and disabling"
+  - url: "https://github.com/gradle/actions/blob/main/docs/setup-gradle.md"
+    label: "gradle/actions — recommended Gradle CI caching action"
