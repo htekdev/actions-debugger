@@ -1,0 +1,96 @@
+id: runner-environment-188
+title: "macOS Self-Hosted Runner Concurrent Checkout Hangs — git-credential-osxkeychain Deadlock"
+category: runner-environment
+severity: error
+tags:
+  - macos
+  - self-hosted
+  - checkout
+  - concurrent
+  - osxkeychain
+  - credential
+  - hang
+patterns:
+  - regex: 'git-credential-osxkeychain store'
+    flags: i
+  - regex: 'run_command.*git-credential-osxkeychain'
+    flags: i
+error_messages:
+  - "trace: run_command: 'git credential-osxkeychain store'"
+  - "trace: exec: git-credential-osxkeychain store"
+  - "trace: start_command: /opt/homebrew/opt/git/libexec/git-core/git-credential-osxkeychain store"
+root_cause: |
+  When two or more concurrent jobs on the same macOS self-hosted runner both execute
+  `actions/checkout`, each job's git process attempts to acquire the macOS Keychain to store
+  the authentication token via `git-credential-osxkeychain`. Because the macOS Keychain
+  serializes write access, a second concurrent credential store call waits indefinitely for
+  the first to release the keychain lock — creating a deadlock that never resolves on its own.
+
+  The job hangs silently. The last visible log line is always the `git-credential-osxkeychain
+  store` trace, followed by no output until the 6-hour GitHub Actions job timeout cancels
+  the run. There is no error message — the step simply never completes.
+
+  Runner v2.331.0 (which moved the base macOS image to 26 / Tahoe) and checkout@v6 together
+  worsened the race condition frequency. The issue also affects earlier runner/checkout
+  version combinations when multiple jobs share the same macOS self-hosted runner workspace.
+fix: |
+  Two workarounds exist. The most reliable is a pre-checkout workspace cleanup step that
+  removes leftover lock files from prior concurrent runs. The second is disabling credential
+  persistence so git never calls the macOS Keychain at all.
+
+  Option A (most reliable — workspace cleanup before every checkout):
+    Add a step before `actions/checkout` that removes all workspace contents. This eliminates
+    stale `.git/index.lock`, `.git/gc.pid` and credential lock files that cause the hang.
+
+  Option B (simpler — disable credential persistence):
+    Set `persist-credentials: false` on the checkout step. This prevents git from calling
+    `git-credential-osxkeychain store` entirely since no token is persisted. Note: this
+    means subsequent git operations in the same job cannot use the persisted token, so you
+    must pass the token explicitly in each git call that needs it.
+
+  If the workspace directory itself is the issue (leftover `.git/index.lock`), add an explicit
+  pre-step that deletes `.git/index.lock` and `.git/gc.pid` if they exist.
+fix_code:
+  - language: yaml
+    label: "Option A — pre-checkout workspace cleanup (most reliable)"
+    code: |
+      jobs:
+        build:
+          runs-on: [self-hosted, macos]
+          steps:
+            - name: Clean workspace before checkout
+              run: |
+                find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + \
+                  || echo "::warning::Workspace cleanup failed due to concurrent writes. Not fatal."
+            - uses: actions/checkout@v6
+  - language: yaml
+    label: "Option B — disable credential persistence to skip keychain"
+    code: |
+      jobs:
+        build:
+          runs-on: [self-hosted, macos]
+          steps:
+            - uses: actions/checkout@v6
+              with:
+                persist-credentials: false
+  - language: yaml
+    label: "Delete stale git lock files before checkout"
+    code: |
+      - name: Remove stale git lock files
+        run: |
+          rm -f "$GITHUB_WORKSPACE/.git/index.lock"
+          rm -f "$GITHUB_WORKSPACE/.git/gc.pid"
+      - uses: actions/checkout@v6
+prevention:
+  - "Use ephemeral self-hosted macOS runners (each job gets a fresh runner) to eliminate workspace state sharing between concurrent jobs"
+  - "Limit concurrency on the macOS runner's job queue to 1 using a concurrency group if ephemeral runners are not available"
+  - "Add a pre-checkout workspace cleanup step as a defensive measure on all macOS self-hosted runner jobs"
+  - "Set `persist-credentials: false` if downstream git operations do not require the persisted token"
+  - "Upgrade to the latest actions/checkout — version tags and runner versions interact; newer releases may reduce the deadlock window"
+docs:
+  - url: "https://stackoverflow.com/questions/79881327/github-actions-self-hosted-runner-on-macos-tries-to-checkout-repository-forever"
+    label: "Stack Overflow — macOS self-hosted runner checkout hangs forever (Feb 2026)"
+  - url: "https://github.com/actions/checkout/issues/550"
+    label: "actions/checkout#550 — Checkout gets stuck forever randomly on self-hosted runners"
+  - url: "https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners"
+    label: "GitHub Docs: About self-hosted runners"
