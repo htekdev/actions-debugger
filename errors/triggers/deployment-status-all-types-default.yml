@@ -1,0 +1,123 @@
+id: triggers-063
+title: 'on.deployment_status fires for all deployment lifecycle statuses by default — add types: to filter'
+category: triggers
+severity: warning
+tags:
+  - deployment_status
+  - deployment
+  - event-types
+  - trigger
+  - duplicate-runs
+  - types-filter
+patterns:
+  - regex: 'on:\s*\n\s*deployment_status:'
+    flags: 'ms'
+  - regex: 'deployment_status:\s*$'
+    flags: 'i'
+error_messages:
+  - '(no error — workflow fires unexpectedly multiple times per deployment)'
+root_cause: |
+  The `on.deployment_status` event fires whenever the status of a deployment changes.
+  A single end-to-end deployment lifecycle emits SIX distinct status events in sequence:
+    created → queued → in_progress → success (or failure / error)
+  Plus `inactive` when an older deployment is superseded by a new one.
+
+  When a workflow uses `on: deployment_status:` without a `types:` filter, it runs for
+  EVERY one of these status transitions. For a typical deployment:
+  - GitHub creates the deployment (fires `deployment_status` with state `created`)
+  - The deployment starts running (fires `in_progress`)
+  - The deployment completes (fires `success`)
+  - Any prior deployment for the same environment becomes inactive (fires `inactive`)
+
+  This causes a workflow to run 3-4 times per deployment. Common consequences:
+  - Post-deployment smoke tests run before the deployment is complete (`in_progress` run)
+  - Notification steps send duplicate Slack/email messages for each status transition
+  - Downstream `workflow_run` triggers fire multiple times, causing race conditions
+  - GitHub-billed Actions minutes are wasted on unwanted runs
+
+  The `deployment_status` event does not have sensible defaults for status filtering —
+  unlike `pull_request` (which defaults to `opened`, `synchronize`, `reopened`),
+  `deployment_status` has no default type filter and fires for everything.
+
+  Note: This is analogous to `on.pull_request_review` firing for all review types by
+  default (documented in triggers-062). Both events require explicit `types:` filters
+  to limit scope to meaningful actions.
+fix: |
+  Add a `types:` filter to `on.deployment_status` to limit which status transitions
+  trigger the workflow. For most use cases:
+  - Post-deployment tests: use `types: [success]`
+  - Deployment monitoring: use `types: [failure, error]`
+  - Full lifecycle tracking: use `types: [in_progress, success, failure, error]`
+
+  Additionally, add an `if:` condition using `github.event.deployment_status.state`
+  for fine-grained control when multiple types are needed.
+fix_code:
+  - language: yaml
+    label: 'Filter to success only — post-deployment smoke tests'
+    code: |
+      on:
+        deployment_status:
+          types:
+            - success   # Only runs when deployment reaches success state
+
+      jobs:
+        smoke-test:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Run smoke tests against deployed environment
+              run: |
+                ENV_URL="${{ github.event.deployment_status.environment_url }}"
+                echo "Testing $ENV_URL"
+                curl -f "$ENV_URL/health"
+  - language: yaml
+    label: 'Filter to failure and error — deployment monitoring'
+    code: |
+      on:
+        deployment_status:
+          types:
+            - failure
+            - error
+
+      jobs:
+        alert:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Notify on deployment failure
+              run: |
+                echo "Deployment failed: ${{ github.event.deployment_status.state }}"
+                echo "Environment: ${{ github.event.deployment.environment }}"
+  - language: yaml
+    label: 'Multiple types with runtime if: check for nuanced handling'
+    code: |
+      on:
+        deployment_status:
+          types:
+            - success
+            - failure
+            - error
+
+      jobs:
+        post-deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Run tests on success
+              if: github.event.deployment_status.state == 'success'
+              run: echo "Running post-deployment tests"
+
+            - name: Alert on failure
+              if: |
+                github.event.deployment_status.state == 'failure' ||
+                github.event.deployment_status.state == 'error'
+              run: echo "Alerting on deployment failure"
+prevention:
+  - "Always add `types:` to `on.deployment_status` — the default of no filter fires for all 6 status transitions"
+  - "Check `github.event.deployment_status.state` in workflow conditions when using multiple status types"
+  - "Use `environment_url` from `github.event.deployment_status` to target the correct environment in post-deployment tests"
+  - "Monitor your Actions run history after deploying — multiple runs per deployment indicates a missing types: filter"
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#deployment_status'
+    label: 'GitHub Docs: deployment_status event — activity types'
+  - url: 'https://docs.github.com/en/rest/deployments/statuses?apiVersion=2022-11-28'
+    label: 'GitHub REST API: Deployment statuses — state values'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#github-context'
+    label: 'GitHub Docs: github.event.deployment_status context fields'
