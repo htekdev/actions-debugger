@@ -1,0 +1,120 @@
+id: silent-failures-087
+title: '`fail-fast: false` Does Not Prevent Downstream `needs:` Jobs From Being Skipped When Matrix Jobs Fail'
+category: silent-failures
+severity: silent-failure
+tags:
+  - matrix
+  - fail-fast
+  - needs
+  - downstream-job
+  - skipped
+  - strategy
+patterns:
+  - regex: 'fail-fast\s*:\s*false'
+    flags: 'i'
+  - regex: 'needs\s*:.*matrix|matrix.*needs\s*:'
+    flags: 'im'
+error_messages:
+  - "This job was skipped"
+  - "Job 'X' is skipped because all dependencies failed or were skipped"
+root_cause: |
+  `strategy.fail-fast: false` only prevents other MATRIX jobs from being
+  cancelled when one matrix job fails. It does NOT affect how downstream
+  jobs that `needs:` the matrix job handle the overall result.
+
+  When at least one matrix job fails (even with `fail-fast: false` allowing
+  all others to complete), the `needs.<matrix-job>.result` for the downstream
+  job evaluates to `'failure'`. A downstream job with a standard `needs:`
+  dependency is then SKIPPED — not because of `fail-fast`, but because its
+  dependency is in a failed state.
+
+  This surprises developers who add `fail-fast: false` expecting the entire
+  pipeline to continue running end-to-end. The final summary/report job
+  that needs the matrix job is silently skipped, producing no output.
+fix: |
+  Add `if: always()` to downstream jobs that should run regardless of matrix
+  outcome. Then explicitly check `needs.<job>.result` values to determine
+  pass/fail:
+
+  - `if: always()` ensures the job is never skipped due to upstream failure
+  - Check `contains(needs.*.result, 'failure')` to detect any matrix failure
+  - Use `needs.<job>.result == 'success'` for strict pass gates
+fix_code:
+  - language: yaml
+    label: "WRONG — summary job silently skipped when matrix job fails"
+    code: |
+      jobs:
+        test:
+          strategy:
+            fail-fast: false  # ❌ allows all matrix jobs to run, but...
+            matrix:
+              node: [18, 20, 22]
+          runs-on: ubuntu-latest
+          steps:
+            - run: npm test
+
+        summary:
+          needs: test           # ❌ still skipped if any matrix job failed
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "All tests done"
+  - language: yaml
+    label: "RIGHT — use if: always() and check result explicitly"
+    code: |
+      jobs:
+        test:
+          strategy:
+            fail-fast: false
+            matrix:
+              node: [18, 20, 22]
+          runs-on: ubuntu-latest
+          steps:
+            - run: npm test
+
+        summary:
+          needs: test
+          if: always()          # ✅ runs even when test jobs failed
+          runs-on: ubuntu-latest
+          steps:
+            - name: Check matrix results
+              if: contains(needs.test.result, 'failure')
+              run: |
+                echo "One or more matrix jobs failed"
+                exit 1
+            - name: Success
+              run: echo "All matrix jobs passed"
+  - language: yaml
+    label: "RIGHT — gate final deploy only when all matrix jobs pass"
+    code: |
+      jobs:
+        test:
+          strategy:
+            fail-fast: false
+            matrix:
+              node: [18, 20, 22]
+          runs-on: ubuntu-latest
+          outputs:
+            result: ${{ job.status }}
+          steps:
+            - run: npm test
+
+        deploy:
+          needs: test
+          if: always() && needs.test.result == 'success'  # ✅ explicit success check
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying"
+prevention:
+  - "Always add `if: always()` to aggregation/summary/deploy jobs that need to run after a matrix job."
+  - "Explicitly check `needs.<job>.result` or `contains(needs.*.result, 'failure')` rather than relying on implicit pass-through."
+  - "Understand that `fail-fast: false` is matrix-scoped — it does not change how the `needs:` graph handles failures."
+  - "Use job outputs combined with `if: always()` to build robust reporting jobs that capture all matrix outcomes."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-jobs-in-a-workflow#defining-prerequisite-jobs"
+    label: "Defining prerequisite jobs — needs context and result values"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idstrategyfail-fast"
+    label: "workflow syntax — jobs.<job_id>.strategy.fail-fast"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#status-check-functions"
+    label: "Status check functions — always(), success(), failure()"
+  - url: "https://github.com/orgs/community/discussions/26822"
+    label: "GitHub Community — fail-fast: false but summary job still skipped"
