@@ -1,0 +1,87 @@
+id: known-unsolved-062
+title: 'workflow_run chains are limited to one level — a workflow_run-triggered workflow cannot trigger another downstream workflow via workflow_run'
+category: known-unsolved
+severity: limitation
+tags:
+  - workflow-run
+  - chaining
+  - pipeline
+  - limitation
+  - no-fix
+  - event-trigger
+patterns:
+  - regex: 'on:\s*\n\s+workflow_run:'
+    flags: 'i'
+error_messages: []
+root_cause: |
+  GitHub Actions explicitly prevents workflow_run events from chaining more than one
+  level deep. A workflow triggered by workflow_run CANNOT itself use workflow_run as
+  an on: trigger to fire a third downstream workflow.
+
+  From GitHub documentation: "A workflow triggered by a workflow_run event can only
+  be triggered by a workflow that is not itself triggered by a workflow_run event."
+
+  This restriction prevents infinite trigger loops but also prevents building linear
+  CI/CD pipelines using workflow_run chaining alone. Multi-stage pipelines of the form
+  Build (push) → Test (workflow_run) → Deploy (workflow_run) → Notify (workflow_run)
+  fail silently at the second hop: the Deploy and Notify workflows never appear in the
+  Actions tab and no error is raised anywhere.
+
+  There is no runtime error, no annotation, and no warning. The on: workflow_run
+  trigger on the downstream workflow is simply never evaluated.
+fix: |
+  Replace the second-hop workflow_run trigger with an explicit dispatch from the
+  first downstream workflow:
+
+  Option 1 — repository_dispatch: use the GitHub REST API from a job step in workflow
+  B to POST to /repos/{owner}/{repo}/dispatches with a custom event_type. Workflow C
+  listens on on: repository_dispatch with a matching types: filter.
+
+  Option 2 — workflow_dispatch: use gh workflow run from a step in workflow B to
+  directly trigger workflow C by filename. Requires a GitHub token with actions:write.
+
+  Option 3 — Consolidate: merge the second and third workflows into a single workflow
+  with job dependencies (needs:) eliminating the cross-workflow hop entirely.
+fix_code:
+  - language: yaml
+    label: 'Does NOT work: workflow_run cannot chain more than one level deep'
+    code: |
+      # Workflow C — this trigger is never evaluated when Workflow B is
+      # itself triggered by workflow_run
+      on:
+        workflow_run:
+          workflows: ["B - Integration Tests"]
+          types: [completed]
+  - language: yaml
+    label: 'Fix: dispatch workflow C via repository_dispatch from workflow B'
+    code: |
+      # In workflow B (intermediate workflow, triggered by workflow_run):
+      jobs:
+        dispatch-downstream:
+          runs-on: ubuntu-latest
+          if: ${{ github.event.workflow_run.conclusion == 'success' }}
+          steps:
+            - name: Trigger workflow C via repository_dispatch
+              run: |
+                gh api repos/${{ github.repository }}/dispatches \
+                  --method POST \
+                  --field event_type=run-deploy \
+                  --field client_payload='{"run_id":"${{ github.event.workflow_run.id }}"}'
+              env:
+                GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # In workflow C:
+      on:
+        repository_dispatch:
+          types: [run-deploy]
+prevention:
+  - 'Design CI/CD pipelines assuming workflow_run allows only one hop; use repository_dispatch or workflow_dispatch for any second-level chaining'
+  - 'Prefer consolidating multi-stage pipelines into a single workflow with job dependencies (needs:) when the stages always execute in sequence'
+  - 'When a downstream workflow never appears in the Actions tab after merging, verify whether its on: trigger is workflow_run and whether its upstream workflow is also workflow_run-triggered'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run'
+    label: 'GitHub Docs: workflow_run event — one-level-deep restriction'
+  - url: 'https://docs.github.com/en/rest/repos/repos#create-a-repository-dispatch-event'
+    label: 'GitHub REST API: Create a repository dispatch event'
+  - url: 'https://cli.github.com/manual/gh_workflow_run'
+    label: 'GitHub CLI: gh workflow run (alternative dispatch method)'
