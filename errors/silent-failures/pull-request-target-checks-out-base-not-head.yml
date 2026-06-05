@@ -1,0 +1,97 @@
+id: silent-failures-093
+title: 'pull_request_target workflow checks out base branch by default — PR head changes are not tested'
+category: silent-failures
+severity: silent-failure
+tags:
+  - pull-request-target
+  - checkout
+  - base-branch
+  - head-ref
+  - fork-pr
+patterns:
+  - regex: 'pull_request_target.*actions/checkout'
+    flags: 'i'
+  - regex: 'HEAD is now at.*base.*not.*head'
+    flags: 'i'
+error_messages:
+  - "Actions attempted to checkout a merge commit for a pull request but the merge commit was unavailable"
+root_cause: |
+  When a workflow is triggered by pull_request_target, the GITHUB_SHA and the default
+  checkout ref point to the BASE branch of the PR — not the PR head commit.
+
+  This is intentional security behavior: pull_request_target runs in the context of
+  the base repository (with full secrets access), so GitHub deliberately avoids
+  running untrusted code from fork PRs by defaulting to the safe base branch state.
+
+  The result is a silent failure: CI appears to run and pass, but it is actually
+  testing the base branch code, not the contributor's changes. No error is emitted.
+
+  Developers commonly hit this when:
+  - Migrating from pull_request to pull_request_target for Dependabot secrets access
+  - Setting up labeler/auto-assign bots that also want to run tests
+  - Building required-status checks that use pull_request_target for fork support
+
+  Even with actions/checkout@v4, the default ref for pull_request_target is
+  github.sha which resolves to the base branch HEAD — not the merge commit.
+fix: |
+  Explicitly check out the PR head ref when you need to test the contributor's code:
+
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.head.sha }}
+
+  WARNING: This executes untrusted code from fork contributors in an environment
+  with full repository secrets. Only do this after careful security review:
+  - Gate on github.event.pull_request.head.repo.fork to distinguish fork vs internal
+  - Never expose secrets to steps that run contributor code
+  - Consider using a separate workflow_run trigger instead for fork PRs that need secrets
+
+  For safe automation (labelers, assignment bots), use pull_request_target but do NOT
+  check out the head ref — these actions only need the event payload, not the code.
+fix_code:
+  - language: yaml
+    label: 'Check out PR head for internal PRs only (safe pattern)'
+    code: |
+      on:
+        pull_request_target:
+          types: [opened, synchronize]
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          # Only run contributor code for PRs from the same repo, not forks
+          if: github.event.pull_request.head.repo.full_name == github.repository
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.pull_request.head.sha }}
+            - run: npm test
+  - language: yaml
+    label: 'Safe bot usage — do NOT check out head (labeler example)'
+    code: |
+      on:
+        pull_request_target:
+          types: [opened]
+
+      jobs:
+        label:
+          runs-on: ubuntu-latest
+          permissions:
+            pull-requests: write
+          steps:
+            # No checkout needed — labeler only reads the event payload
+            - uses: actions/labeler@v5
+              with:
+                repo-token: ${{ secrets.GITHUB_TOKEN }}
+prevention:
+  - 'Always explicitly set ref: when using actions/checkout with pull_request_target triggers'
+  - 'Never check out the PR head commit in a pull_request_target workflow that has access to secrets unless you have verified the source repo'
+  - 'Prefer pull_request for standard CI — use pull_request_target only when secrets access is required from fork workflows'
+  - 'Read the GitHub security hardening guide before using pull_request_target with any code execution steps'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request_target'
+    label: 'GitHub Actions — pull_request_target event (security context and checkout behavior)'
+  - url: 'https://securitylab.github.com/research/github-actions-preventing-pwn-requests/'
+    label: 'GitHub Security Lab — Preventing pwn requests with pull_request_target'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions#understanding-the-risk-of-script-injections'
+    label: 'GitHub Actions security hardening guide'
