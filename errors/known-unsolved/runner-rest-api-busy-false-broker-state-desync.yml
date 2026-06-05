@@ -1,0 +1,102 @@
+id: known-unsolved-063
+title: 'REST API reports runner busy:false while broker shows runner actively executing a job'
+category: known-unsolved
+severity: silent-failure
+tags:
+  - self-hosted
+  - runner
+  - autoscaler
+  - rest-api
+  - broker
+  - state-desync
+  - v2-flow
+  - job-killed
+patterns:
+  - regex: 'busy.*false.*runner.*executing|runner.*busy.*false.*job'
+    flags: 'i'
+  - regex: '"busy"\s*:\s*false'
+    flags: 'i'
+error_messages:
+  - '"busy": false'
+  - 'GET /repos/{owner}/{repo}/actions/runners/{id} → {"busy": false}'
+root_cause: |
+  On non-ephemeral self-hosted runners using the V2 broker flow
+  (`broker.actions.githubusercontent.com`), a state desynchronization exists between
+  the broker service and the GitHub REST API:
+
+  - The broker correctly tracks runner state in real-time: after picking up Job B, the
+    runner reports `JobState: Busy` to the broker and renews its job lease every 60s.
+  - However, `GET /repos/{owner}/{repo}/actions/runners/{runner_id}` (the public REST
+    API) continues to return `"busy": false` during the early phase of job execution.
+    The REST API state may only update after the runner's next periodic sync, which
+    can lag 30–120 seconds behind the broker state.
+
+  Auto-scaling tools that rely on the REST API to identify idle runners (e.g.,
+  `github-aws-runners/terraform-aws-github-runner`, KEDA GitHub Actions scaler,
+  custom Lambda/CloudFunction scalers) interpret `busy: false` as "runner is idle and
+  safe to terminate." This causes the autoscaler to terminate an EC2/GCE/Azure instance
+  mid-job — killing the runner process with no Actions-level error and marking the job
+  as failed with a runner disconnection error.
+
+  From the affected job's perspective, the log ends mid-step with "The runner has
+  received a shutdown signal" or the job times out. There is no annotation indicating
+  the root cause was an autoscaler decision based on stale REST API data.
+
+  No GitHub-side fix is available as of June 2026. The REST API does not expose a
+  real-time busy status consistent with the broker. Open at actions/runner#4422.
+fix: |
+  There is no complete fix — this is a known state inconsistency in the GitHub platform.
+
+  Workarounds (choose one based on your autoscaling setup):
+
+  1. **Switch to ephemeral JIT runners (recommended)**: Use JIT tokens and terminate
+     runners after exactly one job. There is no window for autoscalers to misidentify
+     a running job as idle because the runner is registered and deregistered atomically.
+
+  2. **Add a grace period before termination**: When your autoscaler sees `busy: false`,
+     wait 2–3 minutes and re-poll before actually terminating. This covers the lag
+     between broker state and REST API state.
+
+  3. **Poll job status instead of runner status**: Use
+     `GET /repos/{owner}/{repo}/actions/runs` to check for `in_progress` workflow runs
+     before terminating any runner, rather than relying on per-runner `busy` status.
+
+  4. **Use runner labels + job assignment**: If your autoscaler assigns specific runners
+     to specific jobs via labels, you can cross-reference queued/in-progress job
+     assignments against runner IDs before terminating.
+fix_code:
+  - language: yaml
+    label: 'Example: Switch to ephemeral JIT runners (removes the desync window entirely)'
+    code: |
+      # Use JIT runner registration in your autoscaler
+      # Each runner handles exactly one job — busy/idle desync cannot occur
+      # See: https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions#using-just-in-time-runners
+
+      # In your autoscaler provisioning logic:
+      #   POST /repos/{owner}/{repo}/actions/runners/generate-jit-config
+      #   → Use the returned jit_config to start an ephemeral runner
+      #   → Runner auto-deregisters after job completes — no stale REST state possible
+  - language: yaml
+    label: 'Example: Grace period before termination (Terraform-style pseudocode)'
+    code: |
+      # In your autoscaler Lambda/script, before terminating an instance:
+      # 1. GET /repos/{owner}/{repo}/actions/runners/{runner_id}
+      # 2. If busy == false, wait 2 minutes
+      # 3. Re-poll: GET /repos/{owner}/{repo}/actions/runners/{runner_id}
+      # 4. Only terminate if STILL busy == false after the grace period
+
+      # This covers the broker→REST lag window (~30-120s observed in practice)
+prevention:
+  - "Prefer ephemeral JIT runners for any workload where mid-job termination would be costly; the broker-REST desync window is zero for single-job-per-runner setups."
+  - "Never terminate a runner instance based solely on a single REST API `busy: false` reading — always double-check with a grace period or secondary signal."
+  - "Monitor for jobs that end with 'runner has received a shutdown signal' — this is a reliable indicator that a runner was terminated externally mid-job."
+  - "If using terraform-aws-github-runner or similar, check whether the tool version has built-in grace periods for the busy-state lag."
+docs:
+  - url: 'https://github.com/actions/runner/issues/4422'
+    label: 'actions/runner#4422 — /runners REST API reports busy:false for active runner'
+  - url: 'https://docs.github.com/en/rest/actions/self-hosted-runners'
+    label: 'REST API: Self-hosted runners'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions#using-just-in-time-runners'
+    label: 'Just-in-time runners documentation'
+  - url: 'https://github.com/github-aws-runners/terraform-aws-github-runner'
+    label: 'terraform-aws-github-runner (commonly affected autoscaler)'
