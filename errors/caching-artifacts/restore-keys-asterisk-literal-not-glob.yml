@@ -1,0 +1,107 @@
+id: caching-artifacts-066
+title: 'restore-keys patterns are literal prefix strings — asterisk is not a glob wildcard'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - cache
+  - actions/cache
+  - restore-keys
+  - prefix
+  - cache-miss
+  - glob
+patterns:
+  - regex: 'restore-keys:.*\*'
+    flags: 'i'
+  - regex: 'Cache not found for input keys:'
+    flags: 'i'
+  - regex: 'No cache found for key'
+    flags: 'i'
+error_messages:
+  - 'Cache not found for input keys:'
+  - 'No cache found for key'
+  - '(silent cache miss — no error, restore-keys with asterisk simply fails to match any existing cache entry)'
+root_cause: |
+  GitHub Actions cache restore-keys are prefix strings, not glob patterns. The
+  asterisk (*) character has no special meaning — it is treated as a literal
+  character in the prefix match.
+
+  A restore-keys entry of:
+    restore-keys: npm-${{ runner.os }}-*
+
+  does NOT match cache keys like:
+    npm-Ubuntu-abc123hash
+    npm-Ubuntu-lockfile-abcdef
+
+  It only matches keys whose name starts with the literal string
+  "npm-Ubuntu-*" (including the asterisk), which virtually never exist,
+  resulting in a silent cache miss with no error message.
+
+  This mistake is widespread because:
+  1. The actions/cache documentation uses the term "prefix" but does not
+     explicitly state that glob characters are unsupported or treated literally.
+  2. Many other caching tools (Gradle, Maven, Buildkite, CircleCI) accept glob
+     or wildcard patterns in cache key configurations, leading developers to
+     apply the same syntax to GitHub Actions.
+  3. The failure mode is silent — the step reports "Cache not found for input keys"
+     and continues normally. Without inspecting the exact key string printed in the
+     step log, the asterisk in the pattern is invisible as the cause.
+
+  The correct behavior: restore-keys prefix matching finds any cache entry whose
+  key BEGINS WITH the given string. Trailing a prefix with a dash or separator
+  (e.g., npm-Ubuntu-) is all that is needed to match any entry starting with
+  that prefix — no asterisk required or supported.
+fix: |
+  Remove any glob characters from restore-keys entries. A bare prefix string
+  ending in a dash or other separator correctly matches all cache entries whose
+  key starts with that prefix:
+
+    restore-keys: |
+      npm-${{ runner.os }}-      ← correct: prefix without asterisk
+
+  The cache service automatically returns the most recently saved matching entry,
+  so multiple ordered restore-keys fallback entries can be stacked from most
+  specific to broadest.
+fix_code:
+  - language: yaml
+    label: 'Broken: asterisk treated as literal — no cached keys match this pattern'
+    code: |
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            npm-${{ runner.os }}-*
+  - language: yaml
+    label: 'Fixed: bare prefix (no asterisk) correctly matches all prior cache entries'
+    code: |
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            npm-${{ runner.os }}-
+  - language: yaml
+    label: 'Multiple fallback tiers from most specific to broadest (no globs needed)'
+    code: |
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            ~/.cache/Cypress
+          key: node-${{ runner.os }}-${{ matrix.node-version }}-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            node-${{ runner.os }}-${{ matrix.node-version }}-
+            node-${{ runner.os }}-
+            node-
+prevention:
+  - 'Never use glob characters (*, ?, []) in restore-keys — they are literal string characters; the cache key service does not interpret them as wildcards'
+  - 'End restore-keys prefix entries with a trailing dash or separator: restore-keys: npm-${{ runner.os }}- not npm-${{ runner.os }}-*'
+  - 'If cache misses persist despite restore-keys being configured, add a debug step that echoes the exact key and restore-keys strings being evaluated (using set -x or explicit echo) to spot literal asterisks in the output'
+  - 'Do not confuse restore-keys with glob support in path: — the path: field DOES support glob patterns; restore-keys does not'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows#matching-a-cache-key'
+    label: 'GitHub Docs: Matching a cache key'
+  - url: 'https://github.com/actions/cache#inputs'
+    label: 'actions/cache README: Inputs — restore-keys'
+  - url: 'https://github.com/actions/cache/blob/main/tips-and-workarounds.md'
+    label: 'actions/cache: Tips and workarounds'

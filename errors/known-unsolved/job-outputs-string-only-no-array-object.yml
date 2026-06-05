@@ -1,0 +1,142 @@
+id: known-unsolved-060
+title: 'Job outputs are strings only — arrays, objects, and booleans must be manually JSON-serialized'
+category: known-unsolved
+severity: limitation
+tags:
+  - job-outputs
+  - outputs
+  - string
+  - fromJSON
+  - array
+  - known-limitation
+  - GITHUB_OUTPUT
+patterns:
+  - regex: 'GITHUB_OUTPUT'
+    flags: 'i'
+  - regex: 'needs\.[a-z_-]+\.outputs\.'
+    flags: 'i'
+  - regex: 'fromJSON\s*\('
+    flags: 'i'
+error_messages:
+  - '(no runtime error — arrays or objects written to GITHUB_OUTPUT are silently converted to strings like "Array" or "[object Object]" if not JSON-serialized before writing)'
+root_cause: |
+  GitHub Actions job outputs use the GITHUB_OUTPUT file protocol which only supports
+  string key-value pairs. There is no native type system for job outputs — every
+  value passed through GITHUB_OUTPUT is stored and transmitted as a plain string,
+  regardless of the producing language or shell.
+
+  This becomes a problem in several common scenarios:
+
+  1. Passing arrays: A bash array or newline-separated list written to GITHUB_OUTPUT
+     becomes a space-separated string or a literal "[array]" — not a JSON array.
+     Downstream matrix.include: fromJSON() fails or produces a single-element matrix.
+
+  2. Passing objects: A JSON object must be written as a compact single-line string.
+     Multi-line JSON written to GITHUB_OUTPUT breaks the key=value line format and
+     corrupts the output, causing a parse error or silently reading only the first
+     line as the value.
+
+  3. Boolean comparisons: Outputs written as "true" or "false" are strings, not
+     booleans. Comparing ${{ needs.x.outputs.flag == true }} (boolean literal)
+     silently evaluates to false; only ${{ needs.x.outputs.flag == 'true' }} (string)
+     or ${{ fromJSON(needs.x.outputs.flag) }} works correctly.
+
+  This is a known platform limitation. The GitHub Actions team has acknowledged the
+  string-only constraint in multiple community discussions. There is no native typed
+  output support on the public roadmap as of mid-2026, and no timeline has been given
+  for adding array or object output types.
+fix: |
+  Serialize arrays and objects to compact single-line JSON before writing to
+  GITHUB_OUTPUT, then deserialize with fromJSON() in consuming jobs.
+
+  Key rule: use jq -c to produce compact (one-line) JSON — multi-line JSON
+  embedded in GITHUB_OUTPUT silently truncates at the first newline.
+
+  For booleans: write the literal string "true"/"false" and compare with == 'true'
+  in if: conditions, or wrap with fromJSON() to get a native boolean for contexts
+  that require one (e.g., matrix include).
+fix_code:
+  - language: yaml
+    label: 'Write and consume a JSON array as a job output'
+    code: |
+      jobs:
+        generate-matrix:
+          runs-on: ubuntu-latest
+          outputs:
+            targets: ${{ steps.set-matrix.outputs.targets }}
+          steps:
+            - id: set-matrix
+              run: |
+                # Use jq -c for compact single-line JSON — multi-line breaks GITHUB_OUTPUT
+                TARGETS=$(echo '[{"env":"staging"},{"env":"prod"}]' | jq -c .)
+                echo "targets=$TARGETS" >> "$GITHUB_OUTPUT"
+
+        deploy:
+          needs: generate-matrix
+          strategy:
+            matrix:
+              target: ${{ fromJSON(needs.generate-matrix.outputs.targets) }}
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying to ${{ matrix.target.env }}"
+  - language: yaml
+    label: 'Boolean output — write as string, compare correctly downstream'
+    code: |
+      jobs:
+        check-changes:
+          runs-on: ubuntu-latest
+          outputs:
+            has_changes: ${{ steps.diff.outputs.has_changes }}
+          steps:
+            - id: diff
+              run: |
+                if git diff --quiet HEAD~1; then
+                  echo "has_changes=false" >> "$GITHUB_OUTPUT"
+                else
+                  echo "has_changes=true" >> "$GITHUB_OUTPUT"
+                fi
+
+        build:
+          needs: check-changes
+          # Compare as string literal — NOT: == true (boolean comparison silently fails)
+          if: needs.check-changes.outputs.has_changes == 'true'
+          runs-on: ubuntu-latest
+          steps:
+            - run: make build
+  - language: yaml
+    label: 'Multi-line JSON — always compact with jq -c before writing'
+    code: |
+      jobs:
+        gather-config:
+          runs-on: ubuntu-latest
+          outputs:
+            config: ${{ steps.read-config.outputs.config }}
+          steps:
+            - uses: actions/checkout@v4
+            - id: read-config
+              run: |
+                # jq -c converts any JSON (even pretty-printed) to a single compact line
+                CONFIG=$(cat deploy-config.json | jq -c .)
+                echo "config=$CONFIG" >> "$GITHUB_OUTPUT"
+
+        deploy:
+          needs: gather-config
+          runs-on: ubuntu-latest
+          steps:
+            - run: |
+                CONFIG='${{ needs.gather-config.outputs.config }}'
+                echo "Region: $(echo "$CONFIG" | jq -r .region)"
+prevention:
+  - 'Always pipe JSON values through jq -c before writing to GITHUB_OUTPUT — compact single-line format prevents silent value truncation at embedded newlines'
+  - 'Compare boolean-string outputs with == ''true'' (string) not == true (boolean) in if: conditions; or use fromJSON() to convert to a native boolean'
+  - 'Never write a raw bash array to GITHUB_OUTPUT — it expands to a space-separated string; always serialize through jq -c first'
+  - 'Add a debug step that prints the raw output value using cat $GITHUB_OUTPUT before a consuming job runs, to confirm the serialized form looks correct'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/passing-information-between-jobs'
+    label: 'GitHub Docs: Passing information between jobs'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions#setting-an-output-parameter'
+    label: 'GitHub Docs: Setting an output parameter (GITHUB_OUTPUT)'
+  - url: 'https://github.com/orgs/community/discussions/17245'
+    label: 'GitHub Community: Job outputs only support strings — feature request for typed outputs'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#fromjson'
+    label: 'GitHub Docs: fromJSON expression function'
