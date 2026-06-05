@@ -1,0 +1,101 @@
+id: yaml-syntax-058
+title: "if: always() Runs Even on Manual Workflow Cancellation — Use if: !cancelled() for Cleanup Jobs"
+category: yaml-syntax
+severity: silent-failure
+tags:
+  - if-condition
+  - always
+  - cancelled
+  - status-functions
+  - cleanup-job
+patterns:
+  - regex: 'if:\s*always\(\)'
+    flags: "i"
+  - regex: 'always\(\).*cleanup\|cleanup.*always\(\)'
+    flags: "i"
+error_messages:
+  - "# No error — cleanup job unexpectedly runs after manual workflow cancellation"
+  - "# Job marked 'Cancelled' in UI but cleanup/notify step still executed"
+root_cause: |
+  The `always()` status check function evaluates to `true` in ALL job states:
+  `success`, `failure`, `cancelled`, and `skipped`. This is intentional and
+  documented, but the implication for cleanup/notification jobs surprises many
+  developers.
+
+  When a workflow is manually cancelled (via the GitHub UI, API, or CLI), all
+  running and queued jobs receive a `cancelled` status. Jobs with
+  `if: always()` will still execute because `always()` explicitly includes the
+  `cancelled` state.
+
+  The common intent is "always run this cleanup step even if the build failed"
+  — but the actual effect includes "run even when an operator stops the workflow
+  mid-run." This can cause cleanup jobs to run unexpectedly, send spurious
+  notifications, or consume runner minutes after an intentional cancellation.
+
+  Status function reference:
+    - `success()`    — true only when job status is success (default when no if:)
+    - `failure()`    — true only when job status is failure
+    - `cancelled()`  — true only when workflow was manually cancelled
+    - `always()`     — true for success, failure, cancelled, AND skipped
+    - `!cancelled()` — true for success and failure; skips on cancelled/skipped
+
+  `if: always()` and `if: !cancelled()` are NOT equivalent — the difference
+  becomes apparent only when workflows are manually cancelled.
+fix: |
+  For cleanup and notification jobs that should respect manual cancellation,
+  use `if: !cancelled()` instead of `if: always()`.
+
+  Reserve `if: always()` for jobs that genuinely must run in every state,
+  including intentional cancellations (rare).
+fix_code:
+  - language: yaml
+    label: "Use !cancelled() for cleanup jobs that should respect manual cancellation"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - run: make build
+
+        notify:
+          runs-on: ubuntu-latest
+          needs: build
+          # Bad: always() runs even when workflow is manually cancelled
+          # if: ${{ always() }}
+
+          # Good: !cancelled() runs on success and failure, skips on cancellation
+          if: ${{ !cancelled() }}
+          steps:
+            - name: Send Slack notification
+              run: echo "Build result: ${{ needs.build.result }}"
+  - language: yaml
+    label: "Status function comparison"
+    code: |
+      jobs:
+        # Runs only on success (implicit default — no if: needed)
+        deploy:
+          if: ${{ success() }}
+
+        # Runs on success or failure — skips on manual cancellation
+        notify:
+          if: ${{ !cancelled() }}
+
+        # Runs in every state including manual cancellation (use sparingly)
+        audit-log:
+          if: ${{ always() }}
+
+        # Runs only when the workflow was manually cancelled
+        on-cancel:
+          if: ${{ cancelled() }}
+prevention:
+  - "Use if: !cancelled() for cleanup and notification jobs to respect manual workflow cancellation."
+  - "Reserve if: always() for jobs that must run even when an operator intentionally stops the workflow."
+  - "When combining status functions with needs: checks, use needs.X.result == 'failure' for explicit conditions."
+  - "Run actionlint to detect common if: expression issues before pushing."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#status-check-functions"
+    label: "GitHub Docs — Status check functions"
+  - url: "https://github.com/rhysd/actionlint/blob/main/docs/checks.md"
+    label: "actionlint — Expression checks"
+  - url: "https://stackoverflow.com/questions/58457140"
+    label: "SO#58457140 — Difference between if: always() and if: !cancelled()"
