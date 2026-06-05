@@ -1,0 +1,95 @@
+id: silent-failures-096
+title: "Job timeout-minutes sets result to 'cancelled' not 'failure' — if: failure() notification jobs silently skip timed-out jobs"
+category: silent-failures
+severity: silent-failure
+tags:
+  - timeout-minutes
+  - job-result
+  - if-failure
+  - notification
+  - cancelled
+  - cleanup-job
+patterns:
+  - regex: 'if:.*failure\(\)'
+    flags: 'i'
+  - regex: 'timeout-minutes:\s*\d+'
+    flags: 'i'
+error_messages:
+  - "This step was skipped because a previous step failed"
+  - "notification job skipped — upstream job timed out but result is 'cancelled' not 'failure'"
+root_cause: |
+  When a job exceeds its `timeout-minutes:` limit, GitHub Actions cancels the job and
+  sets its `result` to `"cancelled"` — NOT `"failure"`. This is a consistent but
+  widely misunderstood behavior.
+
+  A standard pattern is to add a notification or cleanup job that runs when builds fail:
+
+    notify:
+      needs: build
+      if: failure()
+      runs-on: ubuntu-latest
+
+  The `failure()` status check function returns true only when at least one upstream job
+  has result `"failure"`. It does NOT match `"cancelled"`. When `build` times out,
+  `needs.build.result` is `"cancelled"`, so `if: failure()` evaluates to false and
+  the notification job is silently skipped.
+
+  The four terminal job result values are: "success", "failure", "cancelled", "skipped".
+  The built-in functions map to:
+  - `failure()` → true when any upstream job result is "failure"
+  - `cancelled()` → true when any upstream job result is "cancelled"
+  - `success()` → true when all upstream jobs result in "success" (default)
+  - `always()` → always true regardless of upstream results
+
+  Developers are often surprised that a timed-out build does not trigger their alerting
+  job. The UI shows the timed-out job in orange ("Cancelled"), while the notification
+  job appears grey ("Skipped") — there is no direct indication that the skip is due to
+  the timeout rather than an unrelated condition.
+fix: |
+  Expand the notification job condition to explicitly cover both `failure` and `cancelled`
+  results, using `always()` to ensure the job runs regardless of upstream outcomes.
+fix_code:
+  - language: yaml
+    label: "Catch both failure and timeout (cancelled) in notification job"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          timeout-minutes: 30
+          steps:
+            - uses: actions/checkout@v4
+            - run: make build
+
+        notify:
+          needs: build
+          # Use always() so the job runs; then check for failure OR cancelled (timeout)
+          if: always() && (needs.build.result == 'failure' || needs.build.result == 'cancelled')
+          runs-on: ubuntu-latest
+          steps:
+            - name: Send alert
+              run: |
+                echo "Build result: ${{ needs.build.result }}"
+                # call your notification webhook here
+  - language: yaml
+    label: "Multi-job pipeline — catch any non-success terminal state"
+    code: |
+      jobs:
+        report:
+          needs: [build, test, deploy]
+          if: >-
+            always() &&
+            (contains(needs.*.result, 'failure') ||
+             contains(needs.*.result, 'cancelled'))
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Pipeline did not complete successfully"
+prevention:
+  - "Replace bare `if: failure()` with `if: always() && (needs.X.result == 'failure' || needs.X.result == 'cancelled')` whenever upstream jobs have `timeout-minutes:` set"
+  - "Treat `timeout-minutes` as a cancellation mechanism — timed-out jobs report `cancelled` not `failure`"
+  - "Test your notification path by temporarily reducing `timeout-minutes` to confirm the alerting logic fires on timeout"
+  - "Document in team runbooks that CI timeouts appear orange ('Cancelled') not red ('Failed') in the Actions UI"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/using-conditions-to-control-job-execution"
+    label: "GitHub Actions — status check functions (failure, cancelled, always)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idtimeout-minutes"
+    label: "GitHub Actions workflow syntax — timeout-minutes"
