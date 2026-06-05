@@ -1,0 +1,95 @@
+id: runner-environment-153
+title: "ubuntu runner systemctl fails — systemd not running as PID 1"
+category: runner-environment
+severity: error
+tags:
+  - ubuntu
+  - systemd
+  - systemctl
+  - services
+  - daemon
+patterns:
+  - regex: 'System has not been booted with systemd as init system \(PID 1\)\. Can''t operate\.'
+    flags: i
+  - regex: 'Failed to connect to bus: No such file or directory'
+    flags: i
+  - regex: 'systemctl: command not found'
+    flags: i
+error_messages:
+  - "System has not been booted with systemd as init system (PID 1). Can't operate."
+  - "Failed to connect to bus: No such file or directory"
+  - "Failed to start postgresql.service: Unit not found."
+  - "System has not been booted with systemd"
+root_cause: |
+  GitHub-hosted Ubuntu runners do not run systemd as the init system (PID 1). The runner
+  process starts directly inside a container-like environment where systemd is never initialized.
+  Any workflow step that calls `sudo systemctl start <service>`, `systemctl enable <service>`,
+  or `systemctl status <service>` will immediately fail because the D-Bus socket and systemd
+  unit system are not present.
+
+  This is a fundamental architectural constraint of GitHub-hosted runners — they are ephemeral
+  VMs (not containers) but systemd is disabled to reduce boot time and resource overhead. The
+  pattern is extremely common when devs copy-paste service startup commands from their local
+  Linux environment or documentation into GitHub Actions run: steps.
+
+  Common affected services: PostgreSQL, MySQL, Redis, MongoDB, Nginx, Apache, RabbitMQ.
+fix: |
+  Replace `systemctl` calls with one of these approaches:
+
+  1. **Use GitHub Actions `services:` containers** — the recommended approach for databases and
+     message queues. GitHub spins up Docker containers alongside your job.
+
+  2. **Use direct daemon start commands** — start the service binary directly:
+     - PostgreSQL: `sudo -u postgres pg_ctl -D /etc/postgresql/*/main start`
+     - MySQL: `sudo mysqld_safe &`
+     - Redis: `redis-server --daemonize yes`
+
+  3. **Use `service` SysV command** — on Ubuntu runners, SysV init `service` works even without
+     systemd: `sudo service postgresql start`
+
+fix_code:
+  - language: yaml
+    label: "Use services: containers block (recommended for databases)"
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          services:
+            postgres:
+              image: postgres:16
+              env:
+                POSTGRES_PASSWORD: postgres
+              ports:
+                - 5432:5432
+              options: >-
+                --health-cmd pg_isready
+                --health-interval 10s
+                --health-timeout 5s
+                --health-retries 5
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run tests
+              run: npm test
+              env:
+                DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test
+  - language: yaml
+    label: "Use SysV 'service' command as systemctl fallback"
+    code: |
+      steps:
+        - name: Start PostgreSQL
+          run: |
+            sudo service postgresql start
+            sudo service postgresql status
+        - name: Create test database
+          run: |
+            sudo -u postgres psql -c "CREATE DATABASE testdb;"
+prevention:
+  - "Use the `services:` block in your workflow for databases and message queues — it's the GitHub Actions-native solution"
+  - "Replace `systemctl start X` with `sudo service X start` for SysV-compatible services"
+  - "For custom daemons, start them in the background with `&` and poll for readiness"
+  - "Never copy-paste `systemctl` commands from local Linux setup scripts into GitHub Actions without adaptation"
+docs:
+  - url: "https://docs.github.com/en/actions/use-cases-and-examples/using-containerized-services/about-service-containers"
+    label: "GitHub Docs: About service containers"
+  - url: "https://docs.github.com/en/actions/use-cases-and-examples/using-containerized-services/creating-postgresql-service-containers"
+    label: "GitHub Docs: Creating PostgreSQL service containers"
