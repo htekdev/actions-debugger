@@ -1,0 +1,87 @@
+id: runner-environment-158
+title: 'Windows MAX_PATH 260-character limit causes npm and build tool failures'
+category: runner-environment
+severity: error
+tags:
+  - windows
+  - max-path
+  - npm
+  - node_modules
+  - path-length
+  - enoent
+  - build
+patterns:
+  - regex: 'The filename or extension is too long'
+    flags: 'i'
+  - regex: 'ENOENT.*node_modules.*node_modules'
+    flags: 'i'
+  - regex: 'error MSB3095.*path.*too long'
+    flags: 'i'
+  - regex: 'The system cannot find the path specified'
+    flags: 'i'
+error_messages:
+  - "The filename or extension is too long."
+  - "ENOENT: no such file or directory, open 'C:\\Users\\runner\\work\\..."
+  - "error MSB3095: Invalid argument. 'path' is too long."
+  - "npm ERR! path C:\\Users\\runner\\work\\..."
+root_cause: |
+  Windows enforces a 260-character maximum path length (MAX_PATH) inherited from
+  the Win32 API. Deep node_modules dependency trees easily exceed this limit: the
+  GitHub-hosted runner workspace is already at
+  C:\Users\runner\work\<repository>\<repository>\ (~50 characters) before any
+  source files are added. A typical transitive npm dependency path like
+  node_modules\pkg\node_modules\sub\node_modules\deep\index.js can push the total
+  well past 260 characters. MSBuild, Java build tools, and other Windows toolchains
+  have the same limitation.
+
+  GitHub-hosted Windows runners (windows-2022, windows-latest) have the
+  LongPathsEnabled registry key set to 1 at the OS level, but Git must still be
+  separately configured with core.longpaths = true, and some Node.js internal APIs
+  call the legacy Win32 CreateFile path which ignores the registry opt-in unless
+  the application explicitly declares long-path awareness in its executable manifest.
+  The result is ENOENT or "path too long" failures that appear to indicate missing
+  files rather than a path-length limit.
+fix: |
+  Option 1 (most effective): Use a short path: in actions/checkout to reduce the
+  base path length. path: a sets the workspace to C:\...\work\repo\a.
+  Option 2: Configure Git long paths and use --legacy-peer-deps to flatten
+  npm dependency nesting.
+  Option 3: Shorten the repository name, which directly reduces the workspace
+  path length.
+fix_code:
+  - language: yaml
+    label: 'Use short checkout path to reduce base path length'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                path: a   # Reduces base path by ~20-30 characters vs default
+            - run: npm ci
+              working-directory: a
+  - language: yaml
+    label: 'Enable Git long paths and flatten npm tree'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-latest
+          steps:
+            - name: Configure Git long paths
+              run: git config --global core.longpaths true
+            - uses: actions/checkout@v4
+            - name: Install with flattened dependencies
+              run: npm ci --legacy-peer-deps
+prevention:
+  - 'Use path: a (or another single-char name) in actions/checkout to reduce baseline path length on Windows'
+  - 'Keep GitHub repository names short when Windows CI is required'
+  - 'Avoid deeply nested workspace directory structures'
+  - 'Run npm ci --legacy-peer-deps to reduce node_modules nesting on npm 7+ which introduced deeper trees'
+docs:
+  - url: 'https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation'
+    label: 'Microsoft Docs: Maximum file path limitation (MAX_PATH)'
+  - url: 'https://git-scm.com/docs/git-config#Documentation/git-config.txt-coreprotectNTFS'
+    label: 'Git: core.longpaths config'
+  - url: 'https://docs.npmjs.com/cli/v10/commands/npm-ci'
+    label: 'npm ci — clean install'
