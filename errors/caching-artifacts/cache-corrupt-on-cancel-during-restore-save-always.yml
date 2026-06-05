@@ -1,0 +1,136 @@
+id: caching-artifacts-067
+title: "Cache corrupted when workflow canceled mid-restore and save runs via always()"
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - cache
+  - cancellation
+  - corrupt
+  - restore
+  - always
+  - windows
+  - tar
+patterns:
+  - regex: 'The operation was canceled'
+    flags: 'i'
+  - regex: 'internal error.*InstallPlan.*not in configured state'
+    flags: 'i'
+  - regex: 'Cache restored successfully'
+    flags: 'i'
+  - regex: 'Cache hit for:.*\nReceived.*\nError: The operation was canceled'
+    flags: 'is'
+error_messages:
+  - "Error: The operation was canceled."
+  - "Cache restored successfully"
+  - "internal error in InstallPlan.completed: not in configured state: Installed"
+root_cause: |
+  When a workflow is canceled while `actions/cache/restore` is mid-way through
+  extracting the cache archive (via `tar`), the extraction is interrupted and the
+  working directory is left in a **partially extracted, corrupt state**. The cache
+  hit was registered before extraction began, so the action considers the key
+  matched.
+
+  If a separate `actions/cache/save` step runs with `if: always()` (or the job has
+  `save-state` / explicit save at the end), it executes despite the cancellation.
+  It then compresses and saves the **partial working directory** — including the
+  incomplete files from the aborted tar extraction — under the exact same cache
+  key.
+
+  On subsequent workflow runs:
+  1. `actions/cache/restore` finds the key (exact match), downloads and extracts
+     the archive successfully ("Cache restored successfully").
+  2. The build starts with corrupt or incomplete files from the previous partial
+     extraction and fails with cryptic internal errors, not a caching error.
+
+  The symptom is particularly confusing because the restore step looks perfectly
+  healthy: it shows 100% download progress and "Cache restored successfully", but
+  the build then fails with errors like "not in configured state: Installed" (Cabal
+  Haskell), "invalid content", "module not found" (npm), or similar tool-specific
+  corruption errors.
+
+  This is distinct from `caching-artifacts-007` (cache post-step skipped on cancel
+  — where the cache is NOT saved). This entry covers the opposite scenario: an
+  explicit `always()` save step actively commits a corrupt partial state, poisoning
+  the cache for all future runs until the key expires or is manually deleted.
+fix: |
+  1. **Delete the corrupt cache entry** via the GitHub Actions UI (Settings →
+     Actions → Caches) or the GitHub API:
+       `DELETE /repos/{owner}/{repo}/actions/caches/{cache_id}`
+
+  2. **Guard the save step** so it only runs when restoration AND the build
+     succeeded — not unconditionally:
+
+     ```yaml
+     - name: Save cache
+       uses: actions/cache/save@v4
+       if: success() && steps.restore.outputs.cache-hit != 'true'
+       with:
+         path: ...
+         key: ...
+     ```
+
+  3. **Avoid pairing `always()` with cache save** when the prior restore step
+     may have been interrupted. Use explicit `success()` or a combination
+     `if: success() || steps.restore.conclusion == 'success'`.
+
+  4. On Windows, consider using `actions/cache@v4` with `enableCrossOsArchive: false`
+     and switching to `zstd`-backed archives, which are more resilient to partial
+     extraction (partial frames are detectable by zstd checksums).
+fix_code:
+  - language: yaml
+    label: "WRONG — always() save can commit partial corrupt state after cancellation"
+    code: |
+      - name: Restore cache
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cabal/store
+          key: cabal-${{ runner.os }}-${{ hashFiles('cabal.project.freeze') }}
+
+      # ... build steps ...
+
+      - name: Save cache
+        uses: actions/cache/save@v4
+        if: always()          # ← PROBLEM: runs even if restore was interrupted
+        with:
+          path: ~/.cabal/store
+          key: cabal-${{ runner.os }}-${{ hashFiles('cabal.project.freeze') }}
+  - language: yaml
+    label: "CORRECT — only save when restore and build succeeded"
+    code: |
+      - name: Restore cache
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cabal/store
+          key: cabal-${{ runner.os }}-${{ hashFiles('cabal.project.freeze') }}
+          restore-keys: |
+            cabal-${{ runner.os }}-
+
+      # ... build steps ...
+
+      - name: Save cache
+        uses: actions/cache/save@v4
+        if: success()          # ← SAFE: only runs on clean job success
+        with:
+          path: ~/.cabal/store
+          key: cabal-${{ runner.os }}-${{ hashFiles('cabal.project.freeze') }}
+prevention:
+  - "Never use `if: always()` on a `cache/save` step — use `if: success()` or
+    an explicit condition that confirms the build completed cleanly."
+  - "After any job cancellation that hit a cache restore step, check the GitHub
+    Actions Caches list and delete the affected cache key to prevent future runs
+    from inheriting the corrupt state."
+  - "Use `actions/cache@v4` in the combined save-on-miss pattern with the default
+    post-job hook only (no explicit save step); the post-job hook is automatically
+    skipped on cancellation, avoiding the corrupt save."
+  - "Consider setting a short TTL on Windows caches or using unique keys per run
+    (`key: ...-${{ github.run_id }}`) for artifacts that are sensitive to partial
+    extraction."
+docs:
+  - url: "https://github.com/actions/cache/issues/1729"
+    label: "actions/cache#1729: If a workflow is canceled during cache/restore then cache/save writes a corrupt cache (Windows)"
+  - url: "https://github.com/actions/toolkit/tree/main/packages/cache"
+    label: "@actions/cache package documentation"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows"
+    label: "Caching dependencies to speed up workflows"

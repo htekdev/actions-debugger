@@ -1,0 +1,122 @@
+id: permissions-auth-067
+title: "OIDC immutable sub claim format for new repos breaks cloud trust policies"
+category: permissions-auth
+severity: error
+tags:
+  - oidc
+  - sub-claim
+  - aws
+  - azure
+  - gcp
+  - immutable
+  - trust-policy
+  - new-repo
+patterns:
+  - regex: 'Not authorized to perform sts:AssumeRoleWithWebIdentity'
+    flags: 'i'
+  - regex: 'AccessDenied.*AssumeRoleWithWebIdentity'
+    flags: 'i'
+  - regex: 'WorkloadIdentityPool.*rejected|token validation failed'
+    flags: 'i'
+  - regex: 'Credentials could not be loaded.*Could not load credentials from any providers'
+    flags: 'i'
+error_messages:
+  - "Not authorized to perform sts:AssumeRoleWithWebIdentity"
+  - "Error: Credentials could not be loaded, please check your action inputs: Could not load credentials from any providers"
+  - "AuthorizationError: Token validation failed: subject claim does not match trust policy"
+  - "WorkloadIdentityPool: token was rejected: sub does not match condition"
+root_cause: |
+  Starting June 18, 2026, GitHub automatically applies a new **immutable subject
+  claim format** to all OIDC tokens issued for repositories created or renamed on
+  or after that date. The new format appends numeric IDs to the owner and repo
+  names:
+
+    Old format: repo:my-org/my-repo:ref:refs/heads/main
+    New format: repo:my-org-123456/my-repo-456789:ref:refs/heads/main
+
+  Cloud provider trust policies (AWS IAM `StringEquals`, GCP Workload Identity
+  Federation condition, Azure Federated Identity) that were copied from docs or
+  examples using only the human-readable `repo:OWNER/REPO:*` pattern will never
+  match the new immutable format. The claim is technically valid — GitHub issued it
+  correctly — but the trust policy simply rejects it, producing an
+  authorization error.
+
+  Existing repositories are NOT affected automatically; they must explicitly opt in
+  via the organization or repository OIDC settings. Only new repos created after
+  June 18, 2026 and repos renamed/transferred after that date receive the new
+  format unconditionally.
+
+  This is distinct from the repo-rename scenario (permissions-auth-019, which covers
+  mutable names changing) and the environment-block scenario (permissions-auth-054,
+  which covers the sub claim changing format when an `environment:` key is added).
+  This entry covers the baseline mismatch for freshly created repos.
+fix: |
+  Update your cloud provider trust policy to use the new immutable sub claim
+  format. Use the GitHub OIDC preview API to inspect the exact subject claim your
+  repository will produce before updating the policy:
+
+    GET /repos/{owner}/{repo}/actions/oidc/customization/sub
+
+  For AWS IAM, replace the StringEquals condition value with the new format
+  (including numeric IDs), or switch to StringLike with a wildcard:
+
+    repo:my-org-*/my-repo-*:ref:refs/heads/main
+
+  For GCP Workload Identity Federation, update the attribute condition string.
+  For Azure Federated Identity, update the subject field in the credential.
+
+  Alternatively, use GitHub's custom subject claim feature to define a simplified
+  subject that is stable across formats (e.g., only include `repository` and
+  `ref` fields that won't change).
+fix_code:
+  - language: yaml
+    label: "AWS — update IAM trust policy StringEquals to new immutable format"
+    code: |
+      # In your AWS IAM trust policy JSON (not YAML), update the condition:
+      # OLD — will fail for repos created after June 18, 2026:
+      #   "token.actions.githubusercontent.com:sub": "repo:my-org/my-repo:ref:refs/heads/main"
+      #
+      # NEW — use StringLike with wildcard to match both formats:
+      #   "token.actions.githubusercontent.com:sub": "repo:my-org*my-repo*:ref:refs/heads/main"
+      #
+      # Or use the exact immutable format shown in the OIDC preview API response.
+      #
+      # Alternatively, switch to a custom subject claim in GitHub OIDC settings
+      # that only includes fields you control.
+  - language: yaml
+    label: "GitHub Actions workflow is unchanged — the issue is in the cloud provider trust policy"
+    code: |
+      jobs:
+        deploy:
+          permissions:
+            id-token: write
+            contents: read
+          runs-on: ubuntu-latest
+          steps:
+            - uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-to-assume: arn:aws:iam::123456789012:role/my-role
+                aws-region: us-east-1
+            # If the above step fails with "Not authorized to perform
+            # sts:AssumeRoleWithWebIdentity", the trust policy sub claim
+            # condition does not match the new immutable format.
+            # Update the IAM trust policy — not this workflow file.
+prevention:
+  - "Use StringLike with a wildcard pattern in cloud trust policies instead of
+    StringEquals with an exact sub claim value — this accommodates both old and
+    new immutable formats."
+  - "After creating a new repo, call the GitHub OIDC preview API
+    (GET /repos/{owner}/{repo}/actions/oidc/customization/sub) to see the
+    exact sub claim format before configuring the cloud trust policy."
+  - "Consider using GitHub's custom subject claim feature to pin a simplified,
+    stable sub claim structure that does not change with naming format updates."
+  - "Existing repos can opt in to the new format in repository or organization
+    OIDC settings — test in a staging environment first to confirm trust policies
+    are updated before enabling in production."
+docs:
+  - url: "https://github.blog/changelog/2026-04-23-immutable-subject-claims-for-github-actions-oidc-tokens/"
+    label: "GitHub Changelog: Immutable subject claims for GitHub Actions OIDC tokens (April 23, 2026)"
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect"
+    label: "About security hardening with OpenID Connect"
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/customizing-the-subject-claims-for-an-organization-or-repository"
+    label: "Customizing the subject claims for an organization or repository"
