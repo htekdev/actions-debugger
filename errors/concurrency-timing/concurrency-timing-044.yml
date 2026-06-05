@@ -1,0 +1,95 @@
+id: concurrency-timing-044
+title: 'Matrix jobs with a static concurrency group key serialize instead of running in parallel'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - matrix
+  - concurrency
+  - parallelism
+  - group-key
+  - strategy
+patterns:
+  - regex: 'Waiting for a pending job to finish'
+    flags: 'i'
+  - regex: 'This workflow is waiting for a pending job to complete'
+    flags: 'i'
+error_messages:
+  - 'Waiting for a pending job to finish — concurrency: ci-deploy'
+root_cause: |
+  When a workflow-level or job-level concurrency group is configured with a static
+  key that does not include the matrix dimension values, all matrix legs share the
+  same concurrency slot. GitHub Actions enforces that only one run occupies each
+  slot at a time, so instead of running N matrix legs in parallel, the legs queue
+  and execute one at a time — silently serializing a job strategy that was intended
+  to be parallel.
+
+  This can multiply workflow duration by the number of matrix dimensions (e.g., a
+  3-OS matrix that should finish in 10 minutes takes 30 minutes). The GitHub Actions
+  UI shows later matrix legs as "Waiting for a pending job to finish" which hints at
+  the problem, but developers often interpret this as runner resource contention rather
+  than a concurrency group misconfiguration.
+
+  Common patterns that trigger this:
+    concurrency:
+      group: ci-${{ github.ref }}    # all matrix legs share "ci-refs/heads/main"
+
+    concurrency:
+      group: ${{ github.workflow }}  # all legs share workflow name
+fix: |
+  Include the relevant matrix dimension values in the concurrency group key so that
+  each matrix leg gets a unique slot. If cancel-in-progress behavior is still needed,
+  it will apply per-matrix-leg rather than globally across all legs.
+
+  If you intentionally want to serialize matrix legs (e.g., sequential deploys to
+  environments), keep the static key but document the serialization intent.
+fix_code:
+  - language: yaml
+    label: 'Include matrix values in concurrency group key'
+    code: |
+      jobs:
+        test:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest, macos-latest]
+              node: [18, 20, 22]
+          runs-on: ${{ matrix.os }}
+          concurrency:
+            # Unique slot per matrix leg — allows full parallelism
+            group: ci-${{ github.ref }}-${{ matrix.os }}-${{ matrix.node }}
+            cancel-in-progress: true
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                node-version: ${{ matrix.node }}
+            - run: npm test
+  - language: yaml
+    label: 'Workflow-level concurrency must also include matrix values'
+    code: |
+      # BAD: workflow-level concurrency applies to ALL jobs, including matrix legs
+      # concurrency:
+      #   group: ci-${{ github.ref }}    # serializes all legs!
+      #   cancel-in-progress: true
+
+      # GOOD: set concurrency at the job level with matrix dimensions in the key
+      jobs:
+        build:
+          strategy:
+            matrix:
+              platform: [linux, windows, macos]
+          runs-on: ubuntu-latest
+          concurrency:
+            group: build-${{ github.ref }}-${{ matrix.platform }}
+            cancel-in-progress: true
+          steps:
+            - run: echo "Building for ${{ matrix.platform }}"
+prevention:
+  - 'Always include matrix dimension values in concurrency group keys: group: ci-${{ github.ref }}-${{ matrix.os }}'
+  - 'Check workflow execution time after adding concurrency groups — unexpected serialization increases total duration'
+  - 'Use workflow-level concurrency only for single-job workflows; for matrix jobs, always configure concurrency at the job level'
+  - 'Verify parallelism by checking the GitHub Actions timeline view — all matrix legs should show overlapping execution'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency'
+    label: 'Using concurrency in GitHub Actions'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idstrategymatrix'
+    label: 'Matrix strategy syntax reference'
