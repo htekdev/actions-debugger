@@ -1,0 +1,147 @@
+id: runner-environment-191
+title: 'GHCup 0.1.x → 0.2.x Upgrade on Ubuntu Runners Breaks Direct ghcup CLI Usage'
+category: runner-environment
+severity: error
+tags:
+  - haskell
+  - ghcup
+  - ubuntu-22.04
+  - ubuntu-24.04
+  - runner-image
+  - breaking-change
+patterns:
+  - regex: 'ghcup: command not found'
+    flags: 'i'
+  - regex: 'ghcup list.*-r[0-9]+|version.*-r[0-9].*not found'
+    flags: 'i'
+  - regex: '\$HOME/\.ghcup/bin/ghc.*no such file|\.ghcup/bin/ghc.*not a regular file'
+    flags: 'i'
+  - regex: 'ghcup.*cabal install.*unknown command|cabal install.*unrecognized.*ghcup'
+    flags: 'i'
+error_messages:
+  - 'test -f ~/.ghcup/bin/ghc returned false (ghc not installed)'
+  - 'GHC version 9.6.6-r1 was not found in the expected location'
+  - 'Error: The value 9.6.6-r1 is not a valid GHC version'
+  - 'ghcup: error: no subcommand: cabal install'
+root_cause: |
+  The ubuntu-22.04 and ubuntu-24.04 runner image update released 2026-05-26
+  (ubuntu24/20260525.161.1, ubuntu22/20260525.156.1) upgraded the pre-installed GHCup
+  from 0.1.50.2 to 0.2.5.0. GHCup 0.2.x introduced several breaking CLI and
+  filesystem changes that affect workflows calling ghcup directly.
+
+  **Breaking changes in GHCup 0.2.x:**
+
+  1. **`ghcup list` version strings now include a `-rX` revision suffix** when a
+     revision update is available (e.g., `9.6.6-r1` instead of `9.6.6`). Scripts
+     that parse `ghcup list` output for version equality checks (e.g., `grep 9.6.6`)
+     or that pipe the version into other tools fail because of the unexpected suffix.
+
+  2. **`~/.ghcup/bin/` is now entirely composed of symlinks** (except the `ghcup`
+     binary itself). Previously, some binaries (like `ghc`, `cabal`, `hls`) were
+     hardlinks or regular executable files. Workflow steps using the POSIX file-
+     existence test `-f ~/.ghcup/bin/ghc` now return false because `-f` returns
+     false for symlinks. The check must be `-e` (exists) or `-L` (is symlink).
+
+  3. **Old undocumented subcommand alias removed**: `ghcup cabal install <ver>` as
+     an alternative form is gone. The canonical form `ghcup install cabal <ver>` and
+     `ghcup install ghc <ver>` still work. Workflows that copied old forum examples
+     using the deprecated form receive an "unknown subcommand" error.
+
+  4. **`ghcup compile hls --isolate=<dir>` changed output path**: binaries are now
+     installed into `<dir>/bin/` instead of `<dir>/`. Scripts expecting the binary
+     directly at the isolate path fail with "file not found".
+
+  Note: The `--install-targets` flag bug present in GHCup 0.2.0–0.2.2 was already
+  fixed before the runner images updated (runner ships 0.2.5.0). That specific bug
+  does not affect GitHub-hosted runners.
+fix: |
+  **For `-f` file existence checks** — replace with `-e` (any file type) or
+  `-L` (is symlink):
+
+  ```bash
+  # Before (breaks on GHCup 0.2.x):
+  if [ -f "$HOME/.ghcup/bin/ghc" ]; then ...
+
+  # After:
+  if [ -e "$HOME/.ghcup/bin/ghc" ]; then ...
+  ```
+
+  **For version parsing from `ghcup list`** — strip the revision suffix:
+
+  ```bash
+  GHC_VER=$(ghcup list -t ghc --show-criteria 'recommended' -r | awk '{print $2}' \
+    | sed 's/-r[0-9]*$//')
+  ```
+
+  Or use `--show-revisions=none` to suppress the suffix entirely:
+
+  ```bash
+  ghcup list -t ghc --show-revisions=none
+  ```
+
+  **For old subcommand syntax** — use the canonical form:
+
+  ```bash
+  # Before:
+  ghcup cabal install 3.12.1.0
+
+  # After:
+  ghcup install cabal 3.12.1.0
+  ```
+
+  **Best practice** — use `haskell-actions/setup` instead of calling ghcup
+  directly. The action is maintained to handle ghcup version changes:
+
+  ```yaml
+  - uses: haskell-actions/setup@v2
+    with:
+      ghc-version: '9.6.6'
+      cabal-version: 'latest'
+  ```
+fix_code:
+  - language: yaml
+    label: 'Use haskell-actions/setup instead of raw ghcup commands'
+    code: |
+      - name: Set up GHC
+        uses: haskell-actions/setup@v2
+        with:
+          ghc-version: '9.6.6'
+          cabal-version: 'latest'
+          enable-stack: false
+
+  - language: yaml
+    label: 'Conditional GHCup binary check — fix -f to -e'
+    code: |
+      - name: Check if GHC is available
+        run: |
+          # GHCup 0.2.x: all ~/.ghcup/bin/ entries are symlinks; use -e not -f
+          if [ -e "$HOME/.ghcup/bin/ghc" ]; then
+            echo "GHC found: $(ghc --version)"
+          else
+            ghcup install ghc recommended
+          fi
+
+  - language: yaml
+    label: 'Parse GHCup list output — strip revision suffix'
+    code: |
+      - name: Get recommended GHC version
+        run: |
+          # GHCup 0.2.x: version may include -rX revision suffix
+          GHC_VER=$(ghcup list -t ghc --show-revisions=none -r \
+            | grep 'recommended' | awk '{print $2}')
+          echo "GHC version: $GHC_VER"
+          ghcup install ghc "$GHC_VER"
+prevention:
+  - 'Use haskell-actions/setup instead of calling ghcup directly — it handles ghcup API changes across versions.'
+  - 'Use `-e` or `-L` for file existence checks on `~/.ghcup/bin/` entries, never `-f`.'
+  - 'Pin to specific GHC/Cabal versions in haskell-actions/setup rather than resolving "recommended" at runtime.'
+  - 'When parsing `ghcup list` output, use `--show-revisions=none` to suppress the `-rX` suffix added in 0.2.x.'
+docs:
+  - url: 'https://github.com/haskell/ghcup-hs/releases/tag/v0.2.1.0'
+    label: 'GHCup 0.2.1.0 release notes (breaking changes section)'
+  - url: 'https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260525.161'
+    label: 'Ubuntu 24.04 runner image release 20260525.161.1 — GHCup 0.1.50.2 → 0.2.5.0'
+  - url: 'https://github.com/actions/runner-images/issues/14142'
+    label: 'runner-images #14142 — GHCup 0.2 version banner format change'
+  - url: 'https://github.com/haskell/haskell-actions/tree/main/setup'
+    label: 'haskell-actions/setup — official Haskell CI setup action'
