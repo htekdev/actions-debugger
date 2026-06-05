@@ -1,0 +1,101 @@
+id: runner-environment-189
+title: 'ARC Kubernetes container hook fails with "Converting circular structure to JSON" during checkout'
+category: runner-environment
+severity: error
+tags:
+  - arc
+  - kubernetes
+  - container-hooks
+  - checkout
+  - circular-json
+  - self-hosted
+  - custom-container
+patterns:
+  - regex: 'Converting circular structure to JSON'
+    flags: 'i'
+  - regex: 'starting at object with constructor .ClientRequest.'
+    flags: 'i'
+  - regex: 'Executing the custom container implementation failed'
+    flags: 'i'
+  - regex: 'property .socket. -> object with constructor .TLSSocket.'
+    flags: 'i'
+error_messages:
+  - "TypeError: Converting circular structure to JSON\n    --> starting at object with constructor 'ClientRequest'\n    |     property 'socket' -> object with constructor 'TLSSocket'\n    --- property '_httpMessage' closes the circle"
+  - "Error: Executing the custom container implementation failed. Please contact your self hosted runner administrator."
+  - "Error: Process completed with exit code 1."
+root_cause: |
+  Actions Runner Controller (ARC) on Kubernetes uses Node.js container-hooks to manage
+  the lifecycle of job container pods. During container startup, ARC makes HTTP requests
+  to the Kubernetes API server to create or wait for pods. When a network request fails
+  mid-connection — due to Kubernetes API server latency, pod scheduling delays, or transient
+  network errors — the error handler in the container hook attempts to serialize the failing
+  Node.js http.ClientRequest object into JSON for logging or error reporting.
+
+  Node.js http.ClientRequest objects contain circular references:
+    ClientRequest → socket (TLSSocket) → _httpMessage → ClientRequest
+
+  JSON.stringify() cannot handle circular structures and throws:
+    "TypeError: Converting circular structure to JSON"
+
+  This error surfaces during the checkout step (or another early step) because the container
+  hook failure terminates the entire job. The error is not in actions/checkout itself — it is
+  in the ARC container-hooks layer executing underneath. The message
+  "Executing the custom container implementation failed" confirms the failure is in the
+  container hook, not the action code.
+
+  This is most commonly triggered by:
+  - Kubernetes API server under high load (slow pod scheduling acknowledgement)
+  - ARC container-hooks < v0.8.1 which lacks circular-reference guarding in error serialization
+  - Network timeouts between ARC runner pod and Kubernetes API during container create
+  - Combined ARC v2.332.0 + container-hooks v0.8.0 regression (see actions/runner#4302)
+fix: |
+  Upgrade ARC and container-hooks to versions that guard against circular reference
+  serialization. The actions/runner-controller v0.9.x chart pins container-hooks
+  v0.8.1+ which patches the circular JSON error.
+
+  If on ARC v2.332.0, also upgrade the runner image tag — that release combined a
+  base image change (Ubuntu 22.04 → 24.04) with a container-hooks version that
+  had this regression.
+
+  As a diagnostic step, check if the Kubernetes API server is under pressure — slow
+  pod acknowledgements cause the HTTP client to timeout in ways that expose this code path.
+fix_code:
+  - language: yaml
+    label: 'Pin ARC to a release with container-hooks v0.8.1+ fix'
+    code: |
+      # In your ARC AutoscalingRunnerSet Helm values:
+      # Upgrade to controller + runner image that includes container-hooks >= v0.8.1
+      # Check releases at https://github.com/actions/actions-runner-controller/releases
+      template:
+        spec:
+          containers:
+            - name: runner
+              # Use a runner image tag that ships container-hooks >= v0.8.1
+              image: ghcr.io/actions/actions-runner:latest
+  - language: yaml
+    label: 'Increase pod startup timeout to reduce API server pressure race'
+    code: |
+      # helm values — increase pod startup grace period to reduce
+      # Kubernetes API timeout racing against container hook
+      template:
+        spec:
+          terminationGracePeriodSeconds: 3600
+          containers:
+            - name: runner
+              resources:
+                requests:
+                  memory: '2Gi'
+                  cpu: '500m'
+prevention:
+  - 'Keep ARC runner controller and container-hooks up to date — circular JSON fixes land in patch releases'
+  - 'Monitor Kubernetes API server latency; high API server load increases the probability of this race condition'
+  - 'Pin to a specific ARC chart version in staging before rolling out to production runners'
+  - 'Check actions/runner#4302 for the specific v2.332.0 regression if pinned to that release'
+  - 'Set appropriate resource requests/limits so pod scheduling completes quickly and avoids API timeout races'
+docs:
+  - url: 'https://github.com/actions/checkout/issues/2056'
+    label: 'actions/checkout#2056: TypeError: Converting circular structure to JSON'
+  - url: 'https://github.com/actions/runner/issues/4302'
+    label: 'actions/runner#4302: ARC v2.332.0 container hook UID / permission regression'
+  - url: 'https://github.com/actions/actions-runner-controller'
+    label: 'Actions Runner Controller (ARC) — GitHub repository'

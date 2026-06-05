@@ -1,0 +1,111 @@
+id: known-unsolved-061
+title: 'actions/github-script does not support ESM — import statements and ESM-only packages fail'
+category: known-unsolved
+severity: error
+tags:
+  - github-script
+  - esm
+  - commonjs
+  - import
+  - ERR_REQUIRE_ESM
+  - octokit
+  - javascript
+patterns:
+  - regex: 'SyntaxError: Cannot use import statement in a module'
+    flags: 'i'
+  - regex: 'ERR_REQUIRE_ESM'
+    flags: 'i'
+  - regex: 'require\(\) of ES Module.*is not supported'
+    flags: 'i'
+  - regex: 'must use import to load ES Module'
+    flags: 'i'
+error_messages:
+  - "SyntaxError: Cannot use import statement in a module"
+  - "Error [ERR_REQUIRE_ESM]: require() of ES Module /path/to/node_modules/pkg/index.mjs is not supported."
+  - "Instead change the require of ... to a dynamic import() which is available in all CommonJS modules."
+  - "Error: Must use import to load ES Module: /path/to/node_modules/pkg/index.js"
+root_cause: |
+  actions/github-script evaluates the inline `script:` input using Node.js vm.Script in a
+  CommonJS (CJS) module context. ECMAScript Module (ESM) syntax is fundamentally incompatible
+  with this execution model:
+
+  1. Top-level `import ... from` statements → SyntaxError: "Cannot use import statement in a module"
+     because vm.Script runs in CJS mode and the `import` keyword is a syntax error at parse time.
+
+  2. require() of an ESM-only package (e.g., modern @octokit/rest ≥ 5.x, chalk ≥ 5.x,
+     node-fetch ≥ 3.x, got ≥ 12.x, axios ≥ 2.x) → ERR_REQUIRE_ESM because those packages
+     publish only .mjs or set "type": "module" in package.json, making them incompatible
+     with require().
+
+  3. External scripts loaded via `const fn = require('./my-script.js')` also run in a CJS
+     context — ESM syntax inside those files also fails.
+
+  The github-script action has no current plan to migrate to ESM execution, and supporting
+  both modes simultaneously in vm.Script is architecturally complex. This is a long-standing
+  limitation open since 2024 with 30+ reactions and no scheduled resolution.
+
+  The GitHub Actions toolkit itself (github-script's own dependencies) also pins to
+  CJS-compatible versions of @octokit packages for this reason.
+fix: |
+  There is no built-in fix — actions/github-script does not support ESM. Use these workarounds:
+
+  WORKAROUND 1 (recommended): Use dynamic import() inside an async function
+  Dynamic import() IS supported inside github-script because it is a CJS-compatible
+  expression (not top-level ESM syntax). Wrap the entire script in an async IIFE or
+  use the top-level await that github-script already provides:
+
+    const { Octokit } = await import('@octokit/rest')
+
+  WORKAROUND 2: Use a CJS-compatible version of the package
+  Many packages (chalk, got, axios, node-fetch) have a last CJS-compatible version.
+  Pin to that in your workflow step using node or npm:
+
+    chalk: ^4.1.2 (last CJS version; chalk 5.x is ESM-only)
+    node-fetch: ^2.7.0 (last CJS version; 3.x is ESM-only)
+    got: ^11.8.6 (last CJS version; 12.x is ESM-only)
+
+  WORKAROUND 3: Create a composite or JavaScript action with a proper ESM Node runtime
+  For complex scripts that heavily use ESM packages, extract them into a standalone
+  composite or JavaScript action that declares "main": "./dist/index.mjs" in action.yml.
+fix_code:
+  - language: yaml
+    label: 'Use dynamic import() for ESM-only packages in github-script'
+    code: |
+      - name: Use ESM package via dynamic import()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Dynamic import() works in github-script even though top-level import does not
+            const { Octokit } = await import('@octokit/rest')
+            const { default: chalk } = await import('chalk')
+            // github, context, core are still available as usual
+            const result = await github.rest.repos.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            })
+            core.info(chalk.green(`Repo: ${result.data.full_name}`))
+  - language: yaml
+    label: 'Pin to last CJS-compatible version of common packages'
+    code: |
+      - name: Install CJS-compatible package versions
+        run: npm install chalk@4 node-fetch@2 got@11
+
+      - name: Use CJS packages in github-script
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const chalk = require('chalk')   // chalk@4 is CJS — works fine
+            const fetch = require('node-fetch')  // node-fetch@2 is CJS
+            core.info(chalk.blue('Using CJS-compatible packages'))
+prevention:
+  - 'Check whether a package is ESM-only before using it in github-script — look for "type": "module" in its package.json'
+  - 'Use dynamic import() as the default pattern for any external package in github-script'
+  - 'For scripts that require heavy ESM ecosystem usage, consider a dedicated JavaScript action instead of github-script'
+  - 'Stay on chalk@4, node-fetch@2, got@11, axios@1 in github-script workflows — these are the last CJS-compatible majors'
+docs:
+  - url: 'https://github.com/actions/github-script/issues/457'
+    label: 'actions/github-script#457: Feature request — ESM support (open, 30+ reactions)'
+  - url: 'https://nodejs.org/api/esm.html#interoperability-with-commonjs'
+    label: 'Node.js Docs — ESM and CommonJS interoperability'
+  - url: 'https://github.com/actions/github-script#use-scripts-with-jsdoc-support'
+    label: 'actions/github-script — README: use scripts with JSDoc support'
