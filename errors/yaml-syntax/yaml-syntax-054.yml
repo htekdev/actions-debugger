@@ -1,0 +1,94 @@
+id: yaml-syntax-054
+title: "env context silently empty in reusable workflow with: inputs"
+category: yaml-syntax
+severity: silent-failure
+tags:
+  - reusable-workflow
+  - env-context
+  - with-inputs
+  - workflow-call
+  - context-availability
+patterns:
+  - regex: '"env" context is not available in this context'
+    flags: i
+  - regex: 'env context.*not available.*reusable'
+    flags: i
+error_messages:
+  - '"env" context is not available in this context'
+  - "Input evaluates to empty string when env context used in reusable workflow with:"
+root_cause: |
+  The `env` context is NOT available inside `jobs.<job_id>.with:` blocks used to
+  call reusable workflows. Unlike `jobs.<job_id>.steps.with:` (regular action steps,
+  which support `env` context), reusable workflow `with:` inputs are evaluated before
+  job-level environment variables are injected.
+
+  Using `${{ env.MY_VAR }}` in a reusable workflow `with:` block silently evaluates
+  to an empty string. No error is thrown and the reusable workflow receives `""` for
+  that input. The actionlint static linter reports:
+  `"env" context is not available in this context`.
+
+  This is explicitly documented in GitHub's context availability table — `env` is
+  available in `jobs.<job_id>.steps.with` but NOT in `jobs.<job_id>.with`.
+fix: |
+  Replace `env` context references in reusable workflow `with:` blocks with one of:
+  1. `vars` context — for repository or organization-level configuration variables
+     (Settings → Variables). Available in reusable workflow `with:`.
+  2. Inline literal values directly in `with:`.
+  3. Workflow-level `inputs:` context if the calling workflow is itself a reusable
+     workflow (chain input passing).
+  4. A prior job that captures the value and passes it via `needs.<job>.outputs`.
+fix_code:
+  - language: yaml
+    label: "Wrong: env context in reusable workflow with: (silently evaluates to empty string)"
+    code: |
+      env:
+        BASE_URL: 'https://api.example.com'
+        DEPLOY_ENV: 'production'
+
+      jobs:
+        call-deploy:
+          uses: ./.github/workflows/deploy.yml
+          with:
+            api-url: ${{ env.BASE_URL }}    # silently empty — env unavailable in reusable with:
+            environment: ${{ env.DEPLOY_ENV }}  # also silently empty
+  - language: yaml
+    label: "Fix: use vars context or inline value"
+    code: |
+      # Set BASE_URL as a repository variable in Settings → Secrets and variables → Variables
+      jobs:
+        call-deploy:
+          uses: ./.github/workflows/deploy.yml
+          with:
+            api-url: ${{ vars.BASE_URL }}       # vars IS available in reusable with:
+            environment: 'production'            # inline literal also works
+  - language: yaml
+    label: "Fix: pass via prior job output if value is dynamic"
+    code: |
+      jobs:
+        resolve-config:
+          runs-on: ubuntu-latest
+          outputs:
+            api-url: ${{ steps.config.outputs.url }}
+          steps:
+            - id: config
+              run: echo "url=$BASE_URL" >> "$GITHUB_OUTPUT"
+              env:
+                BASE_URL: ${{ env.BASE_URL }}  # env IS available in step env:
+
+        call-deploy:
+          needs: resolve-config
+          uses: ./.github/workflows/deploy.yml
+          with:
+            api-url: ${{ needs.resolve-config.outputs.api-url }}  # needs context available
+prevention:
+  - "Consult the GitHub Actions context availability table before using contexts in reusable workflow with: blocks."
+  - "Prefer vars context (repository/org variables) over env for values shared across workflows."
+  - "Run actionlint in CI — it detects unavailable context usage and catches this before runtime."
+  - "If a reusable workflow input is silently empty, check context availability as the first debugging step."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#context-availability"
+    label: "GitHub Actions context availability table"
+  - url: "https://docs.github.com/en/actions/sharing-automations/reusing-workflows#passing-inputs-and-secrets-to-a-called-workflow"
+    label: "Passing inputs and secrets to a called workflow"
+  - url: "https://rhysd.github.io/actionlint/"
+    label: "actionlint — static checker for GitHub Actions"

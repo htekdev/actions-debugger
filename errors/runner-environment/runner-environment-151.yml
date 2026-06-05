@@ -1,0 +1,93 @@
+id: runner-environment-151
+title: "Docker container action creates root-owned files causing Permission denied in following steps"
+category: runner-environment
+severity: error
+tags:
+  - docker
+  - container-action
+  - file-permissions
+  - root-user
+  - workspace
+patterns:
+  - regex: 'Permission denied'
+    flags: i
+  - regex: 'EACCES: permission denied'
+    flags: i
+  - regex: 'cannot open .+ Permission denied'
+    flags: i
+  - regex: 'error: open .+ permission denied'
+    flags: i
+error_messages:
+  - "Permission denied"
+  - "cannot create directory '...': Permission denied"
+  - "EACCES: permission denied, open '/github/workspace/...'"
+  - "error: cannot open '.git/COMMIT_EDITMSG': Permission denied"
+  - "chown: changing ownership of '...': Operation not permitted"
+root_cause: |
+  Docker-based GitHub Actions — both `uses: docker://image:tag` inline steps and
+  actions with `runs.using: docker` in their action.yml — run their container process
+  as root (UID 0) by default unless the Dockerfile explicitly sets a USER directive.
+
+  Any files written to `GITHUB_WORKSPACE` (mounted at `/github/workspace` inside the
+  container) are created with root ownership (uid=0, gid=0). Subsequent workflow steps
+  run as the `runner` user (UID 1001) and cannot read, modify, or delete root-owned
+  files, causing "Permission denied" errors.
+
+  The failure is especially common when:
+  - A Docker action writes build artifacts, generated code, or lock files.
+  - A subsequent step tries to commit changes or run tools on the generated output.
+  - The workflow uses `actions/checkout` after a Docker action and git operations fail.
+fix: |
+  Option 1 — Chown the workspace after the Docker action (easiest for third-party actions):
+    Add a step after the Docker action: `sudo chown -R "$USER:$(id -gn)" "$GITHUB_WORKSPACE"`
+
+  Option 2 — Set USER in the Dockerfile (best for actions you control):
+    Add `USER 1001` (runner UID) to the action's Dockerfile so all written files
+    are owned by the runner user.
+
+  Option 3 — Use --user flag in the Docker run args:
+    Set `args` in the action's action.yml to include `--user=1001:127`.
+fix_code:
+  - language: yaml
+    label: "Fix: chown workspace after Docker action (works for any Docker-based action)"
+    code: |
+      steps:
+        - uses: actions/checkout@v4
+
+        - name: Run Docker-based action
+          uses: docker://my-build-image:latest
+          with:
+            args: '--output /github/workspace/dist'
+
+        - name: Fix file ownership after Docker action
+          run: sudo chown -R "$USER:$(id -gn)" "$GITHUB_WORKSPACE"
+
+        - name: Use build output (now accessible as runner user)
+          run: ls -la dist/ && cat dist/output.txt
+  - language: yaml
+    label: "Fix: set non-root USER in Dockerfile (preferred when controlling the action)"
+    code: |
+      # In your Docker action's Dockerfile — run as UID 1001 to match GitHub runner
+      # FROM ubuntu:22.04
+      # RUN useradd -u 1001 -g 127 runner
+      # WORKDIR /github/workspace
+      # USER 1001
+      # ENTRYPOINT ["/entrypoint.sh"]
+      
+      # With this Dockerfile, no chown step is needed — files are owned by runner user
+      steps:
+        - uses: actions/checkout@v4
+        - uses: ./  # local Docker action with non-root USER
+        - run: cat generated-output.txt  # accessible without permission errors
+prevention:
+  - "Always set a non-root USER directive in Dockerfiles for actions that write to the workspace."
+  - "After any third-party Docker action, add a chown step before accessing created files."
+  - "Prefer JavaScript/TypeScript or composite actions over Docker actions when workspace I/O is needed — they run as the runner user by default."
+  - "Test Docker actions locally with UID 1001 to catch permission issues before CI."
+docs:
+  - url: "https://docs.github.com/en/actions/sharing-automations/creating-actions/dockerfile-support-for-github-actions"
+    label: "Dockerfile support for GitHub Actions"
+  - url: "https://docs.github.com/en/actions/sharing-automations/creating-actions/creating-a-docker-container-action"
+    label: "Creating a Docker container action"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/store-information-in-variables#default-environment-variables"
+    label: "GITHUB_WORKSPACE default environment variable"

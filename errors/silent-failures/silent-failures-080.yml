@@ -1,0 +1,97 @@
+id: silent-failures-080
+title: "github.event.commits always empty array on pull_request events"
+category: silent-failures
+severity: silent-failure
+tags:
+  - pull-request
+  - commits
+  - event-payload
+  - skip-ci
+  - multi-trigger
+patterns:
+  - regex: 'github\.event\.commits\[0\]'
+    flags: i
+  - regex: 'Cannot read propert\w+ of undefined.*message'
+    flags: i
+error_messages:
+  - "Error: Cannot read properties of undefined (reading 'message')"
+  - "github.event.commits[0] evaluates to null on pull_request events"
+  - "contains(github.event.commits[0].message, '[skip ci]') always false on PRs"
+root_cause: |
+  The `github.event.commits` array is only populated in `push` event payloads.
+  On `pull_request` events, `github.event.commits` is always an empty array `[]`.
+  Accessing `github.event.commits[0]` returns `null`, and
+  `github.event.commits[0].message` returns an empty string without throwing an
+  expression error.
+
+  This is the most common footgun when implementing "[skip ci]" commit message
+  detection: the condition works correctly for `push` events but silently never
+  triggers (never skips) on `pull_request` events. The workflow runs for every PR
+  push regardless of the commit message.
+
+  The issue affects any multi-trigger workflow with both `push:` and `pull_request:`
+  that reads commit data from the event payload.
+fix: |
+  Guard `github.event.commits` access by event type, or use PR-specific context:
+  1. Use `if: github.event_name == 'push'` before accessing commits.
+  2. For PR events, check `github.event.pull_request.title` or `github.event.pull_request.body`
+     for skip conditions.
+  3. Use the `actions/github-script` action to query commits via the REST API on PR events.
+  4. Consider separate workflows for push and pull_request to avoid cross-event payload confusion.
+fix_code:
+  - language: yaml
+    label: "Wrong: commit message check silently fails on pull_request events"
+    code: |
+      on: [push, pull_request]
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          # github.event.commits[0].message is null on pull_request — condition always false
+          if: "!contains(github.event.commits[0].message, '[skip ci]')"
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+  - language: yaml
+    label: "Fix: guard by event type and use PR-appropriate skip signal"
+    code: |
+      on: [push, pull_request]
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Check skip condition
+              id: skip
+              run: |
+                SKIP=false
+                if [[ "${{ github.event_name }}" == "push" ]]; then
+                  # Commits array is available on push events
+                  if echo "${{ github.event.commits[0].message }}" | grep -q '\[skip ci\]'; then
+                    SKIP=true
+                  fi
+                elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+                  # Check PR title or body for skip signal on PR events
+                  if echo "${{ github.event.pull_request.title }}" | grep -q '\[skip ci\]'; then
+                    SKIP=true
+                  fi
+                fi
+                echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
+
+            - name: Run tests
+              if: steps.skip.outputs.skip != 'true'
+              run: npm test
+prevention:
+  - "Never access github.event.commits on workflows with pull_request triggers — it will always be empty."
+  - "Use separate workflows for push and pull_request if commit-message-based conditionals are required."
+  - "For PR skip conditions, use the PR title or body rather than commit messages."
+  - "Check which fields are populated for each event type in the GitHub webhook event payload documentation."
+docs:
+  - url: "https://docs.github.com/en/webhooks/webhook-events-and-payloads#push"
+    label: "Push webhook event payload (commits array)"
+  - url: "https://docs.github.com/en/webhooks/webhook-events-and-payloads#pull_request"
+    label: "Pull request webhook event payload"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-conditions-to-control-job-execution"
+    label: "Using conditions to control job execution"
