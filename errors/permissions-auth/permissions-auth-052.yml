@@ -1,0 +1,103 @@
+id: permissions-auth-052
+title: 'GITHUB_TOKEN `packages: write` Cannot Delete Package Versions — Requires PAT with `delete:packages`'
+category: permissions-auth
+severity: error
+tags:
+  - packages
+  - github-token
+  - delete-packages
+  - container-registry
+  - package-cleanup
+  - permissions
+patterns:
+  - regex: 'Resource not accessible by integration'
+    flags: 'i'
+  - regex: 'DELETE.*packages.*versions|packages.*DELETE.*versions'
+    flags: 'i'
+  - regex: '403.*package|package.*403'
+    flags: 'i'
+error_messages:
+  - "Resource not accessible by integration"
+  - "403 Forbidden — DELETE https://api.github.com/user/packages/{type}/{name}/versions/{id}"
+  - "Error: Resource not accessible by integration (HTTP 403)"
+root_cause: |
+  The `packages: write` permission in `GITHUB_TOKEN` grants the ability to
+  publish and overwrite package versions but does NOT include the ability to
+  delete them. Package version deletion requires account-level permission
+  (`delete:packages` OAuth scope) that cannot be granted to an installation
+  token. The GitHub Packages REST API delete endpoint
+  (`DELETE /user/packages/{type}/{name}/versions/{id}` or the org equivalent)
+  validates the caller's account-level scope, which GITHUB_TOKEN—being a
+  repository-scoped installation token—can never satisfy regardless of the
+  `permissions: packages: write` declaration in the workflow.
+
+  This commonly surfaces in:
+  - Container image cleanup jobs that try to prune old tags/digests
+  - npm, Maven, or RubyGems package version retention workflows
+  - Automated housekeeping that uses `ghcr.io` image management actions
+fix: |
+  Store a fine-grained or classic PAT with `delete:packages` scope as a
+  repository secret (e.g., `PACKAGES_DELETE_TOKEN`) and use that token when
+  calling the Packages delete API or actions that delete package versions.
+
+  For GitHub Container Registry (ghcr.io) image pruning, use a PAT or a
+  GitHub App installation token with Packages write + admin scope. Pass it
+  as the `token:` input to the relevant cleanup action.
+fix_code:
+  - language: yaml
+    label: "WRONG — GITHUB_TOKEN cannot delete package versions (403)"
+    code: |
+      jobs:
+        cleanup:
+          runs-on: ubuntu-latest
+          permissions:
+            packages: write   # ❌ write permission does not grant delete
+          steps:
+            - name: Delete old package version
+              run: |
+                # This call will return 403 "Resource not accessible by integration"
+                VERSION_ID=12345
+                curl -X DELETE \
+                  -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                  https://api.github.com/user/packages/container/my-image/versions/$VERSION_ID
+  - language: yaml
+    label: "RIGHT — use a PAT with delete:packages scope"
+    code: |
+      jobs:
+        cleanup:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Delete old package version
+              env:
+                GH_TOKEN: ${{ secrets.PACKAGES_DELETE_TOKEN }}  # PAT with delete:packages
+              run: |
+                VERSION_ID=12345
+                curl -X DELETE \
+                  -H "Authorization: Bearer $GH_TOKEN" \
+                  https://api.github.com/user/packages/container/my-image/versions/$VERSION_ID
+  - language: yaml
+    label: "RIGHT — ghcr.io cleanup action with PAT"
+    code: |
+      jobs:
+        cleanup-images:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: snok/container-retention-policy@v3
+              with:
+                account: user
+                token: ${{ secrets.PACKAGES_DELETE_TOKEN }}  # PAT with delete:packages
+                image-names: my-image
+                cut-off: 7 days ago UTC
+                keep-n-most-recent: 5
+prevention:
+  - "Never assume `packages: write` is sufficient for full package lifecycle management — deletion is always PAT-only."
+  - "Create a dedicated PAT or GitHub App with `delete:packages` scope and store it as a secret for cleanup workflows."
+  - "Scope cleanup jobs separately from build jobs so the PAT is only used where deletion is needed."
+  - "Document in your workflow that PACKAGES_DELETE_TOKEN requires `delete:packages` scope so it is renewed with the right scopes."
+docs:
+  - url: "https://docs.github.com/en/rest/packages/packages#delete-a-package-version-for-a-user"
+    label: "REST API — Delete a package version for a user"
+  - url: "https://docs.github.com/en/packages/learn-github-packages/about-permissions-for-github-packages#about-scopes-and-permissions-for-package-registries"
+    label: "About permissions for GitHub Packages"
+  - url: "https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#creating-a-fine-grained-personal-access-token"
+    label: "Creating a fine-grained PAT with delete:packages"
