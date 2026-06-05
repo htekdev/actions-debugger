@@ -1,0 +1,104 @@
+id: permissions-auth-063
+title: 'security-events: write required for SARIF upload — missing permission causes Resource not accessible by integration'
+category: permissions-auth
+severity: error
+tags:
+  - security-events
+  - sarif
+  - code-scanning
+  - permissions
+  - upload-sarif
+  - github-token
+patterns:
+  - regex: 'Resource not accessible by integration'
+    flags: 'i'
+  - regex: 'HttpError: Resource not accessible by integration'
+    flags: 'i'
+  - regex: 'Code scanning is not enabled for this repository'
+    flags: 'i'
+  - regex: 'Advanced Security must be enabled for this repository to use code scanning'
+    flags: 'i'
+error_messages:
+  - 'Resource not accessible by integration'
+  - 'HttpError: Resource not accessible by integration'
+  - 'Code scanning is not enabled for this repository'
+  - 'Advanced Security must be enabled for this repository to use code scanning'
+root_cause: |
+  The github/codeql-action/upload-sarif action and third-party security scanning
+  actions (Trivy, Snyk, Semgrep, osv-scanner, etc.) submit SARIF results to the
+  GitHub code scanning API endpoint POST /repos/{owner}/{repo}/code-scanning/sarifs.
+  This endpoint requires the security-events: write permission on the GITHUB_TOKEN.
+
+  Since February 2023, newly created repositories default GITHUB_TOKEN to read-only
+  permissions. A workflow that calls upload-sarif without an explicit
+  security-events: write permission block will receive 403 Resource not accessible by
+  integration from the API and the scan results will not appear in the Security tab.
+
+  This error is commonly overlooked because:
+  1. The scanning step (CodeQL analyze, Trivy scan, Semgrep scan) often completes
+     successfully — the red X appears only on the upload step.
+  2. Example workflows published before the read-only-default policy may omit the
+     security-events: write permission line.
+  3. For fork pull requests, the pull_request trigger cannot write security-events
+     even with the permission declared — a workflow_run split pattern is required.
+fix: |
+  Add security-events: write to the job permissions block. Include contents: read
+  for checkout and actions: read if the workflow uses CodeQL (which needs to read
+  workflow definitions).
+fix_code:
+  - language: yaml
+    label: 'Add security-events: write for SARIF upload'
+    code: |
+      jobs:
+        scan:
+          runs-on: ubuntu-latest
+          permissions:
+            security-events: write   # required for upload-sarif
+            contents: read           # required for checkout
+            actions: read            # required by CodeQL to read workflow info
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run Trivy vulnerability scanner
+              uses: aquasecurity/trivy-action@master
+              with:
+                scan-type: 'fs'
+                format: 'sarif'
+                output: 'trivy-results.sarif'
+            - name: Upload Trivy results to GitHub Security tab
+              uses: github/codeql-action/upload-sarif@v3
+              with:
+                sarif_file: 'trivy-results.sarif'
+  - language: yaml
+    label: 'Fork PRs: upload SARIF in a workflow_run triggered workflow (has write access)'
+    code: |
+      # Scanning step runs in pull_request context (no write access from fork)
+      # Upload step runs in workflow_run context (has security-events: write)
+      on:
+        workflow_run:
+          workflows: ['Security Scan']
+          types: [completed]
+      jobs:
+        upload-results:
+          runs-on: ubuntu-latest
+          permissions:
+            security-events: write
+          steps:
+            - name: Download SARIF artifact
+              uses: actions/download-artifact@v4
+              with:
+                run-id: ${{ github.event.workflow_run.id }}
+                name: sarif-results
+            - uses: github/codeql-action/upload-sarif@v3
+              with:
+                sarif_file: results.sarif
+prevention:
+  - 'Add security-events: write to every job that calls github/codeql-action/upload-sarif or any third-party SARIF upload action'
+  - 'For fork pull request scanning, use the workflow_run + artifact pattern — the pull_request trigger cannot write security-events from fork contexts'
+  - 'Check the Security tab after a scan workflow succeeds — absence of scan results despite a green workflow is the primary indicator of missing security-events permission'
+docs:
+  - url: 'https://docs.github.com/en/code-security/code-scanning/integrating-with-code-scanning/uploading-a-sarif-file-to-github'
+    label: 'GitHub Docs: Uploading a SARIF file to GitHub'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/assigning-permissions-to-jobs'
+    label: 'GitHub Docs: Assigning permissions to jobs'
+  - url: 'https://docs.github.com/en/code-security/code-scanning/troubleshooting-code-scanning/results-are-different-than-expected'
+    label: 'GitHub Docs: Code scanning troubleshooting — results are different than expected'
