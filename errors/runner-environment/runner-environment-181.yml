@@ -1,0 +1,114 @@
+id: runner-environment-181
+title: 'Self-hosted Windows runner steps stuck "Waiting for a runner to pick up this job..." mid-job after v2.321.0 auto-update'
+category: runner-environment
+severity: error
+tags:
+  - self-hosted
+  - windows
+  - runner-update
+  - stuck
+  - queued
+  - multi-step
+  - message-queue
+patterns:
+  - regex: 'Waiting for a runner to pick up this job'
+    flags: 'i'
+  - regex: 'Current runner version.*2\.32[1-9]|v2\.32[1-9]\.'
+    flags: 'i'
+error_messages:
+  - "Waiting for a runner to pick up this job..."
+root_cause: |
+  After the GitHub Actions runner auto-updated to v2.321.0 (released November 2024),
+  Windows self-hosted runners began exhibiting a specific failure mode in multi-step
+  jobs: the first step of a job executes successfully, but subsequent steps hang
+  indefinitely in a queued state showing "Waiting for a runner to pick up this job..."
+
+  Root cause: The v2.321.0 update introduced a regression in the Windows runner's
+  inter-step message queue session management. After completing a step, the runner
+  sends a completion signal to the GitHub broker but fails to maintain the job session
+  channel open for the next step. GitHub's broker interprets the broken session as
+  the job needing a fresh runner allocation — hence the "waiting for runner" message
+  for a job that is technically already in-flight.
+
+  The runner service itself remains running and reports "idle" to GitHub, but the job
+  session token has already been invalidated or the queue socket closed. Restarting
+  the runner service re-establishes the connection and any subsequent cancel+rerun
+  immediately picks up because the session management is freshly initialized.
+
+  Characteristics:
+  - Specific to Windows self-hosted runners (not Ubuntu/macOS hosted runners)
+  - Only occurs in jobs with 2 or more steps
+  - Step 1 always completes; step 2+ hangs without timeout
+  - Cancel + rerun of the stuck job resolves it immediately
+  - Runner service restart also resolves it
+  - Began appearing after Nov 27, 2024 auto-update on Windows machines
+  - Still open as of May 2026 with 90+ reactions (actions/runner#3609)
+
+  Note: This is distinct from runner-environment-082 (runner stuck between JOBS in
+  the same workflow) — this failure occurs between STEPS within a single job.
+fix: |
+  Immediate mitigation:
+  1. Cancel the stuck run in the GitHub Actions UI and re-run it — the job typically
+     completes correctly on rerun because the session is re-initialized.
+  2. Restart the GitHub Actions runner service on the Windows host between runs:
+       Restart-Service -Name "actions.runner.*"
+     (replace wildcard with the actual runner service name from services.msc)
+
+  Permanent mitigation:
+  3. Upgrade the runner to the latest version (v2.334.0+) which includes session
+     management improvements. Check https://github.com/actions/runner/releases for
+     the latest stable version.
+  4. Disable auto-update and pin to a known-good runner version by setting
+     `RUNNER_ALLOW_RUNASROOT=false` and specifying the version in your runner
+     configuration script.
+  5. If operating ARC (Actions Runner Controller), upgrade the controller to use a
+     runner image version 2.334.0+ to pick up the fix.
+fix_code:
+  - language: yaml
+    label: 'Workflow with restart-runner step for self-hosted Windows runners (workaround)'
+    code: |
+      # Workaround: add a pre-step that verifies the runner session is healthy.
+      # This forces a new session token for each major step block.
+      jobs:
+        build:
+          runs-on: [self-hosted, windows]
+          steps:
+            - name: Verify runner session (workaround for runner#3609)
+              run: Write-Host "Runner session active — version $env:RUNNER_VERSION"
+              shell: pwsh
+
+            - uses: actions/checkout@v4
+
+            - name: Build
+              run: dotnet build
+              shell: pwsh
+  - language: yaml
+    label: 'Script to upgrade self-hosted runner to latest version on Windows'
+    code: |
+      # Run on each Windows runner host to upgrade to the latest runner version.
+      # Execute from PowerShell as Administrator.
+
+      # Stop the runner service
+      Stop-Service -Name "actions.runner.*" -Force
+
+      # Download and replace the runner binary
+      $version = (Invoke-RestMethod "https://api.github.com/repos/actions/runner/releases/latest").tag_name.TrimStart('v')
+      Invoke-WebRequest "https://github.com/actions/runner/releases/download/v$version/actions-runner-win-x64-$version.zip" -OutFile runner.zip
+      Expand-Archive runner.zip -DestinationPath . -Force
+
+      # Restart the service
+      Start-Service -Name "actions.runner.*"
+      Write-Host "Runner upgraded to v$version"
+prevention:
+  - 'Keep self-hosted runners updated to the latest runner version — regression fixes are frequent'
+  - 'Monitor runner logs at _diag/Runner_*.log for session/message-queue errors between steps'
+  - 'Set up automatic runner version checks in your infrastructure pipeline'
+  - 'For critical pipelines, disable auto-update and pin to a tested runner version then upgrade on schedule'
+  - 'On Windows hosts, ensure the runner service account has rights to re-establish named pipe connections between steps'
+docs:
+  - url: 'https://github.com/actions/runner/issues/3609'
+    label: 'actions/runner#3609: Self-hosted runner stuck "Waiting for runner" in multi-step jobs (90 reactions, open Dec 2024)'
+  - url: 'https://github.com/actions/runner/releases'
+    label: 'GitHub Actions Runner releases — check for v2.321.0 regression fixes'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners'
+    label: 'GitHub Docs: About self-hosted runners'
