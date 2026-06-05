@@ -1,0 +1,100 @@
+id: yaml-syntax-053
+title: 'Step output boolean string coercion — comparing to bare true/false silently never matches'
+category: yaml-syntax
+severity: silent-failure
+tags:
+  - step-outputs
+  - GITHUB_OUTPUT
+  - boolean
+  - string-coercion
+  - if-condition
+  - silent-failure
+patterns:
+  - regex: 'outputs\.[a-z_][a-z0-9_]*\s*==\s*true\b'
+    flags: 'i'
+  - regex: 'outputs\.[a-z_][a-z0-9_]*\s*==\s*false\b'
+    flags: 'i'
+  - regex: 'needs\.[a-z_][a-z0-9_-]*\.outputs\.[a-z_]+ ==\s*(true|false)\b'
+    flags: 'i'
+error_messages:
+  - "if: steps.check.outputs.changed == true"
+  - "if: needs.build.outputs.has_changes == false"
+  - "if: steps.detect.outputs.skip == true"
+root_cause: |
+  All values written to GITHUB_OUTPUT (via echo "key=value" >> $GITHUB_OUTPUT) are
+  stored and transmitted as strings, regardless of the intended type. When a step
+  outputs a boolean-like value such as echo "changed=true" >> $GITHUB_OUTPUT, the
+  output steps.id.outputs.changed is the string 'true', not the boolean true.
+
+  In GitHub Actions expression syntax, type comparison is strict:
+  - 'true' == true  → false  (string 'true' does not equal boolean true)
+  - 'false' == false → false  (string 'false' does not equal boolean false)
+  - '' == false → true  (empty string does equal boolean false — a separate gotcha)
+
+  This means if: steps.check.outputs.changed == true silently evaluates to false
+  even when the output is the string "true", and the step is silently skipped with
+  no error. The workflow log shows the step as skipped with no indication that the
+  condition evaluation was the cause.
+
+  The same pattern applies to job outputs (needs.job.outputs.flag) passed between
+  jobs via the outputs: block.
+fix: |
+  Always compare step and job outputs as strings using single-quoted string literals:
+  - For true check:  == 'true'
+  - For false check: != 'true'  (preferred over == 'false' because empty string also needs handling)
+  - For numeric outputs: use fromJSON() to parse before arithmetic comparison
+
+  For boolean output authors: document that consumers must compare as strings, or
+  use '1'/'0' string conventions to make the string nature explicit.
+fix_code:
+  - language: yaml
+    label: 'Correct: compare step outputs as strings'
+    code: |
+      steps:
+        - id: check
+          run: echo "changed=true" >> $GITHUB_OUTPUT
+
+        # WRONG — silently skipped because 'true' != true (string != boolean)
+        # - if: steps.check.outputs.changed == true
+        #   run: echo "This never runs"
+
+        # CORRECT — compare output string to string literal
+        - if: steps.check.outputs.changed == 'true'
+          run: echo "Files changed, running deploy"
+
+        # CORRECT — inverse check
+        - if: steps.check.outputs.changed != 'true'
+          run: echo "No changes, skipping deploy"
+  - language: yaml
+    label: 'Job-to-job boolean output — compare as string in downstream job'
+    code: |
+      jobs:
+        detect:
+          outputs:
+            has_changes: ${{ steps.diff.outputs.has_changes }}
+          runs-on: ubuntu-latest
+          steps:
+            - id: diff
+              run: |
+                # Output is always a string
+                echo "has_changes=true" >> $GITHUB_OUTPUT
+
+        deploy:
+          needs: detect
+          # CORRECT: compare job output as string literal
+          if: needs.detect.outputs.has_changes == 'true'
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying"
+prevention:
+  - "Always use single-quoted string literals in if: conditions when comparing step or job outputs: == 'true' not == true"
+  - 'Use fromJSON() to parse numeric step outputs before arithmetic or numeric comparisons'
+  - 'Audit workflows for bare == true or == false comparisons on steps.*.outputs.* and needs.*.outputs.*'
+  - 'Use actionlint — it detects type mismatches in expression comparisons involving outputs'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/passing-information-between-jobs'
+    label: 'GitHub Actions — Passing information between jobs'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#literals'
+    label: 'GitHub Actions — Expression literals and type coercion'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/setting-an-output-parameter'
+    label: 'GitHub Actions — Setting an output parameter'

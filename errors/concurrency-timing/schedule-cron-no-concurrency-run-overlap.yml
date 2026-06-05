@@ -1,0 +1,87 @@
+id: concurrency-timing-043
+title: 'Scheduled cron jobs overlap when no concurrency group is configured'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - schedule
+  - cron
+  - overlap
+  - race-condition
+  - concurrency
+  - data-corruption
+patterns:
+  - regex: 'on:\s*schedule'
+    flags: 'i'
+  - regex: 'triggered by:\s*schedule'
+    flags: 'i'
+error_messages:
+  - 'Multiple workflow runs triggered by schedule are running concurrently'
+  - 'triggered by: schedule'
+root_cause: |
+  When a scheduled workflow has no concurrency group configured, GitHub Actions
+  starts a new run at each scheduled time regardless of whether a previous run is
+  still in progress. Two conditions make this especially common:
+
+  1. The job takes longer than the cron interval (e.g., a 10-minute job on a
+     every-5-minute schedule).
+  2. GitHub's scheduler fires queued runs in rapid succession after a platform
+     outage or maintenance window, catching up on missed intervals.
+
+  Both scenarios result in multiple simultaneous runs sharing external resources—
+  databases, S3 buckets, deployment targets, or branch state—causing race
+  conditions, duplicate data writes, and data corruption. No error is surfaced
+  in the workflow logs; the runs both appear green while the downstream system
+  silently degrades.
+fix: |
+  Add a concurrency group to the scheduled workflow. The correct cancel-in-progress
+  value depends on whether the job is idempotent:
+
+  - Non-idempotent jobs (database migrations, state mutations): set
+    cancel-in-progress: false to queue runs sequentially.
+  - Idempotent jobs (report generation, cache refreshes): set
+    cancel-in-progress: true to drop stale queued runs and keep only the latest.
+fix_code:
+  - language: yaml
+    label: 'Queue scheduled runs for non-idempotent jobs (e.g., database migrations)'
+    code: |
+      on:
+        schedule:
+          - cron: '*/5 * * * *'
+
+      concurrency:
+        group: ${{ github.workflow }}-scheduled
+        cancel-in-progress: false
+
+      jobs:
+        migrate:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./scripts/db-migrate.sh
+  - language: yaml
+    label: 'Cancel stale runs for idempotent jobs (e.g., report generation)'
+    code: |
+      on:
+        schedule:
+          - cron: '*/5 * * * *'
+
+      concurrency:
+        group: ${{ github.workflow }}-scheduled
+        cancel-in-progress: true
+
+      jobs:
+        report:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./scripts/generate-report.sh
+prevention:
+  - 'Add a concurrency group to every workflow with an on.schedule trigger'
+  - 'For jobs longer than the cron interval, always use cancel-in-progress: false to serialize execution'
+  - 'Monitor the Actions tab for multiple simultaneous scheduled runs as an early warning sign'
+  - 'Use actionlint to audit workflows that have on.schedule but no concurrency group'
+docs:
+  - url: 'https://docs.github.com/en/actions/using-jobs/using-concurrency'
+    label: 'GitHub Actions — Using concurrency'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#schedule'
+    label: 'GitHub Actions — Schedule event'

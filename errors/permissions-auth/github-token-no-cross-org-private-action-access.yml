@@ -1,0 +1,95 @@
+id: permissions-auth-049
+title: 'GITHUB_TOKEN cannot resolve private actions from a different organization'
+category: permissions-auth
+severity: error
+tags:
+  - github-token
+  - cross-org
+  - private-action
+  - enterprise
+  - repository-not-found
+patterns:
+  - regex: 'Unable to resolve action .* repository not found'
+    flags: 'i'
+  - regex: 'Error: Unable to resolve action `[^`]+`'
+    flags: 'i'
+  - regex: 'remote: Repository not found'
+    flags: 'i'
+error_messages:
+  - "Error: Unable to resolve action `other-org/private-action@v1`, repository not found."
+  - "Error: remote: Repository not found."
+  - "fatal: repository 'https://github.com/other-org/private-action/' not found"
+root_cause: |
+  GITHUB_TOKEN is automatically scoped to the repository where the workflow runs.
+  It cannot authenticate against repositories in a different GitHub organization,
+  even when both organizations are in the same GitHub Enterprise instance.
+
+  When a workflow references a private action from a different org
+  (e.g., uses: other-org/my-action@v1), the Actions runner attempts to clone
+  that action repository during the job setup phase using GITHUB_TOKEN. The
+  clone fails with "repository not found" because the token has no cross-org
+  read access. This is not a permissions: block misconfiguration — no amount of
+  permissions granted in the workflow YAML will fix it, since the token is
+  fundamentally scoped to the calling org.
+
+  This also affects actions/checkout when checking out code from a private repo
+  in another org unless a suitable alternative token is provided.
+fix: |
+  Choose the appropriate strategy based on your setup:
+
+  1. Make the action repository public — simplest if the action contains no secrets.
+  2. Vendor the action into your organization — copy the action code into a repo
+     in the same org or into .github/actions/ in the calling repo and reference it
+     as a local path action.
+  3. Use a GitHub App installation token with cross-org permissions for
+     actions/checkout calls to cross-org repos (does NOT fix job-level uses: loading).
+  4. Use a Personal Access Token (PAT) with access to both orgs for checkout
+     (same limitation: cannot fix uses: loading, only checkout steps).
+
+  Note: The uses: field at the job-steps level (for external actions) is resolved
+  before the workflow starts executing, so token injection via steps is not possible
+  for the action loading stage — vendoring or making the action public is the only
+  reliable fix for job-level uses:.
+fix_code:
+  - language: yaml
+    label: 'Vendor private action as a local path action'
+    code: |
+      # Copy the action code to .github/actions/my-action/ in your repo.
+      # Then reference it as a local action — no cross-org token required:
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: ./.github/actions/my-action
+              with:
+                param: value
+  - language: yaml
+    label: 'Use GitHub App token for cross-org repository checkout (not uses: loading)'
+    code: |
+      jobs:
+        cross-org-checkout:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/create-github-app-token@v2
+              id: app-token
+              with:
+                app-id: ${{ vars.APP_ID }}
+                private-key: ${{ secrets.APP_PRIVATE_KEY }}
+                owner: other-org
+            - uses: actions/checkout@v4
+              with:
+                repository: other-org/private-repo
+                token: ${{ steps.app-token.outputs.token }}
+prevention:
+  - 'Prefer public actions for shared tooling to avoid cross-org token scope issues'
+  - 'Vendor private cross-org actions into .github/actions/ in the calling repo'
+  - 'Create an internal shared-actions org accessible to all teams where GITHUB_TOKEN works'
+  - 'Document which repos depend on cross-org private actions and track them for access reviews'
+docs:
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#permissions-for-the-github_token'
+    label: 'GitHub Actions — Automatic token authentication permissions'
+  - url: 'https://docs.github.com/en/actions/sharing-automations/creating-actions/sharing-actions-and-workflows-with-your-organization'
+    label: 'GitHub Actions — Sharing actions with your organization'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idstepsuses'
+    label: 'GitHub Actions — Workflow syntax for uses'
