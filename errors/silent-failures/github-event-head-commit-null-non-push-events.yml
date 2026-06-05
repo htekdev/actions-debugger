@@ -1,0 +1,99 @@
+id: silent-failures-095
+title: "github.event.head_commit is null on non-push events — commit message checks silently return false"
+category: silent-failures
+severity: silent-failure
+tags:
+  - github-context
+  - head-commit
+  - workflow-dispatch
+  - event-context
+  - commit-message
+  - null-context
+patterns:
+  - regex: 'github\.event\.head_commit\.message'
+    flags: 'i'
+  - regex: 'github\.event\.head_commit\b'
+    flags: 'i'
+error_messages:
+  - "contains(github.event.head_commit.message, ...) returns false on workflow_dispatch"
+  - "github.event.head_commit is null"
+root_cause: |
+  The `github.event.head_commit` context object is only populated on `push` events.
+  On all other trigger types — `workflow_dispatch`, `pull_request`, `pull_request_target`,
+  `schedule`, `workflow_call`, `workflow_run`, `release`, and others — the property is
+  null, and all child fields evaluate to empty string `""` in expressions.
+
+  A very common workflow pattern is to gate deployment or release steps based on the
+  commit message:
+
+    if: contains(github.event.head_commit.message, '[deploy]')
+
+  When this condition is evaluated on a `workflow_dispatch` run, a scheduled run, or
+  any non-push trigger, `github.event.head_commit` is null and `contains()` receives
+  an empty string. The expression silently returns false and the step is skipped.
+
+  No error, no warning, and no indication in the workflow log that the condition was
+  never evaluated against real commit message data. Developers manually triggering the
+  workflow see their step silently skipped with no explanation.
+
+  This is particularly confusing because:
+  - The workflow completes successfully with a green checkmark
+  - The step appears in the log as skipped with no reason given
+  - Manual `workflow_dispatch` runs show no null-context warning
+fix: |
+  Guard the commit message check with an explicit event type condition, or provide a
+  workflow_dispatch input as an equivalent gate for manual runs.
+fix_code:
+  - language: yaml
+    label: "Guard commit message check to push events only"
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Deploy on tagged commit message
+              # Only evaluate head_commit.message on push events where it is defined
+              if: >-
+                github.event_name == 'push' &&
+                contains(github.event.head_commit.message, '[deploy]')
+              run: ./scripts/deploy.sh
+  - language: yaml
+    label: "Support push and manual dispatch with input fallback"
+    code: |
+      on:
+        push:
+          branches: [main]
+        workflow_dispatch:
+          inputs:
+            deploy:
+              description: 'Trigger deployment manually'
+              type: boolean
+              default: false
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Resolve deploy flag
+              id: flag
+              run: |
+                if [[ "${{ github.event_name }}" == "push" ]]; then
+                  MSG="${{ github.event.head_commit.message }}"
+                  echo "enabled=$([[ "$MSG" == *'[deploy]'* ]] && echo true || echo false)" >> $GITHUB_OUTPUT
+                else
+                  echo "enabled=${{ inputs.deploy }}" >> $GITHUB_OUTPUT
+                fi
+
+            - name: Deploy
+              if: steps.flag.outputs.enabled == 'true'
+              run: ./scripts/deploy.sh
+prevention:
+  - "Never use `github.event.head_commit.*` without first checking `github.event_name == 'push'`"
+  - "Use `workflow_dispatch` inputs with boolean type as the manual-trigger equivalent of commit-message gates"
+  - "Document which events activate each step — add inline comments explaining gating conditions"
+  - "Test multi-trigger workflows by manually running them and verifying steps behave as expected"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#push"
+    label: "GitHub Actions push event — head_commit availability"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/contexts#github-context"
+    label: "GitHub context reference — github.event object"
