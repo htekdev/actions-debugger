@@ -1,0 +1,90 @@
+id: caching-artifacts-063
+title: "runner.os insufficient in cache key after ubuntu-22.04 to ubuntu-24.04 migration — glibc-incompatible binaries silently restored"
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - cache-key
+  - runner.os
+  - ubuntu-24.04
+  - binary-compatibility
+  - glibc
+  - migration
+patterns:
+  - regex: 'symbol lookup error.*undefined symbol'
+    flags: 'i'
+  - regex: 'version.*GLIBC.*not found'
+    flags: 'i'
+  - regex: 'GLIBCXX.*not found'
+    flags: 'i'
+error_messages:
+  - "symbol lookup error: ./bin/app: undefined symbol: __libc_single_threaded"
+  - "version `GLIBC_2.38' not found (required by ./bin/app)"
+  - "GLIBCXX_3.4.32 not found in /usr/lib/x86_64-linux-gnu/libstdc++.so.6"
+root_cause: |
+  `runner.os` returns "Linux" for ALL Linux-based GitHub-hosted runners regardless of
+  Ubuntu distribution version: ubuntu-22.04 (glibc 2.35, GCC 11) and ubuntu-24.04
+  (glibc 2.39, GCC 13) both return "Linux".
+
+  When a workflow migrates from `runs-on: ubuntu-22.04` to `runs-on: ubuntu-latest`
+  (which became ubuntu-24.04 in March 2025), cache keys using only `${{ runner.os }}`
+  continue to match previously saved caches from ubuntu-22.04. Compiled native binaries
+  — Rust/Cargo target directories, CMake build outputs, Go CGO artifacts, Python
+  Cython-compiled extensions, pre-built Node.js native addons — are restored from
+  the ubuntu-22.04 cache onto an ubuntu-24.04 runner.
+
+  Because ubuntu-24.04 ships a newer glibc (2.39 vs 2.35) and updated libstdc++, binaries
+  compiled against the older ABI fail at runtime with dynamic linker errors:
+
+    symbol lookup error: ./bin/app: undefined symbol: __libc_single_threaded
+    version `GLIBC_2.38' not found (required by ./bin/app)
+
+  The cache restore step succeeds and shows a green checkmark. The failure surfaces only
+  when the restored binary is executed later in the pipeline, potentially hours into a
+  build. Because the compile step is skipped (cache hit), the error appears to come from
+  the execution step with no indication that a stale cross-version cache is the cause.
+fix: |
+  Add the runner image version to the cache key so that binary artifacts are not shared
+  across different Ubuntu distribution versions. GitHub-hosted runners expose the image
+  version as the `ImageVersion` environment variable (e.g. "20250312.1"). Alternatively,
+  hash `/etc/os-release` as a portable OS version fingerprint.
+fix_code:
+  - language: yaml
+    label: "Include ImageVersion in cache key to isolate per Ubuntu release"
+    code: |
+      - name: Cache Cargo build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          # ImageVersion (e.g. "20250312.1") differs between ubuntu-22.04 and ubuntu-24.04
+          # Prevents restoring ubuntu-22.04 glibc-2.35 binaries on ubuntu-24.04 glibc-2.39
+          key: ${{ runner.os }}-${{ env.ImageVersion }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ env.ImageVersion }}-cargo-
+  - language: yaml
+    label: "Alternative: hash /etc/os-release for portable OS version fingerprint"
+    code: |
+      - name: Cache compiled artifacts
+        uses: actions/cache@v4
+        with:
+          path: build/
+          key: >-
+            ${{ runner.os }}-
+            ${{ hashFiles('/etc/os-release') }}-
+            cmake-${{ hashFiles('CMakeLists.txt', '**/CMakeLists.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ hashFiles('/etc/os-release') }}-cmake-
+prevention:
+  - "After migrating `runs-on` from a specific ubuntu version to `ubuntu-latest`, bust existing caches by adding a new key prefix or bumping a cache version counter"
+  - "Include `${{ env.ImageVersion }}` in cache keys whenever the cached content contains compiled native binaries"
+  - "Use `runner.arch` for x64/ARM64 differences and `ImageVersion` for OS version differences together for complete binary cache isolation"
+  - "Prefer caching dependency manifests and source-level artifacts over compiled binaries when cross-version compatibility is uncertain"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows"
+    label: "GitHub Actions — caching dependencies"
+  - url: "https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2404-Readme.md"
+    label: "ubuntu-24.04 runner image specification (glibc and GCC versions)"
+  - url: "https://github.blog/changelog/2025-03-05-github-actions-ubuntu-latest-is-now-ubuntu-24-04/"
+    label: "GitHub Changelog — ubuntu-latest is now ubuntu-24.04 (March 2025)"
