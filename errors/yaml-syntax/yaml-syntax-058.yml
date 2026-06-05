@@ -1,0 +1,92 @@
+id: yaml-syntax-058
+title: "needs: key does not accept runtime expressions — must be static job IDs"
+category: yaml-syntax
+severity: error
+tags:
+  - needs
+  - expressions
+  - dynamic-jobs
+  - job-dependencies
+  - parse-time
+  - actionlint
+patterns:
+  - regex: "The pipeline is not valid.*needs|needs.*references.*job.*does not exist"
+    flags: 'i'
+  - regex: 'Unrecognized named-value.*steps.*in needs|needs.*invalid.*expression'
+    flags: 'i'
+error_messages:
+  - "The pipeline is not valid. Job 'deploy' needs 'steps' which does not exist"
+  - "Unrecognized named-value: 'steps'"
+  - "Job 'X' depends on unknown job '${{ fromJSON(...) }}'"
+  - "needs: field value '${{ ... }}' is not a valid job identifier"
+root_cause: |
+  The `needs:` key in a GitHub Actions job definition must contain static job ID
+  strings. It is evaluated at workflow parse time — before any step or job runs
+  — so runtime expressions such as `${{ steps.gen.outputs.jobs }}` or
+  `${{ fromJSON(env.DYNAMIC_JOBS) }}` are not evaluated. They are treated as
+  literal strings, and since no job with that literal name exists, GitHub reports
+  a validation error or the dependency is silently ignored.
+
+  This surprises developers who successfully use `fromJSON()` in `matrix:` or
+  `env:` blocks (which ARE expression-capable) and assume `needs:` works the
+  same way. The difference is that the job dependency graph must be fully
+  resolved before execution begins; expressions in `needs:` would create a
+  circular dependency at parse time.
+
+  actionlint statically detects this and reports: "needs: field cannot be
+  computed by a dynamic value. Use a literal value instead."
+fix: |
+  Job dependencies must be statically defined. Use one of these patterns:
+  1. List all potential dependent jobs statically; use `if:` conditions on
+     each downstream job to skip those not needed.
+  2. Use a matrix fan-out + fan-in pattern where the fan-in job has a single
+     static `needs:` on the matrix job name (not individual matrix legs).
+  3. Restructure so the dependency graph is known at workflow authoring time.
+fix_code:
+  - language: yaml
+    label: "Correct: static needs: with if: conditions to control execution"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          outputs:
+            should_deploy: ${{ steps.check.outputs.deploy }}
+          steps:
+            - id: check
+              run: echo "deploy=true" >> $GITHUB_OUTPUT
+
+        deploy:
+          # Static needs: always declared; if: controls whether it runs
+          needs: [build]
+          if: needs.build.outputs.should_deploy == 'true'
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "deploying"
+  - language: yaml
+    label: "Incorrect: expression in needs: causes parse-time validation error"
+    code: |
+      jobs:
+        generate:
+          runs-on: ubuntu-latest
+          outputs:
+            jobs: ${{ steps.list.outputs.jobs }}
+          steps:
+            - id: list
+              run: echo 'jobs=["build","lint"]' >> $GITHUB_OUTPUT
+
+        # ERROR: needs: does not evaluate expressions — this is a parse-time failure
+        deploy:
+          needs: ${{ fromJSON(needs.generate.outputs.jobs) }}
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "this never runs"
+prevention:
+  - "Always use static job ID string literals in `needs:` — no expressions, no fromJSON()"
+  - "Use actionlint to pre-validate workflows before pushing: it catches invalid expression contexts"
+  - "For dynamic fan-in, depend on the matrix job name itself, not individual matrix leg names"
+  - "Use `if: contains(needs.*.result, 'failure')` for conditional logic after static needs"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idneeds"
+    label: "GitHub Docs: jobs.<job_id>.needs"
+  - url: "https://rhysd.github.io/actionlint/"
+    label: "actionlint: Static checker for GitHub Actions workflow files"
