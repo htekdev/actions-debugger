@@ -1,0 +1,130 @@
+id: runner-environment-196
+title: 'actions/cache restore silently crashes Windows runner — job jumps to Post cleanup with no error'
+category: runner-environment
+severity: silent-failure
+tags:
+  - cache
+  - windows
+  - crash
+  - silent-failure
+  - cargo
+  - large-cache
+  - post-cleanup
+patterns:
+  - regex: 'Cache hit for:.*\n(?:.*\n){0,3}Post job cleanup'
+    flags: 'i'
+  - regex: 'Cache hit for:[\s\S]{0,200}Post job cleanup'
+    flags: 'i'
+  - regex: 'Cache up-to-date\.\s*\(node:\d+\) \[DEP0040\] DeprecationWarning.*punycode'
+    flags: 'i'
+error_messages:
+  - 'Cache hit for: [key]'
+  - 'Post job cleanup.'
+  - 'Cache up-to-date.'
+root_cause: |
+  On Windows GitHub-hosted runners, actions/cache@v5 can silently crash the Node.js
+  runner process during cache restore when extracting very large cache archives (multi-GB
+  caches, e.g. Rust/Cargo registry + cache, large Maven/Gradle dependency trees).
+
+  The failure manifests as the job jumping directly from "Cache hit for: [key]" to
+  "Post job cleanup." with no intervening restore log lines and no error message.
+  The step exits with code 0 (success), but the cache was never extracted. Subsequent
+  build steps fail with missing dependency errors (e.g. "error: no such file or directory:
+  ~/.cargo/registry") rather than a cache-related error, making the root cause opaque.
+
+  The log sequence for affected runs:
+  1. "Cache hit for: [cache-key]"  (restore begins)
+  2. [no tar extraction log lines]
+  3. "Post job cleanup."            (job finishes or runner crashes)
+  4. "Cache up-to-date."
+  5. "(node:XXXX) [DEP0040] DeprecationWarning: The `punycode` module is deprecated"
+  6. "Post job cleanup."
+
+  Root cause analysis: The Windows runner process (Runner.Worker.exe) terminates
+  abnormally during tar/zstd decompression of the cache archive. This appears to be a
+  memory-related crash (similar to the Windows heap corruption pattern in upload-artifact,
+  tracked in toolkit#2406) triggered by the high memory pressure of decompressing large
+  archives within the Node.js 20 heap on Windows runners as of May 2026.
+
+  The crash is non-deterministic (intermittent) — the same cache key may restore
+  successfully on retry. Affected cache sizes are typically 1 GB+ uncompressed.
+  Rust Cargo caches (registry/index + registry/cache + git/db) are the most commonly
+  reported trigger.
+
+  Source: actions/cache#1754 (May 2026, Windows runner, Cargo cache).
+fix: |
+  Short-term workaround: Add `continue-on-error: true` to the cache restore step.
+  The job will proceed to the build step which will then reinstall dependencies from
+  scratch. The build takes longer but completes reliably.
+
+  Preferred workaround: Split the cache into smaller chunks. Rust/Cargo caches can be
+  split by caching registry/index, registry/cache, and git/db in separate cache steps
+  with different keys, keeping each archive under ~500 MB.
+
+  Alternative: Use sccache or a remote cache (e.g. Cloudflare R2 + sccache) instead of
+  actions/cache for Rust builds on Windows — this avoids large local archives entirely.
+
+  Long-term: Track actions/cache#1754 for an upstream fix. Adding
+  `ACTIONS_STEP_DEBUG: true` as a repository secret may reveal the crash signal in
+  verbose runner logs.
+fix_code:
+  - language: yaml
+    label: 'Short-term: continue-on-error to prevent job failure on crash'
+    code: |
+      - name: Restore Cargo cache
+        uses: actions/cache@v5
+        continue-on-error: true   # Job proceeds even if cache restore crashes
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+  - language: yaml
+    label: 'Split large Cargo cache into smaller chunks to avoid crash threshold'
+    code: |
+      - name: Restore Cargo registry index (small, fast)
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry/index/
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-index-
+
+      - name: Restore Cargo registry cache (large packages)
+        uses: actions/cache@v5
+        continue-on-error: true
+        with:
+          path: ~/.cargo/registry/cache/
+          key: ${{ runner.os }}-cargo-cache-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-cache-
+
+      - name: Restore Cargo git sources
+        uses: actions/cache@v5
+        continue-on-error: true
+        with:
+          path: ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Restore build target dir
+        uses: actions/cache@v5
+        continue-on-error: true
+        with:
+          path: target/
+          key: ${{ runner.os }}-cargo-target-${{ hashFiles('**/Cargo.lock') }}
+
+prevention:
+  - 'Keep individual cache archives under ~500 MB by splitting large dependency trees (Cargo, Maven, Gradle) into multiple cache steps'
+  - 'Add continue-on-error: true to cache restore steps on Windows runners as a safety net for intermittent crashes'
+  - 'Monitor workflow durations — a sudden increase in Windows build time (cache miss equivalent) with no cache-related error in logs is a symptom of this crash'
+  - 'For Rust/Cargo on Windows runners, consider sccache with a remote backend to avoid large local cache archives entirely'
+  - 'Enable ACTIONS_STEP_DEBUG=true (as repository secret) to capture runner-level crash signals when this failure is suspected'
+docs:
+  - url: 'https://github.com/actions/cache/issues/1754'
+    label: 'actions/cache#1754 — Windows runner randomly dies during cache restore (May 2026)'
+  - url: 'https://github.com/actions/cache#tips-for-using-cache'
+    label: 'actions/cache — usage tips and cache size guidance'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows'
+    label: 'Caching dependencies — limits and best practices'

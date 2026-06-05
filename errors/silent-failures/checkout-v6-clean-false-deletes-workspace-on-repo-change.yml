@@ -1,0 +1,119 @@
+id: silent-failures-105
+title: 'checkout@v6 clean: false still deletes workspace when remote URL changes between checkouts'
+category: silent-failures
+severity: silent-failure
+tags:
+  - checkout
+  - clean
+  - workspace
+  - multi-checkout
+  - v6
+  - remote-url
+patterns:
+  - regex: 'Deleting the contents of.*work.*\n.*Initializing the repository'
+    flags: 'i'
+  - regex: 'clean:\s*false[\s\S]{0,500}Deleting the contents of'
+    flags: 'i'
+  - regex: 'git config --local --get remote\.origin\.url[\s\S]{0,200}Deleting the contents'
+    flags: 'i'
+error_messages:
+  - 'Deleting the contents of ''/home/runner/work/myrepo/myrepo'''
+  - 'Deleting the contents of ''/home/runner/work/_temp/...'
+root_cause: |
+  actions/checkout's `clean: false` option prevents `git clean -ffdx` (removing untracked
+  files) but does NOT prevent the action from deleting and reinitializing the entire
+  workspace directory when it detects that the existing `remote.origin.url` does not match
+  the target repository being checked out.
+
+  When multiple checkout steps run in the same job and the second checkout targets a
+  different repository (different org, different repo name, or different URL), the action
+  reads the current `git config --local --get remote.origin.url`, compares it against the
+  target repository URL, and — on mismatch — deletes the entire workspace directory before
+  reinitializing. This deletion happens regardless of `clean: false`.
+
+  Common scenarios that trigger this:
+  1. First step checks out a support/config repo (sparse-checkout of a different repo for
+     shared config), then a second step checks out the main repo with `clean: false`.
+  2. Checking out the main repo first, then a second checkout of a different repo for
+     reading shared scripts, assuming `clean: false` preserves the main workspace.
+  3. Re-using runner workspace across jobs via `clean: false` where the prior job checked
+     out a different repository.
+
+  The log shows the silent deletion in plain text ("Deleting the contents of '...'") but
+  users commonly miss it because the step still succeeds and subsequent steps may not
+  immediately error if they only use the freshly-checked-out content.
+
+  checkout@v5 has the same behavior — this is not a v6 regression. It is documented as
+  expected behavior but is frequently unexpected by users.
+fix: |
+  Option 1 (recommended): Specify `path:` to checkout each repository into a distinct
+  subdirectory, preventing the remote URL mismatch from triggering deletion.
+
+  Option 2: Reverse the order — checkout the main repo last so the deletion (if any)
+  happens to the support repo's files rather than the main workspace.
+
+  Option 3: Accept that `clean: false` cannot preserve workspace contents across
+  checkouts of different repositories sharing the same path, and restructure the workflow
+  to avoid this pattern.
+
+  Option 4: For reading shared scripts/config from another repo, use curl/gh api to fetch
+  specific files rather than a full checkout step.
+fix_code:
+  - language: yaml
+    label: 'Use path: to isolate each checkout to its own directory'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            # Checkout support config into a subdirectory
+            - name: Checkout shared config
+              uses: actions/checkout@v6
+              with:
+                repository: myorg/shared-config
+                ref: v1
+                sparse-checkout: |
+                  nginx/nginx.conf
+                path: .shared-config   # <-- isolated path, no URL conflict
+
+            # Checkout main repo into workspace root (or another path)
+            - name: Checkout source
+              uses: actions/checkout@v6
+              with:
+                fetch-depth: 0
+                # clean: false is now safe — different paths, no URL mismatch
+
+            - name: Use shared config
+              run: cp .shared-config/nginx/nginx.conf ./nginx.conf
+
+  - language: yaml
+    label: 'Fetch individual files without a full checkout to avoid URL conflict'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v6
+              with:
+                fetch-depth: 0
+
+            # Fetch a single file from another repo without a second checkout
+            - name: Fetch shared nginx config
+              env:
+                GH_TOKEN: ${{ github.token }}
+              run: |
+                gh api repos/myorg/shared-config/contents/nginx/nginx.conf \
+                  --jq '.content' | base64 -d > ./nginx.conf
+
+prevention:
+  - 'Use path: on every checkout step when multiple repositories are checked out in the same job'
+  - 'Do not rely on clean: false to preserve workspace content across checkouts of different repositories'
+  - 'Watch for "Deleting the contents of..." lines in checkout step logs — this confirms workspace was reset even with clean: false'
+  - 'When using sparse-checkout for a support repo followed by a main repo checkout, always isolate them into separate path: directories'
+docs:
+  - url: 'https://github.com/actions/checkout/issues/2348'
+    label: 'actions/checkout#2348 — v6 clean: false still deletes workspace files from prior checkout (Feb 2026)'
+  - url: 'https://github.com/actions/checkout#usage'
+    label: 'actions/checkout — clean input documentation'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-workflow-data-as-artifacts'
+    label: 'Storing workflow data — alternative to multi-repo checkout for sharing files'

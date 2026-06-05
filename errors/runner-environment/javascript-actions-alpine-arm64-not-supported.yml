@@ -1,0 +1,121 @@
+id: runner-environment-195
+title: 'JavaScript Actions in Alpine containers not supported on ARM64 runners'
+category: runner-environment
+severity: error
+tags:
+  - alpine
+  - arm64
+  - javascript-action
+  - container
+  - ubuntu-24.04-arm
+  - musl
+patterns:
+  - regex: 'JavaScript Actions in Alpine containers are only supported on x64 Linux runners'
+    flags: 'i'
+  - regex: 'Detected Linux Arm64'
+    flags: 'i'
+  - regex: 'JavaScript Actions in Alpine containers.*Detected Linux'
+    flags: 'i'
+error_messages:
+  - 'Error: JavaScript Actions in Alpine containers are only supported on x64 Linux runners. Detected Linux Arm64'
+root_cause: |
+  The Actions runner's container hook for JavaScript-based actions (actions that use
+  `using: node20` or `using: node24` in their action.yml) includes a hard platform check
+  when the container image is detected as Alpine Linux.
+
+  Alpine Linux uses musl libc instead of glibc. The Node.js binaries bundled inside
+  GitHub-hosted Actions runners are compiled against glibc and cannot run inside Alpine
+  containers without compatibility shims. The runner guards against this by rejecting
+  JavaScript action execution in Alpine containers that are not on x64 Linux, where a
+  limited musl-compatibility workaround exists.
+
+  On ARM64 runners (ubuntu-24.04-arm, ubuntu-22.04-arm), the runner explicitly rejects
+  JavaScript actions run inside Alpine containers with this error. The check evaluates the
+  container image's /etc/os-release ID field: when ID=alpine is found AND the runner
+  architecture is not x64, the error is thrown.
+
+  Common trigger patterns:
+  - Workflow uses `container: alpine` or a custom image FROM alpine
+  - One or more steps use JavaScript-based actions (e.g. actions/upload-artifact,
+    actions/checkout, actions/setup-node)
+  - Workflow or matrix includes ubuntu-24.04-arm or ubuntu-22.04-arm runners
+
+  Upgrading to a larger ubuntu-based base image resolves the issue because glibc is
+  present. There is no planned fix to add ARM64 Alpine support to the runner.
+fix: |
+  Option 1 (recommended): Replace the Alpine container with a Debian/Ubuntu-based image.
+  Alpine is often chosen for image size, but if JavaScript actions must be used inside the
+  container, a glibc-based image is required on ARM64 runners.
+
+  Option 2: Run JavaScript actions as host-level steps (outside the container) and
+  restrict container use to run: shell steps that do not invoke JS actions.
+
+  Option 3: Restrict ARM64 runners to non-Alpine container images in your matrix.
+
+  Option 4: If the Alpine container is only for the build environment, restructure the
+  workflow so JavaScript actions (checkout, upload-artifact, etc.) run before the
+  container is started rather than inside it.
+fix_code:
+  - language: yaml
+    label: 'Replace Alpine with Debian-slim (smallest glibc image)'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-24.04-arm
+          container:
+            # Replace: image: alpine:latest
+            image: debian:bookworm-slim   # glibc-based, JS actions work on ARM64
+          steps:
+            - uses: actions/checkout@v6
+            - run: apt-get update && apt-get install -y curl
+            - uses: actions/upload-artifact@v4
+              with:
+                name: output
+                path: dist/
+
+  - language: yaml
+    label: 'Run JS actions on host, only use Alpine container for build steps'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-24.04-arm
+          steps:
+            # Checkout on host (no container) — JS action works fine
+            - uses: actions/checkout@v6
+            # Run build inside Alpine via docker run (shell step, not JS action)
+            - name: Build in Alpine
+              run: |
+                docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work \
+                  alpine:latest sh -c "apk add --no-cache build-base && make"
+            # Upload on host — JS action works fine
+            - uses: actions/upload-artifact@v4
+              with:
+                name: output
+                path: dist/
+
+  - language: yaml
+    label: 'Matrix: restrict Alpine container to x64 runners only'
+    code: |
+      jobs:
+        build:
+          runs-on: ${{ matrix.runner }}
+          container:
+            image: ${{ matrix.runner == 'ubuntu-24.04-arm' && 'debian:bookworm-slim' || 'alpine:latest' }}
+          strategy:
+            matrix:
+              runner: [ubuntu-24.04, ubuntu-24.04-arm]
+          steps:
+            - uses: actions/checkout@v6
+
+prevention:
+  - 'Never use Alpine-based container images on ARM64 GitHub-hosted runners if any workflow step calls a JavaScript action'
+  - 'Use debian:bookworm-slim or ubuntu:24.04 as a lightweight glibc alternative to Alpine when JS actions must run in-container on ARM64'
+  - 'When migrating workflows to ARM64 runners, audit all container: image values for Alpine derivation (FROM alpine, alpine:latest, alpine:3.x)'
+  - 'Run JavaScript actions (checkout, upload-artifact, setup-*) as host-level steps before or after the Alpine container block when possible'
+docs:
+  - url: 'https://github.com/actions/upload-artifact/issues/739'
+    label: 'actions/upload-artifact#739 — JS Actions in Alpine containers not supported on ARM64 (Feb 2026)'
+  - url: 'https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners#supported-runners-and-hardware-resources'
+    label: 'GitHub-hosted runners — ARM64 runner support'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/running-jobs-in-a-container'
+    label: 'Running jobs in a container'
