@@ -1,0 +1,137 @@
+id: triggers-068
+title: "pull_request paths/paths-ignore filter evaluates entire PR diff, not latest commit"
+category: triggers
+severity: silent-failure
+tags:
+  - paths-filter
+  - paths-ignore
+  - pull_request
+  - three-dot-diff
+  - silent-trigger
+  - monorepo
+patterns:
+  - regex: 'paths-ignore:'
+    flags: 'i'
+  - regex: 'on:\s*\n\s*pull_request:'
+    flags: 'im'
+error_messages:
+  - "Workflow triggers on push to README.md even though README.md is listed in paths-ignore"
+  - "paths-ignore not respected after one commit touches files outside the ignore list"
+  - "Workflow keeps running for all subsequent commits in PR even though only ignored files changed"
+root_cause: |
+  GitHub's paths and paths-ignore filters for pull_request (and pull_request_target)
+  events use a three-dot diff — a comparison between the most recent version of the
+  topic branch HEAD and the commit where the topic branch last diverged from the base
+  branch (the merge base). This diff encompasses ALL files changed across the entire
+  PR, not just the files changed in the most recent commit/push.
+
+  The practical consequence is: once any commit in the PR has touched a file that is
+  NOT in paths-ignore, the three-dot diff permanently includes that file for the
+  lifetime of the PR. All subsequent pushes to the same PR will also trigger the
+  workflow, even if those pushes only modify files listed in paths-ignore.
+
+  Example: a PR starts by pushing a Go source file (triggers the workflow). The
+  developer then pushes a README.md-only commit. Despite README.md being in
+  paths-ignore, the entire PR diff still includes the earlier Go change, so the
+  workflow fires again.
+
+  This behavior is documented under "Git diff comparisons" in the GitHub Actions
+  workflow syntax reference but is widely misunderstood.
+
+  Contrast with push events: push filters only examine files changed in the
+  individual push commit(s), so paths-ignore works as most developers expect.
+fix: |
+  Option 1 — Use dorny/paths-filter to gate job execution at the step/job level
+  based on files changed only in the current push (most reliable workaround):
+
+    jobs:
+      guard:
+        runs-on: ubuntu-latest
+        outputs:
+          changed: ${{ steps.filter.outputs.src }}
+        steps:
+          - uses: actions/checkout@v4
+          - uses: dorny/paths-filter@v3
+            id: filter
+            with:
+              filters: |
+                src:
+                  - 'src/**'
+                  - '!README.md'
+
+      build:
+        needs: guard
+        if: needs.guard.outputs.changed == 'true'
+        runs-on: ubuntu-latest
+        steps:
+          - run: echo "only runs if src changed in latest push"
+
+  Option 2 — Accept that pull_request paths filtering is PR-wide and use it only
+  for coarse-grained "should this workflow category run at all" decisions, not for
+  per-commit granularity.
+
+  Option 3 — Remove paths/paths-ignore from the pull_request trigger entirely and
+  use conditional job-level steps with dorny/paths-filter instead.
+fix_code:
+  - language: yaml
+    label: "Use dorny/paths-filter for per-commit path gating (recommended)"
+    code: |
+      on:
+        pull_request:
+          branches: [main]
+          # No paths/paths-ignore here — filter is done per-commit in the job
+
+      jobs:
+        check-changes:
+          runs-on: ubuntu-latest
+          outputs:
+            src_changed: ${{ steps.filter.outputs.src }}
+          steps:
+            - uses: actions/checkout@v4
+            - uses: dorny/paths-filter@v3
+              id: filter
+              with:
+                filters: |
+                  src:
+                    - 'src/**'
+                    - '*.go'
+                    - '!**/*.md'
+
+        build:
+          needs: check-changes
+          if: needs.check-changes.outputs.src_changed == 'true'
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: make build
+  - language: yaml
+    label: "What NOT to do — paths-ignore on pull_request silently fails after first non-ignored commit"
+    code: |
+      # This looks correct but DOES NOT work as expected for pull_request events:
+      on:
+        pull_request:
+          paths-ignore:
+            - '**.md'      # <-- evaluated against entire PR diff, not latest push
+            - 'docs/**'
+
+      # After any commit in the PR touches a non-md file, ALL subsequent commits
+      # trigger this workflow, even if those commits only change .md files.
+prevention:
+  - "Do not rely on paths-ignore to prevent a workflow from running on documentation-only
+     follow-up commits in a PR — it only works until any non-ignored file is committed to
+     the PR branch."
+  - "Use dorny/paths-filter or similar per-commit path detection actions instead of workflow-level
+     paths-ignore for pull_request events when per-commit granularity is needed."
+  - "For monorepos, consider separate workflows per component triggered by dorny/paths-filter
+     outputs rather than native paths filters."
+  - "paths-ignore works reliably for push events (single commit diff) — the behavior difference
+     between push and pull_request is a common source of confusion."
+docs:
+  - url: "https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#git-diff-comparisons"
+    label: "GitHub Actions workflow syntax: Git diff comparisons"
+  - url: "https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onpushpull_requestpull_request_targetpathspaths-ignore"
+    label: "GitHub Actions: paths and paths-ignore filter syntax"
+  - url: "https://github.com/actions/runner/issues/2324"
+    label: "actions/runner #2324: on.pull_request.paths-ignore are not respected correctly (64 reactions, still open)"
+  - url: "https://github.com/dorny/paths-filter"
+    label: "dorny/paths-filter — per-commit path change detection action"
