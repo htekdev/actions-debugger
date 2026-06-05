@@ -1,0 +1,76 @@
+id: caching-artifacts-050
+title: "upload-artifact@v4 fails when artifact storage quota is exceeded"
+category: caching-artifacts
+severity: error
+tags:
+  - upload-artifact
+  - storage-quota
+  - v4
+  - billing
+  - artifact-cleanup
+patterns:
+  - regex: 'Artifact storage quota has been hit'
+    flags: i
+  - regex: 'unable to upload any new artifacts'
+    flags: i
+  - regex: 'storage limit.*exceeded'
+    flags: i
+error_messages:
+  - "Artifact storage quota has been hit, unable to upload any new artifacts. Please remove some old artifacts or increase storage for the repo."
+root_cause: |
+  GitHub Actions artifact storage has per-account limits (500 MB for free plans, 2 GB for Pro,
+  50 GB for Teams, and custom limits for Enterprise). Unlike actions/upload-artifact@v3 which
+  used a legacy backend, v4 strictly enforces storage quotas and fails hard when the limit
+  is exceeded. Old artifacts from previous workflow runs accumulate over time and are not
+  automatically purged unless a retention policy is set. Once the quota is hit, all subsequent
+  artifact uploads fail immediately with no partial upload.
+fix: |
+  1. Set retention-days on all upload-artifact steps to automatically expire old artifacts.
+  2. Delete old artifacts programmatically using the GitHub REST API via actions/github-script.
+  3. Increase artifact and log storage in GitHub billing settings (Org/User Settings -> Billing -> Storage).
+  4. Audit artifact size — only upload what is necessary for debugging or downstream jobs.
+fix_code:
+  - language: yaml
+    label: "Set retention-days to auto-expire artifacts"
+    code: |
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: dist/
+          retention-days: 7   # auto-delete after 7 days; default is 90
+
+  - language: yaml
+    label: "Delete artifacts older than 30 days via GitHub API script"
+    code: |
+      - name: Clean up old artifacts
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const cutoff = new Date();
+            cutoff.setDate(cutoff.getDate() - 30);
+            const artifacts = await github.paginate(
+              github.rest.actions.listArtifactsForRepo,
+              { owner: context.repo.owner, repo: context.repo.repo, per_page: 100 }
+            );
+            for (const artifact of artifacts) {
+              if (new Date(artifact.created_at) < cutoff) {
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: artifact.id,
+                });
+              }
+            }
+prevention:
+  - "Always set retention-days on upload-artifact steps — default is 90 days which fills storage quickly"
+  - "Upload only the minimum files needed for debugging or downstream jobs, not entire build directories"
+  - "Add a weekly scheduled workflow to delete artifacts older than your retention window"
+  - "Monitor storage usage under GitHub Settings -> Billing & plans -> Storage"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-workflow-data-as-artifacts#configuring-a-custom-artifact-retention-period"
+    label: "GitHub Docs: Custom artifact retention period"
+  - url: "https://docs.github.com/en/billing/managing-billing-for-your-products/managing-billing-for-github-actions/about-billing-for-github-actions#included-storage-and-minutes"
+    label: "GitHub Docs: Included storage and minutes"
+  - url: "https://github.com/actions/upload-artifact/issues/577"
+    label: "actions/upload-artifact#577: Storage quota exceeded on v4"
