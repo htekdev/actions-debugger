@@ -1,0 +1,117 @@
+id: runner-environment-178
+title: 'ARC Runner v2.332.0 Regression — Container Job GITHUB_ENV and Workspace Permission Denied'
+category: runner-environment
+severity: error
+tags:
+  - arc
+  - actions-runner-controller
+  - container-job
+  - permissions
+  - GITHUB_ENV
+  - non-root
+  - kubernetes
+  - regression
+  - v2.332
+patterns:
+  - regex: 'cannot create /__w/_temp/_runner_file_commands/set_env_[0-9a-f]+: Permission denied'
+    flags: 'i'
+  - regex: 'cannot create /__w/_temp/_runner_file_commands/add_path_[0-9a-f]+: Permission denied'
+    flags: 'i'
+  - regex: 'fatal: detected dubious ownership in repository at .+/__w/'
+    flags: 'i'
+  - regex: '_runner_file_commands.*Permission denied'
+    flags: 'i'
+error_messages:
+  - "/__w/_temp/36e38446.sh: 5: cannot create /__w/_temp/_runner_file_commands/set_env_7bb88aaa: Permission denied"
+  - "fatal: detected dubious ownership in repository at '/__w/repo/repo'"
+  - "/__w/_temp/_runner_file_commands/add_path_: Permission denied"
+root_cause: |
+  Upgrading Actions Runner Controller (ARC) from runner v2.330.0 to v2.332.0
+  introduces a compound regression that breaks container jobs using non-root users.
+
+  The regression spans two runner releases:
+
+  1. v2.331.0 changed the runner container base image from Ubuntu 22.04 to
+     Ubuntu 24.04. The newer base ships git 2.43+ which enforces stricter
+     safe.directory checks. The mounted workspace volume is owned by the runner
+     UID, so a container running as a different non-root UID receives
+     "fatal: detected dubious ownership" on any git operation.
+
+  2. v2.332.0 bumped container hooks to v0.8.1, which updated workspace
+     ownership handling for the runner pod itself — but not for downstream job
+     containers. The _runner_file_commands directory under /__w/_temp/ is
+     still created with runner UID ownership. When a container step writes to
+     $GITHUB_ENV, $GITHUB_OUTPUT, $GITHUB_PATH, or $GITHUB_STEP_SUMMARY via a
+     shell redirect, the shell (running as the container's non-root user) cannot
+     create the file and exits non-zero.
+
+  This regression affects:
+  - ARC-managed self-hosted runners on Kubernetes (EKS, GKE, AKS, on-prem)
+  - Any workflow using `container: image: my-image` with `options: --user <uid>`
+    or a non-root USER in the Dockerfile
+  - Workflows that previously worked on runner v2.330.0 and below
+
+  GitHub-hosted runners (ubuntu-latest, etc.) are NOT affected.
+fix: |
+  If you cannot immediately pin the runner version, add a workaround step at
+  the top of the affected job to fix ownership of the runner file command
+  directories. Alternatively, pin ARC runner images to v2.330.0 until an
+  upstream fix for container hooks is released.
+
+  The most robust long-term fix is to explicitly add the workspace to git's
+  safe.directory list and pre-create the file command directories with the
+  correct ownership.
+fix_code:
+  - language: yaml
+    label: 'Option A — Pre-create _runner_file_commands with container user ownership'
+    code: |
+      jobs:
+        build:
+          runs-on: self-hosted
+          container:
+            image: my-app:latest
+            options: --user 1000
+          steps:
+            - name: Fix runner file command directory ownership (v2.332.0 workaround)
+              # Run as root before any steps that use GITHUB_ENV/GITHUB_OUTPUT
+              run: |
+                chown -R 1000:1000 /__w/_temp/_runner_file_commands/ || true
+                git config --global --add safe.directory /__w/${{ github.repository }}
+              shell: bash
+              # Note: requires container image to have chown available as root
+  - language: yaml
+    label: 'Option B — Pin ARC runner image to v2.330.0 to avoid the regression'
+    code: |
+      # In your ARC HelmRelease or RunnerDeployment spec:
+      # spec:
+      #   template:
+      #     spec:
+      #       containers:
+      #         - name: runner
+      #           image: ghcr.io/actions/actions-runner:2.330.0
+  - language: yaml
+    label: 'Option C — Run container job as root to avoid UID mismatch'
+    code: |
+      jobs:
+        build:
+          runs-on: self-hosted
+          container:
+            image: my-app:latest
+            options: --user root   # avoid UID mismatch until ARC fix ships
+          steps:
+            - uses: actions/checkout@v4
+            - run: echo "FOO=bar" >> $GITHUB_ENV
+prevention:
+  - 'Test ARC runner version upgrades in a staging environment before rolling out to production — especially major bumps (v2.330 → v2.332).'
+  - 'Pin container jobs to run as root if your workflow uses GITHUB_ENV, GITHUB_OUTPUT, or GITHUB_PATH writes and you depend on non-root containers.'
+  - 'Subscribe to actions/runner releases and scan for changes to container-hooks between minor versions.'
+  - 'Add a smoke-test workflow that writes to GITHUB_ENV in a non-root container job — run it against each ARC upgrade to catch regressions early.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4302'
+    label: 'actions/runner #4302 — v2.332.0: Container jobs fail with permission denied on GITHUB_ENV and workspace'
+  - url: 'https://github.com/actions/runner/issues/4131'
+    label: 'actions/runner #4131 — Permissions issue on runners v2.330.0 (/home/runner ownership regression)'
+  - url: 'https://github.com/actions/runner/issues/4251'
+    label: 'actions/runner #4251 — TempDirectoryManager fails to clean temp directory (permission denied on v2.331.0)'
+  - url: 'https://github.com/actions/runner-container-hooks/issues/282'
+    label: 'runner-container-hooks #282 — Permissions denied on workingDir'

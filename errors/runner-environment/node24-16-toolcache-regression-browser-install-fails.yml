@@ -1,0 +1,109 @@
+id: runner-environment-177
+title: 'Node.js 24.16.0 Toolcache Update Breaks Puppeteer, Playwright, and Cypress Browser Install'
+category: runner-environment
+severity: error
+tags:
+  - nodejs
+  - node24
+  - puppeteer
+  - playwright
+  - cypress
+  - toolcache
+  - browser-install
+  - extract-zip
+  - regression
+patterns:
+  - regex: 'Could not find Chrome \(ver\. \d+\.\d+\.\d+'
+    flags: 'i'
+  - regex: 'npx puppeteer browsers install .+ exited with code [^0]'
+    flags: 'i'
+  - regex: 'browserType\.launch: Executable doesn.t exist at .+/chromium'
+    flags: 'i'
+  - regex: 'Cannot find browser at path.*\.cache/puppeteer'
+    flags: 'i'
+  - regex: 'Failed to install browsers.*extract.*zip'
+    flags: 'i'
+error_messages:
+  - "Error: Could not find Chrome (ver. 146.0.7680.153). This can occur if either 1. you did not perform an installation before running the script (e.g. `npx puppeteer browsers install chrome-headless-shell`) or 2. your cache path is incorrectly configured"
+  - "browserType.launch: Executable doesn't exist at /home/runner/.cache/ms-playwright/chromium-1169/chrome-linux/chrome"
+  - "Error: Failed to install browsers at /home/runner/.cache/ms-playwright"
+root_cause: |
+  The ubuntu-24.04 image update from 20260518.149.1 → 20260525.161.1 bumped the
+  cached Node.js toolcache version from 24.15.0 to 24.16.0. Node.js 24.16.0
+  contains an upstream regression in the readable-stream.destroy() lifecycle
+  that breaks yauzl (a ZIP reading library) and extract-zip which depends on it.
+
+  The affected tools all use @puppeteer/browsers or equivalent ZIP-based browser
+  downloaders internally:
+  - Puppeteer: `npx puppeteer browsers install chrome-headless-shell`
+  - Playwright: `npx playwright install chromium` / `npx playwright install --with-deps`
+  - Cypress: `npx cypress install`
+
+  The ZIP archive download completes successfully and the partial extraction
+  begins, but the stream destroy bug causes yauzl to exit before all entries
+  are written. The browser binary never lands on disk. The browser installer
+  exits 0 (or a non-descriptive exit code) and the next step fails with
+  "Could not find Chrome at path..." or a missing executable error.
+
+  Root upstream issues:
+  - https://github.com/nodejs/node/issues/63487 (yauzl/extract-zip hang / partial extraction)
+  - https://github.com/nodejs/node/issues/63638 (libuv regression on Windows)
+
+  Because actions/setup-node resolves to the cached Node.js 24.16.0 when
+  node-version: '24' or node-version: '24.x' is specified (or when using the
+  default runner-baked Node 24 on ubuntu-24.04), every workflow that installs
+  a browser via these tools is affected until Node.js 24.17.0 ships a fix.
+fix: |
+  Pin Node.js to 24.15.0 (the last known-good version) via actions/setup-node
+  until Node.js 24.17.0 is published and rolled into the runner toolcache.
+
+  If your workflow does not strictly require Node.js 24, fall back to Node.js 22
+  (the runner image default), which is unaffected by this regression.
+
+  Do NOT use node-version: '24' or node-version: 'latest' until the upstream
+  fix lands in Node.js 24.17.0.
+fix_code:
+  - language: yaml
+    label: 'Option A — Pin Node.js to 24.15.0 (last known-good release)'
+    code: |
+      steps:
+        - uses: actions/setup-node@v6
+          with:
+            node-version: '24.15.0'   # pin until Node 24.17.0 fixes readable-stream regression
+            cache: 'npm'
+
+        - name: Install Puppeteer Chrome
+          run: npx puppeteer browsers install chrome-headless-shell
+  - language: yaml
+    label: 'Option B — Fall back to Node.js 22 (unaffected)'
+    code: |
+      steps:
+        - uses: actions/setup-node@v6
+          with:
+            node-version: '22'        # LTS, not affected by readable-stream regression
+            cache: 'npm'
+
+        - name: Install Playwright browsers
+          run: npx playwright install --with-deps chromium
+  - language: yaml
+    label: 'Option C — Pin Playwright install to avoid extract-zip entirely (Playwright only)'
+    code: |
+      steps:
+        - uses: actions/setup-node@v6
+          with:
+            node-version: '24.15.0'
+        - uses: microsoft/playwright-github-action@v1   # uses pre-installed image browsers
+prevention:
+  - 'Pin node-version to a specific patch (e.g. 24.15.0) rather than a major/minor range in workflows that install browser binaries via npx commands.'
+  - 'After bumping Node.js versions, verify browser install steps succeed by checking the binary path explicitly with `ls -la ~/.cache/puppeteer` or equivalent before running tests.'
+  - 'Subscribe to actions/runner-images releases to catch toolcache updates that may include Node.js patch regressions.'
+  - 'For Playwright, prefer `npx playwright install --with-deps` combined with an explicit Node.js pin rather than relying on runner-image cached Node versions.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14173'
+    label: 'runner-images #14173 — Puppeteer broken in Ubuntu 24.04 version 20260525.161.1'
+  - url: 'https://github.com/nodejs/node/issues/63487'
+    label: 'nodejs/node #63487 — yauzl/extract-zip hang and partial extraction (readable-stream regression)'
+  - url: 'https://github.com/nodejs/node/issues/63638'
+    label: 'nodejs/node #63638 — libuv regression in Node.js 24.16.0'
+  - url: 'https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260525.161'
+    label: 'runner-images ubuntu24/20260525.161 release — Node.js toolcache bumped 24.15.0 → 24.16.0'

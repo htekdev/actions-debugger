@@ -1,0 +1,112 @@
+id: silent-failures-097
+title: 'setup-node Silently Uses Runner-Baked Node Version When Download Fails — Wrong Version Active'
+category: silent-failures
+severity: silent-failure
+tags:
+  - setup-node
+  - nodejs
+  - download-failure
+  - silent-failure
+  - wrong-version
+  - toolcache
+  - hosted-runner
+  - fallthrough
+patterns:
+  - regex: 'Attempting to download \d+\.\d+\.\d+\.\.\.'
+    flags: 'i'
+  - regex: 'Cannot find module.*engines.*node.*>=\s*24'
+    flags: 'i'
+  - regex: 'The engine .node. is incompatible with this module\. Expected version .+\. Got .2[0-2]\.'
+    flags: 'i'
+  - regex: 'ELIFECYCLE.*node --version.*v2[0-2]\.'
+    flags: 'i'
+error_messages:
+  - "Attempting to download 24.15.0..."
+  - "error: The engine 'node' is incompatible with this module. Expected version '>=24.0.0'. Got '22.14.0'"
+  - "npm ERR! code ELIFECYCLE"
+  - "Error: Cannot find module 'node:crypto' (Node.js version too old)"
+root_cause: |
+  When actions/setup-node's download or extract path fails transiently —
+  network blip, manifest miss, partial extract from a concurrent toolcache
+  write, or a transient S3/CDN cache failure — the action does not surface the
+  error. Instead, it falls back to a secondary download path. If that secondary
+  path also fails or returns an unusable toolPath, setup-node adds an empty or
+  incorrect directory to PATH and exits 0 (success).
+
+  Because the setup-node step succeeds, the runner-baked Node.js version
+  (e.g. v22.x on ubuntu-latest after the Node 20 removal) remains on PATH.
+  Downstream steps execute against the wrong Node.js major version with no
+  indication that setup-node did not install the requested version.
+
+  The mechanism (in official_builds.ts, as of 2026-05-21):
+  - Download/extract errors are logged via core.info(), not core.warning()
+    or core.error(), so they are buried in normal output
+  - After the fallback download attempt, there is no post-condition check
+    that verifies node --version matches the requested version
+  - core.addPath() is called even if toolPath/bin is empty or stale
+
+  Reported failing run: https://github.com/n8n-io/n8n/actions/runs/26100630929
+  The run showed "Attempting to download 24.15.0..." → 33 seconds of silence →
+  next step ran against runner-baked v20.20.0 with no error from setup-node.
+
+  This is distinct from silent-failures-028 which covers self-hosted runners
+  where node is completely absent (node: not found). This entry covers hosted
+  runners where the wrong version is silently active and node IS found.
+
+  Root upstream issue: actions/toolkit#804 — concurrent toolcache writes create
+  partial extracts that pass path existence checks.
+fix: |
+  Add an explicit node --version verification step immediately after setup-node
+  and fail the job if the version does not match. This is the external workaround
+  used by affected projects (e.g., n8n/n8n PR #30849).
+
+  Until actions/setup-node ships a built-in post-install assertion, this
+  workflow-level guard is the only reliable way to catch the silent fallthrough.
+fix_code:
+  - language: yaml
+    label: 'Add explicit version verification after setup-node'
+    code: |
+      steps:
+        - uses: actions/setup-node@v6
+          with:
+            node-version: '24'
+            cache: 'npm'
+
+        - name: Verify Node.js version
+          shell: bash
+          run: |
+            ACTUAL=$(node --version)
+            EXPECTED_MAJOR="24"
+            if [[ "$ACTUAL" != v${EXPECTED_MAJOR}.* ]]; then
+              echo "::error::setup-node installed Node ${EXPECTED_MAJOR} but \`node --version\` reports $ACTUAL"
+              echo "::error::This usually indicates a transient download failure or partial toolcache extract."
+              exit 1
+            fi
+            echo "Node.js version confirmed: $ACTUAL"
+
+        - name: Install dependencies
+          run: npm ci
+  - language: yaml
+    label: 'Pin to exact patch version to reduce toolcache misses'
+    code: |
+      steps:
+        - uses: actions/setup-node@v6
+          with:
+            node-version: '24.15.0'   # exact pin reduces manifest/toolcache lookup failures
+            cache: 'npm'
+
+        - name: Verify Node.js version (belt-and-suspenders)
+          run: |
+            node --version | grep -E '^v24\.15\.' || (echo "Wrong Node version" && exit 1)
+prevention:
+  - 'Always verify node --version matches the requested major after setup-node, especially in workflows that depend on Node.js 24+ features or native modules.'
+  - 'Pin to an exact patch version (e.g. 24.15.0) rather than a range (24.x) to avoid unexpected toolcache miss fallbacks.'
+  - 'If you see "Attempting to download X.Y.Z..." followed by an unusually long pause in setup-node output, the download may have stalled and the fallback path may be active.'
+  - 'Watch setup-node releases for a built-in post-install assertion fix (tracked in actions/setup-node#1556 and actions/toolkit#804).'
+docs:
+  - url: 'https://github.com/actions/setup-node/issues/1556'
+    label: 'setup-node #1556 — setup-node silently falls through to runner-baked Node on download/extract failure'
+  - url: 'https://github.com/actions/toolkit/issues/804'
+    label: 'actions/toolkit #804 — Concurrent toolcache writes cause partial extracts on multi-tenant runners'
+  - url: 'https://github.com/n8n-io/n8n/pull/30849'
+    label: 'n8n/n8n PR #30849 — External Verify Node.js Version workaround'
