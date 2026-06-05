@@ -1,0 +1,122 @@
+id: permissions-auth-064
+title: 'GitHub OIDC Provider Intermittent 500 — Transient Token Request Failures'
+category: permissions-auth
+severity: error
+tags:
+  - oidc
+  - intermittent
+  - 500
+  - token-request
+  - transient
+  - retry
+patterns:
+  - regex: 'Request to OIDC provider failed with status 500'
+    flags: 'i'
+  - regex: 'Unable to get OIDC token.*500'
+    flags: 'i'
+  - regex: 'Failed to get ID token.*status.*500'
+    flags: 'i'
+error_messages:
+  - "Error: Unable to get OIDC token: Error: Request to OIDC provider failed with status 500"
+  - "Request to OIDC provider failed with status 500"
+  - "Error: Failed to get ID token: Request failed with status code 500"
+root_cause: |
+  GitHub's OIDC token endpoint (`https://token.actions.githubusercontent.com`) occasionally
+  returns HTTP **500 Internal Server Error** responses due to transient infrastructure issues
+  on GitHub's side. The failure is server-side and non-deterministic — workflows that ran
+  successfully hours ago may fail today, and re-running the identical job minutes later often
+  succeeds.
+
+  **This error is distinct from other OIDC failures:**
+
+  | Error | Cause | Fix |
+  |---|---|---|
+  | `Unable to get ACTIONS_ID_TOKEN_REQUEST_URL env variable` | Missing `id-token: write` permission | Add permission to workflow |
+  | `OIDC: Could not parse JWT` | Malformed sub-claim or trust config | Fix cloud provider OIDC trust config |
+  | `429 Too Many Requests` | Rate limiting (large parallel matrix) | Add delays, reduce parallelism |
+  | **`status 500`** | **Transient GitHub infrastructure failure** | **Retry the job** |
+
+  The 500 occurs **after** the permission and environment variable checks pass. The OIDC
+  endpoint is reachable but GitHub's token minting service returned an internal error.
+
+  Common patterns where 500s surface:
+  - Workflows that run OIDC auth in every push/PR commit (high frequency)
+  - Parallel matrix jobs that all request tokens simultaneously
+  - Periods of GitHub infrastructure maintenance or elevated load
+fix: |
+  **Option 1 — Re-run the failed job.** The 500 is stateless; simply triggering a re-run
+  from the GitHub Actions UI is usually sufficient for non-blocking situations.
+
+  **Option 2 — Add a retry wrapper** around the cloud authentication step using an action
+  like `nick-fields/retry` or `Wandalen/wretry.action`. Wrap only the OIDC-dependent step
+  so that a transient 500 triggers an automatic retry without failing the entire workflow.
+
+  **Option 3 — Shell retry loop** for custom OIDC token fetches. Use a loop that retries
+  the request up to 3 times with a short backoff before failing.
+
+  There is no client-side configuration that prevents the server 500 — retrying is the
+  only mitigation.
+fix_code:
+  - language: yaml
+    label: 'Retry wrapper with nick-fields/retry'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          permissions:
+            id-token: write
+            contents: read
+          steps:
+            - uses: actions/checkout@v4
+
+            # Wrap the OIDC-based auth step in a retry wrapper
+            - name: Configure AWS credentials (with retry)
+              uses: nick-fields/retry@v3
+              with:
+                max_attempts: 3
+                retry_wait_seconds: 15
+                timeout_minutes: 5
+                command: >
+                  aws sts get-caller-identity  # Or any OIDC-gated step
+
+            # Direct usage example — if your action supports retries natively
+            - name: Authenticate to AWS
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-to-assume: arn:aws:iam::123456789012:role/GitHubActionsRole
+                aws-region: us-east-1
+
+  - language: yaml
+    label: 'Shell retry loop for custom OIDC token fetch'
+    code: |
+      steps:
+        - name: Fetch OIDC token with retry
+          run: |
+            MAX_ATTEMPTS=3
+            for i in $(seq 1 $MAX_ATTEMPTS); do
+              echo "Attempt $i of $MAX_ATTEMPTS..."
+              TOKEN=$(curl -sf \
+                -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+                "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" \
+                | jq -r '.value') && {
+                echo "OIDC_TOKEN=${TOKEN}" >> $GITHUB_ENV
+                echo "Token acquired."
+                exit 0
+              }
+              echo "Attempt $i failed."
+              [ $i -lt $MAX_ATTEMPTS ] && sleep $((10 * i))
+            done
+            echo "All $MAX_ATTEMPTS attempts failed."
+            exit 1
+prevention:
+  - 'Add retry logic to all OIDC-based cloud auth steps — a transient 500 should not block a deployment that can safely retry'
+  - 'Distinguish error types in runbooks: 500 = transient (retry), 403 = permission error (fix config), 429 = rate limited (add delay)'
+  - 'Monitor https://www.githubstatus.com/ when 500s appear in multiple unrelated workflows simultaneously — it often indicates a GitHub Actions incident'
+  - 'For critical pipelines, implement automatic re-run-on-failure so OIDC 500s recover without manual intervention (e.g., peter-evans/create-or-update-comment + workflow_run trigger)'
+docs:
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect'
+    label: 'About security hardening with OpenID Connect — GitHub Actions docs'
+  - url: 'https://www.githubstatus.com/'
+    label: 'GitHub Status — check for active GitHub Actions incidents'
+  - url: 'https://github.com/nick-fields/retry'
+    label: 'nick-fields/retry — retry wrapper action for GitHub Actions'

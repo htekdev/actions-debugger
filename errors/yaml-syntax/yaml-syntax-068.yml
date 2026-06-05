@@ -1,0 +1,137 @@
+id: yaml-syntax-068
+title: 'Composite Action run: Steps Use Caller Workspace as Working Directory — github.action_path Required for Bundled Scripts'
+category: yaml-syntax
+severity: error
+tags:
+  - composite-action
+  - github-action-path
+  - working-directory
+  - relative-path
+  - script
+  - file-not-found
+patterns:
+  - regex: 'run:\s*\./[^\s]+'
+    flags: 'i'
+  - regex: 'No such file or directory.*\./'
+    flags: 'i'
+  - regex: 'bash:.*\./.*: No such file or directory'
+    flags: 'i'
+error_messages:
+  - "bash: ./scripts/build.sh: No such file or directory"
+  - "/bin/bash: ./entrypoint.sh: No such file or directory"
+  - "Error: Process completed with exit code 127."
+  - "bash: line 1: ./setup.sh: No such file or directory"
+root_cause: |
+  When a composite action (whether local `uses: ./` or published `uses: org/action@v1`) runs a
+  `run:` step, the **working directory is the caller's workspace** (`github.workspace`), not the
+  action's own directory. Any relative path like `run: ./scripts/build.sh` resolves against the
+  caller repository root — not the composite action's repository.
+
+  This affects both published composite actions (referenced as `uses: org/my-action@v1`) and
+  local composite actions stored inside the same repository. Developers commonly write:
+
+  ```yaml
+  # In action.yml of org/my-action
+  runs:
+    using: composite
+    steps:
+      - name: Run bundled script
+        run: ./scripts/build.sh    # ❌ Resolves against CALLER workspace, not action directory
+        shell: bash
+  ```
+
+  When a caller uses `uses: org/my-action@v1`, `./scripts/build.sh` resolves to the caller's
+  `$GITHUB_WORKSPACE/scripts/build.sh`, which does not exist — producing "No such file or
+  directory" or exit code 127.
+
+  **Contrast with JavaScript/Docker actions:** In those action types, the action executes in its
+  own context. Composite actions are different — their steps are injected into the caller's
+  job environment and run with the caller's working directory.
+
+  The correct way to reference files bundled inside a composite action is to use
+  `${{ github.action_path }}`, which always points to the directory containing the action's
+  `action.yml` file, regardless of where the action is called from.
+fix: |
+  Replace relative paths in composite action `run:` steps with `${{ github.action_path }}/`:
+
+  ```yaml
+  # In action.yml
+  runs:
+    using: composite
+    steps:
+      - name: Run bundled script
+        run: ${{ github.action_path }}/scripts/build.sh   # ✅ Always resolves to action directory
+        shell: bash
+  ```
+
+  If the script must be made executable, add a `chmod` step using `github.action_path`:
+
+  ```yaml
+  steps:
+    - name: Make script executable
+      run: chmod +x ${{ github.action_path }}/scripts/build.sh
+      shell: bash
+
+    - name: Run bundled script
+      run: ${{ github.action_path }}/scripts/build.sh
+      shell: bash
+  ```
+
+  `github.action_path` is always set to the directory of the currently executing action's
+  `action.yml`, even for deeply nested composite actions calling other composite actions.
+fix_code:
+  - language: yaml
+    label: 'Correct: github.action_path for bundled scripts'
+    code: |
+      # In action.yml of your composite action (org/my-action)
+      name: 'My Action'
+      description: 'Does something useful'
+      runs:
+        using: composite
+        steps:
+          - name: Make script executable
+            run: chmod +x ${{ github.action_path }}/scripts/build.sh
+            shell: bash
+
+          - name: Run bundled build script
+            # ✅ github.action_path always points to the action's directory
+            run: ${{ github.action_path }}/scripts/build.sh
+            shell: bash
+
+          - name: Run inline Python from action directory
+            run: python ${{ github.action_path }}/tools/generate.py
+            shell: bash
+
+  - language: yaml
+    label: 'Wrong: relative path resolves against caller workspace'
+    code: |
+      # In action.yml of your composite action (org/my-action)
+      name: 'My Action'
+      runs:
+        using: composite
+        steps:
+          - name: Run bundled script
+            # ❌ Wrong: ./scripts/build.sh resolves against the CALLER's $GITHUB_WORKSPACE
+            # Fails with: bash: ./scripts/build.sh: No such file or directory
+            run: ./scripts/build.sh
+            shell: bash
+
+          # ❌ Also wrong: explicitly using github.workspace points to caller repo root
+          - name: Run script using workspace
+            run: ${{ github.workspace }}/scripts/build.sh
+            shell: bash
+
+prevention:
+  - 'Never use relative paths (./path) or github.workspace in composite action run: steps to reference the action''s own bundled files — always use github.action_path'
+  - 'Test composite actions by calling them from a separate test repository, not just the same repository where they are defined — relative paths that work locally (same repo) silently break when called externally'
+  - 'Add a step to verify the script exists at the expected path as the first step of your composite action during development: run: ls ${{ github.action_path }}/scripts/'
+  - 'Composite actions that call other composite actions each get their own github.action_path — do not pass it between actions as an input'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#github-context'
+    label: 'github.action_path context — GitHub Actions docs'
+  - url: 'https://docs.github.com/en/actions/sharing-automations/creating-actions/creating-a-composite-action'
+    label: 'Creating a composite action — GitHub Actions docs'
+  - url: 'https://github.com/actions/runner/issues/1348'
+    label: 'actions/runner#1348 — Local composite actions always relative to top level repository'
+  - url: 'https://stackoverflow.com/questions/77033208/github-action-composite-type-not-working-in-other-repositories-due-to-missing'
+    label: 'Stack Overflow — Composite action not working in other repositories due to missing action files'
