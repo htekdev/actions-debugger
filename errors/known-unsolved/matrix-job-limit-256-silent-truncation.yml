@@ -1,0 +1,116 @@
+id: known-unsolved-056
+title: 'GitHub Actions matrix is silently capped at 256 jobs — excess jobs are dropped with no warning'
+category: known-unsolved
+severity: limitation
+tags:
+  - matrix
+  - job-limit
+  - 256
+  - large-matrix
+  - silent-truncation
+patterns:
+  - regex: 'matrix.*256|256.*matrix.*job'
+    flags: 'i'
+  - regex: 'some jobs.*not.*generated.*matrix'
+    flags: 'i'
+error_messages:
+  - "The matrix contains more jobs than the 256 job limit"
+root_cause: |
+  GitHub Actions enforces a hard limit of 256 jobs per matrix expansion. When a
+  matrix generates more than 256 combinations, GitHub silently drops all jobs beyond
+  the first 256 — no error is raised, no warning appears in the workflow run UI,
+  and no notification is sent to the repository owner.
+
+  The truncation is silent and deterministic: GitHub processes matrix entries in
+  the order they are defined and stops at 256. If your matrix has 300 combinations,
+  jobs 257–300 simply do not run, but the workflow completes successfully.
+
+  Common scenarios that hit this limit:
+  - Large monorepo test suites that fan out one job per package/service (50+ packages
+    × multiple OS/version combinations)
+  - Parameterized test sharding where both shard-count and OS are in the matrix
+  - Dynamic matrices built from directory listings or API calls
+  - Security scanning jobs that matrix over many dependency versions
+
+  GitHub Actions documentation mentions the 256 limit but does not surface it as
+  an error at runtime, making it easy to miss for months.
+
+  Note: Enterprise plans have the same 256-job limit per matrix. There is no paid
+  tier that raises this cap.
+fix: |
+  There is no way to raise the 256-job limit. Workarounds:
+
+  1. Restructure the matrix to combine dimensions:
+     Instead of os × version × shard (3×4×30=360), use a pre-computed list of
+     only the combinations you actually need (often far fewer than the full product).
+
+  2. Shard within a single job instead of across jobs:
+     Use a single "test" job that runs a subset of tests in each runner process,
+     controlled by TOTAL_SHARDS / SHARD_INDEX environment variables, without
+     a separate matrix job per shard.
+
+  3. Split into multiple workflows:
+     Use workflow_call to invoke sub-workflows, each handling a subset of jobs.
+     Each workflow has its own 256-job budget.
+
+  4. Use a dynamic include-only matrix:
+     Build the matrix list externally (e.g., a script) and output it as JSON,
+     then ensure the JSON has at most 256 entries. Add a CI check that fails if
+     the list exceeds 255 (leaving headroom for include additions).
+fix_code:
+  - language: yaml
+    label: 'Pre-compute matrix list to stay under 256 (dynamic matrix pattern)'
+    code: |
+      jobs:
+        setup:
+          runs-on: ubuntu-latest
+          outputs:
+            matrix: ${{ steps.build-matrix.outputs.matrix }}
+          steps:
+            - uses: actions/checkout@v4
+            - id: build-matrix
+              run: |
+                # Build matrix, enforce limit
+                MATRIX=$(find packages -name package.json -maxdepth 2 | \
+                  head -256 | jq -R -s -c 'split("\n") | map(select(. != ""))')
+                echo "matrix={\"pkg\":$MATRIX}" >> "$GITHUB_OUTPUT"
+
+        test:
+          needs: setup
+          strategy:
+            matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Testing ${{ matrix.pkg }}"
+  - language: yaml
+    label: 'Split large matrix across two workflows via workflow_call'
+    code: |
+      # .github/workflows/test-batch-a.yml
+      on:
+        workflow_call:
+      jobs:
+        test:
+          strategy:
+            matrix:
+              pkg: [svc-a, svc-b, svc-c]  # First 128 services
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Testing ${{ matrix.pkg }}"
+
+      # .github/workflows/ci.yml
+      on: [push]
+      jobs:
+        batch-a:
+          uses: ./.github/workflows/test-batch-a.yml
+        batch-b:
+          uses: ./.github/workflows/test-batch-b.yml
+prevention:
+  - 'Monitor your matrix job count as the codebase grows — add a pre-flight check that fails CI if the computed matrix exceeds 255'
+  - 'Prefer horizontal test sharding within a single job over per-package matrix expansion for large monorepos'
+  - 'Document the matrix budget in your CONTRIBUTING.md so contributors understand the constraint'
+  - 'Use include: sparingly — each include entry adds to the 256-job budget'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/running-variations-of-jobs-in-a-workflow#about-matrix-strategies'
+    label: 'GitHub Actions — About matrix strategies (256-job limit documented)'
+  - url: 'https://docs.github.com/en/actions/administering-github-actions/usage-limits-billing-and-administration#usage-limits'
+    label: 'GitHub Actions usage limits — job matrix limits'

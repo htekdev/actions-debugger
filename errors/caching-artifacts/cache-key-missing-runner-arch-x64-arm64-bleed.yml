@@ -1,0 +1,101 @@
+id: caching-artifacts-058
+title: 'actions/cache key using runner.os bleeds between x64 and ARM64 Linux runners — wrong architecture binaries restored'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - cache-key
+  - runner-arch
+  - arm64
+  - x64
+  - architecture
+  - cross-arch
+patterns:
+  - regex: 'exec format error'
+    flags: 'i'
+  - regex: 'cannot execute binary file.*Exec format error'
+    flags: 'i'
+  - regex: 'ELF.*wrong ELF class'
+    flags: 'i'
+error_messages:
+  - "bash: /path/to/binary: cannot execute binary file: Exec format error"
+  - "error while loading shared libraries: wrong ELF class: ELFCLASS32"
+  - "qemu: uncaught target signal 11 (Segmentation fault)"
+root_cause: |
+  runner.os returns "Linux" for both ubuntu-24.04 (x86_64) and ubuntu-24.04-arm
+  (arm64/aarch64) runners. A cache key built with only ${{ runner.os }} will match
+  caches created on EITHER architecture, silently restoring the wrong binaries.
+
+  Example: a workflow compiles a Rust binary or installs native npm packages
+  (esbuild, rollup, sharp) on an x86_64 runner, then the same cache key is used on
+  an ARM64 runner. The cached x86_64 ELF binary is restored and immediately fails
+  with "Exec format error" — or worse, a segfault with no obvious cause.
+
+  This affects:
+  - Compiled binaries cached in the build layer
+  - Native npm modules (esbuild, @swc/core, sharp, canvas)
+  - Python packages with C extensions (.so files)
+  - Go, Rust, C++ build artifacts
+  - Any runner.os-keyed cache shared across an architecture matrix
+
+  The silent aspect: the cache HITS (green cache-hit output), no error is reported
+  until the cached binary is actually executed, often many steps later.
+fix: |
+  Add runner.arch to any cache key that stores architecture-dependent content.
+  runner.arch returns "X64" or "ARM64" on Linux runners, disambiguating them.
+
+  Change:
+    key: ${{ runner.os }}-build-${{ hashFiles('**/Cargo.lock') }}
+
+  To:
+    key: ${{ runner.os }}-${{ runner.arch }}-build-${{ hashFiles('**/Cargo.lock') }}
+
+  This applies to all cache keys for compiled artifacts, native modules, or
+  any platform-specific binary output. Pure source-code or platform-agnostic
+  caches (e.g., Go module downloads, pip source distributions) do not need runner.arch.
+fix_code:
+  - language: yaml
+    label: 'WRONG — runner.os only, bleeds between x64 and ARM64'
+    code: |
+      - uses: actions/cache@v4
+        with:
+          path: target/release
+          # BAD: runner.os = "Linux" for both x64 and ARM64
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+  - language: yaml
+    label: 'FIX — include runner.arch in cache key'
+    code: |
+      - uses: actions/cache@v4
+        with:
+          path: target/release
+          # GOOD: runner.arch = "X64" or "ARM64", prevents cross-arch cache hits
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+  - language: yaml
+    label: 'Full matrix example with architecture-aware cache keys'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              runner: [ubuntu-24.04, ubuntu-24.04-arm]
+          runs-on: ${{ matrix.runner }}
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/cache@v4
+              with:
+                path: |
+                  ~/.cargo/registry
+                  target/
+                key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+            - run: cargo build --release
+prevention:
+  - 'Always include runner.arch in cache keys when the cached content contains compiled or architecture-specific binaries'
+  - 'Audit existing cache keys whenever adding ARM64 runners to a workflow that already runs on x86_64'
+  - 'Use a restore-key that does NOT include arch only as a fallback, not as a primary key'
+  - 'Test fresh (clear cache) runs on each architecture to verify binaries execute correctly'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#runner-context'
+    label: 'GitHub Actions runner context — runner.os and runner.arch'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows'
+    label: 'Caching dependencies to speed up workflows'
+  - url: 'https://github.com/actions/cache'
+    label: 'actions/cache — cache key examples and best practices'
