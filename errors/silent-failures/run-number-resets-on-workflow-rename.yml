@@ -1,0 +1,131 @@
+id: silent-failures-098
+title: 'github.run_number resets to 1 when the workflow file is renamed or moved — versioning and artifact names silently regress'
+category: silent-failures
+severity: silent-failure
+tags:
+  - run-number
+  - workflow-rename
+  - versioning
+  - artifact-names
+  - workflow-identity
+  - silent-regression
+patterns:
+  - regex: 'github\.run_number'
+    flags: 'i'
+  - regex: 'run.number.*1\b.*artifact|artifact.*run.number.*1\b'
+    flags: 'i'
+error_messages:
+  - "artifact name collision — run-1 already exists from previous workflow incarnation"
+  - "version number regressed from 247 to 1 after pipeline rename"
+  - "run_number reset after workflow rename"
+root_cause: |
+  In GitHub Actions, `github.run_number` is a per-workflow counter maintained by GitHub's
+  internal workflow identity. A workflow's identity is bound to its **file path** in the
+  repository, not its `name:` key or its content.
+
+  When a workflow file is:
+  - Renamed (e.g., `ci.yml` → `build.yml`)
+  - Moved to a different path (e.g., `.github/workflows/ci.yml` → `.github/workflows/build/ci.yml`)
+  - Deleted and recreated with a different name
+
+  GitHub treats the new path as an **entirely new workflow**. The `run_number` for the new
+  workflow starts at `1`, regardless of how many runs the old workflow had.
+
+  This silently breaks any artifact, release tag, version label, or log reference that
+  uses `run_number` as a counter or version component:
+
+  - `myapp-build-${{ github.run_number }}.zip` → becomes `myapp-build-1.zip` again
+  - CalVer or semantic versions derived from run_number regress
+  - Download links embedded in previous releases now conflict with the new run-1 artifact name
+  - Monitoring dashboards lose continuity
+
+  The old workflow's run history and its run_number sequence remain accessible under the
+  previous file path in the Actions history, but all new runs count from 1.
+fix: |
+  **Option 1 — Use `github.run_id` instead of `github.run_number` for uniqueness:**
+  `run_id` is a globally unique integer that never resets and doesn't depend on workflow
+  identity. Use it when you only need uniqueness, not monotonic sequential counting.
+
+  **Option 2 — Tag-based semantic versioning:**
+  Derive version from git tags using `git describe --tags` or GitVersion. This is portable
+  across workflow renames and provides meaningful versions.
+
+  **Option 3 — External counter (e.g., GitHub release tag count):**
+  Query the GitHub API or use a version file committed to the repo to maintain a counter
+  that persists independently of workflow file identity.
+
+  **Option 4 — If rename is intentional, reset consumer expectations:**
+  Add a `BASE_RUN_OFFSET` environment variable set to the last run_number before the rename,
+  and add it to `github.run_number` in all artifact/version references.
+fix_code:
+  - language: yaml
+    label: 'Broken — run_number resets silently on workflow file rename'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Build
+              run: make build
+
+            - name: Upload artifact
+              uses: actions/upload-artifact@v4
+              with:
+                # ❌ After renaming ci.yml → build.yml, this becomes myapp-1.zip again
+                # Previous artifacts named myapp-247.zip still exist — version regress
+                name: myapp-${{ github.run_number }}
+                path: dist/
+  - language: yaml
+    label: 'Fixed — use run_id for guaranteed globally-unique naming'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Build
+              run: make build
+
+            - name: Upload artifact
+              uses: actions/upload-artifact@v4
+              with:
+                # ✅ run_id is globally unique and never resets — survives any rename
+                name: myapp-${{ github.run_id }}
+                path: dist/
+  - language: yaml
+    label: 'Fixed — git-tag-based semver (most portable across renames)'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          outputs:
+            version: ${{ steps.version.outputs.value }}
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                fetch-depth: 0   # Required for git describe
+
+            - name: Compute version from git tags
+              id: version
+              run: |
+                VERSION=$(git describe --tags --abbrev=7 2>/dev/null || echo "0.0.0-$(git rev-parse --short HEAD)")
+                echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+
+            - name: Upload artifact
+              uses: actions/upload-artifact@v4
+              with:
+                # ✅ Version derived from git history — survives workflow renames
+                name: myapp-${{ steps.version.outputs.value }}
+                path: dist/
+prevention:
+  - "Never use github.run_number as a durable version counter if there is any chance the workflow file will be renamed during the project's lifetime."
+  - "Prefer github.run_id for unique artifact names — it is a monotonically increasing global integer that never resets."
+  - "Use git tag-based versioning (git describe, GitVersion, semantic-release) for release artifacts — these are tied to the commit graph, not workflow identity."
+  - "When deliberately renaming a workflow file, audit all consumers of github.run_number (artifact names, release titles, version files) before merging the rename."
+  - "Document workflow file paths as a stable API surface in your repo's CONTRIBUTING guide if run_number is used for versioning."
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context'
+    label: 'github context — run_number and run_id properties'
+  - url: 'https://github.com/orgs/community/discussions/15218'
+    label: 'GitHub Community Discussion #15218 — run_number resets after workflow rename'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context'
+    label: 'github.run_id — globally unique run identifier that never resets'

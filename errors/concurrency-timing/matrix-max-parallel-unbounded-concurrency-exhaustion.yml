@@ -1,0 +1,131 @@
+id: concurrency-timing-050
+title: 'strategy.max-parallel defaults to unbounded — large matrices silently exhaust plan concurrency limits and queue indefinitely'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - matrix
+  - max-parallel
+  - concurrency
+  - plan-limits
+  - queued
+  - free-plan
+  - self-hosted
+  - resource-exhaustion
+patterns:
+  - regex: 'Waiting for a runner to pick up this job'
+    flags: 'i'
+  - regex: 'max-parallel'
+    flags: 'i'
+  - regex: 'strategy.*matrix.*max.parallel'
+    flags: 'i'
+  - regex: 'queued.*runner.*not.*available'
+    flags: 'i'
+error_messages:
+  - "Waiting for a runner to pick up this job."
+  - "All 20 runners are busy — job queued"
+  - "This job is waiting for a hosted runner to become available"
+  - "Job was queued for more than 10 minutes"
+root_cause: |
+  When `strategy.max-parallel` is not set, GitHub Actions defaults to running ALL matrix
+  jobs simultaneously with no upper bound. For a matrix of N combinations, N runner slots
+  are requested at the same time.
+
+  This becomes a problem in several scenarios:
+
+  **1. Free plan concurrency limit (20 parallel jobs):**
+  GitHub's free plan allows 20 concurrent jobs for GitHub-hosted runners. A matrix with
+  30+ combinations will have 10+ jobs queued waiting for runners — sometimes for minutes
+  or hours depending on queue depth, with no visible error.
+
+  **2. Self-hosted runner pool exhaustion:**
+  If you have 5 self-hosted runners and a 20-combination matrix, 15 jobs will queue
+  indefinitely (the "Waiting for a runner to pick up this job" state). If those runners
+  have no idle capacity, jobs may hang until the job timeout is reached.
+
+  **3. External service rate limits:**
+  When matrix jobs hit external APIs, databases, or artifact registries, simultaneous
+  unbounded parallel execution can trigger rate limiting, connection pool exhaustion,
+  or test database corruption from concurrent writes.
+
+  **4. Cascading queue failures:**
+  A queued matrix job blocks subsequent workflow runs if a `concurrency:` group is set,
+  causing PRs to pile up waiting for a slot that never opens.
+
+  The failure mode is always silent: jobs just show "queued" in the UI with no error,
+  and the root cause (unbounded parallelism hitting a limit) is not surfaced.
+fix: |
+  Set `max-parallel` to a value appropriate for your plan's concurrency limits and
+  the resource contention of your jobs.
+
+  **Rule of thumb:**
+  - Free plan: stay under 20 total across ALL concurrently running workflows
+  - Team plan: stay under 60 total
+  - Self-hosted: set to the number of available idle runners, not total runners
+
+  For most CI pipelines, `max-parallel: 4` to `max-parallel: 8` strikes the right
+  balance between throughput and resource sharing.
+fix_code:
+  - language: yaml
+    label: 'Problematic — unbounded parallel matrix hits free plan limits'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          strategy:
+            matrix:
+              node: [18, 20, 22]
+              os: [ubuntu-latest, windows-latest, macos-latest]
+              # ❌ 9 combinations all launch simultaneously
+              # On free plan: uses 9 of your 20 concurrent slots at once
+              # With other workflows running: may queue for minutes
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                node-version: ${{ matrix.node }}
+            - run: npm test
+  - language: yaml
+    label: 'Fixed — cap parallelism to stay within plan limits'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          strategy:
+            max-parallel: 4    # ✅ At most 4 runners at a time — predictable throughput
+            matrix:
+              node: [18, 20, 22]
+              os: [ubuntu-latest, windows-latest, macos-latest]
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                node-version: ${{ matrix.node }}
+            - run: npm test
+  - language: yaml
+    label: 'Fixed — self-hosted runner pool with bounded parallelism'
+    code: |
+      jobs:
+        integration-test:
+          runs-on: self-hosted
+          strategy:
+            # ✅ Set to your idle runner count, not total registered runners
+            # e.g. 3 self-hosted runners → max-parallel: 3
+            max-parallel: 3
+            matrix:
+              shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+          steps:
+            - uses: actions/checkout@v4
+            - run: npx jest --shard=${{ matrix.shard }}/12
+prevention:
+  - "Always set strategy.max-parallel explicitly in any matrix that creates more than 5 jobs, even if you're on a paid plan."
+  - "On the free GitHub plan, keep total concurrent jobs across all running workflows under 20. A single matrix with 25 combinations will queue 5 jobs immediately."
+  - "For self-hosted runners, set max-parallel to the number of IDLE runners, not total registered — busy runners don't accept new jobs."
+  - "Use actionlint or a CI policy to flag matrices with no max-parallel set when the matrix count exceeds a threshold."
+  - "Monitor the 'queued' duration in your Actions insights dashboard — consistently long queue times indicate concurrency exhaustion."
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/running-variations-of-jobs-in-a-workflow#defining-the-maximum-number-of-simultaneous-jobs-using-a-matrix'
+    label: 'Defining max-parallel — GitHub Actions matrix docs'
+  - url: 'https://docs.github.com/en/actions/administering-github-actions/usage-limits-billing-and-administration#usage-limits'
+    label: 'GitHub Actions usage limits — concurrent job limits by plan'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners#usage-limits'
+    label: 'Self-hosted runner usage limits'

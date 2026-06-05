@@ -1,0 +1,128 @@
+id: known-unsolved-057
+title: 'No date or time expression function in ${{ }} — current timestamp requires a run: step'
+category: known-unsolved
+severity: limitation
+tags:
+  - expressions
+  - date
+  - time
+  - timestamp
+  - run-number
+  - cache-key
+  - scheduling
+  - limitation
+patterns:
+  - regex: 'github\.now|github\.date|github\.timestamp'
+    flags: 'i'
+  - regex: '\$\{\{.*date\(\)|now\(\).*\}\}'
+    flags: 'i'
+  - regex: 'cache-key.*date|date.*cache.key'
+    flags: 'i'
+error_messages:
+  - "Unexpected symbol: 'github.now' is not a valid context property"
+  - "${{ github.date }} resolves to empty string"
+  - "cache key is the same every day despite using date in the expression"
+root_cause: |
+  GitHub Actions expressions (`${{ }}`) have no built-in date or time function. There is
+  no `now()`, `date()`, `github.now`, `github.date`, `github.timestamp`, or similar construct
+  available in the expression language.
+
+  Developers commonly attempt patterns such as:
+  - `${{ github.now }}` — evaluates to empty string (not a valid context property)
+  - `${{ date('YYYY-MM-DD') }}` — expression syntax error
+  - `${{ github.event.created_at }}` — only available on specific webhook events, not universal
+  - `${{ runner.timestamp }}` — does not exist
+
+  This affects common use cases:
+  1. **Daily cache busting** — teams want a per-day cache key like `cache-${{ date }}-deps`
+  2. **Artifact versioning** — stamping artifacts with build date in their name
+  3. **Scheduled workflow logging** — including timestamp in step names or outputs
+  4. **Conditional weekly/monthly logic** — checking if today is Monday or the 1st of the month
+
+  Because `${{ github.now }}` silently resolves to empty string rather than erroring, the
+  cache key or artifact name often contains a literal empty segment, leading to cache
+  collisions or silently wrong artifact names.
+fix: |
+  Use a `run:` step to capture the current date and write it to `$GITHUB_OUTPUT`, then
+  reference the output in subsequent steps/jobs.
+
+  **Pattern A — Date in cache key:**
+  ```yaml
+  - name: Get current date
+    id: date
+    run: echo "today=$(date +'%Y-%m-%d')" >> "$GITHUB_OUTPUT"
+
+  - name: Cache dependencies
+    uses: actions/cache@v4
+    with:
+      path: ~/.npm
+      key: npm-${{ runner.os }}-${{ steps.date.outputs.today }}-${{ hashFiles('**/package-lock.json') }}
+  ```
+
+  **Pattern B — Cross-job date:**
+  Set the date in one job's outputs and reference via `needs.<job>.outputs.date` in downstream jobs.
+
+  **Pattern C — github.event.created_at (event-scoped):**
+  On `push` and PR events, `${{ github.event.head_commit.timestamp }}` provides the commit
+  timestamp (ISO 8601), but NOT the workflow execution time.
+fix_code:
+  - language: yaml
+    label: 'Broken — ${{ github.now }} silently produces empty string'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/cache@v4
+              with:
+                path: ~/.npm
+                # ❌ github.now does not exist — key contains empty segment
+                # Results in key: "npm-Linux--abc123" (missing date entirely)
+                key: npm-${{ runner.os }}-${{ github.now }}-${{ hashFiles('**/package-lock.json') }}
+  - language: yaml
+    label: 'Fixed — capture date in a run step, reference via step output'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Get current date
+              id: date
+              run: echo "today=$(date +'%Y-%m-%d')" >> "$GITHUB_OUTPUT"
+
+            - uses: actions/cache@v4
+              with:
+                path: ~/.npm
+                # ✅ Key includes actual date: "npm-Linux-2026-06-05-abc123"
+                key: npm-${{ runner.os }}-${{ steps.date.outputs.today }}-${{ hashFiles('**/package-lock.json') }}
+                restore-keys: |
+                  npm-${{ runner.os }}-
+  - language: yaml
+    label: 'Fixed — cross-job date propagation via job outputs'
+    code: |
+      jobs:
+        setup:
+          runs-on: ubuntu-latest
+          outputs:
+            build-date: ${{ steps.date.outputs.today }}
+          steps:
+            - id: date
+              run: echo "today=$(date +'%Y-%m-%d')" >> "$GITHUB_OUTPUT"
+
+        build:
+          needs: setup
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Building on ${{ needs.setup.outputs.build-date }}"
+prevention:
+  - "Never use ${{ github.now }}, ${{ github.date }}, or ${{ date() }} — these do not exist and silently resolve to empty string."
+  - "For daily cache busting, always use a dedicated 'get date' step as the first step of any job that needs a timestamp."
+  - "Use ${{ github.run_id }} as a cheap uniqueness token when exact date is not required (e.g., artifact names that just need to be unique per run)."
+  - "On push events, ${{ github.event.head_commit.timestamp }} gives the commit time — useful for build provenance but not workflow execution time."
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#functions'
+    label: 'Available expression functions — GitHub Actions docs (no date/time listed)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/store-information-in-variables#passing-values-between-steps-and-jobs-in-a-workflow'
+    label: 'Passing values between steps and jobs — GITHUB_OUTPUT pattern'
+  - url: 'https://github.com/orgs/community/discussions/13382'
+    label: 'Community Discussion #13382 — Request for date/time functions in expressions'
