@@ -1,0 +1,100 @@
+id: runner-environment-190
+title: 'Git 2.48.0 silently stops fetching tags with fetch-tags: true on non-depth-1 shallow clones'
+category: runner-environment
+severity: silent-failure
+tags:
+  - git-version
+  - fetch-tags
+  - shallow-clone
+  - fetch-depth
+  - ubuntu-24.04
+  - regression
+  - checkout
+patterns:
+  - regex: 'git version 2\.48\.'
+    flags: 'i'
+  - regex: 'fetch-tags.*fetch-depth|fetch-depth.*fetch-tags'
+    flags: 'i'
+error_messages:
+  - "# No error — tags are silently absent after checkout with fetch-tags: true and fetch-depth: N on git 2.48.0"
+  - "fatal: No names found, cannot describe anything."
+  - "fatal: not a tag 'HEAD'"
+root_cause: |
+  Git 2.48.0 introduced a change in how `git fetch --depth=N` handles tag following for
+  direct refspec fetches. In git ≤ 2.47.x, when actions/checkout ran:
+
+    git fetch --depth=N origin +<sha>:refs/remotes/origin/<branch>
+
+  git would automatically follow tags reachable within the depth window — any tag pointing
+  to a commit within the fetched depth was included. This is known as automatic tag following.
+
+  Starting with git 2.48.0, automatic tag following is suppressed for direct refspec fetches
+  with `--depth`. Only the explicitly requested ref is fetched; no tags are included even if
+  they point to commits within the shallow clone window. The fetch log shows only the branch
+  ref fetched — no tag lines appear.
+
+  Result: `fetch-tags: true` combined with `fetch-depth: N` (where N > 1, such as 100, 383, 500)
+  silently returns no tags on runner images shipping git 2.48.0. The workflow log shows no error
+  and no warning — `git tag -l` returns empty. Downstream steps using git describe, semantic-release,
+  helm chart versioning, or any tool that reads git tags break with "no names found" or
+  "not a tag 'HEAD'" errors.
+
+  This regression first appeared when ubuntu-24.04 runner image updated from 20250105.1.0 to
+  20250113.1.0 (which shipped git 2.48.0). The issue was resolved in runner image 20250117.1.0+
+  when git was updated to 2.48.1 which patched the regression. Self-hosted runners running
+  git 2.48.0 remain affected.
+
+  Note: This is distinct from the existing known silent failure where fetch-depth: 1 silently
+  fetches no tags regardless of git version. That is expected shallow-clone behavior. This
+  regression affects fetch-depth: N > 1 scenarios that previously worked.
+fix: |
+  Use `fetch-depth: 0` when git tags are required. A full clone fetches all history and all
+  tags regardless of git version. This is the most reliable fix.
+
+  For large repositories where a full clone is too slow, add a separate fetch --tags step
+  immediately after checkout to explicitly fetch all tag objects:
+
+    git fetch --tags --force
+
+  Self-hosted runners on git 2.48.0 should upgrade to git 2.48.1 or later which patches
+  the tag following regression.
+fix_code:
+  - language: yaml
+    label: 'Use fetch-depth: 0 for reliable tag fetching (recommended)'
+    code: |
+      - name: Checkout with full history and all tags
+        uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 always fetches all commits and tags regardless of git version
+          fetch-depth: 0
+  - language: yaml
+    label: 'Add explicit git fetch --tags step after shallow checkout'
+    code: |
+      - name: Checkout (shallow)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 100
+          # fetch-tags: true is unreliable on git 2.48.0 — use explicit fetch instead
+
+      - name: Fetch tags explicitly (git-version-safe)
+        run: git fetch --tags --force
+  - language: yaml
+    label: 'Check git version in CI for debugging'
+    code: |
+      - name: Debug git version and tags
+        run: |
+          git --version
+          git tag -l | head -20
+          git describe --tags --always || echo "No reachable tags"
+prevention:
+  - 'Always use fetch-depth: 0 when git tags are required by downstream steps like git describe or semantic-release'
+  - 'Add a git tag -l debug step after checkout to verify tags are present before release tooling runs'
+  - 'For self-hosted runners, prefer git 2.48.1+ over 2.48.0 — the regression was patched in 2.48.1'
+  - 'Pin to fetch-depth: 0 in release workflows — the performance cost of a full clone is worth the reliability'
+docs:
+  - url: 'https://github.com/actions/checkout/issues/2041'
+    label: 'actions/checkout#2041: Tags no longer fetch with Git v2.48.0'
+  - url: 'https://github.com/actions/checkout#usage'
+    label: 'actions/checkout — fetch-depth and fetch-tags input documentation'
+  - url: 'https://git-scm.com/docs/git-fetch#_description'
+    label: 'git fetch documentation — tag following with --depth'
