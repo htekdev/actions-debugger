@@ -1,0 +1,94 @@
+id: permissions-auth-062
+title: 'create-github-app-token "Invalid keyData" — private key passed via env var with escaped \\n sequences'
+category: permissions-auth
+severity: error
+tags:
+  - github-app
+  - private-key
+  - invalid-key-data
+  - environment-variable
+  - newlines
+  - create-github-app-token
+  - webcrypto
+patterns:
+  - regex: 'Invalid keyData'
+    flags: 'i'
+  - regex: 'DOMException.*Invalid keyData|DataError.*Invalid keyData'
+    flags: 'i'
+  - regex: 'Failed to create token for .+ \(attempt \d+\): Invalid keyData'
+    flags: 'i'
+error_messages:
+  - "DOMException [DataError]: Invalid keyData"
+  - "Failed to create token for \"repo-name\" (attempt 1): Invalid keyData"
+  - "Failed to create token for \"repo-name\" (attempt 2): Invalid keyData"
+  - "Error: Invalid keyData"
+root_cause: |
+  The `actions/create-github-app-token` action v2+ uses the Web Crypto API
+  (`crypto.subtle.importKey()`) to load the GitHub App private key. This API
+  is strict about key formatting — it throws `DOMException [DataError]: Invalid keyData`
+  if the PEM key material is malformed at the byte level.
+
+  The most common trigger is passing the private key via an environment variable
+  where literal `\n` two-character sequences appear instead of actual newline (0x0A)
+  bytes. This happens when:
+  1. The key is constructed inline in YAML with `"-----BEGIN...\nMIIE...\n-----END..."`
+     where `\n` is a YAML string escape, not a real newline in the multi-line base64 body
+  2. An external CI system or secrets manager serializes the PEM key as a single line
+     with literal backslash-n separators before injecting it into the Actions environment
+  3. Shell variable interpolation collapses the newlines (e.g., `echo $PRIVATE_KEY`)
+
+  The Web Crypto SubtleCrypto API attempts to Base64-decode the key body. When the
+  PEM line breaks are backslash-n characters (0x5C 0x6E) instead of 0x0A, the Base64
+  chunks are malformed and importKey() throws "Invalid keyData" immediately — before
+  any GitHub API call is made.
+
+  This is distinct from "A JSON web token could not be decoded" (permissions-auth-021)
+  which occurs when the key IS imported successfully but the resulting JWT is rejected
+  by GitHub's API — a later-stage failure caused by different formatting issues such
+  as trailing whitespace, CRLF endings, or missing PEM headers.
+fix: |
+  Pass the private key directly as an action input using the GitHub Actions secret
+  expression `${{ secrets.APP_PRIVATE_KEY }}`. When GitHub resolves a secret, it
+  preserves the original stored bytes including actual newlines. Do NOT pass the key
+  through env: variables or inline string construction.
+
+  To store the key with correct newlines, set the secret from the downloaded .pem file
+  using the GitHub CLI:
+    gh secret set APP_PRIVATE_KEY < my-app.private-key.pem
+fix_code:
+  - language: yaml
+    label: 'Correct: pass private key directly as action input from secret'
+    code: |
+      - uses: actions/create-github-app-token@v1
+        id: app-token
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}   # newlines preserved by Actions runtime
+  - language: yaml
+    label: 'Wrong: constructing key inline with \\n escape sequences (causes Invalid keyData)'
+    code: |
+      # DO NOT DO THIS — \n are literal two-char sequences, not newlines
+      - name: Broken token generation
+        env:
+          KEY: "-----BEGIN RSA PRIVATE KEY-----\nMIIEow...\n-----END RSA PRIVATE KEY-----"
+        run: |
+          echo "$KEY" > /tmp/key.pem
+          # The action will fail with: DOMException [DataError]: Invalid keyData
+  - language: shell
+    label: 'Set secret from .pem file using GitHub CLI (preserves real newlines)'
+    code: |
+      gh secret set APP_PRIVATE_KEY < my-app.2024-01-15.private-key.pem
+prevention:
+  - 'Always set APP_PRIVATE_KEY secret using `gh secret set KEY < file.pem`, not by pasting the raw PEM text with \\n sequences'
+  - 'Pass the key exclusively as `private-key: ${{ secrets.KEY }}` — never via env: or inline string interpolation'
+  - 'If importing from an external secrets manager, ensure the manager preserves actual newline bytes (0x0A) when injecting into GitHub Actions secrets'
+  - 'Verify the secret was set correctly: run `gh secret list` and confirm the key was recently updated'
+docs:
+  - url: 'https://github.com/actions/create-github-app-token'
+    label: 'actions/create-github-app-token README'
+  - url: 'https://github.com/actions/create-github-app-token/issues/184'
+    label: 'actions/create-github-app-token#184 — Invalid keyData when key passed via environment variable'
+  - url: 'https://developer.mozilla.org/en-US/docs/Web/API/SubtleCrypto/importKey'
+    label: 'MDN — SubtleCrypto.importKey() — DOMException DataError causes'
+  - url: 'https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-private-key-for-a-github-app'
+    label: 'GitHub Docs — Generating a private key for a GitHub App'
