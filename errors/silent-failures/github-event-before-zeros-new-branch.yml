@@ -1,0 +1,99 @@
+id: silent-failures-092
+title: 'github.event.before is all zeros on first push to a new branch — git diff fails with unknown revision'
+category: silent-failures
+severity: silent-failure
+tags:
+  - push-event
+  - before-sha
+  - new-branch
+  - git-diff
+  - changed-files
+patterns:
+  - regex: 'fatal: ambiguous argument.*0{40}'
+    flags: 'i'
+  - regex: 'unknown revision.*0{10,}.*working tree'
+    flags: 'i'
+  - regex: 'fatal: bad object 0{40}'
+    flags: 'i'
+error_messages:
+  - "fatal: ambiguous argument '0000000000000000000000000000000000000000': unknown revision or path not in the working tree"
+  - "fatal: bad object 0000000000000000000000000000000000000000"
+root_cause: |
+  When a branch is pushed to GitHub for the first time, there is no previous state.
+  GitHub sets github.event.before to the all-zeros SHA (40 zeros) as a sentinel
+  meaning "this is a brand-new branch with no prior history."
+
+  Any workflow step that uses this SHA in git commands fails because 40 zeros is not
+  a valid Git object reference. Common patterns that break:
+    git diff ${{ github.event.before }} ${{ github.sha }} --name-only
+    git log ${{ github.event.before }}..${{ github.sha }}
+
+  This silently breaks:
+  - Changed-file detection scripts that decide which jobs to run
+  - Automated changelog generators that compare before→after SHAs
+  - CI selective-run logic based on modified paths
+  - Commit-message linters that inspect newly added commits only
+
+  The failure is non-obvious because the workflow may succeed on subsequent pushes
+  to the same branch (where before is a real SHA), leading developers to believe
+  the issue was transient or environmental.
+fix: |
+  Guard against the all-zeros SHA before performing git operations:
+
+  Option 1 — Skip the step/job on new-branch pushes with an if: condition:
+    if: github.event.before != '0000000000000000000000000000000000000000'
+
+  Option 2 — Fall back to the initial commit when before is zeros:
+    BEFORE="${{ github.event.before }}"
+    if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+      BEFORE=$(git rev-list --max-parents=0 HEAD)
+    fi
+    git diff "$BEFORE" "${{ github.sha }}" --name-only
+
+  Option 3 — Use tj-actions/changed-files which handles this case automatically.
+fix_code:
+  - language: yaml
+    label: 'Guard with if: to skip diff on new-branch first push'
+    code: |
+      jobs:
+        diff-check:
+          runs-on: ubuntu-latest
+          # Skip when there is no before commit (first push to new branch)
+          if: github.event.before != '0000000000000000000000000000000000000000'
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                fetch-depth: 0
+            - name: Get changed files
+              run: git diff ${{ github.event.before }} ${{ github.sha }} --name-only
+  - language: yaml
+    label: 'Shell fallback — use initial commit when before SHA is zeros'
+    code: |
+      - name: Get changed files (handles new branch)
+        run: |
+          BEFORE="${{ github.event.before }}"
+          if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            # New branch — fall back to root commit
+            BEFORE=$(git rev-list --max-parents=0 HEAD)
+          fi
+          git diff "$BEFORE" "${{ github.sha }}" --name-only
+  - language: yaml
+    label: 'Use tj-actions/changed-files (handles new-branch automatically)'
+    code: |
+      - uses: tj-actions/changed-files@v44
+        id: changed
+        with:
+          since_last_remote_commit: true
+      - run: echo "${{ steps.changed.outputs.all_changed_files }}"
+prevention:
+  - 'Always check github.event.before against the 40-zero sentinel before using it in git commands'
+  - 'Use maintained actions such as tj-actions/changed-files that already handle new-branch edge cases'
+  - 'Add fetch-depth: 0 to actions/checkout so full git history is available for diff operations'
+  - 'Test workflows on a branch that has never had CI run before to catch first-push failures early'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#push'
+    label: 'GitHub Actions — push event payload (before/after SHA fields)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#github-context'
+    label: 'GitHub context reference — github.event.before'
+  - url: 'https://github.com/tj-actions/changed-files'
+    label: 'tj-actions/changed-files — handles new-branch and force-push edge cases'
