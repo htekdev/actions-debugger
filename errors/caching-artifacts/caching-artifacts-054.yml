@@ -1,0 +1,102 @@
+id: caching-artifacts-054
+title: "upload-artifact@v4 Rejects Artifact Names Containing Special Characters"
+category: caching-artifacts
+severity: error
+tags:
+  - upload-artifact
+  - artifact-name
+  - v4-migration
+  - special-characters
+  - validation
+  - branch-name
+patterns:
+  - regex: 'The artifact name is not valid'
+    flags: "i"
+  - regex: 'Artifact name .+ is not valid'
+    flags: "i"
+  - regex: 'characters are not allowed in artifact names?'
+    flags: "i"
+error_messages:
+  - "Error: The artifact name is not valid. The following characters are not allowed in artifact names: \\ / : * ? \" < > |"
+  - "Artifact name 'feature/login-ui' is not valid. The following characters are not allowed: /"
+  - "Error: An artifact name must not contain the following characters: \\ / : * ? \" < > |"
+root_cause: |
+  actions/upload-artifact@v4 introduced strict server-side validation of
+  artifact names. The following characters are now explicitly rejected because
+  they are illegal in file or directory names on the artifact storage backend:
+
+    \ / : * ? " < > |
+
+  In v3, artifact names were either silently sanitized or accepted with these
+  characters (depending on the storage backend behavior). v4 fails hard with a
+  clear error.
+
+  The most common failure mode is dynamic artifact names constructed from:
+  - Branch names: github.ref_name or github.head_ref (contain /)
+  - Pull request titles: github.event.pull_request.title (contain : / " etc.)
+  - Matrix values: matrix.os or matrix.target (may contain : on Windows paths)
+  - Composite keys: combining multiple context values with : as separator
+
+  Example patterns that break:
+    name: build-${{ github.ref_name }}         # "feature/login" contains /
+    name: results-${{ matrix.os }}             # "windows-latest" is fine but
+                                               # some custom os values may not be
+    name: ${{ github.event.pull_request.title }} # PR titles can contain any char
+fix: |
+  Sanitize the artifact name before passing it to upload-artifact. Replace or
+  strip disallowed characters using a shell substitution or a prior step that
+  outputs a safe name. The simplest approach is replacing / with - or _.
+fix_code:
+  - language: yaml
+    label: "Sanitize branch name artifact using shell substitution"
+    code: |
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # Replace / with - to make branch name safe
+          name: build-${{ github.ref_name && replace(github.ref_name, '/', '-') || 'main' }}
+          path: dist/
+
+  - language: yaml
+    label: "Compute safe artifact name in prior step output"
+    code: |
+      - name: Compute safe artifact name
+        id: artifact-name
+        run: |
+          # Strip or replace characters not allowed in artifact names: \ / : * ? " < > |
+          SAFE_NAME=$(echo "${{ github.ref_name }}" | tr '/:*?"<>|\\' '-')
+          echo "name=build-${SAFE_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact-name.outputs.name }}
+          path: dist/
+
+  - language: yaml
+    label: "Use matrix hash or index for safe matrix artifact names"
+    code: |
+      strategy:
+        matrix:
+          config: [debug, release]
+          os: [ubuntu-latest, windows-latest, macos-latest]
+
+      steps:
+        - name: Upload matrix artifact
+          uses: actions/upload-artifact@v4
+          with:
+            # Safe: all matrix.* values here contain no special chars
+            name: build-${{ matrix.os }}-${{ matrix.config }}
+            path: dist/
+prevention:
+  - "Never pass github.ref_name, github.head_ref, or PR titles directly as artifact names without sanitization."
+  - "When constructing dynamic artifact names, run them through tr or sed to replace / : * ? \" < > | \\ with - or _."
+  - "Use actionlint or a pre-commit hook to flag unescaped context expressions in artifact name: fields."
+  - "Consider using a matrix index or a hash of the artifact key for truly collision-safe names."
+docs:
+  - url: "https://github.com/actions/upload-artifact/releases/tag/v4.0.0"
+    label: "upload-artifact v4.0.0 release notes — breaking changes"
+  - url: "https://github.com/actions/upload-artifact#inputs"
+    label: "upload-artifact README — name input and allowed characters"
+  - url: "https://stackoverflow.com/questions/77975069"
+    label: "SO#77975069 — upload-artifact v4 artifact name is not valid"
