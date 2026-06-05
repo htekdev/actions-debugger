@@ -1,0 +1,103 @@
+id: permissions-auth-051
+title: 'GITHUB_TOKEN push blocked by repository ruleset despite contents: write permission'
+category: permissions-auth
+severity: error
+tags:
+  - github-token
+  - rulesets
+  - contents-write
+  - branch-protection
+  - bypass-list
+patterns:
+  - regex: 'GH013: Repository rule violations found for refs\/'
+    flags: 'i'
+  - regex: 'remote: error: Changes must be made through a pull request'
+    flags: 'i'
+  - regex: 'refusing to allow.*to create or update'
+    flags: 'i'
+error_messages:
+  - "remote: error: GH013: Repository rule violations found for refs/heads/main."
+  - "remote: error: GH013: Repository rule violations found for refs/tags/v1.0.0."
+  - "remote: error: Changes must be made through a pull request."
+  - "error: failed to push some refs to 'https://github.com/ORG/REPO.git'"
+  - "refusing to allow a GitHub App to create or update file"
+root_cause: |
+  GitHub Rulesets (generally available January 2025) allow organization and repository
+  administrators to define push rules that enforce requirements such as "all pushes
+  must come through a pull request", "signed commits required", or "tag patterns
+  must match a format". Unlike legacy branch protection rules, rulesets apply to
+  ALL actors including GitHub Apps and the GITHUB_TOKEN by default — regardless of
+  the `contents: write` permission granted in the workflow's `permissions:` block.
+
+  The `contents: write` permission only controls whether the token is *authorized*
+  to make write API calls; it does not grant exemption from repository rulesets.
+  Rulesets have a separate "bypass list" in Settings > Rules > Rulesets that must
+  explicitly include "GitHub Actions" (or a specific GitHub App) to allow workflow
+  pushes to bypass ruleset restrictions.
+
+  This error affects workflows that push commits directly (e.g., auto-format,
+  changelog generation, version bump commits) or push tags (e.g., release tagging)
+  to branches or tags governed by a ruleset.
+fix: |
+  Option 1 (recommended): Add GitHub Actions to the ruleset bypass list.
+  Go to Settings > Rules > Rulesets > (select the ruleset) > Bypass list >
+  Add bypass > select "GitHub Actions". This allows workflow GITHUB_TOKEN
+  pushes to bypass the ruleset.
+
+  Option 2: Use a Personal Access Token (PAT) or GitHub App token from a user
+  account that is in the bypass list. Pass the token via a secret and use it
+  in the push step.
+
+  Option 3: Restructure the workflow to push via a pull request instead of
+  directly to the protected branch, satisfying the "PR required" ruleset rule.
+fix_code:
+  - language: yaml
+    label: 'Use a PAT secret to push when GITHUB_TOKEN is blocked by rulesets'
+    code: |
+      jobs:
+        release:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                token: ${{ secrets.RELEASE_PAT }}  # PAT from bypass-listed account
+                fetch-depth: 0
+
+            # ... version bump or commit steps ...
+
+            - name: Push release commit and tag
+              env:
+                GITHUB_TOKEN: ${{ secrets.RELEASE_PAT }}
+              run: |
+                # Use the PAT-authenticated remote for push
+                echo "Push authorized via PAT from bypass-listed account"
+  - language: yaml
+    label: 'Use a GitHub App token with bypass list membership'
+    code: |
+      jobs:
+        release:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/create-github-app-token@v2
+              id: app-token
+              with:
+                app-id: ${{ vars.RELEASE_APP_ID }}
+                private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+            - uses: actions/checkout@v4
+              with:
+                token: ${{ steps.app-token.outputs.token }}
+
+            # Push step uses the App token — ensure the App is in bypass list
+prevention:
+  - "When enabling rulesets on a repository or organization, immediately check CI/CD workflows that push directly to protected branches or tags"
+  - "Add GitHub Actions to ruleset bypass lists proactively when creating rulesets that restrict direct pushes"
+  - "Prefer pushing via pull requests (open PR, auto-merge) over direct commits in automated workflows — this satisfies 'PR required' rules and avoids bypass list management"
+  - "Audit existing legacy branch protection rules when migrating to rulesets — bypass behavior differs: branch protection 'Restrict who can push' exempts admins by default; rulesets do not"
+docs:
+  - url: 'https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets'
+    label: 'GitHub Docs: Available rules for rulesets'
+  - url: 'https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/creating-rulesets-for-a-repository#granting-bypass-permissions-for-your-ruleset'
+    label: 'GitHub Docs: Granting bypass permissions for a ruleset'
+  - url: 'https://github.blog/changelog/2025-01-29-github-rulesets-are-generally-available/'
+    label: 'GitHub Changelog: Rulesets generally available — January 2025'
