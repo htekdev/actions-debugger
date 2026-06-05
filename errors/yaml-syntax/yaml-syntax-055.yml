@@ -1,0 +1,88 @@
+id: yaml-syntax-055
+title: '`on.workflow_call.outputs.value` references `steps.<id>.outputs` — steps context unavailable at workflow scope; must use `jobs.<job_id>.outputs`'
+category: yaml-syntax
+severity: error
+tags:
+  - reusable-workflow
+  - workflow_call
+  - outputs
+  - steps-context
+  - jobs-context
+  - empty-string
+  - scope
+patterns:
+  - regex: 'steps\.\w+\.outputs\.\w+'
+    flags: 'i'
+error_messages:
+  - "Reusable workflow output is empty — steps context not accessible in on.workflow_call.outputs.value"
+  - "on.workflow_call.outputs value references steps context which is not available at workflow scope"
+root_cause: |
+  In a reusable workflow, `on.workflow_call.outputs[*].value:` expressions are
+  evaluated at the WORKFLOW level, not within a job. The `steps` context is scoped to
+  a specific job and is only accessible inside that job's step expressions — it is
+  not visible at the top-level workflow scope where `on.workflow_call.outputs` lives.
+
+  Using `${{ steps.upload.outputs.artifact-id }}` in the `value:` field silently
+  evaluates to an empty string. No error, warning, or annotation is raised; the
+  caller simply receives an empty output value.
+
+  The correct pattern requires two explicit hops:
+  1. Capture the step output at the JOB level using the job's `outputs:` block.
+  2. Reference the JOB output at the WORKFLOW level using `${{ jobs.<job_id>.outputs.<key> }}`.
+
+  Note: this is distinct from yaml-syntax-032 (jobs.<id>.result empty in workflow_call
+  outputs) which covers the result property specifically, not step output propagation.
+fix: |
+  Bridge step outputs up through the job's `outputs:` block first, then reference the
+  job output in `on.workflow_call.outputs.value`.
+
+  Pattern:
+    step writes to GITHUB_OUTPUT (or action output)
+      → job outputs: exposes it as jobs.<job_id>.outputs.<key>
+        → on.workflow_call.outputs.value references jobs.<job_id>.outputs.<key>
+fix_code:
+  - language: yaml
+    label: 'Correct two-hop output propagation for reusable workflows'
+    code: |
+      on:
+        workflow_call:
+          outputs:
+            artifact-id:
+              description: 'ID of the uploaded build artifact'
+              # CORRECT: reference job-level output
+              value: ${{ jobs.build.outputs.artifact-id }}
+              # WRONG (silent empty string):
+              # value: ${{ steps.upload.outputs.artifact-id }}
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          outputs:
+            # Hop 1: expose step output at job level
+            artifact-id: ${{ steps.upload.outputs.artifact-id }}
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Build
+              run: npm ci && npm run build
+
+            - name: Upload artifact
+              id: upload
+              uses: actions/upload-artifact@v4
+              with:
+                name: build-output
+                path: dist/
+            # Hop 2: job outputs block above captures steps.upload.outputs.artifact-id
+            # Hop 3: on.workflow_call.outputs.value references jobs.build.outputs.artifact-id
+prevention:
+  - 'The `steps` context is job-scoped. Always bridge step outputs through the job `outputs:` block before referencing them at workflow level in `on.workflow_call.outputs.value:`.'
+  - 'Use actionlint to statically analyze reusable workflow output expressions — it reports invalid context usage at workflow scope.'
+  - 'When a reusable workflow output is unexpectedly empty in the caller, check whether the `value:` expression uses `steps.` (wrong scope) vs `jobs.` (correct scope).'
+  - 'Each output needs both a job-level `outputs:` mapping AND a workflow-level `on.workflow_call.outputs[*].value:` reference — missing either hop silently returns empty string.'
+docs:
+  - url: 'https://docs.github.com/en/actions/sharing-automations/reusing-workflows#using-outputs-from-a-reusable-workflow'
+    label: 'Reusable workflows: using outputs'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/passing-information-between-jobs'
+    label: 'Passing information between jobs (job outputs)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#steps-context'
+    label: 'Steps context — job-scoped, not available at workflow level'
