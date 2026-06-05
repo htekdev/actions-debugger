@@ -1,0 +1,93 @@
+id: silent-failures-082
+title: "pull_request_target checkout defaults to base branch, not PR head"
+category: silent-failures
+severity: silent-failure
+tags:
+  - pull_request_target
+  - checkout
+  - security
+  - fork
+  - base-branch
+patterns:
+  - regex: 'on:\s*\n\s+pull_request_target'
+    flags: 'im'
+  - regex: 'pull_request_target'
+    flags: 'i'
+error_messages:
+  - "Workflow runs on base branch code instead of PR contributor changes"
+  - "Tests pass on base but fail on PR code with no visible error in logs"
+root_cause: |
+  When a workflow is triggered by `pull_request_target`, GitHub Actions runs the workflow
+  from the TARGET repository's base branch — not the contributor's PR head. This is
+  intentional: `pull_request_target` provides write-level token access (for labeling,
+  commenting, posting status checks), so GitHub protects secrets by refusing to run
+  untrusted fork code with elevated permissions.
+
+  As a result, `actions/checkout` checks out `github.sha`, which resolves to the merge
+  base commit on the target branch. Any tests, linting, or code analysis in this
+  workflow validate the base branch, not the contributor's changes. The workflow
+  succeeds silently while testing the wrong code.
+fix: |
+  Option 1 (recommended — safe): Use `pull_request` (not `pull_request_target`) for
+  running PR code. `pull_request` triggers run with read-only tokens and check out the
+  PR head by default. Use `pull_request_target` only for privileged actions like posting
+  comments or labels.
+
+  Option 2 (explicit checkout — use with caution): Explicitly check out the PR head
+  using `github.event.pull_request.head.sha`. Only do this if you fully trust all
+  contributors and understand that fork code will execute with the repository write token.
+fix_code:
+  - language: yaml
+    label: "Recommended: use pull_request for code execution, pull_request_target for privileged writes"
+    code: |
+      # Workflow 1: run tests on PR code (read-only, safe for forks)
+      on:
+        pull_request:
+          branches: [main]
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              # Checks out PR head automatically — no ref: override needed
+            - run: npm test
+
+      ---
+      # Workflow 2: post labels (write access via pull_request_target)
+      on:
+        pull_request_target:
+          types: [opened]
+
+      jobs:
+        label:
+          runs-on: ubuntu-latest
+          permissions:
+            pull-requests: write
+          steps:
+            - uses: actions/labeler@v5
+              # Never runs contributor code here — only labels the PR
+  - language: yaml
+    label: "If you must run PR code under pull_request_target (risky)"
+    code: |
+      on:
+        pull_request_target:
+          branches: [main]
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.pull_request.head.sha }}
+                # WARNING: executes untrusted fork code with write-level token
+prevention:
+  - "Use pull_request (not pull_request_target) for workflows that run code — pull_request tokens are read-only and checkout the PR head correctly by default"
+  - "Reserve pull_request_target for privileged write-only actions: posting comments, applying labels, updating statuses — never checkout and execute untrusted PR code in these workflows"
+  - "If CI consistently passes but reviewers find bugs tests should catch, verify which commit your checkout step is using by printing github.sha vs github.event.pull_request.head.sha"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request_target"
+    label: "pull_request_target event — security considerations"
+  - url: "https://securitylab.github.com/research/github-actions-preventing-pwn-requests/"
+    label: "GitHub Security Lab: Preventing pwn requests (pull_request_target risks)"
