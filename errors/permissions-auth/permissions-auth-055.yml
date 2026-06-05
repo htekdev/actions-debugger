@@ -1,0 +1,110 @@
+id: permissions-auth-055
+title: "GITHUB_TOKEN Cannot Push to .github/workflows/ — Requires PAT with workflow Scope"
+category: permissions-auth
+severity: error
+tags:
+  - github-token
+  - workflow-files
+  - workflow-scope
+  - pat
+  - contents-write
+  - self-modifying-workflow
+patterns:
+  - regex: 'refusing to allow .+ to create or update workflow .+\.yml'
+    flags: "i"
+  - regex: 'refusing to allow a GitHub Actions App to create or update workflow'
+    flags: "i"
+  - regex: 'GH006.*refusing to allow.*workflow'
+    flags: "i"
+error_messages:
+  - "refusing to allow a GitHub Actions App to create or update workflow .github/workflows/ci.yml"
+  - "remote: error: GH006: Protected branch update failed for refs/heads/main. remote: error: refusing to allow a GitHub Actions App to create or update workflow .github/workflows/deploy.yml"
+  - "refusing to allow GitHub Actions Bot to update .github/workflows/release.yml"
+  - "remote: Resolving deltas: 100% (1/1), done. remote: error: refusing to allow a GitHub Actions App to create or update workflow"
+root_cause: |
+  GitHub enforces a hard server-side restriction preventing GITHUB_TOKEN from
+  creating or modifying files under .github/workflows/. This restriction applies
+  regardless of the permissions: block in the workflow. Even with
+  permissions: contents: write, GITHUB_TOKEN will be rejected when the push
+  includes changes to workflow files.
+
+  This security control exists to prevent privilege escalation: a compromised or
+  malicious workflow cannot modify itself or other workflows to gain additional
+  permissions or persist access. The restriction is enforced at the remote push
+  validation layer, not by the GitHub Actions runtime.
+
+  Common scenarios that trigger this:
+  - Automated dependency update workflows that pin action versions
+    (e.g., actions/checkout@v3 -> @v4) in workflow files
+  - Workflow generators that create or update .github/workflows/*.yml
+  - Renovate, Dependabot, or custom bots using GITHUB_TOKEN to update action refs
+  - Release automation that stamps version information into workflow files
+  - Repository template sync tools that propagate workflow updates
+
+  Note: fine-grained PATs WITH the repository contents:write permission DO allow
+  workflow file updates (this restriction only applies to GITHUB_TOKEN
+  specifically, not all tokens).
+fix: |
+  Use a Personal Access Token (classic PAT) with the workflow scope, a
+  fine-grained PAT with the repository contents:write permission, or a GitHub
+  App with the workflows repository permission. Store the token as a repository
+  or organization secret and use it in place of GITHUB_TOKEN for the checkout
+  or push steps.
+fix_code:
+  - language: yaml
+    label: "Use PAT with workflow scope via checkout persist-credentials"
+    code: |
+      jobs:
+        update-workflow:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                # Use a PAT with workflow scope — GITHUB_TOKEN cannot push workflow files
+                token: ${{ secrets.WORKFLOW_PAT }}
+
+            - name: Update workflow file
+              run: |
+                sed -i 's/actions\/checkout@v3/actions\/checkout@v4/g' .github/workflows/*.yml
+
+            - name: Commit and push workflow changes
+              env:
+                GH_TOKEN: ${{ secrets.WORKFLOW_PAT }}
+              run: |
+                echo "Commit workflow changes using PAT token"
+                # repository operations using the authenticated token
+
+  - language: yaml
+    label: "Use GitHub App token with workflows permission"
+    code: |
+      jobs:
+        update-workflow:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/create-github-app-token@v1
+              id: app-token
+              with:
+                app-id: ${{ secrets.APP_ID }}
+                private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+            - uses: actions/checkout@v4
+              with:
+                token: ${{ steps.app-token.outputs.token }}
+
+            - name: Modify workflow file and push
+              env:
+                GH_TOKEN: ${{ steps.app-token.outputs.token }}
+              run: |
+                echo "Commit workflow changes via GitHub App token"
+prevention:
+  - "Store a classic PAT with the workflow scope as a secret (e.g., WORKFLOW_PAT) for any job that writes to .github/workflows/."
+  - "Do not expect permissions: contents: write to grant GITHUB_TOKEN the ability to modify workflow files — it will always be rejected."
+  - "Use GitHub Apps with the workflows repository permission for scalable, org-wide workflow automation."
+  - "Prefer Renovate or Dependabot (which use their own token/app with workflow scope) for automated action version pinning."
+docs:
+  - url: "https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#creating-a-personal-access-token-classic"
+    label: "GitHub Docs — Classic PAT workflow scope"
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#permissions-for-the-github_token"
+    label: "GitHub Docs — GITHUB_TOKEN permissions"
+  - url: "https://stackoverflow.com/questions/64059610"
+    label: "SO#64059610 — refusing to allow GitHub Actions App to create or update workflow"
