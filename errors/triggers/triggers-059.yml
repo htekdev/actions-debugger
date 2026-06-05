@@ -1,0 +1,106 @@
+id: triggers-059
+title: "workflow_call required: true inputs silently receive empty string when omitted by caller"
+category: triggers
+severity: silent-failure
+tags:
+  - reusable-workflow
+  - workflow-call
+  - inputs
+  - required
+  - validation
+patterns:
+  - regex: 'required.*input.*not provided'
+    flags: i
+  - regex: 'Input .+ is required but was not provided'
+    flags: i
+error_messages:
+  - "Input 'environment' is required but was not provided"
+  - "required: true input silently receives empty string when omitted from caller with:"
+root_cause: |
+  When a reusable workflow declares `on.workflow_call.inputs` with `required: true`,
+  GitHub does NOT enforce this requirement at call time via the REST API or from other
+  calling workflows. The `required: true` flag is informational documentation only —
+  it is not validated before the workflow runs.
+
+  When a calling workflow omits a required input from its `with:` block, the reusable
+  workflow receives an empty string `""` for the missing input with no error or warning.
+  The workflow starts and runs to whatever conclusion the empty input causes.
+
+  This leads to silent failures such as deploying to an undefined environment, running
+  against an empty target URL, or passing `""` to shell commands that produce incorrect
+  results. The bug is especially hard to find because the calling workflow shows a green
+  "success" until the silent empty input causes a downstream failure.
+fix: |
+  Explicitly validate all required inputs at the start of the reusable workflow:
+  1. Add an input-validation step as the FIRST step of the FIRST job that checks each
+     required input for emptiness and fails with a descriptive error.
+  2. Use `default:` values in `on.workflow_call.inputs` to handle omitted inputs
+     gracefully with a fallback rather than silently using empty string.
+  3. In calling workflows, always pass all inputs explicitly with `with:` — never
+     rely on `required: true` to catch missing inputs.
+fix_code:
+  - language: yaml
+    label: "Reusable workflow: validate required inputs at startup"
+    code: |
+      # .github/workflows/deploy.yml (reusable workflow)
+      on:
+        workflow_call:
+          inputs:
+            environment:
+              required: true   # documentation only — NOT enforced by GitHub
+              type: string
+            target-url:
+              required: true
+              type: string
+
+      jobs:
+        validate-inputs:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Validate required inputs
+              run: |
+                ERRORS=()
+                if [[ -z "${{ inputs.environment }}" ]]; then
+                  ERRORS+=("Required input 'environment' was not provided")
+                fi
+                if [[ -z "${{ inputs.target-url }}" ]]; then
+                  ERRORS+=("Required input 'target-url' was not provided")
+                fi
+                if [[ ${#ERRORS[@]} -gt 0 ]]; then
+                  for ERR in "${ERRORS[@]}"; do
+                    echo "::error::$ERR"
+                  done
+                  exit 1
+                fi
+
+        deploy:
+          needs: validate-inputs
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying to ${{ inputs.environment }}"
+  - language: yaml
+    label: "Fix: use default: values to avoid silent empty string behavior"
+    code: |
+      on:
+        workflow_call:
+          inputs:
+            environment:
+              required: false
+              default: 'staging'   # explicit default instead of relying on required: true
+              type: string
+      
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying to ${{ inputs.environment }}"  # always 'staging' if omitted
+prevention:
+  - "Treat required: true on workflow_call inputs as documentation only — always validate inside the reusable workflow."
+  - "Add a dedicated input-validation job as the first job in every reusable workflow with required inputs."
+  - "Prefer default: values over required: true when a sensible fallback exists."
+  - "In calling workflows, always explicitly pass all inputs in the with: block."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#onworkflow_callinputs"
+    label: "on.workflow_call.inputs syntax reference"
+  - url: "https://docs.github.com/en/actions/sharing-automations/reusing-workflows#using-inputs-and-secrets-in-a-called-workflow"
+    label: "Using inputs in a called workflow"
