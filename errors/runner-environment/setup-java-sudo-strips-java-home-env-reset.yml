@@ -1,0 +1,111 @@
+id: runner-environment-183
+title: "setup-java JAVA_HOME stripped by sudo env_reset on Ubuntu — wrong JDK used silently"
+category: runner-environment
+severity: silent-failure
+tags:
+  - setup-java
+  - sudo
+  - java
+  - ubuntu
+  - env-reset
+  - sudoers
+  - java-home
+patterns:
+  - regex: 'error: invalid target release: \d+'
+    flags: 'i'
+  - regex: '(bad source file|class file has wrong version).*\d+\.\d+'
+    flags: 'i'
+error_messages:
+  - "error: invalid target release: 25"
+  - "error: invalid target release: 21"
+  - "error: invalid target release: 23"
+  - "class file has wrong version"
+root_cause: |
+  Ubuntu's sudoers policy includes `env_reset` and `secure_path` by default. When a
+  workflow step runs any command via `sudo` (e.g., `sudo apt-get install ...`,
+  `sudo ant build`, `sudo mvn package`), the environment is completely reset: PATH
+  reverts to the sudoers secure_path and JAVA_HOME is cleared.
+
+  Because the runner image has JDK 17 registered as the system default via
+  `update-alternatives`, any subsequent Java invocation under sudo — including
+  tool-wrapped invocations via Debian-packaged `ant` (which uses `java-wrappers.sh`
+  to detect Java through system alternatives) — silently uses JDK 17 regardless of
+  what `actions/setup-java` configured.
+
+  This causes silent failures when the build silently compiles against JDK 17 and
+  produces wrong artifacts, and explicit errors when the requested JDK is newer
+  than 17 and javac refuses with "error: invalid target release: N".
+
+  The root cause is not a bug in setup-java — it correctly sets JAVA_HOME and PATH
+  via $GITHUB_ENV / $GITHUB_PATH, which only apply to non-sudo process contexts.
+  Ubuntu's sudoers env_reset is OS-level behaviour that strips those env variables.
+fix: |
+  1. Pass JAVACMD explicitly to sudo: `sudo JAVACMD=$JAVA_HOME/bin/java ant ...`
+     (Debian-packaged ant reads JAVACMD before system alternatives)
+  2. Register the setup-java JDK as the system default before any sudo steps:
+     sudo update-alternatives --install /usr/bin/java java "$JAVA_HOME/bin/java" 2000
+     sudo update-alternatives --set java "$JAVA_HOME/bin/java"
+  3. Avoid running Java build tools via sudo entirely — install build dependencies
+     first, then run the build as the runner user (without sudo).
+  4. Use `sudo -E` to preserve the current environment (requires sudoers NOPASSWD
+     with env_keep or SETENV; not available by default on GitHub-hosted runners).
+fix_code:
+  - language: yaml
+    label: "Workaround: pass JAVACMD explicitly to sudo ant/maven"
+    code: |
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: temurin
+
+      # Debian ant uses java-wrappers which ignores JAVA_HOME — pass JAVACMD directly
+      - name: Build with ant (sudo)
+        run: sudo JAVACMD=$JAVA_HOME/bin/java ant build
+
+  - language: yaml
+    label: "Workaround: register JDK as system default before sudo steps"
+    code: |
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: temurin
+
+      - name: Register JDK as system default (for sudo)
+        run: |
+          sudo update-alternatives --install /usr/bin/java java "$JAVA_HOME/bin/java" 2000
+          sudo update-alternatives --set java "$JAVA_HOME/bin/java"
+          sudo update-alternatives --install /usr/bin/javac javac "$JAVA_HOME/bin/javac" 2000
+          sudo update-alternatives --set javac "$JAVA_HOME/bin/javac"
+
+      - name: Build (sudo now uses correct JDK)
+        run: sudo ant build
+
+  - language: yaml
+    label: "Best practice: separate install from build to avoid sudo"
+    code: |
+      - name: Install build dependencies
+        run: sudo apt-get install -y build-essential
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: temurin
+
+      # No sudo here — JAVA_HOME is intact
+      - name: Build
+        run: ant build
+prevention:
+  - "Avoid running Java build tools (ant, mvn, gradle) via sudo — install OS dependencies before setup-java, build without sudo"
+  - "After setup-java, verify sudo sees the correct JDK: sudo java -version"
+  - "For Debian-packaged tools (apt install ant), always pass JAVACMD=$JAVA_HOME/bin/java when invoking via sudo"
+  - "If sudo is unavoidable, register the JDK via update-alternatives immediately after setup-java"
+docs:
+  - url: "https://github.com/actions/setup-java/issues/997"
+    label: "ubuntu-latest uses wrong JDK version under sudo (setup-java#997)"
+  - url: "https://github.com/actions/setup-java/pull/1013"
+    label: "Update README for Ubuntu sudo JAVA_HOME behavior (setup-java PR#1013)"
+  - url: "https://manpages.ubuntu.com/manpages/noble/en/man5/sudoers.5.html"
+    label: "sudoers(5) — env_reset and secure_path"
