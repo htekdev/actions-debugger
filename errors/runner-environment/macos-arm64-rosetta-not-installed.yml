@@ -1,0 +1,97 @@
+id: runner-environment-154
+title: "macOS ARM64 runner: Rosetta 2 not pre-installed — x86_64 binaries fail"
+category: runner-environment
+severity: error
+tags:
+  - macos
+  - arm64
+  - rosetta
+  - apple-silicon
+  - binary-compatibility
+patterns:
+  - regex: 'Bad CPU type in executable'
+    flags: i
+  - regex: 'Exec format error'
+    flags: i
+  - regex: 'is not supported on this machine \(CPU type'
+    flags: i
+  - regex: 'rosetta.*not.*install|softwareupdate.*rosetta'
+    flags: i
+error_messages:
+  - "zsh: bad CPU type in executable: /usr/local/bin/mytool"
+  - "Exec format error"
+  - "/usr/local/bin/node: Bad CPU type in executable"
+  - "The file '/path/to/binary' is not supported on this machine (CPU type 16777223)"
+root_cause: |
+  GitHub-hosted macOS runners on Apple Silicon hardware (macos-14, macos-15, and the `macos-latest`
+  label when pointing to ARM64 images) do NOT have Rosetta 2 pre-installed. Rosetta 2 is Apple's
+  x86_64-to-ARM64 translation layer that allows Intel-compiled binaries to run on Apple Silicon.
+
+  Without Rosetta 2, any x86_64 binary executed on the ARM64 runner fails immediately with
+  "Bad CPU type in executable" or "Exec format error". Common sources of x86_64 binaries:
+  - Pre-compiled tool downloads targeting darwin-x64
+  - npm packages with native addons built for x86_64
+  - Homebrew formulae that only have x86_64 bottles
+  - Custom build scripts that hardcode `arch -x86_64`
+  - Docker images using `linux/amd64` platform
+
+  This is distinct from Linux ARM64 runners (ubuntu-24.04-arm) where the error manifests
+  differently and no Rosetta equivalent exists. On macOS, Rosetta 2 can be installed as a
+  one-time setup step.
+fix: |
+  Option 1 — Install Rosetta 2 at job start (quick workaround):
+  Add `softwareupdate --install-rosetta --agree-to-license` as the first step. This allows
+  x86_64 binaries to run via translation.
+
+  Option 2 — Use ARM64-native binaries (preferred):
+  Update download scripts to detect `arch` and fetch the correct binary:
+  - Use `$(uname -m)` to branch between arm64 and x86_64 download URLs
+  - Use `arch -arm64 brew install` for Homebrew packages
+  - For npm: ensure native addons are rebuilt for the current architecture
+
+  Option 3 — Pin to Intel macOS runner:
+  Use `runs-on: macos-13` which is the last Intel-based macOS runner image. Note that
+  macos-13 is scheduled for deprecation; this is a temporary workaround only.
+fix_code:
+  - language: yaml
+    label: "Install Rosetta 2 as first step (workaround)"
+    code: |
+      jobs:
+        build:
+          runs-on: macos-latest  # ARM64 Apple Silicon
+          steps:
+            - name: Install Rosetta 2
+              run: softwareupdate --install-rosetta --agree-to-license
+            - uses: actions/checkout@v4
+            - name: Download tool
+              run: |
+                # x86_64 binary will now work via Rosetta translation
+                curl -L https://example.com/tool-darwin-x64 -o tool
+                chmod +x tool
+                ./tool
+  - language: yaml
+    label: "Detect architecture and fetch the correct binary (preferred)"
+    code: |
+      steps:
+        - name: Download architecture-appropriate binary
+          run: |
+            ARCH=$(uname -m)
+            if [ "$ARCH" = "arm64" ]; then
+              BINARY_URL="https://example.com/tool-darwin-arm64"
+            else
+              BINARY_URL="https://example.com/tool-darwin-x64"
+            fi
+            curl -L "$BINARY_URL" -o tool
+            chmod +x tool
+            ./tool
+prevention:
+  - "Always test workflows on both `macos-13` (Intel) and `macos-14`+ (ARM64) runners"
+  - "Check download scripts for hardcoded `darwin-x64` or `darwin-amd64` architecture strings"
+  - "Prefer tools distributed via Homebrew — many formulae now have native ARM64 bottles"
+  - "Use `${{ runner.arch }}` in workflow expressions to branch on architecture (`X64` vs `ARM64`)"
+  - "Audit npm packages with native addons — they must support `darwin-arm64` or provide a WASM fallback"
+docs:
+  - url: "https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners#supported-runners-and-hardware-resources"
+    label: "GitHub Docs: Supported runners and hardware resources"
+  - url: "https://support.apple.com/en-us/102527"
+    label: "Apple: If you need to install Rosetta on your Mac"

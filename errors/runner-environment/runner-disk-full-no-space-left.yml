@@ -1,0 +1,106 @@
+id: runner-environment-155
+title: "GitHub-hosted runner disk full — 'No space left on device' during large builds"
+category: runner-environment
+severity: error
+tags:
+  - disk-space
+  - ubuntu
+  - docker
+  - large-builds
+  - runner-storage
+patterns:
+  - regex: 'No space left on device'
+    flags: i
+  - regex: 'write.*error.*28|errno 28'
+    flags: i
+  - regex: 'disk.*full|filesystem.*full|out of disk'
+    flags: i
+  - regex: 'no space left'
+    flags: i
+error_messages:
+  - "No space left on device"
+  - "Error: write /var/lib/docker/tmp/...: no space left on device"
+  - "tar: ./app: Cannot write: No space left on device"
+  - "error: failed to push some refs: No space left on device"
+  - "OSError: [Errno 28] No space left on device"
+root_cause: |
+  GitHub-hosted Ubuntu runners have approximately 14 GB of usable disk space after the
+  pre-installed tool suite occupies the rest. The runner image includes a large set of
+  pre-installed software that consumes the majority of available disk:
+  - Android SDK: ~8.7 GB
+  - .NET SDKs: ~1.5 GB
+  - Haskell/GHC: ~5.4 GB
+  - CodeQL: ~5.4 GB
+  - Docker images cached on the runner: varies
+
+  Workflows that perform large Docker builds, pull multiple Docker images, build large
+  native packages, or accumulate many npm/cargo/maven dependencies can exhaust the
+  ~14 GB limit. Common triggers:
+  - `docker build` for large multi-stage images
+  - `docker pull` of several large base images
+  - Building and caching large Rust/C++ projects
+  - Downloading large ML models or datasets
+  - Generating large test fixtures or build artifacts
+
+  The error manifests in diverse ways: Docker build errors (errno 28), tar extraction
+  failures, git push failures writing pack files, or Python/Node crashes writing temp files.
+fix: |
+  Free disk space before your build by removing pre-installed tools you don't need.
+  The community-maintained `jlumbroso/free-disk-space` action is the standard solution.
+
+  Manual removal commands for the largest consumers:
+  - Android SDK: `sudo rm -rf /usr/local/lib/android`
+  - .NET: `sudo rm -rf /usr/share/dotnet`
+  - Haskell/GHC: `sudo rm -rf /usr/local/.ghcup`
+  - Large packages: `sudo apt-get clean && sudo apt-get autoremove -y`
+  - Docker build cache: `docker builder prune -af`
+
+  Alternatively, upgrade to GitHub-hosted larger runners (4+ cores) which provide
+  more disk space, or use self-hosted runners.
+fix_code:
+  - language: yaml
+    label: "Free disk space before large Docker build"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Free disk space
+              uses: jlumbroso/free-disk-space@main
+              with:
+                tool-cache: false
+                android: true
+                dotnet: true
+                haskell: true
+                large-packages: true
+                docker-images: true
+                swap-storage: true
+            - uses: actions/checkout@v4
+            - name: Build Docker image
+              run: docker build -t myapp:latest .
+  - language: yaml
+    label: "Manual removal of largest pre-installed tools"
+    code: |
+      steps:
+        - name: Free disk space (manual)
+          run: |
+            df -h /
+            sudo rm -rf /usr/local/lib/android
+            sudo rm -rf /usr/share/dotnet
+            sudo rm -rf /usr/local/.ghcup
+            sudo apt-get clean
+            docker builder prune -af || true
+            df -h /
+prevention:
+  - "Add a disk-space check step (`df -h /`) early in the workflow to detect capacity issues before they cause cryptic failures"
+  - "Run `jlumbroso/free-disk-space` before any Docker build or large compilation job"
+  - "Remove only tools you know you don't need — removing the tool-cache may break `actions/setup-*` steps"
+  - "Consider using `runs-on: ubuntu-latest-4-cores` (GitHub Teams) which provides more disk space"
+  - "Use Docker `--no-cache` flags cautiously — reusing layer cache can actually save disk vs rebuilding every layer"
+docs:
+  - url: "https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners#supported-runners-and-hardware-resources"
+    label: "GitHub Docs: Runner hardware resources"
+  - url: "https://github.com/jlumbroso/free-disk-space"
+    label: "jlumbroso/free-disk-space action"
+  - url: "https://github.com/actions/runner-images/issues/2840"
+    label: "runner-images#2840: Tracking disk space usage"
