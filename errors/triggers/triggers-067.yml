@@ -1,0 +1,134 @@
+id: triggers-067
+title: 'workflow_run types:[completed] fires prematurely with conclusion:null before referenced workflow finishes'
+category: triggers
+severity: error
+tags:
+  - workflow_run
+  - conclusion
+  - null
+  - premature-trigger
+  - race-condition
+  - completed
+patterns:
+  - regex: 'workflow_run\.conclusion.*null'
+    flags: 'i'
+  - regex: 'github\.event\.workflow_run\.conclusion'
+    flags: 'i'
+  - regex: 'conclusion.*randomly.*fail'
+    flags: 'i'
+error_messages:
+  - "github.event.workflow_run.conclusion returned null — job skipped unexpectedly"
+  - "Unable to extend GITHUB_TOKEN expiration time due to: GITHUB_TOKEN has expired."
+root_cause: |
+  The `workflow_run` event with `types: [completed]` is documented to fire only after the
+  referenced workflow finishes running. However, a known race condition in GitHub Actions'
+  event delivery (tracked in actions/runner#4035) causes the event to fire a second time
+  BEFORE the workflow has fully completed — specifically before GitHub has written the final
+  `conclusion` value to the workflow run record.
+
+  When this premature trigger fires, `github.event.workflow_run.conclusion` evaluates to
+  `null` (or an empty string `""`). Any job guarded with:
+
+    if: github.event.workflow_run.conclusion == 'success'
+
+  will evaluate to `false` and be skipped, producing a confusing pattern where the
+  downstream workflow runs twice — once skipped, once (correctly) executed.
+
+  GitHub Support confirmed this as a platform-side delay: the `conclusion` field remains
+  `null` while GitHub's backend is still updating the workflow run record. The event
+  is dispatched before the record is fully consistent.
+
+  This affects all workflows that use `on.workflow_run` with `types: [completed]` and
+  check `github.event.workflow_run.conclusion` to gate job execution.
+fix: |
+  Two mitigations are available:
+
+  1. **Guard with `conclusion != ''`** — Add a condition that explicitly rejects null/empty
+     `conclusion` values before checking for `'success'`:
+
+     if: >-
+       github.event.workflow_run.conclusion != '' &&
+       github.event.workflow_run.conclusion == 'success'
+
+  2. **Re-query via REST API** — Instead of trusting `github.event.workflow_run.conclusion`,
+     use the Actions REST API to fetch the current workflow run conclusion at step runtime:
+
+     gh api /repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }} \
+       --jq '.conclusion'
+
+     This always returns the up-to-date value, bypassing the event payload race condition.
+
+  Note: adding a `sleep` between trigger and conclusion check is NOT a reliable fix, as
+  the delay between trigger and backend consistency is variable and can exceed seconds.
+fix_code:
+  - language: yaml
+    label: 'Problem: conclusion check fails on premature null trigger'
+    code: |
+      on:
+        workflow_run:
+          workflows: ['CI Build']
+          types: [completed]
+
+      jobs:
+        deploy:
+          # This randomly evaluates to false when conclusion is null
+          if: github.event.workflow_run.conclusion == 'success'
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying..."
+  - language: yaml
+    label: 'Fix: guard against null conclusion before equality check'
+    code: |
+      on:
+        workflow_run:
+          workflows: ['CI Build']
+          types: [completed]
+
+      jobs:
+        deploy:
+          # Explicitly reject null/empty conclusion to avoid premature-trigger skips
+          if: >-
+            github.event.workflow_run.conclusion != '' &&
+            github.event.workflow_run.conclusion == 'success'
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying..."
+  - language: yaml
+    label: 'Fix: re-query conclusion via REST API for reliable value'
+    code: |
+      on:
+        workflow_run:
+          workflows: ['CI Build']
+          types: [completed]
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Check conclusion via API
+              id: check
+              env:
+                GH_TOKEN: ${{ github.token }}
+              run: |
+                conclusion=$(gh api \
+                  /repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }} \
+                  --jq '.conclusion')
+                echo "conclusion=$conclusion" >> "$GITHUB_OUTPUT"
+
+            - name: Deploy
+              if: steps.check.outputs.conclusion == 'success'
+              run: echo "Deploying..."
+prevention:
+  - "Never rely solely on `github.event.workflow_run.conclusion == 'success'` without a null guard."
+  - "Add `github.event.workflow_run.conclusion != ''` as an explicit first condition to reject premature triggers."
+  - "If downstream jobs must be fully reliable, re-query conclusion via the REST API rather than reading from the event payload."
+  - "Monitor the Actions tab for unexpectedly skipped `workflow_run` triggered runs — they indicate premature triggers."
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run'
+    label: 'GitHub Docs: workflow_run event'
+  - url: 'https://github.com/actions/runner/issues/4035'
+    label: 'actions/runner#4035: workflow_run triggers before referenced workflow completes'
+  - url: 'https://stackoverflow.com/questions/73107307/any-workaround-for-github-actions-workflow-run-conclusion-randomly-failing'
+    label: 'Stack Overflow: workflow_run.conclusion randomly failing'
+  - url: 'https://github.com/orgs/community/discussions/58929'
+    label: 'GitHub Community #58929: github.event.workflow_run.conclusion is always null'

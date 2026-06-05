@@ -1,0 +1,136 @@
+id: permissions-auth-059
+title: 'GITHUB_TOKEN expires after 24 hours on self-hosted runners — long-running jobs fail with "GITHUB_TOKEN has expired"'
+category: permissions-auth
+severity: error
+tags:
+  - GITHUB_TOKEN
+  - token-expiry
+  - self-hosted-runner
+  - long-running-jobs
+  - 24-hour-limit
+  - authentication
+patterns:
+  - regex: 'GITHUB_TOKEN has expired'
+    flags: 'i'
+  - regex: 'Unable to extend GITHUB_TOKEN expiration'
+    flags: 'i'
+  - regex: 'token.*expired.*self.hosted'
+    flags: 'i'
+error_messages:
+  - "Unable to extend GITHUB_TOKEN expiration time due to: GITHUB_TOKEN has expired."
+  - "Error: fatal: unable to access 'https://github.com/...': The requested URL returned error: 403"
+root_cause: |
+  `GITHUB_TOKEN` is an installation access token issued at the START of each job. Its
+  lifetime is tied to the job execution, with a hard cap determined by the runner type:
+
+  - **GitHub-hosted runners**: `GITHUB_TOKEN` lives for up to 6 hours (matching the maximum
+    job execution time). On hosted runners this limit is never the issue because the job
+    itself can't run longer than 6 hours.
+
+  - **Self-hosted runners**: Jobs can run for up to 5 days, but `GITHUB_TOKEN` can only be
+    refreshed for up to **24 hours**. If a job on a self-hosted runner exceeds 24 hours of
+    runtime, any subsequent GitHub API call, `git push`, `gh` CLI invocation, or action that
+    uses `${{ github.token }}` or `${{ secrets.GITHUB_TOKEN }}` will fail with a 401/403
+    authentication error.
+
+  The specific error message is:
+    "Unable to extend GITHUB_TOKEN expiration time due to: GITHUB_TOKEN has expired."
+
+  This is particularly common in:
+  - Large test suites or build pipelines that process massive monorepos
+  - ML/data pipelines that process large datasets sequentially
+  - Long-running deployment or migration jobs that need GitHub API access at the end
+  - Jobs with retries that collectively exceed 24 hours
+
+  Note: `actions/create-github-app-token` GitHub App tokens have a similar but shorter
+  1-hour expiry — see permissions-auth-046 for that pattern.
+fix: |
+  Several approaches, in order of recommendation:
+
+  1. **Split the job into smaller jobs** — Break the long-running job into multiple shorter
+     jobs connected by `needs:` dependencies. Each job gets its own fresh `GITHUB_TOKEN`.
+
+  2. **Use a GitHub App token** — Use `actions/create-github-app-token` to generate tokens
+     mid-job as needed, or generate a fresh token at the point in the job where you need it.
+
+  3. **Use a PAT (Personal Access Token)** — Store a long-lived PAT in repository or
+     organization secrets and use it in place of `GITHUB_TOKEN` for the API calls at the
+     end of the long-running job. PATs do not expire in 24 hours (they expire based on the
+     PAT expiration date you set). Drawback: PATs are tied to a specific user account.
+
+  4. **Use a machine user PAT** — Create a dedicated machine account and use its PAT.
+     This decouples the secret from any individual developer's account.
+fix_code:
+  - language: yaml
+    label: 'Problem: long-running self-hosted job uses GITHUB_TOKEN after 24+ hours'
+    code: |
+      jobs:
+        long-build:
+          runs-on: [self-hosted, large-runner]
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run 26-hour data processing
+              run: ./scripts/process_all_data.sh   # takes ~26 hours
+
+            # FAILS: GITHUB_TOKEN has expired by the time this step runs
+            - name: Upload results to GitHub
+              env:
+                GH_TOKEN: ${{ github.token }}
+              run: gh release upload v1.0 ./output/*.tar.gz
+  - language: yaml
+    label: 'Fix: split into jobs so each gets a fresh GITHUB_TOKEN'
+    code: |
+      jobs:
+        process-data:
+          runs-on: [self-hosted, large-runner]
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./scripts/process_all_data.sh
+            - uses: actions/upload-artifact@v4
+              with:
+                name: output-files
+                path: ./output/
+
+        upload-release:
+          needs: process-data
+          runs-on: ubuntu-latest     # hosted runner with fresh token
+          permissions:
+            contents: write
+          steps:
+            - uses: actions/download-artifact@v4
+              with:
+                name: output-files
+                path: ./output/
+            # GITHUB_TOKEN is fresh — just issued for this new job
+            - name: Upload to release
+              env:
+                GH_TOKEN: ${{ github.token }}
+              run: gh release upload v1.0 ./output/*.tar.gz
+  - language: yaml
+    label: 'Fix: use stored PAT when splitting jobs is not feasible'
+    code: |
+      jobs:
+        long-build:
+          runs-on: [self-hosted, large-runner]
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./scripts/process_all_data.sh
+
+            # Use a PAT stored in secrets — does not expire in 24 hours
+            - name: Upload results (using PAT)
+              env:
+                GH_TOKEN: ${{ secrets.MACHINE_USER_PAT }}   # PAT, not github.token
+              run: gh release upload v1.0 ./output/*.tar.gz
+prevention:
+  - "Design self-hosted runner jobs to complete within 24 hours, or split them into smaller jobs connected by `needs:`."
+  - "If a job genuinely requires >24 hours of runtime, use a PAT or GitHub App token for API calls instead of `GITHUB_TOKEN`."
+  - "Add a monitoring step that logs elapsed job time — alert if a job approaches 20+ hours."
+  - "Avoid using `GITHUB_TOKEN` for API calls near the end of jobs that are known to run close to the 24-hour limit."
+  - "For GitHub-hosted runners this is not an issue — the job execution limit (6 hours) is shorter than the token lifetime."
+docs:
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#about-the-github_token-secret'
+    label: 'GitHub Docs: GITHUB_TOKEN — effective maximum lifetime'
+  - url: 'https://stackoverflow.com/questions/75602556/how-can-i-use-a-github-token-for-more-than-24-hours'
+    label: 'Stack Overflow: How to use GITHUB_TOKEN for more than 24 hours'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners#usage-limits'
+    label: 'GitHub Docs: Self-hosted runner usage limits (5-day job limit)'
