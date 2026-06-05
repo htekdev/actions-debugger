@@ -1,0 +1,101 @@
+id: runner-environment-197
+title: 'setup-python fails on Windows self-hosted runner without administrator permissions — InstallAllUsers=1 MSI installer requires admin'
+category: runner-environment
+severity: error
+tags:
+  - setup-python
+  - self-hosted
+  - windows
+  - admin-permissions
+  - msi-installer
+patterns:
+  - regex: 'Error happened during Python installation'
+    flags: 'i'
+  - regex: 'InstallAllUsers=1'
+    flags: 'i'
+  - regex: 'setup-python.*self.hosted.*windows.*fail'
+    flags: 'i'
+error_messages:
+  - 'Error happened during Python installation'
+root_cause: |
+  The setup-python action installs Python using the official MSI installer with the
+  flag InstallAllUsers=1. This flag installs Python into the shared runner tool cache
+  (RUNNER_TOOL_CACHE) using the DefaultAllUsersTargetDir argument, which requires
+  administrator privileges to write to the shared system-level installation path.
+
+  When the GitHub Actions runner service is running under a standard user account
+  without local administrator permissions, the Python MSI installer fails because it
+  cannot write to the required system paths, resulting in:
+
+    Error happened during Python installation
+
+  This affects Windows self-hosted runners configured as a Windows service under a
+  non-admin account. GitHub-hosted Windows runners are unaffected because they run
+  as SYSTEM (full admin). Linux and macOS self-hosted runners are unaffected.
+
+  Note: this is by design per the action maintainers — InstallAllUsers=1 is required
+  to correctly populate the shared RUNNER_TOOL_CACHE. A per-user install mode
+  (InstallAllUsers=0) is under consideration as a future enhancement.
+fix: |
+  Primary fix: Configure the Windows runner service to run as a local administrator
+  account. In Windows Services (services.msc), change the "Log On" account for the
+  GitHub Actions Runner service to an account with local admin rights, or install the
+  runner using the .\config.cmd --runasservice flow with an admin account.
+
+  Workaround 1: Pre-install the required Python version system-wide on the runner
+  machine before workflows run. setup-python will use the pre-installed version from
+  PATH without invoking the MSI installer if the version matches.
+
+  Workaround 2: Ensure the runner is run interactively (not as a service) under an
+  account with admin rights during initial Python installation, then cache the tool.
+
+  Workaround 3: Use actions/setup-python''s uses: together with a self-hosted runner
+  image that already has Python pre-installed in RUNNER_TOOL_CACHE, bypassing the
+  MSI install step entirely.
+fix_code:
+  - language: yaml
+    label: 'Workflow: no changes needed — fix is on the runner machine configuration'
+    code: |
+      # Fix requires reconfiguring the Windows runner service account:
+      # 1. Open Services (services.msc) on the runner machine
+      # 2. Find "GitHub Actions Runner (<name>)"
+      # 3. Right-click → Properties → Log On tab
+      # 4. Change to an account with local administrator privileges
+      # 5. Restart the service
+      #
+      # After reconfiguring, setup-python works normally:
+      jobs:
+        build:
+          runs-on: [self-hosted, windows]
+          steps:
+            - uses: actions/setup-python@v5
+              with:
+                python-version: '3.12'
+            - run: python --version
+  - language: yaml
+    label: 'Workaround: use pre-installed Python from PATH if runner has it installed system-wide'
+    code: |
+      jobs:
+        build:
+          runs-on: [self-hosted, windows]
+          steps:
+            # Skip setup-python entirely if Python is pre-installed system-wide
+            - name: Verify Python available
+              run: python --version
+            # OR use setup-python only to add to PATH, not install:
+            - uses: actions/setup-python@v5
+              with:
+                python-version: '3.12'
+                # If Python 3.12 is already in RUNNER_TOOL_CACHE, no install occurs
+prevention:
+  - 'Always run Windows self-hosted runner services under a local administrator account — setup-python requires admin rights to install into the shared tool cache'
+  - 'Test setup-python on self-hosted runners with the same service account before deploying to production workloads'
+  - 'Use pre-installed Python on Windows self-hosted runners to avoid the MSI installer entirely when admin rights cannot be granted'
+  - 'Document the runner service account requirements in your team''s self-hosted runner setup guide'
+docs:
+  - url: 'https://github.com/actions/setup-python/issues/1308'
+    label: 'actions/setup-python#1308: fails on self-hosted runners without admin permissions (2026)'
+  - url: 'https://github.com/actions/setup-python/blob/main/docs/advanced-usage.md#windows'
+    label: 'setup-python docs: Windows advanced usage and self-hosted runner configuration'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/configuring-the-self-hosted-runner-application-as-a-service'
+    label: 'GitHub Docs: Configuring the self-hosted runner as a service'

@@ -1,0 +1,110 @@
+id: yaml-syntax-070
+title: 'continue-on-error expression using inputs.* silently resolves null at composite action call site — "Unexpected value ''"'
+category: yaml-syntax
+severity: error
+tags:
+  - continue-on-error
+  - composite-actions
+  - inputs-context
+  - expression-scoping
+  - template-validation
+patterns:
+  - regex: 'Unexpected value\s+''''$'
+    flags: 'i'
+  - regex: 'error.*determining.*continue on error'
+    flags: 'i'
+  - regex: 'The template is not valid.*Unexpected value\s+'''
+    flags: 'i'
+error_messages:
+  - 'Error: .github/workflows/test.yml (Line: N, Col: N): Unexpected value ''''
+  - 'Error: The step failed and an error occurred when attempting to determine whether to continue on error.'
+  - 'Error: The template is not valid. .github/workflows/test.yml (Line: N, Col: N): Unexpected value ''''
+root_cause: |
+  When continue-on-error on a uses: step that calls a composite action contains an
+  expression referencing inputs.*, the expression is evaluated inside the composite
+  action context — not the calling workflow context. Inside the composite action,
+  inputs refers to the composite action''s own declared inputs, not the caller''s
+  workflow_dispatch inputs or other workflow-level inputs.
+
+  If the composite action does not declare that input, inputs.my_flag resolves to
+  null, which becomes an empty string in the expression context. The runner then
+  tries to parse the empty string as a boolean and emits:
+
+    Error: Unexpected value ''
+
+  followed by:
+
+    Error: The step failed and an error occurred when attempting to determine
+    whether to continue on error.
+
+  The workflow then halts at that step regardless of what the caller intended.
+
+  This context-crossing is unique to uses: steps (composite actions). For run:
+  steps in the same job, inputs.my_flag evaluates in the workflow context and
+  works correctly with continue-on-error.
+fix: |
+  Replace inputs.* with github.event.inputs.* in the continue-on-error expression
+  when calling composite actions from a workflow_dispatch event. github.event.inputs
+  is evaluated in the workflow/runner context before the composite action is entered,
+  so it resolves correctly.
+
+  Alternatively, capture the input as a job-level env or step output and reference
+  the env var or step output in the continue-on-error expression.
+fix_code:
+  - language: yaml
+    label: 'Bug: inputs.continue resolves to null inside composite action context'
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            continue:
+              type: boolean
+              default: false
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: my-org/fail-action@main
+              # inputs.continue resolves to null here — "Unexpected value ''"
+              continue-on-error: ${{ github.event_name == 'workflow_dispatch' && inputs.continue }}
+  - language: yaml
+    label: 'Fix: use github.event.inputs.* instead of inputs.* in continue-on-error on uses: steps'
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            continue:
+              type: boolean
+              default: false
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: my-org/fail-action@main
+              # github.event.inputs evaluates in workflow context, not composite context
+              continue-on-error: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.continue == 'true' }}
+  - language: yaml
+    label: 'Alternative fix: pre-evaluate the flag into an env var'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          env:
+            SHOULD_CONTINUE: ${{ inputs.continue }}
+          steps:
+            - uses: my-org/fail-action@main
+              continue-on-error: ${{ env.SHOULD_CONTINUE == 'true' }}
+prevention:
+  - 'Never reference inputs.* in continue-on-error on a uses: step — use github.event.inputs.* for workflow_dispatch inputs or env.* for pre-evaluated values'
+  - 'Remember that expression contexts differ between run: steps (workflow context) and uses: composite action steps (composite context)'
+  - 'Test continue-on-error with expressions locally using nektos/act before merging to catch context-crossing issues'
+  - 'If a composite action needs conditional behavior, declare it as an explicit composite input and pass the value from the caller'
+docs:
+  - url: 'https://github.com/actions/runner/issues/2418'
+    label: 'GitHub runner#2418: continue-on-error with inputs variables in composite actions (bug, 12 reactions)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#context-availability'
+    label: 'GitHub Docs: Expression context availability'
+  - url: 'https://docs.github.com/en/actions/sharing-automations/creating-actions/creating-a-composite-action'
+    label: 'GitHub Docs: Creating a composite action'
