@@ -1,0 +1,112 @@
+id: known-unsolved-054
+title: 'github.event in a reusable workflow is the workflow_call event, not the caller event'
+category: known-unsolved
+severity: silent-failure
+tags:
+  - reusable-workflow
+  - workflow-call
+  - github-event
+  - context
+  - inputs
+  - github-context
+patterns:
+  - regex: 'github\.event\.(pull_request|commits|release|head_commit)\b'
+    flags: 'i'
+error_messages: []
+root_cause: |
+  When a caller workflow invokes a reusable workflow via jobs.<id>.uses, the
+  github.event context inside the callee is the workflow_call event object,
+  NOT the triggering event (push, pull_request, schedule, etc.) of the caller.
+
+  All event-specific payload fields are undefined inside the reusable workflow
+  and evaluate to empty string or null without any error:
+  - github.event.pull_request (undefined — returns null)
+  - github.event.commits (undefined — returns null)
+  - github.event.release (undefined — returns null)
+  - github.event.head_commit (undefined — returns null)
+  - github.event.inputs (undefined — use inputs context instead)
+
+  Additionally, github.event_name inside the callee always returns 'workflow_call',
+  regardless of what event triggered the caller.
+
+  Importantly, github.ref, github.sha, and github.actor DO retain the caller's
+  values inside the callee — it is specifically github.event and github.event_name
+  that reflect the workflow_call context, not the caller's triggering event.
+
+  This catches developers by surprise when refactoring inline jobs into reusable
+  workflows: the refactored callee silently loses access to the event payload it
+  previously used, with no validation error or warning at parse time or runtime.
+
+  This is by design — reusable workflows execute as independent workflow_call
+  events and there is no mechanism to inherit the caller's event context. GitHub
+  has confirmed this will not change.
+fix: |
+  There is no workaround that exposes the caller's github.event inside the callee.
+  The required approach is to declare all needed event data as explicit inputs:
+  in the reusable workflow and forward them via with: in the caller.
+
+  github.ref, github.sha, and github.actor are available in the callee without
+  any explicit forwarding — they are inherited automatically from the caller context.
+fix_code:
+  - language: yaml
+    label: 'Wrong — accessing caller event payload inside reusable workflow (silently empty)'
+    code: |
+      # .github/workflows/reusable.yml — these are all EMPTY inside the callee
+      on:
+        workflow_call:
+
+      jobs:
+        process:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "PR = ${{ github.event.pull_request.number }}"  # null
+            - run: echo "Event = ${{ github.event_name }}"               # 'workflow_call'
+            - run: echo "Commit = ${{ github.event.head_commit.message }}" # null
+  - language: yaml
+    label: 'Correct — declare inputs in callee and forward event data from caller'
+    code: |
+      # .github/workflows/reusable.yml — declare needed event data as inputs
+      on:
+        workflow_call:
+          inputs:
+            pr_number:
+              type: number
+              default: 0
+              description: 'Pull request number from github.event.pull_request.number'
+            triggering_event:
+              type: string
+              required: true
+              description: 'The caller event name (github.event_name)'
+
+      jobs:
+        process:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "PR = ${{ inputs.pr_number }}"
+            - run: echo "Triggered by = ${{ inputs.triggering_event }}"
+            # github.ref and github.sha are safe to use directly — they are inherited
+            - run: echo "SHA = ${{ github.sha }}"
+
+      # ---- CALLER WORKFLOW ----
+      # .github/workflows/caller.yml — forward event data via with:
+      on: [push, pull_request]
+
+      jobs:
+        call-reusable:
+          uses: ./.github/workflows/reusable.yml
+          with:
+            pr_number: ${{ github.event.pull_request.number || 0 }}
+            triggering_event: ${{ github.event_name }}
+prevention:
+  - 'Never access github.event.* fields directly inside a reusable workflow — they will always be empty'
+  - 'github.event_name inside a reusable workflow always returns workflow_call, not the caller event'
+  - 'Declare all required event data as explicit workflow_call inputs and forward with with: in the caller'
+  - 'github.ref, github.sha, and github.actor are inherited from the caller and are safe to use'
+  - 'Add a comment in the reusable workflow reminding contributors not to use github.event directly'
+docs:
+  - url: 'https://docs.github.com/en/actions/sharing-automations/reusing-workflows#limitations'
+    label: 'GitHub Docs — Reusing workflows: Limitations'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#github-context'
+    label: 'GitHub Docs — github context'
+  - url: 'https://docs.github.com/en/actions/sharing-automations/reusing-workflows#passing-inputs-and-secrets-to-a-called-workflow'
+    label: 'GitHub Docs — Passing inputs and secrets to a called workflow'
