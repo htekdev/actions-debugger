@@ -1,0 +1,141 @@
+id: silent-failures-102
+title: 'Matrix include: Property Boolean Values Coerced to Strings — Conditional Jobs Silently Misbehave'
+category: silent-failures
+severity: silent-failure
+tags:
+  - matrix
+  - include
+  - boolean
+  - string-coercion
+  - if-condition
+  - fromJSON
+patterns:
+  - regex: 'matrix\.[a-z_]+\s*==\s*(?:true|false)\b'
+    flags: 'i'
+  - regex: 'if:\s*\$\{\{\s*matrix\.[a-z_]+\s*\}\}'
+    flags: 'i'
+error_messages:
+  - "if: ${{ matrix.enabled }}"
+  - "if: ${{ matrix.enabled == false }}"
+  - "if: ${{ matrix.deploy == true }}"
+root_cause: |
+  All matrix property values — including those injected via `include:` entries — are coerced to
+  **strings** before expression evaluation at runtime. A matrix property configured as:
+
+  ```yaml
+  strategy:
+    matrix:
+      include:
+        - os: ubuntu-latest
+          enabled: false
+        - os: windows-latest
+          enabled: true
+  ```
+
+  produces `matrix.enabled` equal to the string `"false"` or `"true"`, not the boolean
+  `false` / `true`. This creates two distinct silent failure modes:
+
+  1. `if: ${{ matrix.enabled }}` — the string `"false"` is **truthy** in GitHub Actions expression
+     syntax (non-empty string = true). The job/step **always runs** even when the intent is to skip
+     entries where `enabled: false`.
+
+  2. `if: ${{ matrix.enabled == false }}` — compares a string against a boolean. In GitHub
+     Actions expression syntax, `"false" == false` evaluates to `false` (type mismatch). The
+     condition **always evaluates to false**, silently skipping every include entry regardless
+     of the configured value.
+
+  In both cases the workflow completes without errors or warnings. Only the observable runtime
+  behavior is wrong: jobs that should be skipped always run, or jobs that should run are
+  silently skipped.
+
+  This is distinct from composite action boolean input coercion (silent-failures-004), which
+  covers `inputs.*` properties. Matrix properties have no `type:` annotation — they are always
+  strings at expression evaluation time.
+fix: |
+  Use `fromJSON()` to parse the matrix property string into a native boolean before comparison:
+
+  - `if: ${{ fromJSON(matrix.enabled) }}` ✅ — `fromJSON("false")` → boolean `false` (falsy), skips correctly
+  - `if: ${{ fromJSON(matrix.enabled) == false }}` ✅ — correct boolean comparison
+  - `if: ${{ matrix.enabled }}` ❌ — string `"false"` is truthy, job always runs
+  - `if: ${{ matrix.enabled == false }}` ❌ — string vs boolean comparison, always evaluates to false
+
+  The same `fromJSON()` pattern applies to steps inside the matrix job:
+  ```yaml
+  steps:
+    - name: Deploy step
+      if: ${{ fromJSON(matrix.deploy) }}
+      run: ./deploy.sh
+  ```
+fix_code:
+  - language: yaml
+    label: 'Correct: fromJSON() converts string to native boolean'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              include:
+                - os: ubuntu-latest
+                  enabled: true
+                  deploy: false
+                - os: windows-latest
+                  enabled: false
+                  deploy: false
+          runs-on: ${{ matrix.os }}
+          # ✅ Correct: fromJSON() parses "false" → boolean false (falsy)
+          if: ${{ fromJSON(matrix.enabled) }}
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Deploy (conditional step)
+              # ✅ Correct: fromJSON() for step-level boolean matrix property
+              if: ${{ fromJSON(matrix.deploy) }}
+              run: echo "Deploying on ${{ matrix.os }}"
+
+  - language: yaml
+    label: 'Wrong: string "false" is truthy — job always runs'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              include:
+                - os: ubuntu-latest
+                  enabled: true
+                - os: windows-latest
+                  enabled: false
+          runs-on: ${{ matrix.os }}
+          # ❌ Wrong: matrix.enabled is the string "false", which is truthy
+          if: ${{ matrix.enabled }}
+          steps:
+            - run: echo "This always runs even when enabled: false"
+
+  - language: yaml
+    label: 'Wrong: string vs boolean comparison always false'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          strategy:
+            matrix:
+              include:
+                - name: job-a
+                  skip: false
+                - name: job-b
+                  skip: true
+          # ❌ Wrong: "false" == false is always false in Actions expressions
+          if: ${{ matrix.skip == false }}
+          steps:
+            - run: echo "This never runs for any include entry"
+prevention:
+  - 'Always wrap boolean matrix property references in fromJSON() — e.g., if: ${{ fromJSON(matrix.enabled) }}'
+  - 'Add a test matrix entry with the boolean set to false and verify the job is actually skipped before relying on the condition in production'
+  - 'Consider using string sentinel values (e.g., skip: "yes"/"no") and comparing with == to avoid the boolean coercion ambiguity entirely'
+  - 'Document in the workflow that all matrix properties are runtime strings — reviewers often assume boolean values remain boolean'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-a-matrix-for-your-jobs'
+    label: 'Using a matrix for your jobs — GitHub Actions docs'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#fromjson'
+    label: 'fromJSON() expression function — GitHub Actions docs'
+  - url: 'https://stackoverflow.com/questions/77059002/how-to-use-matrix-variables-to-conditionally-run-jobs-in-a-github-actions-workfl'
+    label: 'Stack Overflow Q77059002 — matrix boolean coercion and fromJSON() fix'
