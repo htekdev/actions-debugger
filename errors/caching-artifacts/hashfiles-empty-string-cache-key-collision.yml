@@ -1,0 +1,63 @@
+id: caching-artifacts-052
+title: 'hashFiles() returns empty string when no files match — collapses cache key'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - hashfiles
+  - cache
+  - cache-key
+  - silent-failure
+  - glob
+  - cache-collision
+patterns:
+  - regex: 'hashFiles\s*\(\s*[''"][^''"]+[''"]\s*\)'
+    flags: 'g'
+error_messages:
+  - ''
+root_cause: |
+  The hashFiles() expression function returns an empty string when no files in
+  GITHUB_WORKSPACE match the provided glob pattern. When used in a cache key
+  expression such as ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }},
+  the key evaluates to Linux-npm- if no package-lock.json exists anywhere in the
+  workspace. This constant key is shared across every workflow run, every branch,
+  and every PR that also finds no lockfile. The first run that stores a cache
+  under this key poisons the cache for all subsequent runs: they restore stale,
+  incorrect, or entirely wrong dependencies with a cache-hit result. No warning
+  or error is emitted — the cache step reports a hit and the workflow continues.
+  This is especially common in monorepos where the lockfile path is inconsistent,
+  or in workflows that run before a checkout step has populated the workspace.
+fix: |
+  Add a fallback expression using the || operator so an empty hashFiles()
+  result is replaced with a unique value (e.g., github.sha). Alternatively,
+  explicitly assert the lockfile exists before the cache step, or use a known
+  stable path instead of a glob.
+fix_code:
+  - language: yaml
+    label: 'Use || github.sha fallback to prevent key collapse'
+    code: |
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          # Falls back to sha when no lockfile exists — prevents constant-key collision
+          key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') || github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+  - language: yaml
+    label: 'Assert lockfile existence before caching'
+    code: |
+      - name: Verify lockfile exists
+        run: test -f package-lock.json || (echo "Missing package-lock.json" && exit 1)
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('package-lock.json') }}
+prevention:
+  - 'Always include a || github.sha or || github.run_id fallback in cache keys that use hashFiles()'
+  - 'Use exact paths instead of ** globs when the lockfile location is known'
+  - 'Run checkout before any cache step so hashFiles() can find workspace files'
+  - 'Test cache key expressions in a dry-run workflow step by echoing the evaluated key'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#hashfiles'
+    label: 'GitHub Docs: hashFiles function — returns empty string when no match'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/caching-dependencies-to-speed-up-workflows'
+    label: 'GitHub Docs: Caching dependencies to speed up workflows'
