@@ -1,0 +1,94 @@
+id: runner-environment-198
+title: 'setup-python fails on macOS self-hosted runner with "ln: python3XX: Permission denied" — symlink created without sudo after sudo install'
+category: runner-environment
+severity: error
+tags:
+  - setup-python
+  - self-hosted
+  - macos
+  - symlink
+  - permissions
+  - sudo
+patterns:
+  - regex: 'ln:.*python3\d+.*Permission denied'
+    flags: 'i'
+  - regex: 'Error:.*ln:.*python.*Permission denied'
+    flags: 'i'
+error_messages:
+  - 'Error: ln: python314: Permission denied'
+  - 'Error: ln: python312: Permission denied'
+  - 'Error: ln: python313: Permission denied'
+root_cause: |
+  The setup-python macOS installer script (setup.sh) uses sudo to install the Python
+  framework into /Library/Frameworks/ — a root-owned directory. However, the
+  subsequent step that creates symlinks inside that directory (e.g., linking
+  python3.14 → python3) runs WITHOUT sudo, causing a permission error when the
+  runner''s CI user is a standard (non-root) account even if sudo is available for
+  the install step.
+
+  The error appears as:
+    Error: ln: python314: Permission denied
+
+  This affects macOS self-hosted runners (EC2, bare-metal, VM) where the runner
+  service is configured as a non-admin user. GitHub-hosted macOS runners are
+  unaffected because they grant passwordless sudo to the runner user.
+
+  A fix was proposed in actions/python-versions PR #384 to use sudo for the symlink
+  creation step as well, but is not yet merged/released as of mid-2026.
+fix: |
+  Short-term workaround: Grant the runner service user passwordless sudo on the
+  macOS runner machine, or run the runner as a user with write access to
+  /Library/Frameworks/ and /usr/local/bin.
+
+  Safer workaround: Pre-install Python on the macOS runner machine using the
+  official Python.org pkg installer (which creates symlinks correctly as root), then
+  rely on setup-python''s PATH-detection to use the pre-installed version without
+  invoking the installer.
+
+  Enterprise workaround: Use a custom RUNNER_TOOL_CACHE path that is owned by the
+  runner user and set python-version to a version already cached there, bypassing
+  the framework installer entirely.
+fix_code:
+  - language: yaml
+    label: 'Workaround: use pre-installed Python to avoid the installer'
+    code: |
+      jobs:
+        build:
+          runs-on: [self-hosted, macos]
+          steps:
+            # If Python 3.14 is pre-installed system-wide (via pkg installer as root),
+            # setup-python finds it in PATH without invoking setup.sh
+            - uses: actions/setup-python@v5
+              with:
+                python-version: '3.14'
+            - run: python3 --version
+  - language: yaml
+    label: 'Workaround: grant passwordless sudo to runner user via /etc/sudoers (NOT recommended for production)'
+    code: |
+      # Add to /etc/sudoers on the macOS runner machine (use visudo):
+      # runner-user ALL=(ALL) NOPASSWD: ALL
+      #
+      # This allows setup-python's installer to use sudo for both the framework
+      # install and symlink creation steps.
+      #
+      # In your workflow, no changes are needed — setup-python works normally once
+      # the runner user has the required sudo permissions.
+      jobs:
+        build:
+          runs-on: [self-hosted, macos]
+          steps:
+            - uses: actions/setup-python@v5
+              with:
+                python-version: '3.14'
+prevention:
+  - 'Use pre-installed Python on macOS self-hosted runners to avoid the setup.sh installer and its sudo/symlink requirements'
+  - 'When provisioning macOS self-hosted runners, ensure the runner user has passwordless sudo or pre-install all required Python versions'
+  - 'Track actions/python-versions#384 for an upstream fix that adds sudo to the symlink creation step'
+  - 'Test setup-python on macOS self-hosted runners in a staging environment before deploying to production'
+docs:
+  - url: 'https://github.com/actions/setup-python/issues/1301'
+    label: 'actions/setup-python#1301: Permission denied when creating symlinks on macOS self-hosted runners (2026)'
+  - url: 'https://github.com/actions/python-versions/pull/384'
+    label: 'actions/python-versions PR #384: fix symlink creation to use sudo (pending)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners#self-hosted-runner-security'
+    label: 'GitHub Docs: Self-hosted runner security'
