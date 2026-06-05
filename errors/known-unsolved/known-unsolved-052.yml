@@ -1,0 +1,119 @@
+id: known-unsolved-052
+title: 'GitHub-hosted runner IP addresses change on every workflow run — static IP allowlisting unreliable'
+category: known-unsolved
+severity: limitation
+tags:
+  - runner
+  - ip-address
+  - firewall
+  - allowlist
+  - network
+  - hosted-runner
+patterns:
+  - regex: 'Connection refused|Connection timed out|Unable to connect'
+    flags: 'i'
+  - regex: 'connect ECONNREFUSED|ECONNRESET|ETIMEDOUT'
+    flags: 'i'
+  - regex: 'blocked by firewall|access denied.*firewall|ip.*not.*allowed'
+    flags: 'i'
+error_messages:
+  - 'Error: connect ECONNREFUSED 10.0.0.5:5432'
+  - 'curl: (7) Failed to connect to internal-api.company.com port 443: Connection refused'
+  - 'Error: connect ETIMEDOUT'
+root_cause: |
+  GitHub-hosted runners are allocated from a large, rotating pool of virtual machines.
+  The IP address assigned to each run is drawn from GitHub's published CIDR ranges
+  (available via https://api.github.com/meta under "actions") but changes on every
+  workflow run — there is no way to obtain a stable, predictable IP for a GitHub-hosted
+  runner in advance.
+
+  GitHub publishes these IP ranges for documentation purposes, but:
+  1. The ranges are broad (/20 or larger) and overlap with other GitHub services
+  2. The specific IP within the range cannot be predicted before the run starts
+  3. The ranges update periodically, requiring allowlist maintenance
+  4. On each run, the runner's IP can be any address in the published ranges
+
+  This makes static IP allowlisting in external firewalls, database security groups
+  (AWS RDS, Azure SQL, Cloudflare), or on-premise systems unreliable. Allowlisting the
+  entire published range exposes hundreds of thousands of IP addresses and violates
+  least-privilege security principles.
+
+  This is a fundamental architecture constraint of GitHub-hosted runners and has no
+  perfect solution — only workarounds.
+fix: |
+  There is no way to guarantee a stable IP for GitHub-hosted runners. Use one of these
+  patterns instead of IP allowlisting:
+
+  1. OIDC (preferred): Use OIDC tokens to authenticate to cloud providers (AWS, Azure,
+     GCP) rather than network-level access controls. No IP allowlisting needed.
+
+  2. Self-hosted runners: Deploy runners on your network with known, stable IPs.
+
+  3. Dynamic allowlisting: At workflow start, call your cloud provider API to add the
+     runner's current IP to the security group; remove it at workflow end. Brittle but
+     workable for database access.
+
+  4. VPN/tunnel action: Use actions like cloudflare/cloudflare-warp-action or a
+     WireGuard setup action to tunnel runner traffic through a fixed gateway IP.
+
+  5. Private hosted runners (GitHub Enterprise): If on GHEC, configure static IP ranges
+     via network configurations for GitHub-hosted runners.
+fix_code:
+  - language: yaml
+    label: 'Use OIDC authentication instead of IP allowlisting (AWS example)'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          permissions:
+            id-token: write
+            contents: read
+          steps:
+            - uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-to-assume: arn:aws:iam::123456789012:role/GitHubActionsRole
+                aws-region: us-east-1
+                # No IP allowlisting needed — OIDC validates the token, not the IP
+            - run: aws rds describe-db-instances
+  - language: yaml
+    label: 'Dynamic security group allowlisting (temporary, for legacy systems)'
+    code: |
+      jobs:
+        test-with-db:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Get runner IP
+              id: ip
+              run: echo "ip=$(curl -s https://api.ipify.org)" >> $GITHUB_OUTPUT
+
+            - name: Add runner IP to DB security group
+              run: |
+                aws ec2 authorize-security-group-ingress \
+                  --group-id sg-0abc123 \
+                  --protocol tcp \
+                  --port 5432 \
+                  --cidr "${{ steps.ip.outputs.ip }}/32"
+
+            - name: Run tests
+              run: npm test
+
+            - name: Remove runner IP from security group
+              if: always()
+              run: |
+                aws ec2 revoke-security-group-ingress \
+                  --group-id sg-0abc123 \
+                  --protocol tcp \
+                  --port 5432 \
+                  --cidr "${{ steps.ip.outputs.ip }}/32"
+prevention:
+  - 'Design CI pipelines to use token-based authentication (OIDC, API keys, mTLS) rather than IP allowlisting from the start'
+  - 'For AWS: use IAM roles with OIDC (aws-actions/configure-aws-credentials); for Azure: use azure/login with OIDC; for GCP: use google-github-actions/auth with Workload Identity Federation'
+  - 'If IP allowlisting is unavoidable, use GitHub Enterprise Cloud with a configured network allowing stable egress IPs'
+  - 'Subscribe to GitHub changelog for updates to runner IP range publications — the ranges do expand over time'
+docs:
+  - url: 'https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners/about-github-hosted-runners#ip-addresses'
+    label: 'GitHub-hosted runner IP addresses'
+  - url: 'https://api.github.com/meta'
+    label: 'GitHub meta API — published actions IP ranges'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/configuring-openid-connect-in-cloud-providers'
+    label: 'Configuring OIDC in cloud providers'
