@@ -1,0 +1,121 @@
+id: known-unsolved-057
+title: 'Jobs run on separate fresh runners — /tmp and filesystem are not shared between jobs'
+category: known-unsolved
+severity: limitation
+tags:
+  - jobs
+  - runner
+  - filesystem
+  - tmp
+  - isolation
+  - artifacts
+  - cross-job
+  - runner-environment
+patterns:
+  - regex: 'No such file or directory.*/tmp/'
+    flags: 'i'
+  - regex: 'ENOENT.*no such file.*tmp|cannot.*open.*/tmp/.*no such'
+    flags: 'i'
+  - regex: 'file.*not found.*/tmp|/tmp/.*does not exist'
+    flags: 'i'
+error_messages:
+  - "/tmp/output.json: No such file or directory"
+  - "Error: ENOENT: no such file or directory, open '/tmp/result.txt'"
+  - "/tmp/build-manifest.json: No such file or directory"
+root_cause: |
+  Each job in a GitHub Actions workflow runs on a completely separate, freshly
+  provisioned runner instance. There is NO shared filesystem between jobs. Files
+  written to `/tmp`, `$RUNNER_TEMP`, `$GITHUB_WORKSPACE`, or any other path during
+  one job are invisible to all subsequent jobs.
+
+  This is a fundamental architectural property: GitHub provisions a new virtual machine
+  for each job. The previous job's VM is terminated before the next job starts. No
+  filesystem state survives the job boundary.
+
+  Common patterns that fail for this reason:
+  1. Build job writes `/tmp/report.json` → deploy job tries to read `/tmp/report.json`
+  2. Test job saves coverage to `$RUNNER_TEMP/coverage.xml` → reporter job looks for it
+  3. Compile job produces `./dist/app` → signing job tries to use `./dist/app` without
+     re-downloading it via artifacts
+  4. First job exports env vars via `$GITHUB_ENV` → second job expects those env vars
+     (env vars set via GITHUB_ENV are also job-scoped and do not persist)
+  5. Steps within the SAME job DO share `/tmp` and the workspace — the limitation is
+     specifically at the JOB boundary
+
+  Self-hosted runner pools with persistent workspaces can accidentally appear to share
+  state between jobs on the same machine, but this is unreliable (another job may have
+  cleaned the directory) and creates security risks (secret leakage between runs).
+fix: |
+  There is no mechanism to share filesystem state between jobs without explicitly
+  transferring the data. Two patterns solve this:
+
+  1. Use `actions/upload-artifact` at the end of the producing job and
+     `actions/download-artifact` at the start of the consuming job.
+     Best for: files, binaries, test results, build outputs.
+
+  2. Use job `outputs:` to pass small string values. The producing job emits
+     `echo "key=value" >> $GITHUB_OUTPUT` and declares it under `outputs:`.
+     The consuming job reads it as `needs.<job>.outputs.<key>`.
+     Best for: version strings, commit SHAs, boolean flags, counts.
+fix_code:
+  - language: yaml
+    label: 'Pass files between jobs using upload-artifact / download-artifact'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Build binary
+              run: make build   # produces ./dist/app
+
+            - name: Upload for next job
+              uses: actions/upload-artifact@v4
+              with:
+                name: app-binary
+                path: ./dist/app   # upload so sign job can download it
+
+        sign:
+          needs: build
+          runs-on: ubuntu-latest
+          steps:
+            - name: Download binary
+              uses: actions/download-artifact@v4
+              with:
+                name: app-binary
+                path: ./dist
+
+            - name: Sign binary
+              run: cosign sign ./dist/app
+  - language: yaml
+    label: 'Pass small string data between jobs using job outputs'
+    code: |
+      jobs:
+        compute-version:
+          runs-on: ubuntu-latest
+          outputs:
+            version: ${{ steps.ver.outputs.version }}
+          steps:
+            - id: ver
+              run: echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+
+        deploy:
+          needs: compute-version
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying v${{ needs.compute-version.outputs.version }}"
+prevention:
+  - 'Never rely on /tmp, $RUNNER_TEMP, or workspace paths to share data between jobs — use artifacts or job outputs'
+  - 'Remember: only steps within the same job share a filesystem; different jobs always get separate runners'
+  - 'Use actions/upload-artifact@v4 for files; use job outputs for strings; use caches only for dependency restoration'
+  - 'Environment variables set with GITHUB_ENV are also job-scoped and do not persist across job boundaries'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-and-sharing-data-from-a-workflow'
+    label: 'GitHub Docs — Storing and sharing data between jobs using artifacts'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/passing-information-between-jobs'
+    label: 'GitHub Docs — Passing information between jobs using outputs'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-where-your-workflow-runs/about-github-hosted-runners'
+    label: 'GitHub Docs — About GitHub-hosted runners (each job gets a fresh VM)'
+  - url: 'https://github.com/orgs/community/discussions/26671'
+    label: 'GitHub Community — Sharing files and filesystem data between workflow jobs'
