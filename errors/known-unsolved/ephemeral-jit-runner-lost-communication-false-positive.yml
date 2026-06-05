@@ -1,0 +1,93 @@
+id: known-unsolved-058
+title: 'Ephemeral JIT Runner Reports "Lost Communication" Despite Successful Job Completion'
+category: known-unsolved
+severity: error
+tags:
+  - self-hosted
+  - ephemeral
+  - jit-runner
+  - lost-communication
+  - false-positive
+  - broker
+patterns:
+  - regex: 'The self-hosted runner lost communication with the server'
+    flags: 'i'
+  - regex: 'messageQueueLoopTokenSource|Stop message queue looping'
+    flags: 'i'
+error_messages:
+  - 'The self-hosted runner lost communication with the server'
+  - 'GET request to broker.actions.githubusercontent.com/message ... has been cancelled'
+  - 'TaskCanceledException: The operation was canceled'
+root_cause: |
+  In Runner.cs line 576, after a one-time-use (ephemeral/JIT) job completes, the message queue
+  is cancelled immediately with zero grace period:
+
+    messageQueueLoopTokenSource.Cancel();
+
+  This tears down the in-flight broker long-poll (GET broker.actions.githubusercontent.com/message)
+  immediately after CompleteJobAsync returns. GitHub's broker health monitor detects the TCP
+  disconnect and flags the runner as "lost communication" — racing against the pipeline service
+  that just received the successful completion.
+
+  Two independent GitHub backend systems race:
+  1. Pipeline service — received CompleteJobAsync, knows the job succeeded
+  2. Broker health monitor — sees TCP disconnect, flags runner as "lost communication"
+
+  When the broker monitor wins (which happens on ~5-10% of short jobs), the UI shows
+  "The self-hosted runner lost communication with the server" even though the worker exited
+  with code 100 (success) and the runner itself exited with return code 0.
+
+  The runner logs show all events at identical timestamps — zero delay between
+  "Received job status event. JobState: Online" and "messageQueueLoopTokenSource.Cancel()".
+
+  No user-side configuration can fix this. A code change to Runner.cs is required
+  (add ~5s grace delay before cancel). Source: actions/runner#4309 (March 2026, open bug,
+  affects runner v2.331.0+, ~5-10% failure rate on short ephemeral jobs).
+fix: |
+  There is no user-side configuration fix. The root cause is a zero-grace-period teardown
+  in Runner.cs that must be patched by GitHub.
+
+  Mitigations:
+  1. Verify the diagnostic logs — the job actually succeeded. Check _diag/Runner_*.log
+     for "return code 0" and "result: Succeeded" to confirm before concluding failure.
+  2. Retry the failed job — the "lost communication" is a false positive; re-running
+     produces a clean success.
+  3. Do not use ephemeral JIT runners as required status checks until actions/runner#4309
+     is resolved, or implement a workflow-level retry wrapper.
+  4. Alert on job result=="failure" not on "lost communication" text alone — false positives
+     from this race should not page on-call engineers.
+  5. Batch small jobs — the race is more likely on jobs shorter than 60 seconds. Combining
+     work into longer-running jobs reduces false positive frequency.
+fix_code:
+  - language: yaml
+    label: 'Confirm false positive by reading runner diagnostic log before retrying'
+    code: |
+      # After "lost communication" on an ephemeral JIT runner, check:
+      # _diag/Runner_YYYYMMDD-hhmmss-utc.log
+      #
+      # Successful completion signs (all at identical timestamps):
+      #   [INFO] finish job request for job {id} with result: Succeeded
+      #   [INFO] Job X completed with result: Succeeded
+      #   [INFO] Received job status event. JobState: Online
+      #   [INFO] Runner execution has finished with return code 0
+      #
+      # If these appear immediately before TaskCanceledException, the job DID succeed.
+      # Simply re-run the workflow — the retry will show a clean green result.
+      jobs:
+        build:
+          runs-on: [self-hosted, ephemeral, linux]
+          # Note: retry-on-failure logic can wrap this job in the caller:
+          steps:
+            - uses: actions/checkout@v4
+            - run: make build
+prevention:
+  - 'Treat "lost communication" on ephemeral JIT runners as a potential false positive — check _diag/Runner_*.log for "return code 0" before escalating.'
+  - 'Do not gate required status checks on ephemeral JIT runners until actions/runner#4309 is resolved upstream.'
+  - 'Alert on job result=="failure", not on the "lost communication" message text alone.'
+  - 'Batch work into longer jobs (>60s total) to reduce the broker teardown race frequency.'
+  - 'Watch actions/runner#4309 for an upstream fix (proposed: 5-second grace period before messageQueueLoopTokenSource.Cancel()).'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4309'
+    label: 'actions/runner#4309: Ephemeral/JIT runner reports "lost communication" despite successful completion (March 2026)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/autoscaling-with-self-hosted-runners#using-just-in-time-runners'
+    label: 'GitHub Docs: Just-in-time (JIT) runners'

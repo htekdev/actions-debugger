@@ -1,0 +1,102 @@
+id: runner-environment-179
+title: 'Runner Registration Token Endpoint Returns 502 Under Concurrent Spawn Bursts'
+category: runner-environment
+severity: error
+tags:
+  - self-hosted
+  - ephemeral
+  - registration
+  - autoscaler
+  - burst
+  - 502
+patterns:
+  - regex: 'HTTP Error 502: Bad Gateway'
+    flags: 'i'
+  - regex: 'registration-token.*502|502.*Bad Gateway.*registration'
+    flags: 'i'
+  - regex: 'HTTPError.*502|urlopen error.*502'
+    flags: 'i'
+error_messages:
+  - 'HTTP Error 502: Bad Gateway'
+  - 'urllib.error.HTTPError: HTTP Error 502: Bad Gateway'
+  - 'POST https://api.github.com/repos/{owner}/{repo}/actions/runners/registration-token — 502'
+root_cause: |
+  GitHub REST endpoint:
+    POST https://api.github.com/repos/{owner}/{repo}/actions/runners/registration-token
+
+  returns HTTP 502 Bad Gateway under burst load when many ephemeral runners attempt to
+  register concurrently (e.g., triggered by webhook-driven autoscalers on workflow_job.queued
+  events). The burst saturates the GitHub backend's registration token issuer.
+
+  The reference runner setup scripts (run.sh / config.sh flow) do NOT retry 5xx responses —
+  a single transient 502 causes the container to exit immediately before registration completes.
+  For ephemeral autoscaler setups (Modal, Lambda, Kubernetes pod-per-job), the container slot
+  is burned and no runner is available for the queued job.
+
+  Phantom containers accumulate: the autoscaler billed for the container, GitHub never received
+  a registration, and the autoscaler's max_containers cap can be held by dead slots — stalling
+  the merge queue for hours.
+
+  Source: actions/runner#4399 (May 2026, open issue, observed during 20+ concurrent registrations
+  — ~21 phantom containers during a webhook-driven burst at ~16:00-17:00 UTC on 2026-05-04).
+fix: |
+  1. Add exponential backoff to your registration token call (4 attempts, 2^n second delays).
+  2. Stagger autoscaler spawns with per-container random jitter (0-10 seconds) to break up
+     concurrent registration bursts before they hit the endpoint simultaneously.
+  3. Switch to JIT runner tokens — they are pre-assigned per job and do not require a burst-
+     sensitive registration token call:
+       POST /repos/{owner}/{repo}/actions/runners/generate-jitconfig
+  4. Reduce max_concurrent_spawns in your autoscaler to limit peak registration load.
+  5. Implement phantom container detection: health-check containers shortly after spawn and
+     kill any that failed to register within N seconds.
+fix_code:
+  - language: yaml
+    label: 'Python — retry-with-backoff on 502 when minting registration token'
+    code: |
+      import time, json, urllib.request, urllib.error
+
+      def mint_registration_token(owner, repo, github_token):
+          url = f"https://api.github.com/repos/{owner}/{repo}/actions/runners/registration-token"
+          headers = {
+              "Authorization": f"token {github_token}",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
+          for attempt in range(4):
+              try:
+                  req = urllib.request.Request(url, method="POST", headers=headers)
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      return json.load(resp)["token"]
+              except urllib.error.HTTPError as e:
+                  if 500 <= e.code < 600 and attempt < 3:
+                      delay = 2 ** attempt  # 1s, 2s, 4s
+                      print(f"Registration token {e.code}, retrying in {delay}s (attempt {attempt+1}/4)...")
+                      time.sleep(delay)
+                      continue
+                  raise
+  - language: yaml
+    label: 'Autoscaler — add random jitter per container spawn to break up burst'
+    code: |
+      import asyncio, random
+
+      async def handle_workflow_job_queued(event):
+          # Stagger spawns: random delay 0-10s reduces simultaneous token requests
+          jitter = random.uniform(0, 10)
+          await asyncio.sleep(jitter)
+          token = await mint_registration_token(owner, repo, github_token)
+          await spawn_ephemeral_container(token)
+prevention:
+  - 'Add exponential backoff (4 attempts, 2^n seconds) for 5xx responses in all registration token calls.'
+  - 'Add random per-container spawn jitter (0-10s) in your autoscaler to break up concurrent registration bursts.'
+  - 'Switch to JIT runner tokens (generate-jitconfig) for burst autoscaler workloads — they do not hit the burst-sensitive registration endpoint.'
+  - 'Monitor for phantom containers: any container that does not show as registered within 60 seconds of spawn should be terminated.'
+  - 'Cap max_concurrent_spawns conservatively (≤10) and tune based on observed 502 rates.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4399'
+    label: 'actions/runner#4399: Registration token endpoint returns 502 in bursts (May 2026)'
+  - url: 'https://docs.github.com/en/rest/actions/self-hosted-runners#create-a-registration-token-for-a-repository'
+    label: 'GitHub REST API: Create a registration token for a repository'
+  - url: 'https://docs.github.com/en/rest/actions/self-hosted-runners#create-configuration-for-a-just-in-time-runner-for-a-repository'
+    label: 'GitHub REST API: Create JIT runner config (avoids burst-sensitive registration token)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/autoscaling-with-self-hosted-runners'
+    label: 'GitHub Docs: Autoscaling with self-hosted runners'

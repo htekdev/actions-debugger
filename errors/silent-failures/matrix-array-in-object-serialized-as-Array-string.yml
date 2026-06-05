@@ -1,0 +1,127 @@
+id: silent-failures-098
+title: 'Matrix Array Output Nested in Object Property Serializes as "Array" String'
+category: silent-failures
+severity: silent-failure
+tags:
+  - matrix
+  - fromJSON
+  - job-outputs
+  - dynamic-matrix
+  - strategy
+  - serialization
+patterns:
+  - regex: '\bArray\b'
+    flags: ''
+  - regex: 'fromJSON\s*\(.*outputs\.[a-zA-Z_]+'
+    flags: 'i'
+error_messages:
+  - 'rhel Array'
+  - 'debian Array'
+  - 'distro = Array'
+  - 'component.distro: Array'
+root_cause: |
+  When a job output containing a JSON array string (e.g. '["el8","el9"]') is passed via
+  fromJSON() as a VALUE inside a matrix OBJECT property, the GitHub Actions expression engine
+  coerces the array to a string using JavaScript Array.prototype.toString(), which produces
+  the literal word "Array" instead of the array elements.
+
+  This happens because the matrix strategy parser evaluates object property values as strings
+  at expansion time. When fromJSON() returns a JavaScript array, the matrix serialization path
+  calls .toString() instead of expanding into multiple jobs.
+
+  The bug only triggers when the array is nested INSIDE an object:
+
+    # BROKEN — array inside object property
+    strategy:
+      matrix:
+        component:
+          - name: rhel
+            distro: ${{ fromJSON(needs.define-matrix.outputs.rpms) }}
+            # ^ distro becomes the string "Array", not ["el8","el9"]
+
+  The same fromJSON() call works correctly at the TOP LEVEL of the matrix:
+
+    # WORKS — array at top level dimension
+    strategy:
+      matrix:
+        distro: ${{ fromJSON(needs.define-matrix.outputs.rpms) }}
+
+  The job does NOT fail — it silently runs with matrix.component.distro set to "Array",
+  producing wrong build targets with no error or warning.
+
+  Source: actions/runner#3794 (April 2025, labeled bug, open as of April 2026 after stale
+  cycle — author confirmed still broken).
+fix: |
+  Restructure the matrix to avoid placing fromJSON() array outputs inside object properties.
+
+  Option 1 — Pre-compute the full cross-product as a JSON array of objects in the matrix-
+  generating job and pass it as a single fromJSON() at the include level.
+
+  Option 2 — Use separate top-level matrix dimensions instead of grouping into objects.
+
+  If object grouping is required for semantic reasons, flatten the arrays at generation time
+  using jq and emit a fully-expanded JSON array of objects from the setup step.
+fix_code:
+  - language: yaml
+    label: 'Workaround — pre-compute full matrix as JSON array, expand via include'
+    code: |
+      jobs:
+        define-matrix:
+          runs-on: ubuntu-latest
+          outputs:
+            matrix: ${{ steps.build.outputs.matrix }}
+          steps:
+            - id: build
+              run: |
+                # Build the full cross-product as a JSON array of objects
+                matrix=$(jq -nc '[
+                  {"arch":"x86_64","runner":"ubuntu-24.04","component":"rhel","distro":"el8"},
+                  {"arch":"x86_64","runner":"ubuntu-24.04","component":"rhel","distro":"el9"},
+                  {"arch":"x86_64","runner":"ubuntu-24.04","component":"debian","distro":"focal"},
+                  {"arch":"aarch64","runner":"ubuntu-24.04-arm","component":"rhel","distro":"el8"},
+                  {"arch":"aarch64","runner":"ubuntu-24.04-arm","component":"rhel","distro":"el9"},
+                  {"arch":"aarch64","runner":"ubuntu-24.04-arm","component":"debian","distro":"focal"}
+                ]')
+                echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+        build:
+          needs: define-matrix
+          runs-on: ${{ matrix.runner }}
+          strategy:
+            matrix:
+              include: ${{ fromJSON(needs.define-matrix.outputs.matrix) }}
+          steps:
+            - run: echo "${{ matrix.component }} ${{ matrix.distro }} on ${{ matrix.arch }}"
+  - language: yaml
+    label: 'Debug step — detect "Array" serialization early'
+    code: |
+      jobs:
+        build:
+          needs: define-matrix
+          runs-on: ubuntu-latest
+          strategy:
+            matrix:
+              # Use top-level dimensions — arrays work at this level
+              distro: ${{ fromJSON(needs.define-matrix.outputs.rpms) }}
+              arch: [x86_64, aarch64]
+          steps:
+            - name: Verify matrix values are not "Array"
+              run: |
+                DISTRO="${{ matrix.distro }}"
+                if [ "$DISTRO" = "Array" ]; then
+                  echo "::error::matrix.distro serialized as 'Array' — fromJSON() inside object bug"
+                  exit 1
+                fi
+                echo "distro=$DISTRO"
+prevention:
+  - 'Never place fromJSON() array outputs as values inside matrix object properties — use top-level dimensions or pre-computed include arrays.'
+  - 'Add a guard step that fails if any matrix value equals the string "Array" to catch this bug early.'
+  - 'Generate complex multi-dimensional matrix shapes in the setup job as a single JSON array, then expand via include: ${{ fromJSON(...) }}.'
+  - 'Track actions/runner#3794 for an upstream fix to the matrix object property serialization bug.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/3794'
+    label: 'actions/runner#3794: array outputs not understood by matrix when nested inside object (April 2025, open)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/running-variations-of-jobs-in-a-workflow'
+    label: 'GitHub Docs: Using a matrix for your jobs'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#fromjson'
+    label: 'GitHub Docs: fromJSON expression function'
