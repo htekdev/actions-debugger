@@ -1,0 +1,113 @@
+id: yaml-syntax-064
+title: 'env context unavailable in defaults.run.working-directory — "Unrecognized named-value: env"'
+category: yaml-syntax
+severity: error
+tags:
+  - env
+  - context
+  - defaults
+  - working-directory
+  - expression
+  - context-availability
+patterns:
+  - regex: 'Unrecognized named-value: ''env''.*defaults|defaults.*working.directory.*env'
+    flags: 'i'
+  - regex: 'The workflow is not valid.*defaults\.run\.working-directory.*env\.'
+    flags: 'i'
+  - regex: 'Unrecognized named-value: ''env''.*position.*working.directory'
+    flags: 'i'
+error_messages:
+  - "The workflow is not valid. .github/workflows/<workflow>.yml (Line: X, Col: Y): Unrecognized named-value: 'env'. Located at position 1 within expression: env.WORKING_DIR"
+  - "Unrecognized named-value: 'env'"
+root_cause: |
+  The `env` context is only available during step execution — not at job evaluation time.
+  `defaults.run.working-directory` is a job-level field evaluated before any steps run,
+  so GitHub Actions rejects references to `env.*` inside it with "Unrecognized named-value: 'env'".
+
+  This is the same fundamental limitation that affects other job-level fields (if:,
+  runs-on, timeout-minutes, continue-on-error) but is less documented for defaults.run.
+
+  Common patterns that fail:
+  - Setting a shared working directory from a workflow-level env variable:
+      env:
+        APP_DIR: './packages/app'
+      jobs:
+        build:
+          defaults:
+            run:
+              working-directory: ${{ env.APP_DIR }}  # FAILS — env not available here
+
+  - Reading an env var set in another job:
+      jobs:
+        setup:
+          ...
+        build:
+          defaults:
+            run:
+              working-directory: ${{ env.BUILD_DIR }}  # FAILS — env from another job not visible
+
+  The limitation applies to all expressions in defaults.run.working-directory and
+  defaults.run.shell at both the workflow level and the job level.
+fix: |
+  Replace env context references in defaults.run.working-directory with contexts that are
+  available at job evaluation time:
+
+  1. Use vars.* (repository or environment variables configured in Settings) for static paths
+  2. Use inputs.* if inside a reusable workflow called with workflow_call
+  3. Set working-directory on each individual step instead of at defaults level
+  4. Use an outputs chain from a prior job if the path is computed dynamically
+fix_code:
+  - language: yaml
+    label: 'WRONG — env context in defaults.run.working-directory (fails)'
+    code: |
+      env:
+        APP_DIR: './packages/app'
+
+      jobs:
+        build:
+          defaults:
+            run:
+              working-directory: ${{ env.APP_DIR }}  # Error: Unrecognized named-value 'env'
+  - language: yaml
+    label: 'FIX option 1 — use vars context (repository variable)'
+    code: |
+      # Configure APP_DIR in Settings > Secrets and variables > Variables
+      jobs:
+        build:
+          defaults:
+            run:
+              working-directory: ${{ vars.APP_DIR }}  # repository variable — available at job level
+  - language: yaml
+    label: 'FIX option 2 — set working-directory on each step directly'
+    code: |
+      jobs:
+        build:
+          env:
+            APP_DIR: './packages/app'
+          steps:
+            - name: Build
+              run: npm run build
+              working-directory: ${{ env.APP_DIR }}  # env IS available at step level
+            - name: Test
+              run: npm test
+              working-directory: ${{ env.APP_DIR }}
+  - language: yaml
+    label: 'FIX option 3 — hardcode the path in defaults.run'
+    code: |
+      jobs:
+        build:
+          defaults:
+            run:
+              working-directory: ./packages/app  # literal path, no context expression needed
+prevention:
+  - 'Only use vars.*, github.*, inputs.*, or needs.*.outputs.* in job-level expressions — env.* is never available at job level'
+  - 'For shared working directories, prefer literal paths in defaults.run.working-directory over expressions'
+  - 'If the path must be dynamic, use step-level working-directory instead of defaults.run'
+  - 'Use actionlint to validate workflows locally — it catches env context misuse in job-level fields'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/setting-default-values-for-jobs'
+    label: 'GitHub Actions — Setting default values for jobs (defaults.run)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#context-availability'
+    label: 'GitHub Actions context availability by workflow key'
+  - url: 'https://github.com/rhysd/actionlint'
+    label: 'actionlint — static checker that validates context availability'
