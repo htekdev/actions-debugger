@@ -1,0 +1,104 @@
+id: silent-failures-099
+title: 'setup-node registry-url auto-sets NODE_AUTH_TOKEN which blocks npm OIDC provenance publish'
+category: silent-failures
+severity: silent-failure
+tags:
+  - setup-node
+  - npm
+  - oidc
+  - provenance
+  - NODE_AUTH_TOKEN
+  - registry-url
+  - publish
+patterns:
+  - regex: 'npm publish.*--provenance'
+    flags: 'i'
+  - regex: 'npm (ERR!|error) code E401'
+    flags: 'i'
+  - regex: 'NODE_AUTH_TOKEN.*publish|npm.*oidc.*token'
+    flags: 'i'
+error_messages:
+  - "npm error code E401"
+  - "npm error 401 Unauthorized - PUT https://registry.npmjs.org/"
+  - "npm publish --provenance"
+root_cause: |
+  When actions/setup-node is used with `registry-url`, it automatically generates a
+  `.npmrc` file containing `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}`. This
+  binds npm authentication to the NODE_AUTH_TOKEN environment variable at publish time.
+
+  For npm OIDC publishing (`npm publish --provenance`), npm requires that no
+  `_authToken` is set (or that it is empty string), so that npm can use the GitHub
+  Actions OIDC token to authenticate and attach a sigstore provenance attestation.
+
+  However, if NODE_AUTH_TOKEN is present in the environment — even set by setup-node's
+  own post-install logic (authutil.ts sets a default value when registry-url is
+  provided) — npm uses that token for auth instead of OIDC. This silently bypasses the
+  OIDC flow in one of two ways:
+    1. NODE_AUTH_TOKEN is set to a valid npm publish token → publish succeeds but
+       WITHOUT provenance attestation (silent failure, no error thrown).
+    2. NODE_AUTH_TOKEN is set to a wrong/expired value (e.g., GitHub token) → npm
+       rejects with E401 Unauthorized, making it seem like a credential problem.
+
+  Both cases confuse developers who believe setup-node + --provenance "just works".
+  The root: setup-node's auto-set NODE_AUTH_TOKEN takes precedence over OIDC.
+
+  Source: actions/setup-node#1440 (23 reactions, closed May 2026 — setup-node v5+ adds
+  a new behavior where OIDC is respected, but pre-v5 or misconfigured workflows still
+  hit this).
+fix: |
+  Option 1 (recommended — explicit unset in publish step):
+  Unset NODE_AUTH_TOKEN in the npm publish step's `env:` block so that OIDC can take
+  over. An empty string `""` causes npm to ignore the .npmrc token reference.
+
+  Option 2: Remove `registry-url` from setup-node if you don't need .npmrc written
+  (e.g., when publishing to npmjs.org with OIDC only). setup-node only writes .npmrc
+  when registry-url is explicitly set.
+
+  Option 3: Upgrade to actions/setup-node@v5+ which fixed the default NODE_AUTH_TOKEN
+  behavior to not override OIDC when the token is unset.
+
+  Option 4: Set `auth-token: ""` in the setup-node step (setup-node v5.5.0+).
+fix_code:
+  - language: yaml
+    label: 'Unset NODE_AUTH_TOKEN in the npm publish step to allow OIDC'
+    code: |
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish with provenance
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ''   # Explicitly empty so npm uses OIDC instead of token auth
+  - language: yaml
+    label: 'Correct OIDC provenance publish permissions'
+    code: |
+      permissions:
+        contents: read
+        id-token: write   # Required for OIDC token — without this npm --provenance fails
+
+      steps:
+        - uses: actions/setup-node@v4
+          with:
+            node-version: '20'
+            registry-url: 'https://registry.npmjs.org'
+
+        - run: npm publish --provenance --access public
+          env:
+            NODE_AUTH_TOKEN: ''
+prevention:
+  - 'Always set `id-token: write` permission when using npm --provenance OIDC publishing'
+  - 'Set `NODE_AUTH_TOKEN: ""` explicitly in the env of the npm publish step when using OIDC'
+  - 'Upgrade to actions/setup-node v5+ which corrected the default NODE_AUTH_TOKEN behavior'
+  - 'Verify provenance attestation was created: check the package page on npmjs.org for the attestations badge'
+  - 'Avoid setting registry-url in setup-node if only using OIDC and no npm install caching is needed'
+docs:
+  - url: 'https://github.com/actions/setup-node/issues/1440'
+    label: 'actions/setup-node#1440: Don''t default NPM_AUTH_TOKEN to support NPM OIDC (23 reactions, closed May 2026)'
+  - url: 'https://docs.npmjs.com/generating-provenance-statements'
+    label: 'npm Docs: Generating provenance statements'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds'
+    label: 'GitHub Docs: Artifact attestations for build provenance'
+  - url: 'https://github.com/actions/setup-node/blob/main/docs/advanced-usage.md#publish-to-npmjs-and-gpr-with-npm'
+    label: 'setup-node advanced usage: publishing to npm'

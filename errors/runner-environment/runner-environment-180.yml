@@ -1,0 +1,132 @@
+id: runner-environment-180
+title: 'ubuntu-24.04 removes Mono/MSBuild/NuGet — .NET Framework net48/net40 builds fail with "command not found"'
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-24
+  - ubuntu-latest
+  - mono
+  - msbuild
+  - nuget
+  - dotnet-framework
+  - migration
+  - tool-removed
+patterns:
+  - regex: 'mono: command not found'
+    flags: 'i'
+  - regex: 'msbuild: command not found'
+    flags: 'i'
+  - regex: '/usr/bin/msbuild.*No such file or directory'
+    flags: 'i'
+  - regex: 'nuget: command not found'
+    flags: 'i'
+  - regex: 'Could not find file.*msbuild\.exe'
+    flags: 'i'
+error_messages:
+  - "mono: command not found"
+  - "msbuild: command not found"
+  - "nuget: command not found"
+  - "/usr/bin/msbuild: No such file or directory"
+  - "bash: line 1: mono: command not found"
+root_cause: |
+  When GitHub Actions migrated `ubuntu-latest` to Ubuntu 24.04 (rollout Dec 2024 –
+  Jan 2025, runner-images#10636), the Mono framework, mono-based MSBuild, and mono-based
+  NuGet were intentionally removed from the Ubuntu 24.04 runner image. These packages
+  are not available in Ubuntu 24.04 (Noble Numbat) apt repositories because Mono is not
+  maintained for Noble.
+
+  Affected workflows:
+  - .NET Framework projects targeting net40, net45, net46, net47, net48 built on Linux
+    using Mono (common for Unity CI, Windows-targeted libraries, legacy C# projects)
+  - Any workflow running `mono`, `msbuild`, or `nuget` shell commands on ubuntu-latest
+  - Third-party actions that internally call mono (e.g., Unity build actions, some .NET
+    test runners)
+
+  The failure is immediate and obvious ("command not found") but the root cause is often
+  unclear because the workflow worked fine on ubuntu-22.04. The ubuntu-latest label
+  silently changed the underlying image, not the workflow YAML.
+
+  Source: actions/runner-images#10636 (384 reactions, closed Jan 2025),
+  actions/runner-images#11675 (mono specifically, closed "not planned" — Mono will NOT
+  be added back to ubuntu-24.04).
+fix: |
+  Option 1 (recommended for most cases): Switch to windows-latest
+  .NET Framework targets are first-class on Windows runners which still include MSBuild,
+  NuGet, and full .NET Framework support. Most .csproj net48 builds run correctly on
+  windows-latest.
+
+  Option 2: Install Mono at runtime on Ubuntu 22.04 (not 24.04)
+  Pin to ubuntu-22.04 (supported until April 2027) and install Mono via apt at runtime:
+    sudo apt-get install -y mono-complete msbuild
+
+  Option 3: Migrate to .NET Core / .NET 6+ with multi-targeting
+  Add a `net8.0` target to your csproj alongside `net48` for CI builds on Linux, and
+  build the Linux target on ubuntu-latest. The Windows-only target can be built on
+  windows-latest in a separate matrix job.
+
+  Option 4: Use a Docker container with Mono
+  Run the build step in a `mono:latest` container:
+    container: mono:latest
+fix_code:
+  - language: yaml
+    label: 'Switch net48 / Mono builds to windows-latest'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-latest   # .NET Framework is fully supported on Windows runners
+          steps:
+            - uses: actions/checkout@v4
+            - name: Setup MSBuild
+              uses: microsoft/setup-msbuild@v2
+            - name: Restore NuGet packages
+              run: nuget restore MySolution.sln
+            - name: Build
+              run: msbuild MySolution.sln /p:Configuration=Release
+  - language: yaml
+    label: 'Pin to ubuntu-22.04 and install Mono at runtime'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-22.04   # ubuntu-24.04 has no Mono; 22.04 supported until April 2027
+          steps:
+            - uses: actions/checkout@v4
+            - name: Install Mono
+              run: |
+                sudo apt-get update -q
+                sudo apt-get install -y mono-complete msbuild
+            - name: Build
+              run: msbuild MySolution.sln /p:Configuration=Release
+  - language: yaml
+    label: 'Matrix build separating Linux .NET Core from Windows .NET Framework'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              include:
+                - os: ubuntu-latest
+                  target: net8.0
+                - os: windows-latest
+                  target: net48
+          runs-on: ${{ matrix.os }}
+          steps:
+            - uses: actions/checkout@v4
+            - uses: microsoft/setup-msbuild@v2
+              if: runner.os == 'Windows'
+            - name: Build
+              run: dotnet build -f ${{ matrix.target }} -c Release
+prevention:
+  - 'Pin `runs-on: ubuntu-22.04` for any workflow requiring Mono, msbuild, or nuget CLI on Linux'
+  - 'Use `windows-latest` for all .NET Framework (net40/45/46/47/48) builds — MSBuild is native there'
+  - 'Audit workflows for bare `mono`, `msbuild`, or `nuget` commands before migrating ubuntu-latest'
+  - 'Consider migrating legacy .NET Framework projects to .NET 8+ for platform-agnostic CI'
+  - 'Check runner software lists at https://github.com/actions/runner-images for tool availability per OS'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/10636'
+    label: 'actions/runner-images#10636: Ubuntu-latest migrates to Ubuntu-24.04 (384 reactions, Jan 2025)'
+  - url: 'https://github.com/actions/runner-images/issues/11675'
+    label: 'actions/runner-images#11675: Mono missing on Ubuntu 24.04 (closed not_planned — will not be added back)'
+  - url: 'https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2404-Readme.md'
+    label: 'Ubuntu 24.04 runner image software list'
+  - url: 'https://github.com/microsoft/setup-msbuild'
+    label: 'microsoft/setup-msbuild action for Windows runners'
