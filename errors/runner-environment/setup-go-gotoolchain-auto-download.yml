@@ -1,0 +1,122 @@
+id: runner-environment-159
+title: 'setup-go@v5 with Go 1.21+ toolchain directive — GOTOOLCHAIN=auto downloads newer Go toolchain mid-CI'
+category: runner-environment
+severity: warning
+tags:
+  - setup-go
+  - go
+  - gotoolchain
+  - toolchain-directive
+  - go-version
+  - network
+  - go-mod
+patterns:
+  - regex: 'go: downloading go1\.\d+\.\d+ \(linux/amd64\)'
+    flags: 'i'
+  - regex: 'go: module requires GOTOOLCHAIN at least go1\.'
+    flags: 'i'
+  - regex: 'go: toolchain.*not available'
+    flags: 'i'
+  - regex: 'toolchain go1\.\d+\.\d+ required, have go1\.'
+    flags: 'i'
+error_messages:
+  - 'go: downloading go1.22.3 (linux/amd64)'
+  - 'go: module requires GOTOOLCHAIN at least go1.22.0'
+  - 'go: toolchain download not available: dial tcp: lookup proxy.golang.org: no such host'
+  - 'toolchain go1.22.3 required, have go1.21.13'
+root_cause: |
+  Go 1.21 introduced the `toolchain` directive in `go.mod` and `go.sum`, along with the
+  `GOTOOLCHAIN` environment variable that controls toolchain version management. The default
+  value `GOTOOLCHAIN=auto` causes the Go runtime to automatically download a newer Go
+  toolchain if the installed version is older than the version specified by the `toolchain`
+  directive (or the `go` directive when no explicit `toolchain` key exists).
+
+  When `actions/setup-go@v5` installs Go 1.21.x but the project's `go.mod` contains:
+    toolchain go1.22.3
+  Go will automatically attempt to download the go1.22.3 toolchain from proxy.golang.org
+  at runtime — during `go build`, `go test`, or any go command. This download adds
+  15-120 seconds to CI jobs and can fail entirely in:
+  - Self-hosted runners in air-gapped or network-restricted environments
+  - Runners with strict egress firewall rules blocking proxy.golang.org
+  - Flaky network conditions during toolchain resolution
+
+  The behavior is often invisible in logs because the download proceeds silently before
+  each `go` invocation. The symptom is slower-than-expected build times or a cryptic
+  `dial tcp: lookup proxy.golang.org: no such host` error that appears unrelated to
+  the Go version.
+
+  Note: This is distinct from the Go 1.23 telemetry cache tar collision
+  (runner-environment-041). That is a cache restore bug; this is an unexpected network
+  download triggered by the toolchain directive.
+fix: |
+  Option 1 (recommended): Set `GOTOOLCHAIN=local` to prevent auto-downloads and fail fast
+  if the installed version doesn't satisfy the toolchain directive. Then configure
+  `actions/setup-go@v5` to install exactly the required Go version.
+
+  Option 2: Use `go-version-file: go.mod` so that setup-go installs the exact Go version
+  matching the `go` line in go.mod — ensure this matches or exceeds the `toolchain`
+  directive to prevent downloads.
+
+  Option 3: Remove the `toolchain` directive from `go.mod` if it is not intentionally
+  pinning a minimum toolchain version. The directive was added automatically by
+  `go mod tidy` in Go 1.21+ and many projects don't need it.
+fix_code:
+  - language: yaml
+    label: 'Set GOTOOLCHAIN=local to prevent mid-CI toolchain downloads'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          env:
+            GOTOOLCHAIN: local   # Never auto-download; use only the installed toolchain
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-go@v5
+              with:
+                go-version: '1.22.x'   # Install the exact version needed by go.mod
+                cache: true
+            - run: go build ./...
+  - language: yaml
+    label: 'Use go-version-file to pin version from go.mod'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          env:
+            GOTOOLCHAIN: local
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-go@v5
+              with:
+                go-version-file: go.mod   # Reads 'go' directive from go.mod
+                cache: true
+            # go.mod should specify 'go 1.22.3' matching or exceeding the toolchain directive
+            - run: go build ./...
+  - language: yaml
+    label: 'Remove toolchain directive from go.mod to avoid the download trigger'
+    code: |
+      # In go.mod, remove the toolchain line if your project does not require a
+      # minimum toolchain version beyond what setup-go installs:
+      # BEFORE (triggers GOTOOLCHAIN=auto download):
+      # go 1.21
+      # toolchain go1.22.3
+      #
+      # AFTER (no automatic download):
+      # go 1.22.3
+      # (no toolchain directive)
+      #
+      # Run `go mod tidy` with GOTOOLCHAIN=local after editing go.mod to clean up.
+prevention:
+  - "Set `GOTOOLCHAIN: local` as a job-level env var in all Go workflows to prevent unexpected toolchain downloads"
+  - "When upgrading Go versions, use `go-version-file: go.mod` in setup-go so CI always installs the correct version"
+  - "After running `go mod tidy` locally with Go 1.21+, check whether a `toolchain` directive was added to go.mod before committing"
+  - "In air-gapped environments, always set GOTOOLCHAIN=local and pre-bake the required toolchain into the self-hosted runner image"
+docs:
+  - url: 'https://go.dev/doc/toolchain'
+    label: 'Go Toolchains — official documentation for GOTOOLCHAIN and toolchain directive'
+  - url: 'https://go.dev/blog/toolchain'
+    label: 'Go Blog: Go Toolchains (Go 1.21 announcement)'
+  - url: 'https://github.com/actions/setup-go/blob/main/README.md'
+    label: 'actions/setup-go README — go-version-file input'
+  - url: 'https://pkg.go.dev/cmd/go#hdr-Go_toolchain_management'
+    label: 'go command: toolchain management — GOTOOLCHAIN environment variable'
