@@ -1,0 +1,119 @@
+id: silent-failures-078
+title: "Skipped step leaves job-level outputs: silently empty — downstream jobs receive empty string"
+category: silent-failures
+severity: silent-failure
+tags:
+  - job-outputs
+  - skipped-step
+  - outputs
+  - if-condition
+  - conditional
+  - downstream-jobs
+patterns:
+  - regex: 'steps\.[a-z_][a-z0-9_-]*\.outputs\.[a-z_]'
+    flags: 'i'
+error_messages:
+  - "needs.<job>.outputs.<key> is empty string when producing step was skipped"
+  - "Job output silently empty — step that writes output was conditionally skipped"
+root_cause: |
+  A job's `outputs:` block maps keys to values using `${{ steps.<id>.outputs.<key> }}`
+  expressions. These expressions are evaluated at the end of the job, after all steps have
+  run. If the step referenced in the output mapping is skipped (due to an `if:` condition
+  evaluating to false), the step never runs and never writes to `$GITHUB_OUTPUT`. The
+  output expression evaluates to an empty string with no warning.
+
+  Downstream jobs that depend on this output via `needs.<job>.outputs.<key>` receive an
+  empty string and continue running without error. This silent empty propagation causes
+  incorrect behavior: deploy jobs receiving an empty version string, notification jobs
+  receiving an empty status, or matrix jobs receiving an empty configuration list.
+
+  This is distinct from the `skipped-job-outputs-empty-string` limitation (where the
+  entire job is skipped) — here the job itself runs successfully, but one or more of its
+  steps are conditionally skipped.
+fix: |
+  Ensure the step that writes the output always runs, or provide a fallback value.
+  Use `if: always()` on the step if it should run regardless of prior step results.
+  Use a separate step to set a default/fallback output for the skipped case.
+  Alternatively, restructure the workflow so that the output-producing step is never
+  guarded by a condition that might prevent it from running.
+fix_code:
+  - language: yaml
+    label: "Wrong — output step conditionally skipped, downstream sees empty string"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          outputs:
+            version: ${{ steps.get-version.outputs.version }}
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Get version (only on tags)
+              id: get-version
+              if: startsWith(github.ref, 'refs/tags/')   # skipped on branch pushes!
+              run: echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+
+        deploy:
+          needs: build
+          runs-on: ubuntu-latest
+          steps:
+            - run: |
+                echo "Deploying version: ${{ needs.build.outputs.version }}"
+                # On branch push: prints "Deploying version: " (empty — step was skipped)
+  - language: yaml
+    label: "Correct — provide a fallback step to always set the output"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          outputs:
+            version: ${{ steps.get-version.outputs.version }}
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Get version from tag
+              id: get-version
+              run: |
+                if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+                  echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+                else
+                  echo "version=dev-${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
+                fi
+              # Always runs — handles both tag and branch pushes
+
+        deploy:
+          needs: build
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying version ${{ needs.build.outputs.version }}"
+  - language: yaml
+    label: "Alternative — gate deploy job to only run when version is set"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          outputs:
+            version: ${{ steps.get-version.outputs.version }}
+          steps:
+            - uses: actions/checkout@v4
+            - name: Get version (only on tags)
+              id: get-version
+              if: startsWith(github.ref, 'refs/tags/')
+              run: echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+
+        deploy:
+          needs: build
+          if: needs.build.outputs.version != ''   # only run when version was set
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying ${{ needs.build.outputs.version }}"
+prevention:
+  - "Audit all job outputs: blocks — for each step reference, verify it always runs"
+  - "Avoid conditional if: guards on steps that produce job-level outputs unless a fallback step provides the same output key"
+  - "Add an explicit check step at the end of each job that validates required outputs are non-empty"
+  - "Use actionlint — it warns when output-producing steps have if: conditions that may skip them"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/passing-information-between-jobs"
+    label: "Passing information between jobs — job outputs"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows"
+    label: "Events that trigger workflows — job outputs with conditional steps"

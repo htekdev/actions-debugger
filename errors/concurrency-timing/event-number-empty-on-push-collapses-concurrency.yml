@@ -1,0 +1,90 @@
+id: concurrency-timing-042
+title: "github.event.number empty on push events collapses concurrency group across all branches"
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - github-event-number
+  - push-event
+  - cancel-in-progress
+  - cross-branch
+  - pull-request
+patterns:
+  - regex: 'github\.event\.number\b'
+    flags: 'i'
+error_messages:
+  - "Run was cancelled due to concurrency group collision between push events on different branches"
+  - "Unexpected cancellation of push workflow by unrelated branch push"
+root_cause: |
+  `github.event.number` contains the pull request or issue number for events that have one
+  (e.g., `pull_request`, `pull_request_review`, `issue_comment`). On `push` events,
+  `github.event.number` is undefined and evaluates to an empty string in expressions.
+
+  When a workflow is triggered by both `push` and `pull_request` events, and the
+  concurrency group key uses `github.event.number`, all push-triggered runs share a
+  single concurrency group key (the suffix becomes empty):
+
+    group: "${{ github.workflow }}-${{ github.event.number }}"
+    # PR run:   "CI-123"   (unique per PR number)
+    # Push run: "CI-"      (ALL branch pushes share this single group!)
+
+  With `cancel-in-progress: true`, pushing to any branch cancels all other in-progress
+  push runs — even if they are on completely different branches. Developers intend to
+  serialize CI per PR but instead unintentionally cancel unrelated branch pushes.
+fix: |
+  Use the `||` operator to fall back to `github.ref` when `github.event.number` is empty.
+  `github.ref` is always populated (e.g., `refs/heads/main`, `refs/pull/123/merge`) and
+  produces a unique key per branch or PR.
+
+  Alternatively, use `github.event.number || github.sha` if you want push runs to each
+  be independent (no cancellation between pushes) while still serializing per PR.
+fix_code:
+  - language: yaml
+    label: "Wrong — all push runs share the same concurrency group key"
+    code: |
+      on:
+        push:
+          branches: [main, 'feature/**']
+        pull_request:
+
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.event.number }}
+        # On push: group = "CI-"  (empty number → all pushes share one group)
+        # On PR:   group = "CI-123" (unique per PR)
+        cancel-in-progress: true
+  - language: yaml
+    label: "Correct — fall back to github.ref so push runs are keyed per branch"
+    code: |
+      on:
+        push:
+          branches: [main, 'feature/**']
+        pull_request:
+
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.event.number || github.ref }}
+        # On push: group = "CI-refs/heads/main" (unique per branch)
+        # On PR:   group = "CI-123" (unique per PR number)
+        cancel-in-progress: true
+  - language: yaml
+    label: "Alternative — use github.ref for both triggers (no per-PR serialization)"
+    code: |
+      on:
+        push:
+          branches: [main, 'feature/**']
+        pull_request:
+
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        # On push: group = "CI-refs/heads/main"
+        # On PR:   group = "CI-refs/pull/123/merge"
+        cancel-in-progress: true
+prevention:
+  - "Always test concurrency group keys against all event types in the on: block"
+  - "Use github.event.number || github.ref as a safe pattern for mixed push/PR workflows"
+  - "Check that github.event.number is not undefined by printing it in a debug step when first setting up concurrency"
+  - "Prefer github.ref or github.ref_name as the base concurrency discriminator for branch-level serialization"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idconcurrency"
+    label: "Workflow syntax: concurrency"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context"
+    label: "GitHub context — github.event.number availability by event type"
