@@ -1,0 +1,87 @@
+id: concurrency-timing-047
+title: 'workflow_dispatch and schedule sharing a concurrency group — manual dispatch silently cancels queued scheduled run'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - workflow_dispatch
+  - schedule
+  - cancel-in-progress
+  - scheduled-job
+patterns:
+  - regex: 'schedule:.*\n.*workflow_dispatch:|workflow_dispatch:.*\n.*schedule:'
+    flags: 'ms'
+  - regex: 'group:\s*.*github\.workflow'
+    flags: 'i'
+error_messages:
+  - 'This run was automatically cancelled'
+  - 'Canceling since a higher priority waiting run was found'
+root_cause: |
+  When a workflow is triggered by both schedule and workflow_dispatch and uses a shared
+  concurrency group key that does not include github.event_name (e.g.,
+  group: ${{ github.workflow }}-${{ github.ref }}), all runs — regardless of trigger
+  type — map to the same concurrency slot.
+
+  When cancel-in-progress: true is set, any manual workflow_dispatch run immediately
+  cancels the scheduled run that may be actively executing. A developer who triggers
+  a manual run can silently kill a scheduled maintenance job, nightly report, or backup
+  workflow with no warning or notification.
+
+  When cancel-in-progress: false, GitHub only keeps one pending run per concurrency
+  slot. A queued scheduled run is silently displaced when the dispatch run arrives.
+  The scheduled run is discarded with no error, no notification, and no log entry.
+
+  This affects maintenance workflows, report generators, data sync jobs, and backup
+  workflows where workflow_dispatch is added for "emergency manual runs" after the
+  initial scheduled implementation.
+fix: |
+  Include github.event_name in the concurrency group key to give each trigger type
+  its own independent concurrency slot:
+
+    group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+
+  This ensures that manual dispatch runs and scheduled runs never compete for the
+  same slot and cannot cancel each other.
+fix_code:
+  - language: yaml
+    label: 'Wrong: schedule and workflow_dispatch share the same concurrency slot'
+    code: |
+      on:
+        schedule:
+          - cron: '0 3 * * *'   # nightly at 03:00 UTC
+        workflow_dispatch:
+
+      # WRONG: both trigger types evaluate to the same group key
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: true  # dispatch run kills the in-progress scheduled run
+  - language: yaml
+    label: 'Correct: include github.event_name to isolate trigger types'
+    code: |
+      on:
+        schedule:
+          - cron: '0 3 * * *'
+        workflow_dispatch:
+
+      # CORRECT: schedule and workflow_dispatch get separate concurrency slots
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+        cancel-in-progress: true
+
+      jobs:
+        nightly:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./nightly-tasks.sh
+prevention:
+  - 'Always include ${{ github.event_name }} in the concurrency group for workflows with multiple trigger event types'
+  - 'After adding workflow_dispatch to an existing scheduled workflow, verify scheduled runs are not silently displaced'
+  - 'Monitor the Actions tab run history — consecutive scheduled run gaps may indicate silent cancellations'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency'
+    label: 'GitHub Docs: Using concurrency'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#schedule'
+    label: 'GitHub Docs: schedule event'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_dispatch'
+    label: 'GitHub Docs: workflow_dispatch event'
