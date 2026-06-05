@@ -1,0 +1,144 @@
+id: runner-environment-192
+title: 'ubuntu-24.04 Kernel 6.17.0-1015-azure Oops in ublk_drv — User Block Device Workflows Hang'
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-24.04
+  - kernel
+  - ublk
+  - io-uring
+  - runner-image
+  - regression
+patterns:
+  - regex: 'ublk_init_queues.*Oops|RIP.*ublk_init_queues'
+    flags: 'i'
+  - regex: 'ublk_ctrl_add_dev|UBLK_U_CMD_ADD_DEV.*hang|ublk_drv.*kernel.*oops'
+    flags: 'i'
+  - regex: 'note: iou-wrk-.*exited with irqs disabled'
+    flags: 'i'
+  - regex: 'modprobe ublk_drv.*ublk.*add.*dev.*timeout|ublk.*command.*never completes'
+    flags: 'i'
+error_messages:
+  - 'RIP: 0010:ublk_init_queues+0x4e/0x1e0 [ublk_drv]'
+  - 'note: iou-wrk-* exited with irqs disabled'
+  - 'ublk_ctrl_add_dev+0x31a/0x5e0 [ublk_drv]'
+  - 'Oops: general protection fault, probably for non-canonical address'
+root_cause: |
+  The ubuntu-24.04 runner image released 2026-05-26 (version 20260525.161.1) ships
+  Linux kernel 6.17.0-1015-azure (upgraded from 6.17.0-1013-azure). This kernel
+  contains an upstream bug in the `ublk_drv` module: calling `UBLK_U_CMD_ADD_DEV`
+  once via io_uring triggers a kernel Oops in `ublk_init_queues+0x4e/0x1e0`.
+
+  **Affected call chain:**
+  ```
+  ublk_init_queues
+  ublk_ctrl_add_dev
+  ublk_ctrl_uring_cmd
+  io_uring_cmd
+  io_wq_submit_work
+  io_wq_worker
+  ```
+
+  After the Oops, the ADD_DEV io_uring command never receives a completion event
+  (CQE), so the userspace program waits indefinitely. The GitHub Actions job hangs
+  until it hits the workflow timeout.
+
+  **Affected environments:**
+  - ubuntu-24.04 amd64 hosted runners with kernel 6.17.0-1015-azure
+  - Any workflow that calls `modprobe ublk_drv` and then performs `UBLK_U_CMD_ADD_DEV`
+
+  **Unaffected environments:**
+  - ubuntu-22.04 runners (kernel 6.8.0-1052-azure — not affected)
+  - ubuntu-24.04 self-hosted runners still on kernel 6.17.0-1013-azure or earlier
+
+  This is an upstream `linux-azure` kernel bug (not a runner-images regression).
+  GitHub does not pin the kernel — it is delivered from Canonical's HWE channel.
+  A kernel SRU fix from Canonical will be picked up automatically in future
+  ubuntu-24.04 runner image releases.
+fix: |
+  **Workaround: pin ublk-based jobs to ubuntu-22.04 until the kernel SRU is deployed.**
+
+  ```yaml
+  ublk-test:
+    runs-on: ubuntu-22.04   # kernel 6.8.0 — ublk_drv works correctly
+    steps:
+      - uses: actions/checkout@v6
+      - run: |
+          sudo modprobe ublk_drv || {
+            sudo apt-get install -y --no-install-recommends \
+              "linux-modules-extra-$(uname -r)"
+            sudo modprobe ublk_drv
+          }
+          # your ublk test here
+  ```
+
+  **Alternative: install `linux-modules-extra` and test kernel version at runtime:**
+
+  ```bash
+  KERNEL=$(uname -r)
+  if [[ "$KERNEL" == "6.17.0-1015-azure" ]]; then
+    echo "::warning::Kernel 6.17.0-1015-azure has a ublk_drv bug. Skipping ublk tests."
+    exit 0
+  fi
+  ```
+
+  Track the upstream kernel SRU at Canonical:
+  https://bugs.launchpad.net/ubuntu/+source/linux-azure/
+fix_code:
+  - language: yaml
+    label: 'Pin ublk-dependent jobs to ubuntu-22.04 as workaround'
+    code: |
+      jobs:
+        ublk-integration:
+          # Workaround: ubuntu-24.04 kernel 6.17.0-1015-azure has a ublk_drv bug.
+          # Pin to ubuntu-22.04 until a fixed kernel SRU lands in ubuntu-24.04.
+          runs-on: ubuntu-22.04
+          steps:
+            - uses: actions/checkout@v6
+            - name: Load ublk_drv
+              run: |
+                sudo modprobe ublk_drv || {
+                  sudo apt-get update -qq
+                  sudo apt-get install -y --no-install-recommends \
+                    "linux-modules-extra-$(uname -r)"
+                  sudo modprobe ublk_drv
+                }
+            - name: Run ublk tests
+              run: make test-ublk
+
+  - language: yaml
+    label: 'Matrix with runtime kernel guard to skip known-broken kernel'
+    code: |
+      jobs:
+        ublk-test:
+          strategy:
+            matrix:
+              runner: [ubuntu-22.04, ubuntu-24.04]
+          runs-on: ${{ matrix.runner }}
+          steps:
+            - uses: actions/checkout@v6
+            - name: Check kernel for ublk_drv bug
+              run: |
+                KERNEL=$(uname -r)
+                echo "Kernel: $KERNEL"
+                if [[ "$KERNEL" == "6.17.0-1015-azure" ]]; then
+                  echo "::warning::Skipping ublk tests on $KERNEL (known ublk_drv Oops)"
+                  echo "SKIP_UBLK=true" >> "$GITHUB_ENV"
+                fi
+            - name: Run ublk tests
+              if: env.SKIP_UBLK != 'true'
+              run: make test-ublk
+prevention:
+  - 'Monitor ubuntu-24.04 kernel version in release notes before running ublk/io_uring block device tests.'
+  - 'Add a kernel version gate in ublk-dependent CI steps to skip on known-bad kernels.'
+  - 'Subscribe to or monitor `actions/runner-images` issues for kernel regression reports on Ubuntu runners.'
+  - 'Consider pinning ublk integration tests to ubuntu-22.04 as a long-term stable baseline for kernel-intensive work.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14175'
+    label: 'runner-images #14175 — ubuntu-24.04 kernel 6.17.0-1015-azure Oops in ublk_drv (open)'
+  - url: 'https://github.com/e2b-dev/ublk-adddev-repro'
+    label: 'Minimal ublk UBLK_U_CMD_ADD_DEV repro repo'
+  - url: 'https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260525.161'
+    label: 'Ubuntu 24.04 runner image 20260525.161.1 — kernel 6.17.0-1015-azure'
+  - url: 'https://bugs.launchpad.net/ubuntu/+source/linux-azure/'
+    label: 'Canonical linux-azure bug tracker (for SRU status)'

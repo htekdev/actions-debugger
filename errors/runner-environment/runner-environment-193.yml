@@ -1,0 +1,136 @@
+id: runner-environment-193
+title: 'ubuntu-24.04-arm64 GitHub-Managed Image Ships Ruby 3.2.3 vs x64 Ruby 4.0 — Matrix Builds Fail'
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-24.04
+  - arm64
+  - ruby
+  - matrix
+  - runner-image
+  - version-mismatch
+patterns:
+  - regex: 'Your Ruby version is 3\.2\.[0-9], but your Gemfile specified.*[~>].*4\.'
+    flags: 'i'
+  - regex: 'bundler.*RUBY_VERSION.*3\.2.*expected.*4\.|incompatible.*ruby.*3\.2.*4\.'
+    flags: 'i'
+  - regex: 'LoadError.*incompatible library version.*ruby.*3\.2|\.bundle.*built for Ruby 3\.2.*running.*4\.'
+    flags: 'i'
+  - regex: 'ubuntu-24\.04-arm.*ruby.*3\.2|arm64.*ruby.*version.*mismatch'
+    flags: 'i'
+error_messages:
+  - 'Your Ruby version is 3.2.3, but your Gemfile specified ~> 4.0'
+  - 'LoadError: incompatible library version - /path/to/native.bundle'
+  - "An error occurred while installing nokogiri (1.x.x), and Bundler cannot continue."
+  - 'Gem::RuntimeRequirementNotMetError: ruby 4.0 is required'
+root_cause: |
+  The first GitHub-managed Ubuntu 24.04 ARM64 runner image (ubuntu24-arm64/
+  20260531.15.1, released 2026-06-03) ships Ruby 3.2.3 as the default system Ruby.
+  In contrast, the Ubuntu 24.04 x86-64 runner image (ubuntu24/20260525.161.1) ships
+  Ruby 4.0.5. This version gap was introduced when GitHub took over ARM64 image
+  maintenance from Arm Limited in May–June 2026; the ARM64 image was rebuilt with a
+  different baseline software set.
+
+  **Affected workflows — any that run a Ruby matrix over both platforms:**
+  ```yaml
+  strategy:
+    matrix:
+      os: [ubuntu-24.04, ubuntu-24.04-arm]
+  ```
+
+  Failure modes:
+  1. **Gemfile Ruby version constraint** — if the Gemfile (or `.ruby-version`) pins
+     `ruby ~> 4.0` (or uses Ruby 4.0 syntax features), the ARM64 run fails immediately
+     with "Your Ruby version is 3.2.3, but your Gemfile specified ~> 4.0".
+
+  2. **Native extension ABI mismatch** — if the workflow restores a gem cache built
+     on the x64 runner (Ruby 4.0 ABI), native extension `.bundle` files are
+     incompatible with Ruby 3.2 on ARM64, producing a `LoadError` at test time.
+
+  3. **Ruby 4.0 language/stdlib differences** — Ruby 4.0 removed several deprecated
+     methods that exist in Ruby 3.2 (e.g., Kernel#binding). Code that uses 4.0-only
+     APIs silently succeeds on x64 but may have unexpected behaviour differences on
+     ARM64.
+
+  4. **setup-ruby without an explicit ruby-version** — if no version is pinned, the
+     action resolves "system ruby" differently per platform, producing Ruby 3.2 on
+     ARM64 and Ruby 4.0 on x64.
+
+  Ubuntu ARM64 runners maintained by Arm Limited previously matched x64 Ruby
+  versions more closely. The GitHub-managed ARM64 baseline is younger and will
+  converge with x64 over subsequent image releases.
+fix: |
+  **Explicit Ruby version with ruby/setup-ruby** on all platforms to override the
+  system Ruby and get a consistent version:
+
+  ```yaml
+  - uses: ruby/setup-ruby@v1
+    with:
+      ruby-version: '3.3'   # or whatever version your project supports on both arches
+      bundler-cache: true
+  ```
+
+  **Separate cache keys per OS/arch** to avoid cross-ABI gem cache poisoning:
+
+  ```yaml
+  - uses: actions/cache@v4
+    with:
+      path: vendor/bundle
+      key: ${{ runner.os }}-${{ runner.arch }}-ruby-${{ hashFiles('Gemfile.lock') }}
+  ```
+
+  **Guard Gemfile ruby version** to accept both 3.x and 4.x on the arm64 matrix:
+
+  ```ruby
+  # Gemfile
+  ruby '>= 3.2'   # instead of ~> 4.0, to allow both ubuntu-24.04 and ubuntu-24.04-arm
+  ```
+fix_code:
+  - language: yaml
+    label: 'Pin Ruby version with setup-ruby across all matrix platforms'
+    code: |
+      jobs:
+        test:
+          strategy:
+            matrix:
+              os: [ubuntu-24.04, ubuntu-24.04-arm]
+          runs-on: ${{ matrix.os }}
+          steps:
+            - uses: actions/checkout@v6
+
+            # Explicitly pin Ruby to get the same version on x64 AND ARM64.
+            # Without this, x64 gets Ruby 4.0.x and ARM64 gets Ruby 3.2.x.
+            - uses: ruby/setup-ruby@v1
+              with:
+                ruby-version: '3.3'    # consistent across both architectures
+                bundler-cache: true
+
+            - run: bundle exec rspec
+
+  - language: yaml
+    label: 'Per-arch gem cache key to prevent ABI mismatch on cache restore'
+    code: |
+      - name: Cache gems
+        uses: actions/cache@v4
+        with:
+          path: vendor/bundle
+          # Include runner.arch so ARM64 and x64 don't share native extension builds
+          key: >-
+            ${{ runner.os }}-${{ runner.arch }}-gems-
+            ${{ hashFiles('Gemfile.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-gems-
+prevention:
+  - 'Always use `ruby/setup-ruby` with an explicit `ruby-version` in cross-arch matrix jobs — never rely on the system Ruby.'
+  - 'Include `runner.arch` in gem cache keys to prevent native extension ABI mismatches between x64 and ARM64 runs.'
+  - 'Set Gemfile Ruby version constraint to `>= 3.2` instead of `~> 4.0` when the matrix includes ubuntu-24.04-arm.'
+  - 'Check the ubuntu24-arm64 runner release notes for software version differences vs ubuntu-24.04 x64 before adding ARM64 to your CI matrix.'
+docs:
+  - url: 'https://github.com/actions/runner-images/releases/tag/ubuntu24-arm64%2F20260531.15'
+    label: 'ubuntu24-arm64/20260531.15 — first GitHub-managed ARM64 image (Ruby 3.2.3)'
+  - url: 'https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260525.161'
+    label: 'ubuntu24/20260525.161.1 — Ubuntu 24.04 x64 image (Ruby 4.0.5)'
+  - url: 'https://github.com/actions/runner-images/issues/14100'
+    label: 'runner-images #14100 — ARM64 runner images now maintained by GitHub'
+  - url: 'https://github.com/ruby/setup-ruby'
+    label: 'ruby/setup-ruby — install a consistent Ruby version on any runner'
