@@ -1,0 +1,96 @@
+id: silent-failures-084
+title: "github.sha on pull_request event is the ephemeral merge commit SHA, not the PR head commit"
+category: silent-failures
+severity: silent-failure
+tags:
+  - github-sha
+  - pull_request
+  - merge-commit
+  - docker
+  - tagging
+  - status-checks
+patterns:
+  - regex: '\$\{\{\s*github\.sha\s*\}\}'
+    flags: 'i'
+  - regex: 'github\.sha'
+    flags: 'i'
+error_messages:
+  - "Docker image tagged with SHA not found in git history"
+  - "Deployment status does not appear on the PR commit"
+  - "Commit status check not visible on pull request"
+root_cause: |
+  On `pull_request` events, `github.sha` is NOT the PR branch's head commit SHA. It is
+  the SHA of a temporary merge commit that GitHub creates automatically to simulate
+  "what would happen if this PR were merged right now." This ephemeral merge commit:
+
+  - Does NOT appear in the repository's git history
+  - Changes every time the base branch advances, even with no new PR commits
+  - Is not accessible via normal git operations outside the workflow run
+
+  Consequences developers hit in the wild:
+  - Docker images tagged with `github.sha` have tags that don't correspond to any real
+    commit, making rollbacks and tracing impossible
+  - Commit status checks or deployment markers posted to `github.sha` don't appear on
+    any commit in the PR and are effectively invisible to reviewers
+  - Scripts that fetch the commit from the API using github.sha return 404
+
+  The actual PR head commit SHA is available via `github.event.pull_request.head.sha`.
+fix: |
+  Use `github.event.pull_request.head.sha` to get the actual PR head commit on
+  pull_request events. For workflows triggered by both push and pull_request, use a
+  conditional to select the correct SHA per event type.
+fix_code:
+  - language: yaml
+    label: "Get the correct SHA for both push and pull_request events"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Resolve commit SHA
+              id: sha
+              run: |
+                if [ "${{ github.event_name }}" = "pull_request" ]; then
+                  echo "value=${{ github.event.pull_request.head.sha }}" >> $GITHUB_OUTPUT
+                else
+                  echo "value=${{ github.sha }}" >> $GITHUB_OUTPUT
+                fi
+
+            - name: Tag Docker image with correct SHA
+              run: |
+                docker build -t myapp:${{ steps.sha.outputs.value }} .
+                docker push myapp:${{ steps.sha.outputs.value }}
+  - language: yaml
+    label: "Post commit status to the correct PR head SHA"
+    code: |
+      on:
+        pull_request:
+
+      jobs:
+        status:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Post status to actual PR commit
+              uses: actions/github-script@v7
+              with:
+                script: |
+                  // Use PR head SHA, not github.sha (merge commit)
+                  await github.rest.repos.createCommitStatus({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    sha: context.payload.pull_request.head.sha,
+                    state: 'success',
+                    description: 'Build passed',
+                    context: 'ci/build'
+                  });
+prevention:
+  - "Never tag Docker images or create commit statuses using github.sha on pull_request events — use github.event.pull_request.head.sha for the real PR head"
+  - "If deployment statuses or commit checks are missing from PR commits, verify you are not posting them to github.sha (the merge commit)"
+  - "The merge commit SHA changes every time the base branch gets new commits, even without new PR activity — this makes github.sha unstable for artifact tagging on PRs"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request"
+    label: "pull_request event — note on github.sha merge commit"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context"
+    label: "GitHub context — sha property"
