@@ -1,0 +1,137 @@
+id: concurrency-timing-046
+title: 'Batch workflow_dispatch Runs Silently Cancel Each Other via Static Concurrency Group'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - workflow-dispatch
+  - batch
+  - cancel
+  - static-group
+  - lost-run
+  - dispatch-api
+patterns:
+  - regex: 'This run was cancelled'
+    flags: 'i'
+  - regex: 'concurrency:\s*\n\s*group:\s*[''"]?\$\{\{\s*github\.workflow\s*\}\}'
+    flags: 'im'
+  - regex: 'workflow_dispatch.*concurrency|concurrency.*workflow_dispatch'
+    flags: 'ims'
+error_messages:
+  - "This run was cancelled."
+  - "Run has been cancelled because it is in a concurrency group with a newer run."
+  - "Canceling since a more recent run was started"
+root_cause: |
+  When a workflow uses a **static concurrency group** — one that does not
+  incorporate any per-run unique value like `github.run_id` or a user-supplied
+  input — and multiple `workflow_dispatch` runs are triggered in rapid succession
+  (e.g., from a batch API script, a label webhook fan-out, or automation), GitHub
+  Actions cancels all but the last run.
+
+  GitHub Actions enforces a limit of **1 running + 1 pending** run per concurrency
+  group. Each new dispatch replaces the existing pending run:
+
+  1. Run A starts → becomes "running"
+  2. Run B dispatched → becomes "pending" (waits for A)
+  3. Run C dispatched → **cancels Run B** (B was pending), C becomes "pending"
+  4. Run D dispatched → **cancels Run C**, D becomes "pending"
+  5. Only Run D eventually runs after Run A finishes.
+
+  This produces silent data loss when each dispatch carries different `inputs:`
+  (e.g., different artifact IDs, tenant IDs, or tags to process). All runs except
+  the last are silently discarded with "This run was cancelled."
+
+  Commonly triggered by:
+  - A webhook handler that dispatches one workflow run per event, with bursts of
+    events arriving simultaneously.
+  - Automation scripts that loop over a list and call `gh workflow run` for each item.
+  - A cron job that fans out to per-repo dispatches sharing the same workflow name.
+
+  Note: this is distinct from `concurrency-timing-040` (push + workflow_dispatch
+  sharing a group) — this issue occurs with ONLY workflow_dispatch runs sharing a
+  static group with no event-name differentiation.
+fix: |
+  **Option 1 (recommended): Include a unique input value in the concurrency group**
+  If each dispatch has a unique identifier as an input (e.g., a tenant ID, artifact
+  ID, or item key), include it in the concurrency group so different dispatches
+  get independent groups.
+
+  **Option 2: Include github.run_id in the concurrency group**
+  Using `github.run_id` makes every run its own concurrency group — effectively
+  disabling concurrency entirely. Use only if all runs are important and must
+  complete.
+
+  **Option 3: Use cancel-in-progress: false (no-queue mode)**
+  With `cancel-in-progress: false`, new pending runs do not cancel existing pending
+  ones. The 1-running + 1-pending limit still applies, but the *last* queued run
+  (not the most recent dispatch) survives. This still means high-burst dispatches
+  lose most runs.
+
+  **Option 4: Use a queue-based architecture**
+  For high-volume fan-out, avoid workflow_dispatch entirely. Instead, push items to
+  a queue (SQS, GitHub Issues, database) and have a single polling workflow process
+  items from the queue sequentially or in bounded parallel batches.
+fix_code:
+  - language: yaml
+    label: 'Include unique input in concurrency group to isolate per-dispatch runs'
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            item_id:
+              description: 'Unique identifier for this dispatch'
+              required: true
+              type: string
+
+      concurrency:
+        # Each unique item_id gets its own concurrency slot — no cross-dispatch cancellation
+        group: ${{ github.workflow }}-${{ inputs.item_id }}
+        cancel-in-progress: true
+  - language: yaml
+    label: 'Use github.run_id to guarantee all dispatches run independently'
+    code: |
+      on:
+        workflow_dispatch:
+
+      concurrency:
+        # Every run is its own group — effectively disables concurrency queueing
+        group: ${{ github.workflow }}-${{ github.run_id }}
+        cancel-in-progress: false
+  - language: yaml
+    label: 'Fan-out batch dispatch via matrix instead of separate workflow runs'
+    code: |
+      # Instead of dispatching N separate workflow runs (which cancel each other),
+      # dispatch ONE run with a matrix input to process all items in parallel.
+      on:
+        workflow_dispatch:
+          inputs:
+            item_ids:
+              description: 'JSON array of item IDs to process'
+              required: true
+              type: string
+
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: false
+
+      jobs:
+        process-items:
+          strategy:
+            matrix:
+              item_id: ${{ fromJSON(inputs.item_ids) }}
+          runs-on: ubuntu-latest
+          steps:
+            - name: Process item
+              run: echo "Processing ${{ matrix.item_id }}"
+prevention:
+  - 'Never use a static concurrency group (e.g., `group: ${{ github.workflow }}`) for workflows dispatched in batch — include a unique per-dispatch key.'
+  - 'When dispatching multiple runs from a script, add a unique ID as an input and include it in the concurrency group.'
+  - 'For high-volume fan-out workloads, use a single matrix job instead of N separate workflow_dispatch runs.'
+  - 'Monitor workflow cancellation counts in the Actions UI — unexpected "This run was cancelled" on dispatch events signals a concurrency group collision.'
+docs:
+  - url: 'https://github.com/github/gh-aw/issues/19467'
+    label: 'github/gh-aw#19467: Batch workflow_dispatch runs cancel each other via static concurrency group'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency'
+    label: 'GitHub Docs: Using concurrency — 1 running + 1 pending limit per group'
+  - url: 'https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-workflow-runs/manually-running-a-workflow'
+    label: 'GitHub Docs: Manually running a workflow'
