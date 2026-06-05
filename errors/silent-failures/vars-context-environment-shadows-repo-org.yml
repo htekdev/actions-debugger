@@ -1,0 +1,97 @@
+id: silent-failures-088
+title: 'vars.* context: environment-scoped variable silently shadows repository and org variable'
+category: silent-failures
+severity: silent-failure
+tags:
+  - vars
+  - variables
+  - environment
+  - precedence
+  - shadow
+  - configuration
+patterns:
+  - regex: 'vars\.[A-Z_]+'
+    flags: 'i'
+error_messages: []
+root_cause: |
+  The vars.* context resolves configuration variables in strict precedence order:
+  environment-scoped > repository-level > organization-level. When a job specifies
+  an environment: key, any variable defined at that deployment environment's scope
+  with the same name as a repository or organization variable silently overrides
+  the higher-scope value.
+
+  No warning or error is emitted when shadowing occurs. The workflow runs
+  successfully but uses the environment-scoped value rather than the expected
+  org or repository value.
+
+  Common scenario: an organization defines vars.REGION='us-east-1' for all repos.
+  A production deployment environment defines vars.REGION='eu-west-1' to override
+  it for EU deploys. All jobs that reference the production environment now receive
+  'eu-west-1' — including notification jobs, post-deploy validation jobs, or any
+  other job that happens to run in the production environment but was not intended
+  to use the EU override.
+
+  Unlike secrets, where absence raises a validation error, variable shadowing is
+  entirely transparent to the workflow author. Debugging requires manually
+  inspecting variable scopes in GitHub Settings across three levels (org, repo,
+  environment) to find the effective value.
+fix: |
+  Use scope-specific prefixes for variables that intentionally override
+  parent-scope defaults (e.g., PROD_REGION instead of REGION). Audit effective
+  variable values at runtime by echoing vars.* at the start of critical jobs.
+
+  To inspect what is currently configured:
+  - GitHub > Organization Settings > Variables (org-level)
+  - Repo Settings > Secrets and variables > Variables (repo-level)
+  - Repo Settings > Environments > <name> > Variables (environment-level)
+fix_code:
+  - language: yaml
+    label: 'Debug effective vars.* resolution in a job with environment scope'
+    code: |
+      jobs:
+        deploy:
+          environment: production
+          runs-on: ubuntu-latest
+          steps:
+            - name: Audit effective variable values
+              run: |
+                echo "REGION (effective): ${{ vars.REGION }}"
+                # If this shows 'eu-west-1' when you expected 'us-east-1',
+                # the 'production' environment has a REGION variable that
+                # silently shadows the org or repository-level value.
+  - language: yaml
+    label: 'Use environment-scoped prefixes to make overrides explicit'
+    code: |
+      # Organization variable: REGION=us-east-1
+      # Environment 'production' variable: PROD_REGION=eu-west-1  (distinct name)
+
+      jobs:
+        deploy:
+          environment: production
+          runs-on: ubuntu-latest
+          steps:
+            - name: Deploy to production
+              run: |
+                # Explicit — no ambiguity about which scope is used
+                deploy --region ${{ vars.PROD_REGION }}
+
+        notify:
+          environment: production
+          runs-on: ubuntu-latest
+          steps:
+            - name: Notify
+              run: |
+                # Without prefix, this would silently get 'eu-west-1' instead
+                # of 'us-east-1' if REGION is defined at environment scope
+                notify --datacenter ${{ vars.NOTIFICATION_REGION }}
+prevention:
+  - 'Prefix environment-scoped variable names to make overrides explicit — PROD_REGION not REGION'
+  - 'Audit all three variable scopes before deployments: org, repo, and environment'
+  - 'Add a comment in the workflow file documenting which variables each environment is expected to override'
+  - 'For critical deployment config, avoid relying on implicit variable inheritance — reference scope-prefixed names'
+  - 'Run a variable audit step at the start of critical jobs to log effective vars.* values'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/store-information-in-variables#precedence-for-variable-values'
+    label: 'GitHub Docs — Variable precedence for the vars.* context'
+  - url: 'https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment'
+    label: 'GitHub Docs — Managing environments for deployment'
