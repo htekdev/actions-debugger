@@ -1,0 +1,97 @@
+id: permissions-auth-052
+title: "gh CLI Uses GITHUB_TOKEN Env Variable, Not actions/checkout Custom Token"
+category: permissions-auth
+severity: silent-failure
+tags:
+  - gh-cli
+  - GITHUB_TOKEN
+  - checkout
+  - PAT
+  - token-scope
+patterns:
+  - regex: 'Resource not accessible by integration'
+    flags: "i"
+  - regex: 'gh:.*HTTP 403'
+    flags: "i"
+  - regex: 'gh:.*could not resolve to a node'
+    flags: "i"
+error_messages:
+  - "gh: Resource not accessible by integration (HTTP 403)"
+  - "remote: Permission to org/repo.git denied to github-actions[bot]."
+  - "gh: GraphQL: Could not resolve to a node with the global id of ''"
+root_cause: |
+  When `actions/checkout` is configured with a custom `token:` (e.g., a PAT or
+  GitHub App installation token), the custom token is written into the local
+  git credential helper so that git operations (push, fetch) authenticate with
+  the custom token.
+
+  However, the `gh` CLI does NOT read from the git credential helper. It resolves
+  authentication by checking these environment variables in priority order:
+    1. `GH_TOKEN`
+    2. `GITHUB_TOKEN`
+    3. System keychain / credential store (unavailable on hosted runners)
+
+  GitHub Actions always sets `GITHUB_TOKEN` to the default job token, regardless
+  of any custom token supplied to `actions/checkout`. When a step uses `gh` CLI
+  without an explicit `GH_TOKEN`, it picks up the default `GITHUB_TOKEN` which
+  may lack the required scopes (e.g., packages:write, org membership, cross-repo
+  access) — producing a 403 or permission error that appears to contradict the
+  checkout step succeeding with the PAT.
+
+  This mismatch is especially confusing because `git push` (using credentials
+  from checkout) succeeds while `gh pr create` or `gh release create` (using
+  GITHUB_TOKEN) fails in the same job.
+fix: |
+  Explicitly pass the custom token to `gh` via the `GH_TOKEN` or `GITHUB_TOKEN`
+  environment variable. Do not rely on `actions/checkout token:` to authenticate
+  `gh` CLI.
+
+  Setting `GH_TOKEN` at the step or job level is preferred as it keeps the scope
+  limited to where the elevated token is needed.
+fix_code:
+  - language: yaml
+    label: "Explicitly set GH_TOKEN for gh CLI steps"
+    code: |
+      jobs:
+        release:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                # Custom token sets git credentials — does NOT affect gh CLI
+                token: ${{ secrets.ORG_PAT }}
+
+            - name: Create GitHub release
+              # gh reads GH_TOKEN (not checkout token) — pass it explicitly
+              env:
+                GH_TOKEN: ${{ secrets.ORG_PAT }}
+              run: |
+                gh release create v1.0.0 --title "v1.0.0" --generate-notes
+  - language: yaml
+    label: "Set GITHUB_TOKEN at job level to override for all gh CLI steps"
+    code: |
+      jobs:
+        release:
+          runs-on: ubuntu-latest
+          # Override GITHUB_TOKEN for the entire job so all gh steps use the PAT
+          env:
+            GITHUB_TOKEN: ${{ secrets.ORG_PAT }}
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                token: ${{ secrets.ORG_PAT }}
+            - run: gh pr create --title "Automated PR" --body "Auto-generated"
+prevention:
+  - "Always check which token gh CLI is using — it reads GH_TOKEN or GITHUB_TOKEN, not git credentials set by actions/checkout."
+  - "Set GH_TOKEN or GITHUB_TOKEN explicitly in env: blocks for any step that uses gh CLI with elevated permissions."
+  - "Use permissions: at the job level to grant additional scopes to the default GITHUB_TOKEN before reaching for a PAT."
+  - "When using a custom checkout token for git operations, remember gh CLI still needs GH_TOKEN set separately."
+docs:
+  - url: "https://cli.github.com/manual/gh_help_environment"
+    label: "gh CLI — GH_TOKEN environment variable"
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication"
+    label: "GitHub Docs — GITHUB_TOKEN automatic authentication"
+  - url: "https://github.com/cli/cli/issues/2534"
+    label: "cli/cli#2534 — gh CLI ignores git credential helper token"
+  - url: "https://github.com/actions/checkout/issues/1168"
+    label: "actions/checkout#1168 — Custom token not used by gh CLI"

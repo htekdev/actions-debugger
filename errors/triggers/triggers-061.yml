@@ -1,0 +1,122 @@
+id: triggers-061
+title: "workflow_run Triggered Workflow Cannot Access github.event.pull_request — PR Number Is Empty"
+category: triggers
+severity: silent-failure
+tags:
+  - workflow_run
+  - pull-request
+  - event-context
+  - pr-number
+  - artifact
+patterns:
+  - regex: 'github\.event\.pull_request\.number'
+    flags: "i"
+  - regex: 'event\.number.*workflow_run'
+    flags: "i"
+error_messages:
+  - "# No error thrown — github.event.pull_request.number evaluates to empty string"
+  - "Error: PR number is empty"
+root_cause: |
+  When a workflow is triggered by `on: workflow_run`, the event payload is a
+  `workflow_run` object — NOT the event that triggered the upstream workflow.
+
+  This means `github.event.pull_request`, `github.event.number`, and all
+  other pull_request-specific context keys evaluate to empty string (not an
+  error). The only event data available is under `github.event.workflow_run.*`,
+  which exposes run metadata (run ID, head branch, head SHA, conclusion, etc.)
+  but NOT the original pull request event payload.
+
+  The common pattern breaks when developers write `workflow_run`-triggered
+  workflows to post PR comments or add labels and reference
+  `${{ github.event.pull_request.number }}` — the expression silently evaluates
+  to empty string, causing downstream API calls to fail or act on the wrong
+  resource without a clear error.
+
+  `github.event.workflow_run.pull_requests` is populated by GitHub only when
+  the triggering workflow was itself triggered by a pull_request event, providing
+  a lighter-weight alternative to the artifact pattern.
+fix: |
+  Upload the needed PR context (number, head SHA, labels) as a JSON artifact
+  in the upstream workflow. In the downstream `workflow_run` workflow, download
+  the artifact and extract the values.
+
+  For simpler cases, read `github.event.workflow_run.pull_requests[0].number`
+  — GitHub populates this array when the triggering workflow ran on a PR.
+fix_code:
+  - language: yaml
+    label: "Upstream workflow: upload PR context as artifact"
+    code: |
+      on:
+        pull_request:
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: make build
+            - name: Save PR context for downstream workflow
+              run: |
+                mkdir -p /tmp/pr-context
+                echo '${{ toJSON(github.event.pull_request) }}' \
+                  > /tmp/pr-context/pr.json
+            - uses: actions/upload-artifact@v4
+              with:
+                name: pr-context
+                path: /tmp/pr-context/pr.json
+  - language: yaml
+    label: "Downstream workflow_run: download artifact and read PR number"
+    code: |
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+
+      jobs:
+        report:
+          runs-on: ubuntu-latest
+          permissions:
+            actions: read
+            pull-requests: write
+          steps:
+            - uses: actions/download-artifact@v4
+              with:
+                name: pr-context
+                run-id: ${{ github.event.workflow_run.id }}
+                github-token: ${{ secrets.GITHUB_TOKEN }}
+            - name: Read PR number and comment
+              run: |
+                PR_NUMBER=$(jq '.number' pr.json)
+                echo "PR: $PR_NUMBER"
+              env:
+                GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  - language: yaml
+    label: "Lightweight alternative: use github.event.workflow_run.pull_requests array"
+    code: |
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+
+      jobs:
+        report:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Get PR number from workflow_run context
+              run: |
+                echo "PR: ${{ github.event.workflow_run.pull_requests[0].number }}"
+                # Note: pull_requests array is only populated when the triggering
+                # workflow was triggered by a pull_request event from a non-fork.
+                # For forks, the array is empty — use the artifact pattern instead.
+prevention:
+  - "Never reference github.event.pull_request in workflow_run-triggered workflows — the event payload is workflow_run, not pull_request."
+  - "Upload PR context (number, head SHA, labels) as a JSON artifact in the upstream workflow for downstream consumption."
+  - "Use github.event.workflow_run.pull_requests[0].number for a lighter approach when the triggering workflow ran on a non-fork pull_request."
+  - "Add defensive checks: if the PR number resolves to empty, skip steps that require it to avoid silent API failures."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run"
+    label: "GitHub Docs — workflow_run event"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#using-data-from-the-triggering-workflow"
+    label: "GitHub Docs — Using data from the triggering workflow"
+  - url: "https://stackoverflow.com/questions/71570882"
+    label: "SO#71570882 — Get PR number in workflow_run triggered workflow"
