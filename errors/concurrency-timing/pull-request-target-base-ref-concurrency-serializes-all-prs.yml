@@ -1,0 +1,78 @@
+id: concurrency-timing-046
+title: 'pull_request_target github.ref resolves to base branch — all PRs targeting same branch share one concurrency slot'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - pull_request_target
+  - github-ref
+  - base-branch
+  - serialization
+patterns:
+  - regex: 'on:\s*\n\s+pull_request_target:'
+    flags: 'ms'
+  - regex: 'group:.*github\.ref'
+    flags: 'i'
+error_messages:
+  - 'This run was automatically queued'
+  - 'Waiting for a pending job to complete'
+root_cause: |
+  On pull_request events, github.ref is the head branch ref (e.g., refs/heads/my-feature).
+  On pull_request_target events, however, github.ref is the BASE branch ref (e.g.,
+  refs/heads/main) — the branch the PR targets. This is a security design choice that
+  prevents untrusted fork code from influencing the event ref.
+
+  When a concurrency group key uses github.ref in a pull_request_target workflow, all
+  open PRs targeting the same base branch (main, develop, etc.) evaluate to the identical
+  group key. Only one PR's CI can run at a time; all others queue behind it. On repos
+  with many open PRs, this effectively serializes all PR workflows into a single lane
+  with potentially multi-hour wait times.
+
+  The correct per-PR identifier in pull_request_target workflows is
+  github.event.pull_request.number — unique per PR regardless of base branch.
+fix: |
+  Replace github.ref with github.event.pull_request.number in concurrency group keys
+  for pull_request_target workflows. PR numbers are unique per repository and stable
+  across new commits to the same PR:
+
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+fix_code:
+  - language: yaml
+    label: 'Wrong: github.ref = base branch on pull_request_target — all PRs share one slot'
+    code: |
+      # WRONG: github.ref = refs/heads/main for ALL PRs targeting main
+      on:
+        pull_request_target:
+
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}  # same for every PR!
+        cancel-in-progress: true
+  - language: yaml
+    label: 'Correct: use github.event.pull_request.number for per-PR isolation'
+    code: |
+      # CORRECT: PR number is unique per PR, stable across pushes to same PR
+      on:
+        pull_request_target:
+
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+        cancel-in-progress: true
+
+      jobs:
+        lint:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.pull_request.head.sha }}
+prevention:
+  - 'In pull_request_target workflows, never use github.ref as the sole differentiator in concurrency groups — it is the base branch ref'
+  - 'Use github.event.pull_request.number to scope concurrency to individual PRs'
+  - 'Audit concurrency groups when migrating workflows from pull_request to pull_request_target'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request_target'
+    label: 'GitHub Docs: pull_request_target event'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency'
+    label: 'GitHub Docs: Using concurrency'

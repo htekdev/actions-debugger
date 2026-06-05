@@ -1,0 +1,90 @@
+id: concurrency-timing-048
+title: 'github.run_id in concurrency group key disables cancel-in-progress — every run is unique, unlimited parallelism'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - cancel-in-progress
+  - github-run-id
+  - unique-key
+  - parallelism
+  - anti-pattern
+patterns:
+  - regex: 'group:.*\$\{\{\s*github\.run_id\s*\}\}'
+    flags: 'i'
+  - regex: 'group:.*github\.run_id'
+    flags: 'i'
+error_messages:
+  - 'Old workflow runs are not being cancelled despite cancel-in-progress: true'
+  - 'Multiple concurrent runs executing simultaneously'
+root_cause: |
+  github.run_id is always unique per workflow run — it is the numeric identifier
+  assigned at run creation time. When used in the concurrency group key, every run
+  evaluates to a different group name. No two runs ever share the same group, so
+  cancel-in-progress: true has nothing to cancel. All runs proceed simultaneously.
+
+  This anti-pattern typically originates from developers who experienced unwanted
+  concurrency cancellations and "fixed" the problem by adding a unique value to the
+  group key. The immediate cancellation symptom disappears but a more serious problem
+  is introduced: on high-velocity branches, dozens of in-progress CI runs pile up
+  simultaneously, exhausting the available runner pool and increasing costs.
+
+  Related: github.sha in the group key has the same effect (concurrency-timing-030),
+  but github.run_id is more severe. github.sha can repeat when a commit is re-run;
+  github.run_id is unconditionally unique per run and per re-run attempt, so
+  cancel-in-progress is permanently disabled with no exceptions.
+fix: |
+  Remove github.run_id from the concurrency group key. Use github.ref (for branch-scoped
+  deduplication) or github.head_ref (for PR-scoped deduplication). If the original
+  goal was to prevent manual dispatch runs from being cancelled, scope the unique key
+  to workflow_dispatch events only using a conditional expression:
+
+    group: >-
+      ${{ github.workflow }}-
+      ${{ github.event_name == 'workflow_dispatch' && github.run_id || github.ref }}
+fix_code:
+  - language: yaml
+    label: 'Wrong: github.run_id makes every run unique — cancel-in-progress is dead code'
+    code: |
+      # WRONG: every run gets its own unique group — cancel-in-progress never fires
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}-${{ github.run_id }}
+        cancel-in-progress: true  # never cancels anything
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+  - language: yaml
+    label: 'Correct: branch-scoped group key enables cancel-in-progress'
+    code: |
+      # CORRECT: all pushes to same branch share one group
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: true
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+  - language: yaml
+    label: 'Advanced: isolate manual dispatch runs while deduplicating automated runs'
+    code: |
+      # Manual dispatch runs are never cancelled; push/PR runs cancel old runs on same branch
+      concurrency:
+        group: >-
+          ${{ github.workflow }}-
+          ${{ github.event_name == 'workflow_dispatch' && github.run_id || github.ref }}
+        cancel-in-progress: true
+prevention:
+  - 'Never add github.run_id to a concurrency group key when the goal is to cancel old runs — it defeats cancel-in-progress entirely'
+  - 'Verify cancel-in-progress by triggering two rapid pushes and confirming the first run is cancelled in the Actions UI'
+  - 'If cancellation of specific trigger types is unwanted, use event_name-conditional keys instead of unique values'
+  - 'Monitor runner utilization — unbounded parallel runs will exhaust available runners and increase billing'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency'
+    label: 'GitHub Docs: Using concurrency'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#github-context'
+    label: 'GitHub Docs: github context — run_id'
