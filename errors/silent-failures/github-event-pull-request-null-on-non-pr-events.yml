@@ -1,0 +1,96 @@
+id: silent-failures-090
+title: '`github.event.pull_request.*` Fields Are Null on Non-PR Events — Comparisons Silently Evaluate Incorrectly'
+category: silent-failures
+severity: silent-failure
+tags:
+  - github-context
+  - pull_request
+  - null-context
+  - push-event
+  - multi-event
+  - expression
+patterns:
+  - regex: 'github\.event\.pull_request\.\w+'
+    flags: 'i'
+error_messages:
+  - "Unexpected value '' in expression"
+root_cause: |
+  When a workflow is triggered by a non-pull_request event — such as `push`, `schedule`,
+  `workflow_dispatch`, `workflow_call`, or `release` — the `github.event.pull_request`
+  object is null. Every child field evaluates to empty string `""` in expressions.
+
+  This silently breaks conditions in multi-event workflows:
+
+  - `if: github.event.pull_request.draft == false`
+    On a push event, `draft` resolves to `""`. The comparison `"" == false` evaluates to
+    FALSE (empty string is not boolean false), so the step silently skips.
+
+  - `if: github.event.pull_request.merged == true`
+    Always false on push events, causing steps intended for merged-PR context to silently
+    never execute.
+
+  - `env: PR_NUMBER: ${{ github.event.pull_request.number }}`
+    Sets `PR_NUMBER` to empty string on push events. Downstream scripts that require a
+    PR number fail with "invalid argument" or use `0` as the number.
+
+  - `if: github.event.pull_request.head.repo.fork != true`
+    Always evaluates to true on push events (empty string != true), bypassing fork guards.
+
+  The root issue is that workflows triggered by multiple events (e.g., `on: [push,
+  pull_request]`) share the same `if:` conditions and `env:` references, but the
+  `github.event` object structure differs per event type. Note that `yaml-syntax-060`
+  covers the object filter `.*` operator on null — this entry covers field-level null
+  comparisons in `if:` and `env:` contexts.
+fix: |
+  Guard all `github.event.pull_request.*` access with an event type check:
+
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+
+  For env variables that should only apply on PR events, set them conditionally:
+  use a step to export the variable only when running under a pull_request trigger,
+  or use separate jobs per event type.
+
+  For the fork guard pattern, use `github.event_name == 'pull_request' &&
+  github.event.pull_request.head.repo.fork` as a combined check rather than relying
+  on the fork field being non-null.
+fix_code:
+  - language: yaml
+    label: "Guard PR context access with event type check in if: condition"
+    code: |
+      jobs:
+        check-draft:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Skip if draft PR (only meaningful on PR events)
+              # Without the event_name guard, draft is "" on push — comparison silently fails
+              if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+              run: echo "Proceeding — not a draft PR"
+  - language: yaml
+    label: "Export PR-specific context safely in multi-event workflows"
+    code: |
+      on: [push, pull_request]
+      
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Export PR metadata (PR events only)
+              if: github.event_name == 'pull_request'
+              run: |
+                echo "PR_NUMBER=${{ github.event.pull_request.number }}" >> $GITHUB_ENV
+                echo "IS_DRAFT=${{ github.event.pull_request.draft }}" >> $GITHUB_ENV
+            
+            - name: Deploy
+              run: |
+                echo "Branch: ${{ github.ref_name }}"
+                # Use PR_NUMBER only after confirming event_name == pull_request above
+prevention:
+  - "In multi-event workflows, always guard `github.event.pull_request.*` access with `github.event_name == 'pull_request'`"
+  - "Run actionlint on workflow files — it detects context availability mismatches per event type"
+  - "Test workflows manually for both push and pull_request trigger types to verify that conditional logic works as expected"
+  - "Prefer separate jobs or separate workflow files per event type rather than a single workflow handling multiple events with shared conditions"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows"
+    label: "GitHub Docs: Events that trigger workflows — context availability per event"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#github-context"
+    label: "GitHub Docs: Contexts — github.event object structure"
