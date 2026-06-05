@@ -1,0 +1,94 @@
+id: known-unsolved-051
+title: 'No workflow-level `timeout-minutes` — only job-level and step-level timeouts; runaway workflows consume runner hours with no global cap'
+category: known-unsolved
+severity: limitation
+tags:
+  - timeout
+  - workflow-level
+  - runner-hours
+  - billing
+  - limitation
+  - runaway-workflow
+patterns:
+  - regex: 'timeout.minutes'
+    flags: 'i'
+  - regex: 'workflow.*timed? ?out|timed? ?out.*workflow'
+    flags: 'i'
+error_messages:
+  - "No workflow-level timeout — only job-level timeout-minutes is supported"
+  - "Unexpected key 'timeout-minutes' at workflow level — property is only valid on jobs"
+root_cause: |
+  GitHub Actions supports `timeout-minutes:` only at the JOB level and STEP level.
+  There is no `timeout-minutes:` field at the workflow level (the level containing
+  `on:`, `env:`, and `jobs:`). If placed at the workflow level, actionlint reports
+  "unexpected key 'timeout-minutes'" and the key is silently ignored at runtime
+  with no effect on execution.
+
+  The default job timeout is 360 minutes (6 hours). A workflow with multiple jobs,
+  each using the default timeout, can run for many times 360 minutes total. There is
+  no built-in way to enforce a global "if this entire workflow hasn't finished in X
+  hours, cancel everything."
+
+  Common scenarios where this causes unexpected runner hour consumption:
+  - A self-hosted runner goes offline mid-job; the job hangs until its per-job timeout
+  - A workflow waiting on a deployment environment review that is never approved
+  - A matrix job with a misconfigured container that hangs on startup
+  - A network call in a step that never times out (no step-level timeout set)
+
+  This is a long-requested GitHub Actions feature with hundreds of community upvotes.
+fix: |
+  Workarounds (no official workflow-level timeout exists):
+
+  1. SET CONSERVATIVE JOB TIMEOUTS: Add explicit `timeout-minutes:` to every job
+     with a value appropriate for that job's actual expected runtime plus a buffer.
+     Do not rely on the 360-minute default.
+
+  2. SET STEP-LEVEL TIMEOUTS: Add `timeout-minutes:` to individual steps that perform
+     network calls, long-running builds, or any operation that can hang.
+
+  3. WATCHDOG WORKFLOW: A separate workflow triggered by `workflow_run` can monitor
+     in-progress runs and cancel them via the API if they exceed a threshold duration.
+
+  4. ENVIRONMENT REVIEW EXPIRY: For deployment workflows stuck on required reviewers,
+     configure an expiry window under Settings > Environments > [env] >
+     Deployment protection rules > Timeout.
+fix_code:
+  - language: yaml
+    label: 'Set explicit per-job timeouts as a workaround'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          timeout-minutes: 15   # Set per-job: build should not exceed 15 min
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm ci && npm run build
+
+        test:
+          needs: build
+          runs-on: ubuntu-latest
+          timeout-minutes: 20   # Integration tests: 20 min max
+          steps:
+            - name: Run tests
+              timeout-minutes: 15   # Step-level: individual test run cap
+              run: npm run test:integration
+
+        deploy:
+          needs: test
+          runs-on: ubuntu-latest
+          timeout-minutes: 10   # Deployment itself should be fast
+          environment: production
+          steps:
+            - run: ./scripts/deploy.sh
+prevention:
+  - 'Always set `timeout-minutes:` on every job — do not rely on the 360-minute default for normal CI workflows.'
+  - 'Add `timeout-minutes:` to individual steps that perform network I/O, external API calls, or any blocking operation.'
+  - 'Monitor unexpected Actions billing spikes: they often indicate a stuck workflow running against the 6-hour default job timeout.'
+  - 'Set deployment environment review expiry windows to prevent workflows from hanging indefinitely awaiting approval.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idtimeout-minutes'
+    label: 'Workflow syntax: jobs.<job_id>.timeout-minutes'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idstepstimeout-minutes'
+    label: 'Workflow syntax: jobs.<job_id>.steps[*].timeout-minutes'
+  - url: 'https://github.com/orgs/community/discussions/16058'
+    label: 'GitHub Community: Workflow-level timeout-minutes (feature request)'

@@ -1,0 +1,86 @@
+id: silent-failures-081
+title: '`needs.<job_id>.conclusion` does not exist — correct property is `result`; evaluates to empty string silently'
+category: silent-failures
+severity: silent-failure
+tags:
+  - needs-context
+  - job-result
+  - downstream-jobs
+  - if-condition
+  - empty-string
+  - notification-job
+patterns:
+  - regex: 'needs\.\w+\.conclusion'
+    flags: 'i'
+error_messages:
+  - "needs.<job_id>.conclusion evaluates to empty string — condition using .conclusion never fires"
+root_cause: |
+  The `needs` context exposes `.result` for each upstream job — NOT `.conclusion`.
+  Valid values for `needs.<job_id>.result` are: `success`, `failure`, `cancelled`,
+  and `skipped`.
+
+  The property `.conclusion` does not exist on the needs context object. Accessing
+  `needs.<job_id>.conclusion` silently evaluates to an empty string `""` with no
+  warning, error, or annotation in the workflow logs. The downstream job runs but the
+  `if:` condition never matches because `"" == 'failure'` is always false.
+
+  This confusion arises because the `steps` context exposes BOTH `.conclusion` and
+  `.outcome` for step results, leading developers to assume the needs context follows
+  the same property naming. The mismatch causes notification jobs, cleanup steps, and
+  failure-handler jobs to silently skip execution with no observable error.
+fix: |
+  Replace `.conclusion` with `.result` in all `needs` context expressions.
+
+    WRONG: if: needs.build.conclusion == 'failure'   # always empty string, never matches
+    RIGHT: if: needs.build.result == 'failure'        # correct
+
+  For aggregate checks, prefer the built-in status functions over manual needs.result
+  comparisons — `failure()`, `success()`, `cancelled()`, `always()` — which evaluate
+  the combined result of all upstream jobs automatically.
+fix_code:
+  - language: yaml
+    label: 'Correct: use needs.<job>.result not needs.<job>.conclusion'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm ci && npm test
+
+        notify-on-failure:
+          needs: [build]
+          # Use built-in failure() or explicit needs.<job>.result
+          if: failure()
+          runs-on: ubuntu-latest
+          steps:
+            - name: Send failure notification
+              run: |
+                echo "Build result: ${{ needs.build.result }}"
+                # .result values: success | failure | cancelled | skipped
+  - language: yaml
+    label: 'Multi-job downstream check using needs.result'
+    code: |
+      jobs:
+        deploy:
+          needs: [lint, test, build]
+          # Explicit per-job result check — use .result not .conclusion
+          if: >-
+            needs.lint.result == 'success' &&
+            needs.test.result == 'success' &&
+            needs.build.result == 'success'
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "All upstream jobs succeeded"
+prevention:
+  - 'The needs context exposes `.result` only — `.conclusion` does not exist. Use `needs.<job>.result` for all downstream conditional checks.'
+  - 'Prefer the status check functions `failure()`, `success()`, `cancelled()`, `always()` in downstream job `if:` conditions — they aggregate all upstream job results automatically.'
+  - 'Add actionlint to CI — it reports references to undefined context properties including `needs.<job>.conclusion`, catching this mistake at review time.'
+  - 'When a notification or cleanup job silently skips, verify the `if:` condition uses `.result` and check the actual result value in the Actions run summary.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#needs-context'
+    label: 'GitHub Actions: needs context — result property'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-conditions-to-control-job-execution'
+    label: 'Using conditions to control job execution'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#status-check-functions'
+    label: 'Status check functions: failure(), success(), cancelled(), always()'
