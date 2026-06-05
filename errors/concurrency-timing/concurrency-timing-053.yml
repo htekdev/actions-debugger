@@ -1,0 +1,83 @@
+id: concurrency-timing-053
+title: 'Concurrency pending slot overflow: third concurrent run silently cancels the already-queued second run when cancel-in-progress is false'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - cancel-in-progress
+  - pending
+  - queue
+  - silent-cancellation
+  - overflow
+patterns:
+  - regex: 'Canceling since a higher priority waiting run was found'
+    flags: 'i'
+  - regex: 'This run was automatically cancelled'
+    flags: 'i'
+error_messages:
+  - 'Canceling since a higher priority waiting run was found'
+  - 'This run was automatically cancelled'
+root_cause: |
+  GitHub Actions concurrency groups with cancel-in-progress: false allow at most one
+  run to be in-progress and one run to be pending (queued) simultaneously per group.
+  This queue depth is exactly 1, not unlimited.
+
+  When a third run arrives while run 1 is in-progress and run 2 is pending:
+    - Run 2 (the pending run) is immediately and silently cancelled
+    - Run 3 takes run 2's pending slot
+
+  The user who triggered run 2 typically sees it flip from "Queued" to "Cancelled"
+  with no notification and no failure alert. From their perspective their commit's CI
+  simply disappeared.
+
+  This behavior is documented in GitHub docs but surprises teams that expect a FIFO
+  queue of unlimited depth. The concurrency feature is a mutex with a single
+  waiting-room slot, not a job scheduler queue.
+
+  Common scenarios where this causes silent data loss:
+    - Rapid-fire merges to a protected branch with slow integration tests
+    - Multiple developers pushing within seconds of each other to the same branch
+    - Automated commits (dependency updates, release bots) arriving while CI runs
+fix: |
+  Option 1 — Accept the overflow: intended behavior for fast-merge scenarios where only
+  the LATEST commit needs CI. No change needed.
+
+  Option 2 — Widen the concurrency key so each commit gets its own slot:
+    group: ${{ github.workflow }}-${{ github.sha }}
+  This disables cancellation entirely; every run completes regardless of newer pushes.
+
+  Option 3 — Use cancel-in-progress: true explicitly if "latest wins" is the desired
+  semantics. In-progress runs cancel rather than queued runs disappearing silently.
+
+  Option 4 — Queue at the runner group level by using a self-hosted runner group with
+  a concurrency limit to provide true multi-run queuing.
+fix_code:
+  - language: yaml
+    label: 'Common mistake: expecting cancel-in-progress: false to queue all pending runs indefinitely'
+    code: |
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: false
+      # Only 1 run can be pending; a 3rd arriving run silently cancels the queued 2nd
+  - language: yaml
+    label: 'Option A: per-commit group key — every run completes, no cancellation at all'
+    code: |
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.sha }}
+        cancel-in-progress: false
+  - language: yaml
+    label: 'Option B: cancel-in-progress: true — explicit latest-wins, in-progress runs cancelled not pending ones'
+    code: |
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: true
+prevention:
+  - 'Understand that cancel-in-progress: false does not create an unlimited queue — it allows exactly one pending run per concurrency group key'
+  - 'For deployment workflows where no commit should be skipped, use per-commit group keys (${{ github.sha }}) to guarantee every run completes'
+  - 'Monitor the Actions tab during rapid-push periods to verify queued runs are completing, not silently disappearing'
+  - 'Prefer cancel-in-progress: true when only the latest result matters; the cancellation is explicit and visible rather than silent'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency'
+    label: 'GitHub Docs: Using concurrency'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency#example-only-cancel-in-progress-jobs-or-runs-for-the-current-workflow'
+    label: 'GitHub Docs: Concurrency — one pending slot per group'
