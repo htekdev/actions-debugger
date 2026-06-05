@@ -1,0 +1,100 @@
+id: yaml-syntax-060
+title: "Object Filter Expression .* on Null Parent Context Raises Template Validation Error"
+category: yaml-syntax
+severity: error
+tags:
+  - expression
+  - object-filter
+  - null-context
+  - wildcard
+  - pull_request
+  - multi-trigger
+patterns:
+  - regex: 'Object filter left operand must be of type Array or Object but is Null'
+    flags: "i"
+  - regex: 'github\.event\.[a-z_]+\.\*\.[a-z_]+'
+    flags: "i"
+  - regex: 'The template is not valid.*Object filter'
+    flags: "i"
+error_messages:
+  - "Error: The template is not valid. .github/workflows/ci.yml (Line: 12, Col: 8): Object filter left operand must be of type Array or Object but is Null"
+  - "Object filter left operand must be of type Array or Object but is Null"
+  - "Unexpected value 'null'. Located at position 0 within expression: contains(github.event.pull_request.labels.*.name, 'skip-ci')"
+root_cause: |
+  GitHub Actions supports object filtering via the .* wildcard syntax, which
+  maps over an array or object and extracts a named property from each element.
+  For example: github.event.pull_request.labels.*.name returns an array of
+  label names on a pull_request event.
+
+  When the parent context object is null — which occurs whenever the event
+  payload does not include that property — the .* filter throws a template
+  validation error at expression evaluation time rather than returning an empty
+  array. This is a common pitfall in workflows that handle multiple event types:
+
+  - On push events, github.event.pull_request is null
+  - On schedule events, github.event.issue is null
+  - On workflow_dispatch events, github.event.commits is null
+
+  The expression evaluator does NOT fall back to an empty result for null .*.
+  Instead it fails the step with a template error, even though null.property
+  (single property access) would silently return an empty string.
+
+  Typical pattern that fails on push events:
+    if: contains(github.event.pull_request.labels.*.name, 'skip-ci')
+fix: |
+  Guard the object filter expression with an event type check so the .* filter
+  is only evaluated when the parent context is known to be non-null. Use
+  github.event_name to gate the condition, or split the if: into separate
+  trigger-specific jobs.
+fix_code:
+  - language: yaml
+    label: "Guard with event type check"
+    code: |
+      # BAD: fails on push events because pull_request context is null
+      # if: contains(github.event.pull_request.labels.*.name, 'skip-ci')
+
+      # GOOD: gate on event type first
+      - name: Check for skip-ci label
+        if: >
+          github.event_name == 'pull_request' &&
+          contains(github.event.pull_request.labels.*.name, 'skip-ci')
+        run: echo "skip-ci label found, skipping build"
+
+  - language: yaml
+    label: "Use separate jobs per event trigger"
+    code: |
+      on:
+        push:
+          branches: [main]
+        pull_request:
+
+      jobs:
+        # Only runs on pull_request — safe to use pull_request context
+        label-check:
+          if: github.event_name == 'pull_request'
+          runs-on: ubuntu-latest
+          steps:
+            - name: Check labels
+              if: contains(github.event.pull_request.labels.*.name, 'skip-ci')
+              run: echo "Label found"
+
+        # Runs on both push and pull_request — no pull_request context access
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: make build
+prevention:
+  - "Before using github.event.X.*.property, verify the event type with github.event_name == 'X' in the same if: expression."
+  - "In multi-trigger workflows (on: push, pull_request), never access pull_request context properties without an event type guard."
+  - "Use actionlint to catch null context dereferences statically before they fail in CI."
+  - "When checking PR labels in workflows triggered by both push and pull_request, consider splitting into separate per-event jobs."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#object-filters"
+    label: "GitHub Docs — Object filters in expressions"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#github-context"
+    label: "GitHub Docs — github context availability by event"
+  - url: "https://github.com/rhysd/actionlint"
+    label: "actionlint — Static checker for GitHub Actions workflow files"
+  - url: "https://stackoverflow.com/questions/67368005"
+    label: "SO#67368005 — Object filter left operand must be of type Array or Object but is Null"
