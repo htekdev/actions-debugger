@@ -1,0 +1,84 @@
+id: runner-environment-160
+title: 'ubuntu-24.04 apt-get install hangs on tzdata interactive timezone prompt'
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-24.04
+  - apt-get
+  - tzdata
+  - noninteractive
+  - hang
+  - debian-frontend
+patterns:
+  - regex: 'Please select the geographic area in which you live'
+    flags: 'i'
+  - regex: 'Configuring tzdata'
+    flags: 'i'
+  - regex: 'debconf: unable to initialize frontend: Dialog'
+    flags: 'i'
+error_messages:
+  - 'Please select the geographic area in which you live.'
+  - 'Configuring tzdata'
+  - 'debconf: unable to initialize frontend: Dialog'
+  - 'debconf: falling back to frontend: Readline'
+root_cause: |
+  When installing packages that depend on tzdata (tzdata itself, libssl-dev, php,
+  libpq-dev, and many others) without setting DEBIAN_FRONTEND=noninteractive,
+  apt-get sends interactive prompts for timezone configuration to the TTY. GitHub
+  Actions runner steps have no interactive TTY to respond to debconf prompts, so
+  the step hangs indefinitely until the 6-hour job timeout is reached.
+
+  Ubuntu 24.04 runners are particularly susceptible because the debconf default
+  frontend is "dialog", which requires a terminal. The hang appears to come from
+  a frozen step with no output — making it look like a performance issue rather
+  than a prompt waiting for input.
+
+  The symptom is often indirect: a workflow step that installs a package with
+  tzdata as a transitive dependency (not an explicitly installed package) silently
+  hangs. Developers are surprised because the same apt-get install command works
+  fine in an interactive shell.
+fix: |
+  Set DEBIAN_FRONTEND=noninteractive in the step or job env block before running
+  apt-get install. For tzdata specifically, pre-configure the timezone using
+  environment variables or a symlink before installation.
+fix_code:
+  - language: yaml
+    label: 'Set DEBIAN_FRONTEND at step level'
+    code: |
+      - name: Install dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tzdata libssl-dev
+  - language: yaml
+    label: 'Set DEBIAN_FRONTEND at job level (applies to all steps)'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-24.04
+          env:
+            DEBIAN_FRONTEND: noninteractive
+          steps:
+            - name: Install dependencies
+              run: |
+                sudo apt-get update
+                sudo apt-get install -y tzdata
+  - language: yaml
+    label: 'Pre-configure timezone to avoid the prompt entirely'
+    code: |
+      - name: Install tzdata non-interactively
+        run: |
+          sudo ln -snf /usr/share/zoneinfo/UTC /etc/localtime
+          echo UTC | sudo tee /etc/timezone
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tzdata
+prevention:
+  - 'Always set DEBIAN_FRONTEND=noninteractive when running apt-get in CI environments'
+  - 'Set DEBIAN_FRONTEND at the job level env block to protect all steps automatically'
+  - 'Check transitive dependencies with apt-cache show <package> to detect tzdata deps early'
+  - 'Add a timeout-minutes to critical steps so tzdata hangs fail fast instead of blocking for 6 hours'
+docs:
+  - url: 'https://manpages.ubuntu.com/manpages/noble/man7/debconf.7.html'
+    label: 'debconf manual page — debconf frontends and noninteractive mode'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/store-information-in-variables'
+    label: 'GitHub Actions: Store information in variables'
