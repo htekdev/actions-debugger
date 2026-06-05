@@ -1,0 +1,109 @@
+id: silent-failures-103
+title: "concurrency queue: max silently ignored when cancel-in-progress: true is also set"
+category: silent-failures
+severity: silent-failure
+tags:
+  - concurrency
+  - queue
+  - cancel-in-progress
+  - silent-failure
+  - deployment
+  - serialization
+patterns:
+  - regex: 'This run has been cancelled'
+    flags: 'i'
+  - regex: 'Canceling since a higher priority waiting run was found'
+    flags: 'i'
+  - regex: 'queue:\s*max'
+    flags: 'i'
+error_messages:
+  - "This run has been cancelled."
+  - "Canceling since a higher priority waiting run was found"
+root_cause: |
+  GitHub Actions introduced `queue: max` in May 2026 as a way to allow up to 100
+  pending runs to wait in a concurrency group instead of being cancelled and
+  replaced. Adding `queue: max` to an existing concurrency block without removing
+  `cancel-in-progress: true` results in the `queue: max` setting being silently
+  ignored — no validation error is raised, no warning is emitted.
+
+  The concurrency group continues to cancel pending runs exactly as it did before.
+  The developer believes their deployment queue is now buffering up to 100 runs,
+  but every third commit or concurrent PR merge still cancels the previously queued
+  run, dropping deployments silently.
+
+  The language services editor plugin (VS Code Actions extension) does report a
+  lint error for this combination, but:
+    - Not all teams have the extension installed or enabled.
+    - The Actions UI and `gh` CLI do not surface the conflict at run time.
+    - The workflow file passes schema validation and runs without a reported error.
+
+  The practical symptom is identical to having no `queue: max` at all: runs are
+  still cancelled, the queue never grows beyond one pending run, and deployments
+  are dropped during high-frequency push periods — exactly the problem `queue: max`
+  was supposed to solve.
+fix: |
+  Remove `cancel-in-progress: true` (or omit it entirely, since `false` is the
+  default) when using `queue: max`. These two options are mutually exclusive:
+
+  - `cancel-in-progress: true` — cancel the pending run when a newer run arrives.
+  - `queue: max` — hold up to 100 pending runs in order.
+
+  If you need both semantics (cancel old pending runs for feature branches but queue
+  for main), split into separate concurrency group expressions per ref:
+
+    ```yaml
+    concurrency:
+      group: deploy-${{ github.ref }}
+      cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+      # Do NOT add queue: max when cancel-in-progress may be true
+    ```
+
+  For the main branch where ordered deploys matter, use `queue: max` alone:
+
+    ```yaml
+    concurrency:
+      group: deploy-production
+      queue: max
+      # cancel-in-progress must be omitted or set to false
+    ```
+fix_code:
+  - language: yaml
+    label: "WRONG — queue: max silently ignored when cancel-in-progress: true"
+    code: |
+      concurrency:
+        group: deploy-${{ github.repository }}-${{ github.ref }}
+        cancel-in-progress: true   # ← PROBLEM: negates queue: max
+        queue: max                 # ← silently ignored, no error shown
+  - language: yaml
+    label: "CORRECT — use queue: max without cancel-in-progress"
+    code: |
+      concurrency:
+        group: deploy-${{ github.repository }}-${{ github.ref }}
+        queue: max                  # ← up to 100 pending runs queued
+        # cancel-in-progress is false by default — omit it entirely
+  - language: yaml
+    label: "ADVANCED — cancel-in-progress for branches, queue for main"
+    code: |
+      concurrency:
+        group: deploy-${{ github.repository }}-${{ github.ref }}
+        # Dynamic cancel: cancel feature branch runs (fast feedback), queue
+        # main branch deploys (preserve ordering).
+        cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+        # Note: queue: max cannot be combined with cancel-in-progress.
+        # For main branch serialization without cancel, omit cancel-in-progress
+        # and rely on queue: max in a separate workflow targeting only main.
+prevention:
+  - "When adding `queue: max` to an existing concurrency block, always audit the
+    block for a `cancel-in-progress: true` setting and remove it."
+  - "Install the GitHub Actions VS Code extension — it reports a lint error for
+    `queue: max` + `cancel-in-progress: true` combinations before you push."
+  - "After enabling `queue: max`, verify it works by triggering two rapid pushes
+    and confirming both runs appear in the Actions UI as 'Queued' rather than one
+    being cancelled."
+docs:
+  - url: "https://github.blog/changelog/2026-05-07-github-actions-concurrency-groups-now-allow-larger-queues/"
+    label: "GitHub Changelog: GitHub Actions concurrency groups now allow larger queues (May 7, 2026)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/using-concurrency"
+    label: "Using concurrency — GitHub Actions documentation"
+  - url: "https://github.com/actions/languageservices/pull/355"
+    label: "actions/languageservices#355: Add queue property to concurrency, validate queue+cancel-in-progress conflict"
