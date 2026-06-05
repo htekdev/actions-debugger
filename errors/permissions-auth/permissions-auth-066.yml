@@ -1,0 +1,129 @@
+id: permissions-auth-066
+title: "AWS IAM OIDC Trust Policy Pins Reusable Workflow to Version Tag — Breaks on Called Action Major Version Upgrade"
+category: permissions-auth
+severity: error
+tags:
+  - oidc
+  - aws
+  - iam
+  - reusable-workflow
+  - job_workflow_ref
+  - version-tag
+  - trust-policy
+patterns:
+  - regex: 'Not authorized to perform sts:AssumeRoleWithWebIdentity'
+    flags: i
+  - regex: 'Could not assume role with OIDC'
+    flags: i
+  - regex: 'AccessDenied.*AssumeRoleWithWebIdentity'
+    flags: i
+error_messages:
+  - "Could not assume role with OIDC: Not authorized to perform sts:AssumeRoleWithWebIdentity"
+  - "An error occurred (AccessDenied) when calling the AssumeRoleWithWebIdentity operation: Not authorized to perform sts:AssumeRoleWithWebIdentity"
+root_cause: |
+  When a reusable workflow is called at a specific version tag (e.g.,
+  `uses: org/lib/.github/workflows/deploy.yml@v2`), GitHub's OIDC token embeds the called
+  workflow's ref in the `sub` claim as `job_workflow_ref`:
+
+    repo:ORG/CALLER:job_workflow_ref:org/lib/.github/workflows/deploy.yml@refs/tags/v2.1.0
+
+  An AWS IAM trust policy that uses a `StringLike` condition pinned to a specific version
+  pattern such as `@refs/tags/v2*` accepts this token. However, when the caller upgrades
+  the called action from `@v2` to `@v3`, the OIDC token `sub` claim changes to:
+
+    repo:ORG/CALLER:job_workflow_ref:org/lib/.github/workflows/deploy.yml@refs/tags/v3.0.0
+
+  The `@refs/tags/v2*` condition no longer matches `@refs/tags/v3.0.0`, so AWS STS rejects
+  the `AssumeRoleWithWebIdentity` call with AccessDenied. The error message is identical to
+  any other OIDC trust policy mismatch — nothing in the error output reveals that the version
+  tag in the `job_workflow_ref` claim is the cause.
+
+  This is distinct from the ref→job_workflow_ref format change (permissions-auth-044) which
+  occurs when a direct job is refactored into a reusable workflow. Here, the `job_workflow_ref`
+  format is already in use and working — it breaks silently only after a version upgrade.
+fix: |
+  Update the AWS IAM trust policy `StringLike` condition to accept any version of the called
+  workflow, not a pinned version pattern. Use a wildcard that matches across versions.
+
+  Option A (wildcard on the version suffix — recommended):
+    Replace `@refs/tags/v2*` with `@*` or use a broader pattern that includes the full path
+    before the version, such as:
+    `"repo:ORG/CALLER:job_workflow_ref:org/lib/.github/workflows/deploy.yml@*"`
+
+  Option B (OIDC subject claim customization):
+    Use GitHub's OIDC subject claim customization (repo Settings → Actions → General → OIDC
+    subject claims) to define a custom sub template that excludes the `job_workflow_ref` field
+    or removes the version portion. Then update the trust policy to match the customized sub.
+
+  Option C (accept both old and new versions):
+    Add both version patterns to the IAM trust policy during a transition window:
+    `StringLike: ["...deploy.yml@refs/tags/v2*", "...deploy.yml@refs/tags/v3*"]`
+    Remove the old pattern after all callers have upgraded.
+fix_code:
+  - language: json
+    label: "AWS IAM trust policy — version-agnostic StringLike condition (recommended)"
+    code: |
+      {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+            },
+            "Action": "sts:AssumeRoleWithWebIdentity",
+            "Condition": {
+              "StringEquals": {
+                "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+              },
+              "StringLike": {
+                "token.actions.githubusercontent.com:sub": "repo:ORG/CALLER:job_workflow_ref:org/lib/.github/workflows/deploy.yml@*"
+              }
+            }
+          }
+        ]
+      }
+  - language: json
+    label: "Multi-version transition — accept both v2 and v3 during upgrade"
+    code: |
+      {
+        "Condition": {
+          "StringEquals": {
+            "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+          },
+          "StringLike": {
+            "token.actions.githubusercontent.com:sub": [
+              "repo:ORG/CALLER:job_workflow_ref:org/lib/.github/workflows/deploy.yml@refs/tags/v2*",
+              "repo:ORG/CALLER:job_workflow_ref:org/lib/.github/workflows/deploy.yml@refs/tags/v3*"
+            ]
+          }
+        }
+      }
+  - language: yaml
+    label: "How to decode the actual sub claim from a failing run"
+    code: |
+      # Add this step before configure-aws-credentials to log the actual sub claim
+      - name: Debug OIDC subject claim
+        id: debug-oidc
+        run: |
+          token=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" | jq -r '.value')
+          echo "$token" | cut -d. -f2 | base64 -d 2>/dev/null | jq '.sub'
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ${{ env.ACTIONS_ID_TOKEN_REQUEST_TOKEN }}
+          ACTIONS_ID_TOKEN_REQUEST_URL: ${{ env.ACTIONS_ID_TOKEN_REQUEST_URL }}
+prevention:
+  - "Use version-agnostic wildcards in IAM trust policy StringLike conditions (e.g., `@*` suffix) unless the policy intentionally restricts to a specific version"
+  - "Treat IAM OIDC trust policies as part of the release checklist — whenever a reusable workflow's major version is bumped, update the trust policy before merging callers"
+  - "Use GitHub OIDC subject claim customization to remove the version from the sub claim if version-agnostic trust is always preferred"
+  - "Document the expected sub claim format in the reusable workflow README alongside the required IAM trust policy pattern"
+  - "Run the sub-claim debug step in a dry-run workflow before updating the IAM trust policy to confirm the exact new sub value"
+docs:
+  - url: "https://github.com/aws-actions/configure-aws-credentials/issues/1707"
+    label: "aws-actions/configure-aws-credentials#1707 — OIDC AssumeRole fails after action version upgrade"
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/using-openid-connect-with-reusable-workflows"
+    label: "GitHub Docs: Using OIDC with reusable workflows"
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect#customizing-the-subject-claims-for-an-organization-or-repository"
+    label: "GitHub Docs: Customizing OIDC subject claims"
+  - url: "https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_providers_oidc.html"
+    label: "AWS Docs: IAM OIDC identity providers"
