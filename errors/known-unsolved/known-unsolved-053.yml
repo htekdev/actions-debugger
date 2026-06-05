@@ -1,0 +1,114 @@
+id: known-unsolved-053
+title: '`workflow_dispatch` Has No Native Array or List Input Type — Must Serialize as JSON String'
+category: known-unsolved
+severity: limitation
+tags:
+  - workflow_dispatch
+  - inputs
+  - array
+  - list
+  - json
+  - limitation
+patterns:
+  - regex: 'workflow_dispatch.*inputs|inputs.*type\s*:\s*string.*array'
+    flags: 'im'
+  - regex: "fromJSON\\(.*inputs\\."
+    flags: 'i'
+error_messages:
+  - "Input type 'array' is not supported for workflow_dispatch"
+  - "Unexpected value 'array'"
+root_cause: |
+  GitHub Actions `workflow_dispatch` supports only five input types:
+  `string`, `boolean`, `choice`, `number`, and `environment`. There is no
+  native `array` or `list` type. Users who need to pass multiple values
+  (e.g., a list of services to deploy, a set of environments to target)
+  must serialize the array as a JSON string and parse it in the workflow.
+
+  This limitation affects:
+  - Manual dispatch with dynamic target lists
+  - CI/CD automation via the REST API (`POST /repos/.../actions/workflows/.../dispatches`)
+  - Reuse of workflow_dispatch workflows that naturally accept variable-length input
+  - Validation — no schema can prevent malformed JSON from being passed
+
+  A `type: array` schema was proposed in actions/runner#1844 (800+ reactions)
+  and remains one of the highest-voted open feature requests for GitHub Actions.
+fix: |
+  Serialize the array as a JSON string in the dispatch call and use
+  `fromJSON()` in the workflow to parse it into a matrix or loop variable.
+
+  Workarounds by use case:
+  1. **API dispatch**: Serialize to `'["a","b","c"]'` and use `fromJSON(inputs.targets)`
+  2. **UI dispatch**: Document the expected JSON format in the input description
+  3. **Choice type**: If the list is finite and known ahead of time, use
+     `type: choice` with predefined options instead
+  4. **Multiple boolean inputs**: For small fixed sets, use separate boolean
+     inputs per option (verbose but typed)
+fix_code:
+  - language: yaml
+    label: "Workaround — serialize array as JSON string, parse with fromJSON"
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            services:
+              description: 'JSON array of services to deploy e.g. ["api","worker","ui"]'
+              required: true
+              type: string
+              default: '["api","worker"]'
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          strategy:
+            matrix:
+              service: ${{ fromJSON(inputs.services) }}
+          steps:
+            - run: echo "Deploying ${{ matrix.service }}"
+  - language: yaml
+    label: "Workaround — comma-separated string split in shell"
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            environments:
+              description: 'Comma-separated environments e.g. staging,production'
+              required: true
+              type: string
+              default: 'staging'
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Deploy to each environment
+              run: |
+                IFS=',' read -ra ENVS <<< "${{ inputs.environments }}"
+                for env in "${ENVS[@]}"; do
+                  echo "Deploying to: $env"
+                done
+  - language: yaml
+    label: "Alternative — use type: choice for known finite sets"
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            target_env:
+              description: 'Target environment'
+              required: true
+              type: choice
+              options:
+                - staging
+                - production
+                - both
+prevention:
+  - "Document the expected JSON format in the input `description` field so UI dispatchers know the required syntax."
+  - "Add a validation step that runs `echo '${{ inputs.targets }}' | jq .` to fail fast on malformed JSON before processing."
+  - "Consider using `type: choice` with predefined options if the list is small and known at workflow-definition time."
+  - "For API-driven workflows, generate the JSON array programmatically and pass it as a string in the dispatch payload."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#onworkflow_dispatchinputsinput_idtype"
+    label: "workflow_dispatch input types — supported values"
+  - url: "https://github.com/actions/runner/issues/1844"
+    label: "actions/runner #1844 — Support array inputs for workflow_dispatch (800+ reactions)"
+  - url: "https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event"
+    label: "REST API — Create a workflow dispatch event"
