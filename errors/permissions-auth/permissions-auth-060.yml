@@ -1,0 +1,115 @@
+id: permissions-auth-060
+title: 'Fork Pull Request Workflows Cannot Access Repository Secrets — Secrets Context Is Empty'
+category: permissions-auth
+severity: silent-failure
+tags:
+  - fork
+  - pull-request
+  - secrets
+  - security
+  - workflow-permissions
+patterns:
+  - regex: 'secrets\.[\w_]+.*empty|secrets context.*fork'
+    flags: 'i'
+error_messages:
+  - "Error: Input required and not supplied: token"
+  - "HttpError: Bad credentials"
+  - "Error: Resource not accessible by integration"
+root_cause: |
+  GitHub's security model prevents workflows triggered by `pull_request` events from
+  fork repositories from accessing repository secrets. This applies to ALL non-Dependabot
+  external contributor forks — not just Dependabot.
+
+  When a fork PR workflow runs:
+  - All `secrets.*` values resolve to empty string `''`
+  - `secrets.GITHUB_TOKEN` is replaced with a read-only token scoped only to the fork
+    repository (cannot write to the upstream repo, cannot access packages, etc.)
+  - Environment secrets are also unavailable
+  - Fine-grained PATs stored as secrets are unavailable
+
+  This is intentional — allowing forks to read secrets would enable malicious PRs to
+  exfiltrate credentials.
+
+  Common failure patterns:
+  - `actions/setup-node` with `registry-url` + `NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}` → 401 Unauthorized
+  - `docker/login-action` with `${{ secrets.DOCKERHUB_TOKEN }}` → login fails silently, image push 403
+  - `aws-actions/configure-aws-credentials` with role ARN from secrets → empty role, OIDC fallback
+  - Custom actions reading a `token:` input wired to `${{ secrets.MY_TOKEN }}` → action receives ''
+    and may throw "Input required and not supplied: token"
+
+  The fork PR restriction also applies to `workflow_dispatch` when triggered from a fork,
+  and to `check_suite`/`check_run` events from fork PRs.
+
+  Note: `pull_request_target` DOES have access to secrets because it runs in the context
+  of the BASE repository — but this introduces a different security risk (running untrusted
+  code with secret access) that requires careful mitigation.
+fix: |
+  For CI checks that don't need secrets (lint, unit tests, build validation), no change
+  is needed — the read-only GITHUB_TOKEN is sufficient.
+
+  For steps that require secrets:
+
+  1. Gate secret-requiring steps on `github.event.pull_request.head.repo.fork == false`
+     to skip them on fork PRs gracefully.
+  2. Use `pull_request_target` + a separate privileged job for publishing/deploying,
+     but ALWAYS check out from `github.event.pull_request.head.sha` explicitly and
+     never run untrusted code in the same job.
+  3. For package publishing, only publish from base branch pushes (not from PRs at all).
+fix_code:
+  - language: yaml
+    label: "Skip secret-requiring steps on fork PRs gracefully"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Run tests (works on fork PRs)
+              run: npm test
+
+            - name: Publish coverage report (skip on fork PRs)
+              if: github.event.pull_request.head.repo.fork == false
+              env:
+                CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+              run: npx codecov
+  - language: yaml
+    label: "Split fork-safe CI from privileged deployment using workflow_run"
+    code: |
+      # workflow: ci.yml — runs on all PRs including forks (no secrets needed)
+      on:
+        pull_request:
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm ci && npm test
+
+      ---
+      # workflow: publish-coverage.yml — runs after ci.yml completes (has secrets)
+      on:
+        workflow_run:
+          workflows: ['CI']
+          types: [completed]
+      jobs:
+        coverage:
+          if: github.event.workflow_run.conclusion == 'success'
+          runs-on: ubuntu-latest
+          steps:
+            - name: Publish coverage
+              env:
+                CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+              run: echo "Publishing coverage for run ${{ github.event.workflow_run.id }}"
+prevention:
+  - "Design CI workflows to not require secrets for the build/test steps — secrets should only be needed for publish/deploy"
+  - "Check `github.event.pull_request.head.repo.fork` before any step that uses secrets to provide a clear skip message"
+  - "Do not use `pull_request_target` as a shortcut to get secrets — it runs untrusted fork code with base repo privileges, creating a severe injection risk"
+  - "Use `workflow_run` to chain a privileged follow-up workflow that runs in base repo context after fork CI succeeds"
+docs:
+  - url: "https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#understanding-the-risk-of-script-injections"
+    label: "GitHub Docs — Security hardening: fork PR and secret access"
+  - url: "https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#pull_request"
+    label: "GitHub Docs — pull_request event: fork limitations"
+  - url: "https://securitylab.github.com/research/github-actions-preventing-pwn-requests/"
+    label: "GitHub Security Lab — Preventing pwn requests (pull_request_target risks)"

@@ -1,0 +1,94 @@
+id: silent-failures-091
+title: '`github.ref_name` Returns Ephemeral Merge Ref (`123/merge`) on `pull_request` Trigger, Not Branch Name'
+category: silent-failures
+severity: silent-failure
+tags:
+  - github-context
+  - ref-name
+  - pull-request
+  - docker
+  - branch-name
+  - deployment
+patterns:
+  - regex: '\d+/merge'
+    flags: 'i'
+error_messages:
+  - "invalid reference format"
+  - "invalid tag format"
+root_cause: |
+  When a workflow is triggered by a `pull_request` event, GitHub creates an ephemeral
+  merge commit that merges the PR head into the base branch. The context variables for
+  this run reflect the merge ref, not the source branch:
+
+  - `github.ref` = `refs/pull/123/merge`
+  - `github.ref_name` = `123/merge`
+  - `github.sha` = SHA of the ephemeral merge commit
+  - `github.head_ref` = `feature-branch-name` (the actual PR branch)
+  - `github.base_ref` = `main` (the target branch)
+
+  Using `github.ref_name` in contexts that expect a branch name silently produces
+  the merge ref string `123/merge` instead:
+
+  - **Docker image tags**: `docker.io/myapp:123/merge` — Docker rejects the forward slash
+    as an invalid tag character (`invalid reference format` error), OR worse, interprets
+    `123` as a registry name.
+  - **Deployment environment names**: The environment is created as `123/merge` rather
+    than the branch name, causing routing rules to miss the deployment.
+  - **Branch-based conditional logic**: `if: github.ref_name == 'feature-foo'` always
+    evaluates to false on pull_request events.
+  - **Artifact naming**: Artifacts uploaded with the ref_name contain forward slashes,
+    causing path traversal issues on some download handlers.
+
+  `github.head_ref` is only populated for `pull_request` and `pull_request_target`
+  events, making branch detection logic that works on push but silently fails on PR
+  events harder to diagnose.
+fix: |
+  Use the correct context variable for each event type:
+
+  - For the PR's source branch name: `github.head_ref` (only set on pull_request events)
+  - For push events' branch name: `github.ref_name`
+  - For a branch name that works across both event types, use a conditional expression.
+fix_code:
+  - language: yaml
+    label: "Unified branch name across push and pull_request events"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Determine branch name
+              id: branch
+              run: |
+                if [ "${{ github.event_name }}" = "pull_request" ]; then
+                  echo "name=${{ github.head_ref }}" >> "$GITHUB_OUTPUT"
+                else
+                  echo "name=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+                fi
+
+            - name: Build and tag Docker image
+              run: |
+                # Sanitize slashes for use in image tags
+                TAG=$(echo "${{ steps.branch.outputs.name }}" | tr '/' '-')
+                docker build -t "myapp:${TAG}" .
+  - language: yaml
+    label: "Expression-based branch name (no shell step needed)"
+    code: |
+      env:
+        BRANCH_NAME: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          environment: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
+          steps:
+            - run: echo "Deploying branch ${{ env.BRANCH_NAME }}"
+prevention:
+  - "Never use `github.ref_name` directly in Docker image tags — always sanitize forward slashes with `tr '/' '-'` or similar"
+  - "Test branch-detection expressions with both `push` and `pull_request` triggers in a dry-run workflow"
+  - "Use `github.head_ref` for PR branch name and `github.ref_name` for push branch name — they are NOT interchangeable"
+  - "Add an explicit check: if `github.ref_name` contains a `/`, the workflow is running on a pull_request or merge ref, not a regular branch"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context"
+    label: "GitHub Docs — github context reference"
+  - url: "https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#pull_request"
+    label: "GitHub Docs — pull_request event"

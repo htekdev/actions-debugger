@@ -1,0 +1,98 @@
+id: caching-artifacts-057
+title: '`actions/cache` Never Refreshes Cached Content — Cache Keys Are Immutable Once Stored'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - cache
+  - stale
+  - immutable
+  - cache-hit
+  - refresh
+  - node-modules
+patterns:
+  - regex: 'cache-hit.*true.*post.*skip'
+    flags: 'i'
+error_messages:
+  - "Cache hit occurred on the primary key, not saving cache."
+  - "Cache hit occurred on the primary key runner-os-node-"
+root_cause: |
+  `actions/cache` uses immutable cache keys. Once a cache entry is stored for a given
+  key, it cannot be updated or overwritten — any subsequent run that produces an exact
+  key match will restore the cached content and the post step will NOT save a new cache
+  entry because one already exists for that key.
+
+  This means cached content (node_modules, pip packages, Maven artifacts, etc.) is
+  frozen at the point of first creation and will not reflect package updates until:
+  - The cache entry expires (GitHub-hosted caches expire after 7 days of no access)
+  - The cache key changes (e.g., lockfile hash changes)
+  - The cache entry is manually deleted via the GitHub UI or API
+
+  Common misconception: developers expect that running `npm ci` inside a cached
+  node_modules hit will update the cache if packages changed. It won't. The cache key
+  (usually `${{ hashFiles('package-lock.json') }}`) must change for a new cache to be
+  saved.
+
+  Related gotcha: if restore-keys produce a partial hit (different key prefix), the
+  post step DOES save a new cache — but for the full key, not the partial restore key.
+  This creates unexpected cache churn from the developer's perspective where cache hit
+  rate is high but actual content is outdated.
+
+  This is intentional GitHub design but frequently misunderstood, leading to:
+  - Stale node_modules with old transitive dependencies
+  - pip packages that don't receive security patches within 7 days
+  - Build artifacts compiled against old toolchain versions
+fix: |
+  To force periodic cache refresh without changing your lockfile, use one of these patterns:
+
+  1. Include a date-based component in the cache key (weekly rotation).
+  2. Use `actions/cache/restore` + `actions/cache/save` with explicit control of when
+     to save (allows saving even on hits).
+  3. Delete the cache manually via GitHub UI (Actions > Caches) or the API when you
+     need an immediate refresh.
+fix_code:
+  - language: yaml
+    label: "Weekly-rotating cache key to prevent indefinitely stale caches"
+    code: |
+      - name: Get week number for cache rotation
+        id: date
+        run: echo "week=$(date +'%Y-%U')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache node_modules (refreshes weekly)
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ steps.date.outputs.week }}-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ steps.date.outputs.week }}-
+            ${{ runner.os }}-node-
+  - language: yaml
+    label: "Separate restore + save for explicit cache update control"
+    code: |
+      - name: Restore cache
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: ${{ runner.os }}-node-
+
+      - run: npm ci
+
+      - name: Save updated cache (always saves, even on hit)
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}-${{ github.run_id }}
+prevention:
+  - "Understand that GitHub cache keys are immutable — a key that already exists in the cache will never be overwritten"
+  - "Use time-based or run-id-based cache key suffixes when cached content must be refreshed more frequently than lockfile changes"
+  - "Monitor cache age in the GitHub UI (Actions > Caches) and manually purge entries that appear stale"
+  - "For security-sensitive dependencies, prefer short cache TTLs via run-id keys or disable caching entirely"
+docs:
+  - url: "https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows"
+    label: "GitHub Docs — Caching dependencies to speed up workflows"
+  - url: "https://github.com/actions/cache/blob/main/tips-and-workarounds.md"
+    label: "actions/cache tips and workarounds"
+  - url: "https://github.com/actions/cache/issues/1380"
+    label: "actions/cache #1380 — cache never updates on key hit"
