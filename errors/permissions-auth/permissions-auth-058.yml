@@ -1,0 +1,101 @@
+id: permissions-auth-058
+title: 'actions/checkout does not rewrite ssh:// submodule URLs — only git@github.com: format is rewritten'
+category: permissions-auth
+severity: error
+tags:
+  - checkout
+  - submodules
+  - ssh
+  - gitmodules
+  - URL-rewriting
+  - host-key-verification
+  - ssh-key
+patterns:
+  - regex: 'Host key verification failed'
+    flags: 'i'
+  - regex: 'ssh://.*Permission denied|ssh://.*Could not read from remote'
+    flags: 'i'
+  - regex: 'fatal: clone of .ssh://. into submodule path .* failed'
+    flags: 'i'
+  - regex: 'git@github\.com.*vs.*ssh://github\.com'
+    flags: 'i'
+error_messages:
+  - "Host key verification failed."
+  - "fatal: Could not read from remote repository."
+  - "Please make sure you have the correct access rights and the repository exists."
+  - "fatal: clone of 'ssh://git@github.com/Org/SubRepo.git' into submodule path '<path>' failed"
+root_cause: |
+  actions/checkout rewrites submodule URLs in .gitmodules to inject the
+  provided ssh-key or GITHUB_TOKEN credentials, but the rewriting logic only
+  handles the git@github.com: URL format. URLs using the alternative
+  ssh://git@github.com/ scheme are NOT rewritten and are passed to git
+  as-is.
+
+  When git attempts to clone an ssh:// URL without an SSH agent providing
+  the key, and without the runner having github.com in ~/.ssh/known_hosts,
+  the clone fails with "Host key verification failed." or permission errors.
+
+  The affected code path is actions/checkout/src/git-auth-helper.ts which
+  contains an explicit regex that only matches the git@ style:
+    /^git@github\.com:/
+  The ssh:// variant does not match, so the credential injection and
+  known_hosts population steps are skipped for those URLs.
+
+  This is a confirmed open bug with a pending fix (PR #2367), but as of
+  early 2026 it remains unmerged and unreleased.
+fix: |
+  Convert all submodule URLs in .gitmodules from ssh:// to git@github.com:
+  format. This ensures actions/checkout's URL rewriting logic applies the
+  SSH key and adds the host key to known_hosts.
+
+  If you cannot change .gitmodules (e.g., the submodule is a third-party
+  repo), use a manual git config insteadOf URL rewrite in a pre-checkout
+  step to normalize the URL before the checkout action runs.
+fix_code:
+  - language: bash
+    label: 'Option A — Change .gitmodules to use git@ format instead of ssh://'
+    code: |
+      # .gitmodules — BEFORE (broken)
+      [submodule "MySubrepo"]
+          path = MySubrepo
+          url = ssh://git@github.com/Org/MySubrepo.git
+
+      # .gitmodules — AFTER (working)
+      [submodule "MySubrepo"]
+          path = MySubrepo
+          url = git@github.com:Org/MySubrepo.git
+  - language: yaml
+    label: 'Option B — Add git config URL rewrite step before checkout'
+    code: |
+      steps:
+        - name: Rewrite ssh:// submodule URLs to git@ format
+          run: |
+            git config --global url."git@github.com:".insteadOf "ssh://git@github.com/"
+
+        - uses: actions/checkout@v4
+          with:
+            submodules: recursive
+            ssh-key: ${{ secrets.SSH_DEPLOY_KEY }}
+  - language: yaml
+    label: 'Option C — Use HTTPS with token for submodule auth (avoids SSH entirely)'
+    code: |
+      steps:
+        - uses: actions/checkout@v4
+          with:
+            submodules: recursive
+            token: ${{ secrets.PAT_WITH_SUBMODULE_ACCESS }}
+            # Requires .gitmodules to use https:// URLs
+prevention:
+  - "Standardize on git@github.com: format for all .gitmodules URLs in repositories using actions/checkout with SSH keys."
+  - "Use HTTPS URLs with a PAT for submodule access when possible — this is simpler and avoids SSH host key issues entirely."
+  - "Add a linting step (e.g., grep .gitmodules for ssh://) to your repo's pre-commit hooks to catch the wrong URL format early."
+  - "Track actions/checkout PR #2367 for the fix; upgrade once it is merged and released."
+docs:
+  - url: 'https://github.com/actions/checkout/issues/2178'
+    label: 'actions/checkout #2178 — ssh:// URLs in .gitmodules do not work'
+  - url: 'https://github.com/actions/checkout/pull/2367'
+    label: 'actions/checkout PR #2367 — Fix: also rewrite ssh:// URLs'
+  - url: 'https://github.com/actions/checkout/blob/main/src/git-auth-helper.ts'
+    label: 'actions/checkout git-auth-helper.ts — URL rewriting source code'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-conditions-to-control-job-execution'
+    label: 'GitHub Docs — Checking out submodules'

@@ -1,0 +1,104 @@
+id: caching-artifacts-055
+title: 'setup-python cache: poetry broken when poetry is installed before setup-python — virtualenv 20.33.0+ Python version mismatch'
+category: caching-artifacts
+severity: error
+tags:
+  - setup-python
+  - poetry
+  - cache
+  - virtualenv
+  - python-version
+  - pipx
+  - ordering
+patterns:
+  - regex: 'Current Python version \([\d.]+\) is not allowed by the project'
+    flags: 'i'
+  - regex: 'poetry.*install.*exit code 1'
+    flags: 'i'
+  - regex: 'Please change python executable via the "env use" command'
+    flags: 'i'
+  - regex: 'installed package poetry.*using Python \d+\.\d+'
+    flags: 'i'
+error_messages:
+  - "Current Python version (3.12.3) is not allowed by the project (>= 3.13, < 4). Please change python executable via the \"env use\" command."
+  - "Current Python version (3.11.9) is not allowed by the project (>=3.12,<3.13). Please change python executable via the \"env use\" command."
+  - "Error: Process completed with exit code 1."
+root_cause: |
+  When using actions/setup-python with cache: 'poetry', the action requires
+  poetry to be installed BEFORE it runs (to resolve the cache path). Developers
+  commonly install poetry via pipx before calling setup-python, which causes
+  pipx to anchor poetry to the runner's pre-installed system Python (e.g., 3.12.3).
+
+  After setup-python runs and installs the project's target Python version
+  (e.g., 3.13), poetry's internal virtualenv logic still references the Python
+  version it was originally installed with. Consequently, when poetry creates
+  or activates a virtual environment, it resolves to the old Python version —
+  which violates the project's python requirement and produces the
+  "Current Python version is not allowed" error.
+
+  This became a consistent failure in August 2025 when virtualenv 20.33.0
+  changed how it resolves the Python interpreter for new virtual environments,
+  making the version mismatch explicit and fatal rather than silently using
+  the wrong interpreter.
+
+  The fundamental issue is a circular dependency in the documented workflow:
+  setup-python needs poetry installed to set up caching, but poetry must be
+  installed after setup-python to use the correct Python version.
+fix: |
+  Use actions/cache manually instead of setup-python's built-in poetry cache.
+  Install poetry AFTER setup-python so it is anchored to the correct Python.
+  This avoids the circular ordering problem entirely.
+fix_code:
+  - language: yaml
+    label: 'Workaround — Manual cache + install poetry after setup-python'
+    code: |
+      steps:
+        - uses: actions/setup-python@v5
+          id: setup-python
+          with:
+            python-version: '3.13'
+            # Do NOT use cache: 'poetry' here
+
+        - name: Install poetry
+          run: pipx install poetry
+
+        - name: Cache poetry virtualenv
+          uses: actions/cache@v4
+          with:
+            path: ~/.cache/pypoetry/virtualenvs
+            key: ${{ runner.os }}-poetry-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('**/poetry.lock') }}
+            restore-keys: |
+              ${{ runner.os }}-poetry-${{ steps.setup-python.outputs.python-version }}-
+
+        - name: Install dependencies
+          run: poetry install
+  - language: yaml
+    label: 'Alternative — pin virtualenv version as a short-term patch'
+    code: |
+      steps:
+        - name: Install poetry (with pinned virtualenv)
+          run: |
+            pipx install poetry
+            pipx inject poetry virtualenv==20.26.6
+
+        - uses: actions/setup-python@v5
+          with:
+            python-version: '3.13'
+            cache: 'poetry'
+
+        - name: Install dependencies
+          run: poetry install
+prevention:
+  - "Never use setup-python cache: poetry in combination with a poetry install step that runs before setup-python."
+  - "Use actions/cache manually to avoid the circular dependency between poetry installation and Python version resolution."
+  - "Keep poetry updated — poetry 2.1.4+ partially mitigates the virtualenv version mismatch for some project configurations."
+  - "Use uv as an alternative to poetry; uv is installed on GitHub-hosted runners and handles Python version resolution differently."
+docs:
+  - url: 'https://github.com/actions/setup-python/issues/1167'
+    label: 'actions/setup-python #1167 — Issues with poetry caching (Aug 2025)'
+  - url: 'https://github.com/python-poetry/poetry/issues/10490'
+    label: 'python-poetry/poetry #10490 — virtualenv 20.33.0 compatibility issue'
+  - url: 'https://github.com/pypa/virtualenv/issues/2931'
+    label: 'pypa/virtualenv #2931 — Python interpreter resolution change'
+  - url: 'https://github.com/actions/setup-python/blob/main/docs/advanced-usage.md#caching-packages'
+    label: 'actions/setup-python — Caching packages documentation'

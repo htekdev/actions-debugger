@@ -1,0 +1,88 @@
+id: runner-environment-169
+title: 'actions/runner 2.320.0+ container image removes SSH — "error: cannot run ssh: No such file or directory"'
+category: runner-environment
+severity: error
+tags:
+  - runner
+  - ssh
+  - openssh-client
+  - git-submodules
+  - self-hosted
+  - container-runner
+  - 2.320
+patterns:
+  - regex: 'error: cannot run ssh: No such file or directory'
+    flags: 'i'
+  - regex: 'fatal: unable to fork'
+    flags: 'i'
+  - regex: 'Unable to locate executable file: ssh'
+    flags: 'i'
+  - regex: 'error downloading.*ssh://.*No such file or directory'
+    flags: 'i'
+error_messages:
+  - "error: cannot run ssh: No such file or directory"
+  - "fatal: unable to fork"
+  - "Unable to locate executable file: ssh. Please verify either the file path exists or the file can be found within a directory specified by the PATH environment variable."
+  - "error downloading 'ssh://git@github.com/...': /usr/bin/git exited with 128: error: cannot run ssh: No such file or directory"
+root_cause: |
+  Starting with actions/runner 2.320.0, the base container image
+  (ghcr.io/actions/actions-runner) no longer ships openssh-client by default.
+  Workflows that rely on git operations over SSH — including submodule cloning
+  via SSH URLs, Terragrunt module downloads over ssh://, or any step that
+  calls ssh-keyscan — fail at runtime because the ssh binary is absent from
+  the runner's PATH.
+
+  This affected both self-hosted runners built from the official container
+  image and any ephemeral runners (Actions Runner Controller / ARC) that
+  derive from ghcr.io/actions/actions-runner:2.320.0+. Hosted runners
+  (ubuntu-latest, etc.) were not affected because they use a separate,
+  pre-loaded VM image that still includes openssh-client.
+
+  The regression was introduced when the container image was slimmed down
+  between 2.319.1 and 2.320.0 without a corresponding changelog callout,
+  leaving self-hosted container runners silently broken on upgrade.
+fix: |
+  Install openssh-client in the runner container image before the runner
+  process starts. For Dockerfiles extending the official image, add an
+  explicit RUN instruction. For ARC runner deployments, add an
+  initContainers step or a containerStartupCommand to install the package.
+
+  If you do not control the image, add an installation step at the top of
+  the failing workflow job before any SSH-dependent steps.
+fix_code:
+  - language: yaml
+    label: 'Option A — Add install step in the workflow before any SSH steps'
+    code: |
+      jobs:
+        build:
+          runs-on: self-hosted
+          steps:
+            - name: Install SSH client
+              run: |
+                apt-get update -qq && apt-get install -y --no-install-recommends openssh-client
+            - name: Checkout with submodules
+              uses: actions/checkout@v4
+              with:
+                submodules: recursive
+                ssh-key: ${{ secrets.SSH_KEY }}
+  - language: dockerfile
+    label: 'Option B — Bake openssh-client into a custom runner image'
+    code: |
+      FROM ghcr.io/actions/actions-runner:latest
+      USER root
+      RUN apt-get update && apt-get install -y --no-install-recommends openssh-client && rm -rf /var/lib/apt/lists/*
+      USER runner
+prevention:
+  - "Pin your ARC / self-hosted runner image to a tested version (e.g., ghcr.io/actions/actions-runner:2.319.1) and test upgrades in a staging environment before rolling out."
+  - "Add a pre-flight check step that runs 'which ssh || (apt-get install -y openssh-client)' if your workflow requires SSH."
+  - "Prefer HTTPS-based submodule URLs and GITHUB_TOKEN for submodule auth in GitHub Actions — this avoids SSH entirely."
+  - "Subscribe to the actions/runner GitHub Releases feed to catch breaking changes in container image composition."
+docs:
+  - url: 'https://github.com/actions/runner/issues/3490'
+    label: 'actions/runner #3490 — Runner 2.320.0 no longer has SSH installed'
+  - url: 'https://github.com/actions/runner/issues/3488'
+    label: 'actions/runner #3488 — Runner version 2.320.0 breaks custom image'
+  - url: 'https://github.com/actions/checkout/issues/1942'
+    label: 'actions/checkout #1942 — Unable to locate executable file: ssh'
+  - url: 'https://github.com/actions/runner/releases'
+    label: 'actions/runner releases'
