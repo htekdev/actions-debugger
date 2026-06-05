@@ -1,0 +1,118 @@
+id: yaml-syntax-069
+title: 'Job-level `env:` Variables Silently Resolve to Empty String in `services.*.image` and `container.image`'
+category: yaml-syntax
+severity: silent-failure
+tags:
+  - services
+  - container
+  - env-context
+  - image
+  - context-availability
+  - job-level-env
+  - silent-failure
+patterns:
+  - regex: 'image:\s*\S*\$\{\{\s*env\.'
+    flags: 'im'
+  - regex: 'Error response from daemon: manifest for \S+: not found'
+    flags: 'i'
+  - regex: 'invalid reference format'
+    flags: 'i'
+error_messages:
+  - "Error response from daemon: manifest for redis: not found: manifest unknown"
+  - "Error response from daemon: manifest for postgres: not found"
+  - "invalid reference format"
+  - "Error: Container action is using an invalid image"
+  - "Unable to pull image 'redis:': invalid reference format"
+root_cause: |
+  GitHub Actions evaluates `services.*.image` and `container.image` expressions BEFORE
+  the job's environment scope is initialized. At evaluation time, the `env` context only
+  contains WORKFLOW-level `env:` variables (defined in the top-level `env:` block). Any
+  `env:` variable declared inside `jobs.<job_id>.env:` is NOT yet in scope and silently
+  evaluates to empty string `""`.
+
+  Example of the broken pattern:
+
+  ```yaml
+  jobs:
+    test:
+      env:
+        REDIS_VERSION: '7.2'     # ← job-level env: NOT available in services below
+      services:
+        redis:
+          image: 'redis:${{ env.REDIS_VERSION }}'   # ← evaluates to "redis:" (empty tag)
+  ```
+
+  The expression `redis:${{ env.REDIS_VERSION }}` resolves to `redis:` which Docker treats
+  as an invalid or missing tag, causing the service to fail to start — often with
+  "manifest not found" or "invalid reference format" errors.
+
+  **Context availability in `services.*.image` and `container.image`**:
+
+  | Context       | Available? |
+  |---------------|------------|
+  | `github`      | ✅ Yes     |
+  | `inputs`      | ✅ Yes     |
+  | `vars`        | ✅ Yes     |
+  | `secrets`     | ✅ Yes     |
+  | `matrix`      | ✅ Yes     |
+  | `env` (workflow-level) | ✅ Yes |
+  | `env` (job-level)      | ❌ No — silently empty |
+  | `steps.*`     | ❌ No — no steps have run yet |
+  | `needs.*`     | ❌ No |
+
+  This affects any image version that a developer attempts to centralize in their job's
+  local `env:` block — a common pattern for organizing service dependencies.
+fix: |
+  Move the image-version environment variable from the job-level `env:` block to the
+  WORKFLOW-level `env:` block (outside `jobs:`). Alternatively, use `vars` context
+  (repository/org variables) for externalized configuration, or pin the version inline.
+fix_code:
+  - language: yaml
+    label: "Broken — job-level env silently empty in services.image"
+    code: |
+      jobs:
+        test:
+          env:
+            REDIS_VERSION: '7.2'   # ← job-level: NOT visible in services below
+          services:
+            redis:
+              image: 'redis:${{ env.REDIS_VERSION }}'  # resolves to "redis:" — fails
+  - language: yaml
+    label: "Fixed — move version to workflow-level env"
+    code: |
+      env:
+        REDIS_VERSION: '7.2'       # ← workflow-level: visible in services.image
+
+      jobs:
+        test:
+          services:
+            redis:
+              image: 'redis:${{ env.REDIS_VERSION }}'  # resolves to "redis:7.2" ✓
+  - language: yaml
+    label: "Alternative — use vars context (repository variable)"
+    code: |
+      # Set REDIS_VERSION in repository Settings → Secrets and variables → Variables
+      jobs:
+        test:
+          services:
+            redis:
+              image: 'redis:${{ vars.REDIS_VERSION }}'  # always available ✓
+  - language: yaml
+    label: "Alternative — pin version inline (simplest)"
+    code: |
+      jobs:
+        test:
+          services:
+            redis:
+              image: 'redis:7.2'   # no expression needed if version doesn't change often
+prevention:
+  - "Always define image-version env vars at the WORKFLOW level (top-level `env:`) when they are referenced in `services:` or `container:`"
+  - "Lint workflows with the GitHub VS Code extension or actionlint — it flags unsupported context references in service/container image fields"
+  - "When a service fails to pull, check the exact image name in the runner log — an empty or malformed tag (e.g., `redis:`) indicates this context-availability issue"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#context-availability"
+    label: "GitHub Actions context availability — which contexts are valid in each workflow field"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idservicesservice_idimage"
+    label: "jobs.<job_id>.services.<service_id>.image — workflow syntax reference"
+  - url: "https://github.com/orgs/community/discussions"
+    label: "GitHub Community Discussions — GitHub Actions service container configuration"

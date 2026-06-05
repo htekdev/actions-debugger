@@ -1,0 +1,119 @@
+id: silent-failures-104
+title: '`github.event.inputs.X` Returns Empty String (Not Declared Default) for `on: schedule` and Other Non-Dispatch Triggers — Use `inputs.X` Instead'
+category: silent-failures
+severity: silent-failure
+tags:
+  - github-event-inputs
+  - inputs-context
+  - schedule
+  - workflow-dispatch
+  - multi-trigger
+  - empty-string
+  - default-value
+  - context
+  - boolean-input
+patterns:
+  - regex: 'github\.event\.inputs\.[a-zA-Z_][a-zA-Z0-9_-]*'
+    flags: 'g'
+  - regex: 'on:\s*\n(?:.*\n)*?\s+schedule:'
+    flags: 'im'
+error_messages:
+  - "Deploy target is empty — expected a non-empty value from github.event.inputs.environment"
+  - "Error: Input required and not supplied"
+  - "github.event.inputs.dry_run was '' but expected 'false'"
+root_cause: |
+  Multi-trigger workflows that combine `on: schedule` (or `on: push`, `on: pull_request`,
+  etc.) with `on: workflow_dispatch` commonly read input values via
+  `${{ github.event.inputs.X }}`. This silently produces wrong results for all
+  non-dispatch runs because:
+
+  - **`github.event.inputs.X`** is populated ONLY when the workflow is triggered via
+    `workflow_dispatch`. For every other event type — including `schedule`, `push`,
+    and `pull_request` — `github.event.inputs` is null or an empty object. Accessing a
+    property returns `""` (empty string). The `default:` declared in the `inputs:` block
+    is NEVER applied through this context.
+
+  - **`inputs.X`** correctly returns the declared `default:` value for non-dispatch
+    triggers, and the actual provided value for dispatch-triggered runs.
+
+  **Silent failure patterns:**
+
+  1. **Boolean gate inverted on schedule** — `if: github.event.inputs.dry_run == 'false'`
+     evaluates to `false` on schedule runs (because `"" != "false"`), so deployment steps
+     that should run on the nightly schedule are silently skipped.
+
+  2. **Non-empty guard always fails** — `if: github.event.inputs.target != ''` is always
+     `false` on schedule even when the intended behavior is to run with the default target.
+
+  3. **String comparison breaks** — `${{ github.event.inputs.environment == 'staging' }}`
+     is `false` on schedule because the empty string does not match any environment name.
+
+  Unlike `inputs.X`, `github.event.inputs.X` has no concept of a fallback default — it
+  returns `""` for every non-dispatch event.
+
+  **Distinct from sf-077** (which covers `workflow_call` — where `github.event.inputs`
+  is null because reusable workflows use the `inputs` context, not `github.event.inputs`).
+  **Distinct from sf-072** (which covers the `inputs.X` context being empty on non-dispatch,
+  not the `github.event.inputs.X` context).
+fix: |
+  Replace all `github.event.inputs.X` references with `inputs.X` in any workflow that
+  uses multiple triggers. The `inputs` context is populated for `workflow_dispatch` and
+  `workflow_call` events, and returns the declared `default:` value for all other triggers.
+fix_code:
+  - language: yaml
+    label: "Broken — github.event.inputs.X ignores defaults on schedule runs"
+    code: |
+      on:
+        schedule:
+          - cron: '0 2 * * *'
+        workflow_dispatch:
+          inputs:
+            dry_run:
+              type: boolean
+              default: false
+            environment:
+              type: string
+              default: production
+
+      jobs:
+        deploy:
+          steps:
+            # ❌ On schedule: dry_run="" (not "false"), environment="" (not "production")
+            - run: echo "Env=${{ github.event.inputs.environment }}"
+            # ❌ This if-condition is always false on schedule — step silently skipped!
+            - if: github.event.inputs.dry_run == 'false'
+              run: ./deploy.sh --env ${{ github.event.inputs.environment }}
+  - language: yaml
+    label: "Fixed — use inputs.X which applies declared defaults on all non-dispatch runs"
+    code: |
+      on:
+        schedule:
+          - cron: '0 2 * * *'
+        workflow_dispatch:
+          inputs:
+            dry_run:
+              type: boolean
+              default: false
+            environment:
+              type: string
+              default: production
+
+      jobs:
+        deploy:
+          steps:
+            # ✓ On schedule: dry_run="false", environment="production" (defaults applied)
+            - run: echo "Env=${{ inputs.environment }}"
+            # ✓ Correctly runs on schedule (dry_run defaults to "false")
+            - if: inputs.dry_run == 'false'
+              run: ./deploy.sh --env ${{ inputs.environment }}
+prevention:
+  - "Always use `inputs.X` (not `github.event.inputs.X`) in any workflow with more than one trigger — `inputs.X` applies declared defaults for non-dispatch runs"
+  - "Audit all `github.event.inputs.*` references in workflows that also include `on: schedule`, `on: push`, or `on: pull_request` triggers"
+  - "Add a debug step in the workflow to log `inputs.*` values on each run — catching empty-input regressions before they cause silent deploy failures"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#inputs-context"
+    label: "GitHub Actions inputs context — recommended approach for reading workflow inputs"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#context-availability"
+    label: "Context availability — github.event.inputs is only set for workflow_dispatch triggers"
+  - url: "https://github.com/orgs/community/discussions"
+    label: "GitHub Community Discussions — multi-trigger workflows with workflow_dispatch inputs"
