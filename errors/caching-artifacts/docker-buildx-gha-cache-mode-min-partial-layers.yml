@@ -1,0 +1,91 @@
+id: caching-artifacts-049
+title: 'Docker buildx GHA cache mode:min only caches final layer — rebuilds remain slow'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - docker
+  - buildx
+  - gha-cache
+  - layer-cache
+  - mode-min
+  - silent-failure
+patterns:
+  - regex: 'cache-to.*type=gha'
+    flags: 'i'
+  - regex: 'importing\s+cache\s+manifest\s+from\s+ghcr\.io'
+    flags: 'i'
+  - regex: 'exporting\s+cache\s+.*\s+type=gha'
+    flags: 'i'
+error_messages:
+  - 'cache-to: type=gha'
+  - 'exporting cache to GitHub Actions Cache Service'
+  - 'CACHED [stage 2/4]'
+root_cause: |
+  docker/build-push-action uses cache-to: type=gha with mode=min by default when
+  no explicit mode is specified. In min mode, BuildKit exports ONLY the layers of
+  the final image (the last build stage), discarding all intermediate layer cache
+  data. This means:
+
+  - Multi-stage Dockerfiles get no benefit from the GHA cache for base/dependency
+    stages (the expensive ones) — only the final artifact stage is cached.
+  - Subsequent runs re-execute all intermediate stages from scratch while the
+    cache appears to "work" (export/import steps succeed in the logs).
+  - Developers see 80-90% cache miss rates and slow builds despite believing the
+    GHA cache is active.
+
+  The silent aspect: the workflow logs show cache export and import succeeding,
+  and BuildKit reports "CACHED" for layers it finds, with no warning that intermediate
+  stages were excluded from the cache.
+fix: |
+  Explicitly set mode=max on the cache-to option. This instructs BuildKit to export
+  ALL layer metadata — including every intermediate build stage — into the GHA cache.
+  Combined with cache-from: type=gha, all previously-built stages will be restored
+  on the next run.
+
+  Note: mode=max requires more GHA cache storage (subject to the 10 GB repository
+  limit). Use separate cache scopes per Dockerfile or build target to prevent
+  cross-contamination and LRU eviction pressure.
+fix_code:
+  - language: yaml
+    label: 'Set mode=max for full layer caching in multi-stage builds'
+    code: |
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository }}:latest
+          cache-from: type=gha,scope=main
+          cache-to: type=gha,scope=main,mode=max
+  - language: yaml
+    label: 'Use separate scopes per Dockerfile to isolate caches'
+    code: |
+      - name: Build API image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./api
+          push: true
+          tags: ghcr.io/${{ github.repository }}/api:latest
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,scope=api,mode=max
+
+      - name: Build Frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: true
+          tags: ghcr.io/${{ github.repository }}/frontend:latest
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,scope=frontend,mode=max
+prevention:
+  - 'Always explicitly set mode=max in cache-to: type=gha for multi-stage Dockerfiles'
+  - 'Use the scope= parameter to isolate caches per Dockerfile or build target'
+  - 'Monitor cache size with the GitHub Actions Cache API if approaching the 10 GB repository limit'
+  - 'Verify cache effectiveness by checking that intermediate build stages show CACHED in buildx output'
+docs:
+  - url: 'https://docs.docker.com/build/cache/backends/gha/'
+    label: 'Docker BuildKit — GitHub Actions cache backend'
+  - url: 'https://github.com/docker/build-push-action#cache'
+    label: 'docker/build-push-action — Cache inputs'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows#usage-limits-and-eviction-policy'
+    label: 'GitHub Actions — Cache usage limits and eviction policy'
