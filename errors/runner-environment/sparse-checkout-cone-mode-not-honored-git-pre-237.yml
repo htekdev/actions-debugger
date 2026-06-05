@@ -1,0 +1,121 @@
+id: 'runner-environment-182'
+title: 'actions/checkout sparse-checkout-cone-mode: true not honored when container git < 2.37'
+category: 'runner-environment'
+severity: 'error'
+tags:
+  - sparse-checkout
+  - cone-mode
+  - git-version
+  - container
+  - checkout
+  - self-hosted
+patterns:
+  - regex: 'sparse-checkout-cone-mode.*true.*container'
+    flags: 'i'
+  - regex: 'git.*2\.[12][0-9]\.'
+    flags: 'i'
+  - regex: 'core\.sparseCheckoutConeMode.*not set'
+    flags: 'i'
+error_messages:
+  - "Expected full checkout but only subdirectory present"
+  - "Sibling files missing from sparse checkout cone"
+  - "core.sparseCheckoutConeMode"
+root_cause: |
+  `actions/checkout` enables sparse-checkout cone mode by setting
+  `core.sparseCheckoutConeMode = true` in the git config. However, the
+  `git sparse-checkout set` command requires the explicit `--cone` flag to
+  activate cone mode in Git versions **before 2.37.0**.
+
+  Starting with Git 2.37.0, cone mode became the default for `git sparse-checkout`.
+  In earlier Git versions, cone mode must be opted into with `--cone`. The
+  `actions/checkout` action does NOT pass `--cone` explicitly, so when running
+  inside a container image with Git < 2.37 (e.g., `ubuntu:22.04` ships with
+  Git 2.34.1), setting `sparse-checkout-cone-mode: true` has no effect.
+
+  The result is that cone mode is silently ignored. The checkout runs in non-cone
+  (gitignore pattern) mode instead, which means:
+  - Root-level sibling files that should be included in cone mode are absent
+  - Only the exact subdirectory specified is checked out, without the expected
+    parent-level files
+  - Subsequent steps that depend on root-level files (e.g., package.json, .env,
+    Makefile) fail with "file not found" errors that appear unrelated to checkout
+
+  Reported in actions/checkout#1868 (Aug 2024).
+fix: |
+  Option 1 (recommended): Upgrade Git in the container to 2.37.0 or later.
+  For containers based on Ubuntu 22.04, install a newer Git via PPA:
+    add-apt-repository ppa:git-core/ppa && apt-get install git
+
+  Option 2: Add an explicit `git sparse-checkout init --cone` step AFTER checkout
+  to force cone mode activation retroactively. This is a workaround for containers
+  where upgrading Git is not possible.
+
+  Option 3: Use GitHub-hosted runners (ubuntu-latest, ubuntu-24.04) which ship
+  with Git >= 2.43, where cone mode works correctly by default.
+
+  Option 4: If specific file patterns are required (not just directories), use
+  `sparse-checkout-cone-mode: false` with root-anchored `/pattern` patterns
+  instead of relying on cone mode.
+fix_code:
+  - language: yaml
+    label: 'Upgrade git in container before checkout (Ubuntu 22.04 example)'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          container:
+            image: ubuntu:22.04
+          steps:
+            - name: Upgrade git to 2.37+ for sparse-checkout cone mode support
+              run: |
+                apt-get update -qq
+                apt-get install -y software-properties-common
+                add-apt-repository -y ppa:git-core/ppa
+                apt-get update -qq
+                apt-get install -y git
+                git --version  # Verify >= 2.37
+
+            - uses: actions/checkout@v4
+              with:
+                sparse-checkout: |
+                  src
+                  config
+                sparse-checkout-cone-mode: true   # Now honored after Git 2.37+ installed
+  - language: yaml
+    label: 'Workaround: force --cone after checkout on old Git'
+    code: |
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: src
+          sparse-checkout-cone-mode: true
+
+      # Explicitly enable cone mode on Git < 2.37 (workaround for actions/checkout#1868)
+      - name: Force cone mode on old git
+        run: |
+          git sparse-checkout init --cone
+          git sparse-checkout set src
+  - language: yaml
+    label: 'Use GitHub-hosted runner to avoid old git versions'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest  # Ships with Git 2.43+ — cone mode works correctly
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                sparse-checkout: |
+                  src
+                  config
+                # sparse-checkout-cone-mode: true  # Default, works on ubuntu-latest
+prevention:
+  - "Check the git version in container images before relying on sparse-checkout cone mode: run 'git --version' in a workflow step."
+  - "Upgrade container base images to Ubuntu 24.04 or Debian 12 which ship with Git >= 2.39."
+  - "Pin to GitHub-hosted runners (ubuntu-latest, ubuntu-24.04) for consistent Git versions that support cone mode."
+  - "After setting up sparse checkout, add a debug step printing 'git config core.sparseCheckoutConeMode' to verify cone mode is active."
+docs:
+  - url: 'https://github.com/actions/checkout/issues/1868'
+    label: 'actions/checkout#1868 — sparse-checkout-cone-mode not honored on git < 2.37'
+  - url: 'https://git-scm.com/docs/git-sparse-checkout/2.37.0'
+    label: 'Git 2.37 release notes — cone mode becomes the default for sparse-checkout'
+  - url: 'https://github.com/actions/checkout?tab=readme-ov-file'
+    label: 'actions/checkout — sparse-checkout inputs documentation'

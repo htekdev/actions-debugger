@@ -1,0 +1,123 @@
+id: 'caching-artifacts-065'
+title: 'Docker BuildKit type=gha cache fails on self-hosted runners with BuildKit < 0.21.0 after legacy cache service v1 shutdown'
+category: 'caching-artifacts'
+severity: 'error'
+tags:
+  - docker
+  - buildkit
+  - buildx
+  - gha-cache
+  - self-hosted
+  - cache-api-v2
+  - legacy-service
+patterns:
+  - regex: 'This legacy service is shutting down'
+    flags: 'i'
+  - regex: 'failed to solve.*legacy.*service'
+    flags: 'i'
+  - regex: 'gha-cache-sunset'
+    flags: 'i'
+  - regex: 'cache.*type=gha.*legacy'
+    flags: 'i'
+error_messages:
+  - "ERROR: failed to solve: This legacy service is shutting down, effective April 15, 2025. Migrate to the new service ASAP. For more information: https://gh.io/gha-cache-sunset"
+  - "This legacy service is shutting down, effective April 15, 2025."
+  - "importing cache manifest from gha"
+  - "exporting to GitHub Actions Cache"
+root_cause: |
+  GitHub decommissioned the legacy GitHub Actions Cache service v1 API on
+  April 15, 2025. All cache operations now require the new v2 API.
+
+  Docker BuildKit uses a separate Go-based GitHub Actions cache client
+  (`tonistiigi/go-actions-cache`) — distinct from the `@actions/cache` npm
+  package used by `actions/cache`. The `go-actions-cache` library added support
+  for cache API v2 in BuildKit 0.20.0 and Buildx 0.21.0.
+
+  Self-hosted runners that have not been updated since before the migration
+  still ship Docker Engine with an older BuildKit version (< 0.20.0) or an
+  older Docker Buildx binary (< 0.21.0). When these workflows use
+  `cache-from: type=gha` or `cache-to: type=gha`, the old BuildKit communicates
+  with the now-decommissioned v1 API endpoint and receives the shutdown error:
+
+    ERROR: failed to solve: This legacy service is shutting down, effective
+    April 15, 2025. Migrate to the new service ASAP.
+
+  GitHub-hosted runners (ubuntu-latest, etc.) are automatically up to date and
+  are not affected. Only self-hosted runners or custom BuildKit setups that
+  pin an old Buildx/BuildKit version are impacted.
+
+  Note: this is distinct from `actions/cache` action failing due to stale
+  ACTIONS_CACHE_URL overrides (caching-artifacts-031), which is a different
+  failure mode involving the npm-based cache client.
+fix: |
+  Option 1 (recommended): Pin docker/setup-buildx-action to install the latest
+  Buildx on the self-hosted runner before each build. This ensures Buildx >=
+  0.21.0 is always used regardless of the runner's system Buildx version.
+
+  Option 2: Update the self-hosted runner's Docker Engine to >= 28.0.0 and
+  Buildx to >= 0.21.0 at the system level.
+
+  Option 3: Switch to registry-based cache (type=registry) if upgrading Buildx
+  is not feasible. GHCR registry cache is not subject to the API version
+  requirement and is free for public repositories.
+
+  Minimum versions required for cache API v2:
+  - Docker Buildx >= 0.21.0
+  - BuildKit >= 0.20.0
+  - Docker Compose >= 2.33.1
+  - Docker Engine >= 28.0.0 (when using containerd image store)
+fix_code:
+  - language: yaml
+    label: 'Pin setup-buildx-action to install latest Buildx on self-hosted runner'
+    code: |
+      jobs:
+        build:
+          runs-on: [self-hosted, linux, x64]
+          steps:
+            - uses: actions/checkout@v4
+
+            # Always install the latest Buildx — ensures >= 0.21.0 for cache API v2
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@v3
+              with:
+                version: latest   # Overrides the runner's system Buildx version
+
+            - name: Build and push
+              uses: docker/build-push-action@v7
+              with:
+                push: ${{ github.ref == 'refs/heads/main' }}
+                tags: ghcr.io/${{ github.repository }}:latest
+                cache-from: type=gha
+                cache-to: type=gha,mode=max
+  - language: yaml
+    label: 'Fallback: use GHCR registry cache instead of type=gha'
+    code: |
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (registry cache — no API version dependency)
+        uses: docker/build-push-action@v7
+        with:
+          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: ghcr.io/${{ github.repository }}:latest
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max
+prevention:
+  - "Always add docker/setup-buildx-action with 'version: latest' before any Docker build step on self-hosted runners."
+  - "Periodically update self-hosted runner Docker Engine and Buildx to latest stable versions."
+  - "Subscribe to the GitHub Changelog (github.blog/changelog) for advance notice of cache service API changes."
+  - "Verify Buildx version in CI: add 'docker buildx version' as a diagnostic step to catch version drift early."
+  - "Consider using registry cache (type=registry) as a more portable alternative to type=gha on self-hosted runners."
+docs:
+  - url: 'https://github.com/docker/build-push-action/issues/1345'
+    label: 'docker/build-push-action#1345 — type=gha cache failure after legacy service shutdown (Apr 2025)'
+  - url: 'https://docs.docker.com/build/ci/github-actions/cache/#github-cache'
+    label: 'Docker Docs — GitHub Actions cache backend (note: legacy v1 API shut down April 15, 2025)'
+  - url: 'https://github.com/docker/setup-buildx-action'
+    label: 'docker/setup-buildx-action — Install latest Buildx on any runner'
+  - url: 'https://gh.io/gha-cache-sunset'
+    label: 'GitHub — GHA cache service v1 sunset announcement'
