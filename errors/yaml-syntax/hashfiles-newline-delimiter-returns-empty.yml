@@ -1,0 +1,99 @@
+id: yaml-syntax-066
+title: 'hashFiles() Newline Delimiter in Single String Returns Empty — Use Multiple Arguments'
+category: yaml-syntax
+severity: silent-failure
+tags:
+  - hashfiles
+  - expression
+  - cache-key
+  - empty-string
+  - multifile
+  - glob
+  - newline-delimiter
+patterns:
+  - regex: 'hashFiles\([''"].*\\n.*[''"]'
+    flags: 'i'
+  - regex: 'hashFiles\s*\(\s*[''"][^''",]+\\n[^''",]+[''"]'
+    flags: 'i'
+error_messages:
+  - "${{ hashFiles('src/**\npackage.json') }}"
+  - "${{ hashFiles('**/*.lock\n**/*.toml') }}"
+  - "hashFiles result: ''"
+root_cause: |
+  The `@actions/glob` internal implementation documents that file patterns can be
+  separated by newline (`\n`) characters when passed as a single string. This causes
+  developers to write `hashFiles('file.ts\nfile.tsx')` expecting it to hash both
+  files.
+
+  However, inside a GitHub Actions expression (`${{ ... }}`), string literals do
+  NOT interpret escape sequences. The `\n` in `'file.ts\nfile.tsx'` is a literal
+  two-character sequence: backslash + "n". The glob function then looks for a file
+  literally named `file.ts\nfile.tsx` — which does not exist — and returns an empty
+  string `''`.
+
+  **Result:**
+  - `cache-key: ${{ hashFiles('package.json\nyarn.lock') }}` → cache key ends with
+    an empty string, causing ALL runs to collide on the same constant prefix key.
+  - `if: hashFiles('src/**\ntest/**') != ''` → always false (no hash returned), so
+    cache/condition logic silently skips.
+  - No error is raised; the expression just evaluates to `''` silently.
+
+  Confirmed in actions/runner#3467 and actions/runner#4049.
+
+  Note: `hashFiles()` DOES accept multiple comma-separated string arguments, and
+  each argument is a full glob pattern. The variadic call form works correctly.
+fix: |
+  Use multiple comma-separated arguments to `hashFiles()` instead of a
+  newline-delimited single string.
+
+  `hashFiles('pattern1', 'pattern2', ...)` correctly hashes all files matching
+  any of the provided glob patterns.
+
+  If you are building a dynamic list of patterns from a context value or step
+  output, write the patterns to a file and hash that file, or hash each pattern
+  in separate expressions and combine.
+fix_code:
+  - language: yaml
+    label: 'Use multiple arguments (correct) instead of newline-delimited string (broken)'
+    code: |
+      # BROKEN — \n is a literal backslash-n, not a newline; returns empty string
+      # key: npm-${{ hashFiles('package.json\npackage-lock.json') }}
+
+      # CORRECT — comma-separated arguments, hashes both files
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('package.json', 'package-lock.json') }}
+  - language: yaml
+    label: 'Multiple lock files hashed with variadic hashFiles()'
+    code: |
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            ~/.cache/pip
+          key: multi-${{ runner.os }}-${{ hashFiles('**/package-lock.json', '**/requirements*.txt', '**/Pipfile.lock') }}
+          restore-keys: |
+            multi-${{ runner.os }}-
+  - language: yaml
+    label: 'Conditional step using hashFiles() with multiple arguments'
+    code: |
+      # BROKEN — always evaluates to '' because \n is not a newline escape
+      # if: ${{ hashFiles('src/**\ntest/**') != '' }}
+
+      # CORRECT
+      - name: Check if source files changed
+        if: ${{ hashFiles('src/**', 'test/**') != '' }}
+        run: echo "Source files found"
+prevention:
+  - 'Never use `\n` as a pattern delimiter inside a `hashFiles()` call in a workflow expression — it is a literal backslash-n, not a newline.'
+  - 'Use multiple comma-separated arguments: `hashFiles(''pattern1'', ''pattern2'')` to hash files from multiple glob patterns.'
+  - 'When a `hashFiles()` result is used as a cache key suffix, validate it is non-empty by running the workflow once and checking the logged cache key.'
+  - 'If you suspect an empty hash, add a debug step: `run: echo "hash=${{ hashFiles(''**/*.lock'') }}"` to verify the value before using it in a key.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/3467'
+    label: 'actions/runner#3467: hashFiles does not follow docs — newline delimiter in string returns empty'
+  - url: 'https://github.com/actions/runner/issues/4049'
+    label: 'actions/runner#4049: hashFiles newline pattern delimiter not interpreted in expressions'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#hashfiles'
+    label: 'GitHub Docs: hashFiles function — variadic arguments'

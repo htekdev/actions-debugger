@@ -1,0 +1,104 @@
+id: caching-artifacts-059
+title: 'actions/cache Primary key Uses Undocumented Prefix Matching — Stale Cache Restored on Partial Hit'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - cache
+  - actions/cache
+  - key
+  - prefix-match
+  - stale-cache
+  - cache-hit
+  - restore-keys
+patterns:
+  - regex: 'Cache restored from key:'
+    flags: 'i'
+  - regex: 'cache-hit.*true'
+    flags: 'i'
+  - regex: 'uses:\s*actions/cache@v[34]'
+    flags: 'i'
+error_messages:
+  - "Cache restored from key: npm-cache-linux"
+  - "cache-hit: true"
+  - "Restored cache from key"
+root_cause: |
+  GitHub Actions documentation states that `actions/cache`'s primary `key:`
+  parameter requires an **exact match** to trigger a cache hit. In practice,
+  the cache service backend uses **prefix matching** for primary keys, identical
+  to how `restore-keys:` works. This undocumented behavior was confirmed by the
+  GitHub Actions team in actions/cache#1433:
+
+  > "I've checked the internal service implementation and it appears that our
+  > documentation is incorrect. `key` uses prefix-matching similar to how
+  > `restore-keys` works."
+
+  **What this means in practice:**
+  - If an existing cached entry has key `npm-cache-linux` and the current run
+    uses key `npm-cache-linux-abc123`, the primary `key` lookup returns a hit on
+    `npm-cache-linux` (the existing key is a prefix of the requested key).
+  - The cache is restored silently with `cache-hit: true`, even though the
+    actual content may be outdated or from a completely different run.
+  - Downstream jobs that check `cache-hit == 'true'` to skip install steps will
+    skip them, causing builds to use stale dependencies.
+
+  This is especially problematic when:
+  1. A broad, short key (e.g., `linux-npm`) was saved long ago and a new, more
+     specific key (e.g., `linux-npm-${{ hashFiles('package-lock.json') }}`)
+     happens to have the old key as a prefix.
+  2. CI changes add a version suffix to cache keys, but old caches from before
+     the change are still present and match as prefixes.
+fix: |
+  **Option 1 (recommended): Use unique, non-colliding key prefixes**
+  Design your cache key so that no broader key from a previous run can be a prefix
+  of your current key. Include the hash of lock files or use a version token that
+  changes with major dependency updates.
+
+  **Option 2: Rotate keys by appending a version token**
+  Prefix with a cache version that you bump whenever you want to guarantee a cold
+  start, preventing old keys from matching.
+
+  **Option 3: Use `restore-keys:` intentionally**
+  If you want prefix fallback, make it explicit with `restore-keys:` and verify
+  what you're getting. Check `cache-hit` output and run install even on partial
+  hits when correctness matters.
+
+  **Option 4: Delete stale caches via API**
+  Use `gh extension install actions/gh-actions-cache` or the REST API to delete
+  old broad-key caches that would match as prefixes, preventing unexpected hits.
+fix_code:
+  - language: yaml
+    label: 'Use versioned prefix to prevent stale prefix matches'
+    code: |
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          # v2 prefix ensures old "v1" caches never match as prefixes
+          key: v2-npm-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            v2-npm-${{ runner.os }}-
+  - language: yaml
+    label: 'Re-install deps on partial cache hit to avoid stale cache'
+    code: |
+      - uses: actions/cache@v4
+        id: npm-cache
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: npm-${{ runner.os }}-
+
+      - name: Install dependencies
+        # Always install when not an exact hit to avoid stale partial cache
+        if: steps.npm-cache.outputs.cache-hit != 'true'
+        run: npm ci
+prevention:
+  - 'Always include a lockfile hash in cache keys: `key: npm-${{ runner.os }}-${{ hashFiles(''**/package-lock.json'') }}`'
+  - 'Prefix cache keys with a version token (e.g., `v1-`, `v2-`) so you can easily invalidate all old caches by bumping the version.'
+  - 'Do not rely solely on `cache-hit == true` to skip install steps; consider re-running `npm install --prefer-offline` even on hits to handle partial prefix matches.'
+  - 'Periodically audit and delete stale cache entries via the GitHub REST API or `gh actions-cache` extension.'
+docs:
+  - url: 'https://github.com/actions/cache/issues/1433'
+    label: 'actions/cache#1433: Cache key uses prefix matching — documentation is incorrect'
+  - url: 'https://github.com/actions/cache/issues/1385'
+    label: 'actions/cache#1385: Unexpected cache hit from prefix match'
+  - url: 'https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows'
+    label: 'GitHub Docs: Caching dependencies to speed up workflows'

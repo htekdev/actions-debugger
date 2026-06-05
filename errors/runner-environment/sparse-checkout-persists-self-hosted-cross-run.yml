@@ -1,0 +1,99 @@
+id: runner-environment-174
+title: 'Sparse Checkout Config Persists Across Workflow Runs on Self-Hosted Runners'
+category: runner-environment
+severity: silent-failure
+tags:
+  - sparse-checkout
+  - self-hosted
+  - git-config
+  - workspace-reuse
+  - checkout
+  - non-ephemeral
+patterns:
+  - regex: 'core\.sparseCheckout\s*=\s*true'
+    flags: 'i'
+  - regex: 'sparse.checkout.*persist|persist.*sparse.checkout'
+    flags: 'i'
+  - regex: 'git sparse-checkout disable'
+    flags: 'i'
+error_messages:
+  - "Run actions/checkout@v4"
+  - "Checkout was successful but expected files are missing from working directory"
+  - "sparse-checkout: /run/git/config: sparseCheckout = true"
+root_cause: |
+  On non-ephemeral self-hosted runners, the workspace directory (e.g.
+  `/home/runner/work/my-repo/my-repo`) is reused across multiple workflow runs
+  on the same runner machine. When `actions/checkout` runs with `sparse-checkout:`
+  options, it sets `core.sparseCheckout = true` in the repository's `.git/config`
+  file.
+
+  In older versions of `actions/checkout` (before the fix in commit aadec89,
+  merged ~2025), the `disableSparseCheckout()` method reset `core.sparseCheckout`
+  only in `.git/config.worktree` (used in git worktrees), but NOT in the main
+  `.git/config`. As a result:
+
+  - **Workflow run N** uses `sparse-checkout:` → sets `core.sparseCheckout = true`
+    in `.git/config`.
+  - **Workflow run N+1** on the same runner does NOT use `sparse-checkout:`, but
+    inherits the stale `core.sparseCheckout = true` setting from the reused workspace.
+  - `actions/checkout` reports success, but the working directory contains only
+    the files that matched the previous run's sparse-checkout patterns. All other
+    files silently absent.
+
+  This is distinct from the same-job sticky cone mode issue (sf-008), which covers
+  two `actions/checkout` calls within a single job sharing sparse state. This issue
+  manifests across entirely separate workflow runs on a shared workspace.
+
+  Confirmed in actions/checkout#2249 (published Aug 2025) and actions/checkout#1992.
+fix: |
+  **Option 1 (recommended): Upgrade to actions/checkout v4.2.0+**
+  The bug was fixed in commit aadec89. Pinning to a patched release ensures
+  `disableSparseCheckout()` explicitly sets `core.sparseCheckout = false` in
+  `.git/config` when no `sparse-checkout:` input is provided.
+
+  **Option 2: Add an explicit `git sparse-checkout disable` step**
+  Add this step at the beginning of workflows that do NOT use sparse-checkout
+  on a runner that may previously have run sparse-checkout workflows:
+
+  **Option 3: Use ephemeral self-hosted runners**
+  Configure runners so each job gets a fresh workspace (e.g., ARC ephemeral mode,
+  EC2 runners with fresh AMIs). Ephemeral runners eliminate all cross-run workspace
+  contamination.
+
+  **Option 4: Configure runner to clean workspace between runs**
+  Set `ACTIONS_RUNNER_CLEAN_WORKSPACE=true` in the runner environment (where
+  supported) to force workspace cleanup between job runs.
+fix_code:
+  - language: yaml
+    label: 'Upgrade to patched actions/checkout version'
+    code: |
+      steps:
+        - uses: actions/checkout@v4  # Use v4.2.0+ for the sparse-checkout fix
+          # No sparse-checkout options — will correctly restore full tree
+  - language: yaml
+    label: 'Explicit sparse-checkout reset before checkout on shared runners'
+    code: |
+      steps:
+        - name: Reset sparse-checkout (safety guard for shared self-hosted runners)
+          shell: bash
+          run: |
+            if git -C "${{ github.workspace }}" rev-parse --git-dir > /dev/null 2>&1; then
+              git -C "${{ github.workspace }}" sparse-checkout disable 2>/dev/null || true
+              git -C "${{ github.workspace }}" config --unset core.sparseCheckout 2>/dev/null || true
+            fi
+
+        - uses: actions/checkout@v4
+prevention:
+  - 'On self-hosted runners, always pin `actions/checkout` to v4.2.0+ which fixes the sparse-checkout persistence bug.'
+  - 'Add a `git sparse-checkout disable` guard step at the start of any workflow that runs on a non-ephemeral self-hosted runner.'
+  - 'Use ephemeral runners (fresh environment per job) to eliminate all cross-run workspace contamination.'
+  - 'Do not mix sparse-checkout and full-checkout workflows on the same non-ephemeral runner without resetting `.git/config` between runs.'
+docs:
+  - url: 'https://github.com/actions/checkout/issues/2249'
+    label: 'actions/checkout#2249: Sparse-checkout configuration persists across workflows on self-hosted runners'
+  - url: 'https://github.com/actions/checkout/issues/1992'
+    label: 'actions/checkout#1992: Sparscheckout breaks cached repository on self-hosted runners'
+  - url: 'https://github.com/actions/checkout/commit/aadec899646c8e0f34c52d9219c2faac36626b55'
+    label: 'Fix commit aadec89: Explicitly disable sparseCheckout in .git/config when not using sparse-checkout'
+  - url: 'https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners'
+    label: 'GitHub Docs: About GitHub-hosted runners (ephemeral vs self-hosted)'
