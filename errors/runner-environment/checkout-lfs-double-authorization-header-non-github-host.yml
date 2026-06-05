@@ -1,0 +1,70 @@
+id: runner-environment-175
+title: "checkout@v4 LFS with Non-GitHub Host Sends Double Authorization Header -- 400 Bad Request"
+category: runner-environment
+severity: error
+tags:
+  - checkout
+  - lfs
+  - git-lfs
+  - non-github-host
+  - authorization-header
+  - submodule
+patterns:
+  - regex: 'Authorization.*Authorization'
+    flags: i
+  - regex: 'HTTP.*400.*lfs'
+    flags: i
+error_messages:
+  - "trace git-lfs: HTTP: 400"
+  - "batch request failed with status 400"
+root_cause: |
+  When actions/checkout is used with lfs: true and the repository contains submodules
+  pointing to a non-GitHub host (Gitea, Bitbucket, self-hosted GitLab, etc.), the checkout
+  action writes an HTTP Authorization header into .git/config via http.<url>.extraheader.
+  For GitHub.com remotes this works correctly. However, for submodule remotes on other hosts,
+  the git-lfs client then sends BOTH this injected header AND its own credential-helper-derived
+  Authorization header in the same LFS batch request.
+
+  Most non-GitHub servers reject duplicate Authorization headers with HTTP 400 Bad Request,
+  as the HTTP spec treats repeated Authorization headers as ambiguous. GitHub.com silently
+  deduplicates them, hiding the problem. Only non-GitHub hosts expose this bug.
+
+  Diagnosed by enabling GIT_CURL_VERBOSE: 1 and GIT_TRACE: 1 in the workflow environment,
+  which reveals two Authorization: Basic lines in the same LFS request headers.
+  Reported in actions/checkout#1830 (15 reactions).
+fix: |
+  Use SSH key authentication for the non-GitHub submodule remote — no HTTP Authorization
+  header is injected for SSH remotes, eliminating the conflict:
+fix_code:
+  - language: yaml
+    label: "Recommended: use ssh-key for non-GitHub submodule host"
+    code: |
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          lfs: true
+          ssh-key: ${{ secrets.SUBMODULE_SSH_KEY }}
+  - language: yaml
+    label: "Alternative: disable lfs on checkout and pull LFS per-host manually"
+    code: |
+      steps:
+        - uses: actions/checkout@v4
+          with:
+            submodules: recursive
+            lfs: false   # prevents checkout from injecting LFS auth header
+        - name: Clear injected extraheader and pull LFS for non-GitHub host
+          env:
+            GIT_CURL_VERBOSE: "1"
+          run: |
+            cd path/to/non-github-submodule
+            git config --unset http.https://your-host.example.com/.extraheader || true
+            git lfs pull
+prevention:
+  - "Use SSH keys for non-GitHub submodule remotes to avoid HTTP credential injection conflicts"
+  - "Enable GIT_CURL_VERBOSE=1 to diagnose duplicate Authorization headers in LFS requests"
+  - "Test LFS workflows after upgrading checkout to a new major version"
+docs:
+  - url: "https://github.com/actions/checkout/issues/1830"
+    label: "actions/checkout#1830 -- LFS fails with double auth header on non-GitHub host"
+  - url: "https://github.com/actions/checkout#readme"
+    label: "actions/checkout -- lfs and submodules input documentation"
