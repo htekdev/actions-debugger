@@ -1,0 +1,116 @@
+id: runner-environment-176
+title: "hashFiles() fails on macOS with 'Fail to hash files under directory'"
+category: runner-environment
+severity: error
+tags:
+  - hashfiles
+  - macos
+  - runner-images
+  - cache
+  - expression
+  - image-regression
+patterns:
+  - regex: 'hashFiles\(.+\) failed\. Fail to hash files under directory'
+    flags: 'i'
+  - regex: 'The template is not valid.*hashFiles.*Fail to hash files'
+    flags: 'is'
+error_messages:
+  - "Error: The template is not valid. /Users/runner/work/.../action.yml (Line: 48, Col: 12): hashFiles('**/go.sum') failed. Fail to hash files under directory '/Users/runner/work/...'"
+  - "hashFiles('**/package-lock.json') failed. Fail to hash files under directory '/Users/runner/work/...'"
+root_cause: |
+  Certain macOS runner image versions (including macos-15-arm64 image
+  20251119.0020 through approximately 20251122) introduced a regression
+  where the hashFiles() expression function fails to enumerate files
+  under the workspace directory on macOS. The same workflow succeeds on
+  Linux and Windows runners.
+
+  The failure manifests whenever hashFiles() is used in any expression
+  context — strategy.matrix, cache key, conditional — on the affected
+  macOS runner image versions. The underlying cause is a filesystem
+  enumeration permission or path-resolution change introduced by the
+  runner image update (see actions/runner-images #13341). The issue was
+  not present in the previous macOS image version and reappeared without
+  workflow changes.
+
+  Root cause in runner-images: the runner image update changed system
+  configuration in a way that prevented the runner process from
+  recursively listing files under the workspace directory on macOS. The
+  fix was a runner image rollback / patch released around December 12,
+  2025.
+
+  This failure is a runner-image regression, not a workflow bug. It can
+  recur if future macOS runner image updates introduce similar filesystem
+  configuration changes.
+fix: |
+  If you encounter this error on macOS:
+
+  1. Wait for GitHub to release a patched macOS runner image — runner
+     image regressions are typically resolved within days. Monitor
+     actions/runner-images for the fix.
+
+  2. Pin your workflow to a specific macOS runner image version that
+     predates the regression while waiting for the fix.
+
+  3. As a temporary workaround, replace hashFiles() with a manual
+     hash computation step using sha256sum or similar:
+
+       - name: Compute hash manually (macOS workaround)
+         id: hash
+         run: |
+           echo "hash=$(find . -name 'go.sum' -exec sha256sum {} \; | sha256sum | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+       - uses: actions/cache@v4
+         with:
+           path: ~/go/pkg/mod
+           key: ${{ runner.os }}-go-${{ steps.hash.outputs.hash }}
+
+  4. After the runner image is updated to a fixed version, remove the
+     workaround and restore hashFiles().
+fix_code:
+  - language: yaml
+    label: "Manual hash workaround for macOS hashFiles() regression"
+    code: |
+      jobs:
+        build:
+          runs-on: macos-latest
+
+          steps:
+            - uses: actions/checkout@v4
+
+            # Workaround: compute cache key hash manually when hashFiles() fails on macOS
+            - name: Compute go.sum hash
+              id: hash
+              run: |
+                echo "hash=$(find . -name 'go.sum' | sort | xargs sha256sum | sha256sum | cut -d' ' -f1)" \
+                  >> "$GITHUB_OUTPUT"
+
+            - uses: actions/cache@v4
+              with:
+                path: ~/go/pkg/mod
+                key: ${{ runner.os }}-go-${{ steps.hash.outputs.hash }}
+
+            - run: go build ./...
+  - language: yaml
+    label: "Pin to a known-good macOS runner image while waiting for fix"
+    code: |
+      jobs:
+        build:
+          # Pin to a specific macOS runner image version that predates the regression.
+          # Check https://github.com/actions/runner-images/releases for available versions.
+          runs-on: macos-15-arm64
+          # Alternatively, use an older pinned version: macos-14 or macos-15-xlarge
+          # when the current macos-latest image has the regression.
+prevention:
+  - "Subscribe to actions/runner-images release notifications to detect image regressions early."
+  - "When hashFiles() fails only on macOS (Linux/Windows succeed), suspect a runner image regression
+     rather than a workflow bug — check the actions/runner-images issue tracker for reports."
+  - "If CI budget allows, run a short nightly workflow that tests hashFiles() on all target OS
+     combinations to detect image regressions before they block your main CI."
+  - "When pinning a runner image version as a workaround, add a TODO comment and a link to the
+     upstream issue so the pin is removed once the fix is released."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#hashfiles"
+    label: "GitHub Actions: hashFiles() expression function"
+  - url: "https://github.com/actions/runner/issues/4134"
+    label: "actions/runner #4134: hashFiles on macOS fails with 'Fail to hash files under directory' (14 reactions, closed Dec 2025)"
+  - url: "https://github.com/actions/runner-images/issues/13341"
+    label: "actions/runner-images #13341: macOS hashFiles regression report (Nov 2025)"

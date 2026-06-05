@@ -1,0 +1,144 @@
+id: silent-failures-094
+title: "Reusable workflow input default: value silently ignored when caller passes empty string"
+category: silent-failures
+severity: silent-failure
+tags:
+  - reusable-workflow
+  - workflow-call
+  - inputs
+  - default
+  - empty-string
+  - silent-failure
+patterns:
+  - regex: 'on:\s*\n\s*workflow_call:'
+    flags: 'im'
+  - regex: 'inputs\.\w+\.default:'
+    flags: 'i'
+  - regex: 'with:\s*\n(?:\s+\w+:\s*\$\{\{[^}]+\}\}\s*\n)+'
+    flags: 'im'
+error_messages:
+  - "Reusable workflow input default value not used when caller passes empty string"
+  - "Expected default message, got empty string"
+  - "inputs.message is empty even though default is set"
+root_cause: |
+  The default: field in on.workflow_call.inputs is only applied when the input is
+  completely absent (not provided by the caller at all). It is NOT applied when the
+  caller explicitly passes an empty string "".
+
+  A very common pattern is a caller workflow that passes a workflow_dispatch input
+  directly to a reusable workflow:
+
+    # caller.yml
+    on:
+      workflow_dispatch:
+        inputs:
+          message:
+            type: string
+            required: false       # defaults to "" when not provided
+
+    jobs:
+      call:
+        uses: ./.github/workflows/reusable.yml
+        with:
+          message: ${{ inputs.message }}   # passes "" when dispatch runs without input
+
+    # reusable.yml
+    on:
+      workflow_call:
+        inputs:
+          message:
+            type: string
+            default: 'default message'
+
+  When a developer triggers the caller workflow_dispatch without providing the
+  message input, inputs.message resolves to "" (the workflow_dispatch default for
+  unset string inputs). The caller then passes "" to the reusable workflow. The
+  reusable workflow receives "" as an explicitly-provided value, so its own
+  default: 'default message' is never used. The job runs with message = "".
+
+  This is by design: GitHub Actions treats "" as a valid non-absent value. The
+  default: key only activates for truly absent inputs (when with: does not include
+  the key at all). Since ${{ inputs.message }} always resolves to some string (even
+  "", it is always present in the with: block, so the called workflow's default
+  is always bypassed.
+fix: |
+  Move the default value handling to the calling workflow rather than the reusable
+  workflow, using a conditional expression to fall back to the default:
+
+    # caller.yml — handle empty-string fallback here
+    jobs:
+      call:
+        uses: ./.github/workflows/reusable.yml
+        with:
+          message: ${{ inputs.message != '' && inputs.message || 'default message' }}
+
+  Alternatively, handle the fallback inside the reusable workflow steps using an
+  env variable substitution:
+
+    # reusable.yml
+    jobs:
+      run:
+        runs-on: ubuntu-latest
+        env:
+          EFFECTIVE_MESSAGE: ${{ inputs.message != '' && inputs.message || 'default message' }}
+        steps:
+          - run: echo "Message is $EFFECTIVE_MESSAGE"
+
+  Do NOT rely on default: in on.workflow_call.inputs when the caller may pass ""
+  via ${{ inputs.x }} from a workflow_dispatch input.
+fix_code:
+  - language: yaml
+    label: "Apply the default in the caller with a conditional expression (recommended)"
+    code: |
+      # caller.yml
+      on:
+        workflow_dispatch:
+          inputs:
+            message:
+              type: string
+              required: false
+
+      jobs:
+        call:
+          uses: ./.github/workflows/reusable.yml
+          with:
+            # Use || to fall back to default when inputs.message is empty
+            message: ${{ inputs.message != '' && inputs.message || 'default message' }}
+  - language: yaml
+    label: "Apply the fallback inside the reusable workflow using env:"
+    code: |
+      # reusable.yml
+      on:
+        workflow_call:
+          inputs:
+            message:
+              type: string
+              required: false
+              # Note: default: here is bypassed when caller passes ""
+
+      jobs:
+        run:
+          runs-on: ubuntu-latest
+          env:
+            # Handle empty string at job level — inputs.message may be "" not null
+            EFFECTIVE_MESSAGE: ${{ inputs.message != '' && inputs.message || 'default message' }}
+          steps:
+            - name: Use effective message
+              run: echo "Message is $EFFECTIVE_MESSAGE"
+prevention:
+  - "Never place default values only in on.workflow_call.inputs.default when the caller
+     passes the input via ${{ inputs.x }} from a workflow_dispatch — the empty string
+     will always bypass the default."
+  - "Place fallback logic in the caller using '${{ inputs.x != '''''' && inputs.x || ''default'' }}'
+     to handle both absent and empty-string cases."
+  - "If you need the reusable workflow to have its own default, handle it via env: fallback
+     inside the job steps, not via on.workflow_call.inputs.default."
+  - "This behavior stems from GitHub Actions treating \"\" as an explicitly provided string
+     value rather than an absent/null input. Document this distinction for your team."
+docs:
+  - url: "https://docs.github.com/en/actions/sharing-automations/reusing-workflows#using-inputs-and-secrets-in-a-reusable-workflow"
+    label: "GitHub Actions: Using inputs and secrets in a reusable workflow"
+  - url: "https://github.com/actions/runner/issues/2907"
+    label: "actions/runner #2907: Reusable workflow input default not used when caller passes empty string (16 reactions)"
+  - url: "https://github.com/actions/runner/issues/924"
+    label: "actions/runner #924: Differentiate between input parameter empty or not present (76 reactions, still open)"
