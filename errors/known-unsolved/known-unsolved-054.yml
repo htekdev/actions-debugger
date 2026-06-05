@@ -1,0 +1,124 @@
+id: known-unsolved-054
+title: 'github.event.workflow_run.pull_requests is empty for fork PRs — PR context unavailable in triggered workflow'
+category: known-unsolved
+severity: silent-failure
+tags:
+  - workflow_run
+  - fork
+  - pull-requests
+  - event-context
+  - security
+  - limitation
+  - pull_request
+patterns:
+  - regex: 'github\.event\.workflow_run\.pull_requests'
+    flags: 'i'
+  - regex: 'pull_requests.*\[\]|workflow_run.*pull_requests.*empty'
+    flags: 'i'
+error_messages:
+  - "# No error thrown — github.event.workflow_run.pull_requests evaluates to [] for fork PRs"
+  - "Error: PR number is empty or undefined"
+  - "Cannot read properties of undefined (reading 'number')"
+root_cause: |
+  When a workflow is triggered by on: workflow_run: and the upstream workflow
+  was triggered by a pull_request event from a fork, the
+  github.event.workflow_run.pull_requests array is deliberately empty ([]).
+
+  For same-repository PRs, the pull_requests array is populated with PR
+  metadata (number, head.sha, head.ref, base.ref, etc.). For fork PRs, it
+  is always an empty array for security reasons: GitHub does not expose PR
+  metadata from fork branches through this event payload to prevent
+  untrusted code from accessing repository information via the privileged
+  workflow_run context.
+
+  This is a known, by-design limitation (GitHub closed the tracker issue as
+  "not planned"). The result is that workflows designed to comment on PRs,
+  post status checks, or download artifacts using the PR number silently
+  fail or crash when run against fork-originated pull requests because
+  github.event.workflow_run.pull_requests[0].number evaluates to undefined.
+
+  The limitation is easy to miss during development because the workflow
+  works correctly for PRs from within the same organization — the failure
+  only appears when an external contributor opens a fork PR.
+fix: |
+  Pass the required PR information as an artifact from the upstream
+  (untrusted) workflow to the downstream (privileged) workflow_run workflow.
+  The upstream workflow writes the PR number to a file and uploads it as
+  an artifact; the downstream workflow downloads the artifact and reads
+  the PR number from it.
+
+  This is the officially documented pattern for safe fork PR workflows.
+fix_code:
+  - language: yaml
+    label: 'Upstream (untrusted) workflow — upload PR number as artifact'
+    code: |
+      # .github/workflows/pr-checks.yml (runs on pull_request, limited privileges)
+      name: PR Checks
+      on:
+        pull_request:
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: echo "${{ github.event.number }}" > pr_number.txt
+            - uses: actions/upload-artifact@v4
+              with:
+                name: pr-number
+                path: pr_number.txt
+  - language: yaml
+    label: 'Downstream (privileged) workflow — download artifact to get PR number'
+    code: |
+      # .github/workflows/pr-comment.yml (runs on workflow_run, full privileges)
+      name: PR Comment
+      on:
+        workflow_run:
+          workflows: ["PR Checks"]
+          types: [completed]
+
+      jobs:
+        comment:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Download PR number artifact
+              uses: actions/github-script@v7
+              with:
+                script: |
+                  const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    run_id: context.payload.workflow_run.id,
+                  });
+                  const prArtifact = artifacts.data.artifacts.find(a => a.name === 'pr-number');
+                  if (!prArtifact) { core.setFailed('No pr-number artifact'); return; }
+                  const download = await github.rest.actions.downloadArtifact({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    artifact_id: prArtifact.id,
+                    archive_format: 'zip',
+                  });
+                  require('fs').writeFileSync('pr_number.zip', Buffer.from(download.data));
+            - run: unzip pr_number.zip && echo "PR=$(cat pr_number.txt)" >> $GITHUB_ENV
+            - name: Post comment
+              uses: actions/github-script@v7
+              with:
+                script: |
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: Number(process.env.PR),
+                    body: 'Checks passed!'
+                  });
+prevention:
+  - "Always use the artifact-passing pattern for workflow_run workflows that need PR context — never assume github.event.workflow_run.pull_requests is populated."
+  - "Check the triggering event type: if github.event.workflow_run.event == 'pull_request' and the array is empty, the PR came from a fork."
+  - "Use github.event.workflow_run.head_branch and head_sha for correlating runs, but not for PR numbers (which are unavailable for forks)."
+  - "Consider using the gh-action-pr-number community action which handles the artifact-based lookup pattern automatically."
+docs:
+  - url: 'https://github.com/actions/runner/issues/3444'
+    label: 'actions/runner #3444 — workflow_run from fork pull_request lacks pull_requests payload'
+  - url: 'https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#using-data-from-the-triggering-workflow'
+    label: 'GitHub Docs — Using data from the triggering workflow (artifact pattern)'
+  - url: 'https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#workflow_run'
+    label: 'GitHub Docs — workflow_run event reference'
