@@ -1,0 +1,86 @@
+id: caching-artifacts-051
+title: 'download-artifact@v4 places each artifact in a named subdirectory, breaking v3 flat path assumption'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - download-artifact
+  - v4-migration
+  - directory-structure
+  - breaking-change
+  - path
+patterns:
+  - regex: 'Downloading artifact.*to.*'
+    flags: 'i'
+  - regex: 'ENOENT.*no such file or directory'
+    flags: 'i'
+  - regex: 'no such file or directory.*dist\/'
+    flags: 'i'
+error_messages:
+  - "Downloading artifact: my-artifact to /home/runner/work/repo/dist"
+  - "Error: ENOENT: no such file or directory, open 'dist/index.js'"
+  - "Error: Cannot find module '/home/runner/work/repo/dist/index.js'"
+  - "cp: cannot stat 'dist/main.js': No such file or directory"
+root_cause: |
+  In actions/download-artifact@v3, downloading a named artifact with `path: dist`
+  placed files directly inside the `dist/` directory (flat layout). In v4,
+  the action changed to place each artifact in a subdirectory named after the
+  artifact: files land at `dist/<artifact-name>/filename` instead of `dist/filename`.
+
+  This is a silent failure: the `download-artifact` step succeeds with exit code 0
+  and emits no warning about the path change. Downstream steps that reference
+  `dist/index.js` fail with "no such file" errors — the file is actually at
+  `dist/my-artifact/index.js`. The behavior is especially confusing in matrix
+  workflows where each job uploads an artifact with a unique name, and the
+  consuming job downloads all artifacts into a single `path:`.
+
+  The change was made to support downloading multiple artifacts into the same
+  `path:` without name collisions, but it breaks any workflow that migrated from
+  v3 without adjusting downstream path references.
+fix: |
+  Option 1 (recommended): Set the `path:` to a staging directory and reference
+  files using the artifact subdirectory path, or use `merge-multiple: true` to
+  flatten all artifacts into the `path:` directory.
+
+  Option 2: Name the artifact the same as the target directory and download into
+  the parent, so the subdirectory becomes the expected location.
+
+  Option 3: Add a step to move the artifact contents up one level after download.
+fix_code:
+  - language: yaml
+    label: 'Use merge-multiple: true to restore v3 flat behavior for single artifact'
+    code: |
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-bundle
+          path: dist
+          merge-multiple: true   # Flattens into dist/ directly, matching v3 behavior
+  - language: yaml
+    label: 'Adjust downstream path to include artifact subdirectory'
+    code: |
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-bundle
+          path: staging
+
+      # Files land at staging/dist-bundle/index.js — reference accordingly
+      - run: node staging/dist-bundle/index.js
+  - language: yaml
+    label: 'Download all matrix artifacts and merge into one directory'
+    code: |
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: build-*        # Matches all matrix artifacts
+          path: dist
+          merge-multiple: true   # All files merged flat into dist/
+prevention:
+  - "When migrating from download-artifact@v3 to v4, audit all `path:` references and downstream file access patterns"
+  - "Use `merge-multiple: true` if you need the v3 flat download behavior for a single named artifact"
+  - "Set `path:` to a staging directory and explicitly reference the `path/<artifact-name>/` subdirectory in downstream steps"
+  - "Run the workflow once after migrating and check the action log for 'Downloading artifact: X to Y' to verify the actual destination path"
+docs:
+  - url: 'https://github.com/actions/download-artifact/blob/main/docs/migration-guide.md'
+    label: 'download-artifact migration guide: v3 to v4 breaking changes'
+  - url: 'https://github.com/actions/download-artifact?tab=readme-ov-file#inputs'
+    label: 'download-artifact@v4 inputs reference — merge-multiple option'
+  - url: 'https://github.com/actions/upload-artifact/discussions/562'
+    label: 'Community discussion: v4 directory structure change from v3'
