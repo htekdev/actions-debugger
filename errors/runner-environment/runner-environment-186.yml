@@ -1,0 +1,95 @@
+id: runner-environment-186
+title: "windows-2025 Runner Label Unexpectedly Includes VS 2026 — Pinned VS 2022 Paths Break"
+category: runner-environment
+severity: error
+tags:
+  - windows
+  - windows-2025
+  - visual-studio
+  - runner-image
+  - msbuild
+  - cmake
+  - breaking-change
+patterns:
+  - regex: 'Cannot find path.*Visual Studio\\2022.*because it does not exist'
+    flags: i
+  - regex: 'Visual Studio 2022.*not found|MSBuild.*17\.[0-9]+.*not available'
+    flags: i
+  - regex: 'CMake.*generator.*Visual Studio 17 2022.*not available'
+    flags: i
+  - regex: 'vswhere.*version.*\[17,18\).*returned empty|No valid VS instances found'
+    flags: i
+  - regex: 'MSB4019.*Microsoft\.CppBuild\.targets.*was not found'
+    flags: i
+error_messages:
+  - "Cannot find path 'C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\MSBuild\\Microsoft\\VC' because it does not exist."
+  - "MSB4019: The imported project 'Microsoft.CppBuild.targets' was not found. Confirm that the expression in the Import declaration is correct."
+  - "CMake Error: CMake was unable to find a build program corresponding to \"Visual Studio 17 2022\"."
+  - "The C++ toolchain version 14.30 targeting platform 'x64' is not installed. Install it from the VS Installer."
+root_cause: |
+  In early 2026, some builds of the `windows-2025` runner image label began shipping with
+  Visual Studio 2026 (Public Preview) as the primary Visual Studio installation, removing or
+  demoting VS 2022 components that had been present in earlier `windows-2025` builds. Developers
+  who had explicitly pinned `runs-on: windows-2025` (rather than `windows-latest`) to preserve
+  VS 2022 compatibility found their workflows unexpectedly broken, because hardcoded paths to
+  `C:\Program Files\Microsoft Visual Studio\2022\...` no longer existed, and CMake generators
+  targeting "Visual Studio 17 2022" could not locate a matching installation.
+
+  This is distinct from the intentional `windows-latest` → VS 2026 migration documented in
+  `runner-environment-020`. In that case, developers pinned to a versioned label specifically
+  to avoid the change — the versioned label was supposed to be stable. The regression occurred
+  because `windows-2025` image builds that included VS 2026 were briefly pushed to the label's
+  rotation before being identified and rolled back.
+
+  Source: actions/runner-images#13638, actions/runner-images#14004.
+fix: |
+  Pin to `windows-2022` to guarantee a VS 2022 toolchain for the foreseeable future. Use
+  `vswhere.exe` to discover Visual Studio components at runtime rather than hardcoding
+  installation paths, which protects against future image changes on any Windows label.
+fix_code:
+  - language: yaml
+    label: "Pin to windows-2022 for guaranteed VS 2022"
+    code: |
+      jobs:
+        build:
+          # Use windows-2022 instead of windows-2025 to guarantee VS 2022 toolchain
+          runs-on: windows-2022
+  - language: yaml
+    label: "Use vswhere to discover MSBuild path at runtime"
+    code: |
+      - name: Locate MSBuild via vswhere
+        id: msbuild
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $msbuild = & $vswhere -latest -requires Microsoft.Component.MSBuild `
+            -find MSBuild\**\Bin\MSBuild.exe | Select-Object -First 1
+          if (-not $msbuild) { throw "MSBuild not found via vswhere" }
+          "path=$msbuild" | Out-File -Append $env:GITHUB_OUTPUT
+
+      - name: Build solution
+        shell: pwsh
+        run: |
+          & "${{ steps.msbuild.outputs.path }}" MySolution.sln /p:Configuration=Release /p:Platform=x64
+  - language: yaml
+    label: "Use CMake with dynamic VS version detection"
+    code: |
+      - name: Configure CMake
+        run: |
+          # Let CMake auto-detect the installed VS version instead of pinning generator
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+        # Avoid: cmake -G "Visual Studio 17 2022" which fails if VS 2022 is absent
+prevention:
+  - "Use `vswhere.exe` to locate Visual Studio and MSBuild components at runtime — never hardcode installation paths"
+  - "Subscribe to the actions/runner-images releases feed to get notified when versioned labels are updated"
+  - "Avoid CMake `-G \"Visual Studio 17 2022\"` in favor of `cmake -B build` with auto-detection when possible"
+  - "For CUDA or other toolchain integrations that require a specific VS version, test on a matrix of runner labels to catch regressions early"
+docs:
+  - url: "https://github.com/actions/runner-images/issues/13638"
+    label: "runner-images #13638: windows-2025 label includes VS2026 regression report"
+  - url: "https://github.com/actions/runner-images/issues/14004"
+    label: "runner-images #14004: VS 2022 paths missing on windows-2025"
+  - url: "https://github.com/microsoft/vswhere"
+    label: "vswhere — Visual Studio locator (Microsoft)"
+  - url: "https://github.com/actions/runner-images/blob/main/images/windows/Windows2025-Readme.md"
+    label: "Windows Server 2025 Runner Image Readme"
