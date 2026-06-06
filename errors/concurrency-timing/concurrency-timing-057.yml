@@ -1,0 +1,115 @@
+id: concurrency-timing-057
+title: "Fork PRs with Identical Branch Names Share Concurrency Group and Cancel Each Other"
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - fork
+  - pull_request
+  - head_ref
+  - cancel-in-progress
+  - silent-cancel
+patterns:
+  - regex: 'group.*github\.head_ref'
+    flags: 'i'
+  - regex: 'This run was cancelled'
+    flags: 'i'
+error_messages:
+  - "This run was cancelled."
+  - "Run was cancelled."
+root_cause: |
+  When a workflow uses 'github.head_ref' as the sole identifier in a
+  concurrency group key (a common pattern to cancel stale runs on the same
+  branch), all pull requests that share a branch name across different forks
+  map to the SAME concurrency group. With 'cancel-in-progress: true', the
+  latest queued run cancels all earlier runs in that group — including runs
+  from completely unrelated PRs in OTHER contributor forks.
+
+  Example scenario:
+  - Fork A (alice/myrepo) opens PR from branch 'fix/auth-bug'.
+  - Fork B (bob/myrepo) opens a PR from a branch also named 'fix/auth-bug'.
+  - Both PRs target the same upstream repo (org/myrepo).
+  - Concurrency group: 'ci-fix/auth-bug' (from github.head_ref).
+  - When Fork B's PR triggers a run, it cancels Fork A's in-progress run.
+
+  The cancellation appears as "This run was cancelled" with no explanation
+  that a different fork's PR caused it. Maintainers and contributors see
+  flaky-looking CI with no obvious cause.
+
+  This is especially common in:
+  - Large open-source projects where many contributors use the same
+    conventional branch names (fix/typo, docs/readme, feature/x).
+  - Dependabot/Renovate PRs across forks — all use the same structured
+    branch name pattern (dependabot/npm_and_yarn/lodash-4.0.0).
+fix: |
+  Include 'github.event.pull_request.number' in the concurrency group key.
+  PR numbers are unique per repository, so two PRs from different forks
+  always have different numbers even if their branch names collide.
+
+  Alternative: use 'github.run_id' for maximum uniqueness (no cancellation
+  across runs at all), but this defeats the purpose of cancel-in-progress
+  for the same PR.
+
+  The recommended pattern from GitHub documentation:
+  group: '${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}'
+
+  The '|| github.ref' fallback handles non-PR events (push, schedule)
+  where 'github.event.pull_request.number' is empty.
+fix_code:
+  - language: yaml
+    label: "Broken — github.head_ref alone causes cross-fork cancellation"
+    code: |
+      concurrency:
+        group: ci-${{ github.head_ref }}   # ❌ Collides across forks with same branch name
+        cancel-in-progress: true
+
+  - language: yaml
+    label: "Fixed — include PR number to ensure per-PR uniqueness"
+    code: |
+      concurrency:
+        # PR number is unique per repo — different forks never collide
+        group: '${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}'
+        cancel-in-progress: true
+
+  - language: yaml
+    label: "Alternative — include repo owner to scope per fork"
+    code: |
+      concurrency:
+        # Include head repo full_name to distinguish forks explicitly
+        group: >-
+          ${{ github.workflow }}-
+          ${{ github.event.pull_request.head.repo.full_name || github.repository }}-
+          ${{ github.event.pull_request.number || github.ref }}
+        cancel-in-progress: true
+
+  - language: yaml
+    label: "Recommended pattern from GitHub docs — workflow + PR number or ref"
+    code: |
+      name: CI
+      on:
+        pull_request:
+        push:
+          branches: [main]
+
+      concurrency:
+        group: '${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}'
+        cancel-in-progress: true
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./run-tests.sh
+
+prevention:
+  - "Never use github.head_ref alone as a concurrency group key for pull_request workflows."
+  - "Always pair github.head_ref with github.event.pull_request.number to scope to the specific PR."
+  - "Use the GitHub-recommended pattern: '${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}'."
+  - "Test concurrency behavior by opening two PRs from different forks with the same branch name before merging concurrency configuration."
+  - "On public repos with many external contributors, audit all concurrency group keys for cross-fork collision risk."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency"
+    label: "GitHub Docs — Using concurrency (recommended group key pattern)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#concurrency"
+    label: "GitHub Docs — Workflow syntax: concurrency"

@@ -1,0 +1,111 @@
+id: runner-environment-218
+title: "docker/build-push-action 'load: true' and 'push: true' Are Mutually Exclusive"
+category: runner-environment
+severity: error
+tags:
+  - docker
+  - build-push-action
+  - buildx
+  - buildkit
+  - load
+  - push
+patterns:
+  - regex: 'load.{0,20}push cannot be both set|cannot use both --load and --push|load.*push.*incompatible|--load.*--push.*incompatible'
+    flags: 'i'
+  - regex: "contradictory options given: load and push"
+    flags: 'i'
+error_messages:
+  - "contradictory options given: load and push cannot be both set at the same time"
+  - "ERROR: cannot use both --load and --push flags"
+  - "error: '--load' and '--push' cannot be used together"
+  - "Error: buildx failed with: error: failed to solve: load and push cannot be both set"
+root_cause: |
+  docker/build-push-action (and the underlying docker buildx) does not support
+  setting both 'load: true' and 'push: true' in the same build step. These two
+  options are mutually exclusive:
+
+  - 'load: true' exports the built image into the local Docker daemon
+    (equivalent to --load / --output type=docker).
+  - 'push: true' pushes the image to a remote registry
+    (equivalent to --push / --output type=registry).
+
+  Both flags specify different output targets, and docker buildx cannot satisfy
+  both simultaneously with most drivers. The docker-container and kubernetes
+  drivers explicitly reject the combination. The docker driver (used without
+  explicit driver setup) may silently ignore 'push' in some versions.
+
+  Common triggers:
+  - Copying a workflow snippet that has 'push: true' and adding 'load: true'
+    for local testing without removing 'push: true'.
+  - Conditional 'push' logic using expressions that evaluate to true at the
+    same time as unconditional 'load: true'.
+fix: |
+  Use only one of 'load' or 'push' in a single step. To both test locally and
+  push to a registry, split the build into two separate steps, or use
+  conditional logic so only one output target is active at a time.
+
+  The idiomatic pattern is:
+  - Set 'push: ${{ github.ref == 'refs/heads/main' }}' to push only on
+    default branch, and omit 'load:' entirely (or use a separate step for
+    local testing).
+  - To load the image for integration tests AND push on main, build twice:
+    once with 'load: true' for tests, once with 'push: true' for release.
+  - Use build outputs caching (cache-from/cache-to) so the second build
+    is fast.
+fix_code:
+  - language: yaml
+    label: "Wrong — load and push both true (fails)"
+    code: |
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true      # ❌ Incompatible with push: true
+          push: true      # ❌ Incompatible with load: true
+          tags: myrepo/myimage:latest
+
+  - language: yaml
+    label: "Fixed — push conditionally, no load"
+    code: |
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: myrepo/myimage:latest
+
+  - language: yaml
+    label: "Fixed — load for tests, push separately on main"
+    code: |
+      - name: Build image for integration tests
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true        # ✅ load only — no push
+          tags: myrepo/myimage:test
+
+      - name: Run integration tests
+        run: docker run --rm myrepo/myimage:test ./run-tests.sh
+
+      - name: Push to registry (main branch only)
+        if: github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true        # ✅ push only — no load
+          tags: myrepo/myimage:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+prevention:
+  - "Never set both 'load: true' and 'push: true' in the same build-push-action step."
+  - "Use 'push: ${{ condition }}' expression to conditionally push; omit 'load' in the same step."
+  - "If you need the image locally for testing and also want to push, use two separate steps."
+  - "Review docker/build-push-action README — the compatibility matrix for load, push, and outputs is documented."
+docs:
+  - url: "https://github.com/docker/build-push-action#inputs"
+    label: "docker/build-push-action — inputs reference (load, push, outputs)"
+  - url: "https://docs.docker.com/build/building/export/"
+    label: "Docker Buildx — build output types (load vs push)"
+  - url: "https://github.com/docker/build-push-action/blob/master/README.md#multi-platform-image"
+    label: "docker/build-push-action — multi-platform and output guidance"
