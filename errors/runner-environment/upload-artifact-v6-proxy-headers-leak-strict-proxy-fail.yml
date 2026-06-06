@@ -1,0 +1,101 @@
+id: runner-environment-208
+title: 'upload-artifact@v6 fails behind strict corporate proxy — ECONNRESET or HTTP 400 on CONNECT tunnel'
+category: runner-environment
+severity: error
+tags:
+  - upload-artifact
+  - v6
+  - proxy
+  - self-hosted
+  - ECONNRESET
+  - corporate-network
+  - azure-storage
+patterns:
+  - regex: 'Proxy connection ended before receiving CONNECT response'
+    flags: 'i'
+  - regex: 'Unable to make request: ECONNRESET'
+    flags: 'i'
+  - regex: 'upload-artifact@v[6-9]'
+    flags: 'i'
+error_messages:
+  - 'Error: Proxy connection ended before receiving CONNECT response'
+  - 'Error: Unable to make request: ECONNRESET'
+  - 'HTTP 400 Bad Request from proxy'
+root_cause: |
+  `actions/upload-artifact@v6` switched its Azure Blob Storage client from
+  `@azure/storage-blob` backed by `@azure/core-http` (used in v4/v5) to
+  `@azure/storage-blob` backed by `@azure/core-rest-pipeline` and
+  `@typespec/ts-http-runtime`.
+
+  The `proxyPolicy` in `@typespec/ts-http-runtime` contains a bug: it leaks
+  destination HTTP request headers — including `content-type`, `content-length`,
+  `x-ms-version`, and `accept` — directly into the HTTP `CONNECT` tunnel
+  request sent to the corporate proxy. RFC 9110 §9.3.6 does not expect
+  `CONNECT` requests to carry a `Content-Length`, and many strict enterprise
+  forward proxies (Squid with strict policies, Zscaler, BlueCoat, some HAProxy
+  configurations) reject `CONNECT` requests with unexpected headers.
+
+  This manifests as:
+  - `Proxy connection ended before receiving CONNECT response` — proxy drops
+    the connection before sending `200 Connection established`
+  - `ECONNRESET` — proxy resets the TCP connection
+  - HTTP 400 Bad Request — proxy rejects the malformed CONNECT
+
+  The issue does NOT reproduce with permissive proxies like default Squid
+  (which is why GitHub's own CI did not catch it). Only strict corporate proxies
+  that validate CONNECT request headers are affected.
+
+  `actions/upload-artifact@v5` uses the older `@azure/core-http` stack which
+  sends proper CONNECT tunnels without leaking headers, so workflows that pin
+  to v5 are not affected.
+
+  The fix was shipped in `actions/upload-artifact@v7.0.1` (April 12, 2026),
+  which bumps `@actions/artifact` to a version that uses the fixed
+  `@typespec/ts-http-runtime` proxyPolicy.
+fix: |
+  **Preferred fix:** Upgrade to `actions/upload-artifact@v7` (v7.0.1 or later):
+
+  ```yaml
+  - uses: actions/upload-artifact@v7
+    with:
+      name: build-artifacts
+      path: dist/
+  ```
+
+  **Temporary workaround (stay on v6):** Set the `HTTPS_PROXY` environment
+  variable AND apply a one-liner patch to strip headers from the ProxyAgent
+  call inside the cached action source:
+
+  ```yaml
+  - name: Patch upload-artifact proxy headers bug
+    run: |
+      for f in $(find "${GITHUB_WORKSPACE}/../.." -name "index.js" \
+        -path "*actions/upload-artifact*dist*" 2>/dev/null); do
+        sed -i 's/ProxyAgent(proxyUrl, { headers })/ProxyAgent(proxyUrl)/g' "$f"
+      done
+  ```
+
+  **Do NOT downgrade to v5** in new workflows; v5 relies on deprecated
+  dependencies. Upgrading to v7 is the correct long-term fix.
+fix_code:
+  - language: yaml
+    label: 'Upgrade to upload-artifact@v7 (recommended)'
+    code: |
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-artifacts
+          path: dist/
+          retention-days: 7
+prevention:
+  - 'Always upgrade upload-artifact to @v7 or later on self-hosted runners that sit behind a corporate proxy'
+  - 'When adding new @v6 steps, test on a runner behind your actual proxy before deploying to all pipelines'
+  - 'If the proxy blocks the artifact upload step silently, enable RUNNER_DEBUG=1 to see the full CONNECT request/response cycle'
+  - 'Pin to upload-artifact@v7.0.1 or later — earlier v7 releases were not published, v7.0.1 is the first tagged release'
+docs:
+  - url: 'https://github.com/actions/upload-artifact/issues/747'
+    label: 'upload-artifact#747 — V6 upload stalled behind proxy (10 reactions)'
+  - url: 'https://github.com/actions/upload-artifact/pull/792'
+    label: 'upload-artifact#792 — Fix proxy headers leak errconnect on strict proxies'
+  - url: 'https://github.com/actions/upload-artifact/releases/tag/v7.0.1'
+    label: 'upload-artifact v7.0.1 release notes — includes proxy fix'
