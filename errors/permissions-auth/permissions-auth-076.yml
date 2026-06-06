@@ -1,0 +1,158 @@
+id: permissions-auth-076
+title: '`docker push` to ghcr.io fails with 403 / "denied: permission_denied: write_package" — missing `packages: write` permission'
+category: permissions-auth
+severity: error
+tags:
+  - ghcr
+  - github-packages
+  - container-registry
+  - packages-write
+  - github-token
+  - docker-push
+  - 403
+  - permission-denied
+patterns:
+  - regex: 'denied: permission_denied: write_package'
+    flags: 'i'
+  - regex: 'Error response from daemon.*denied.*ghcr\.io.*403'
+    flags: 'i'
+  - regex: 'error parsing HTTP 403 response body.*ghcr\.io'
+    flags: 'i'
+  - regex: 'unauthorized.*ghcr\.io.*write'
+    flags: 'i'
+  - regex: 'The token provided does not match expected format for.*packages'
+    flags: 'i'
+error_messages:
+  - "Error response from daemon: denied: permission_denied: write_package"
+  - "error parsing HTTP 403 response body: unexpected end of JSON input: \"\""
+  - "denied: denied"
+  - "unauthorized: authentication required"
+  - "buildx failed with: ERROR [auth] ghcr.io token refreshing failed with status: 403 Forbidden"
+root_cause: |
+  GitHub Container Registry (ghcr.io) requires the `packages: write` permission
+  to be explicitly granted in the workflow job's `permissions:` block before
+  `GITHUB_TOKEN` can push (publish) images.
+
+  Since GitHub tightened default GITHUB_TOKEN permissions in 2023, new repositories
+  and organization workflows that set "Restrict GitHub Actions permissions" to
+  "Read repository contents and packages" have `packages: write` DISABLED by default.
+  Without this permission, any `docker push` or `docker buildx build --push` to
+  `ghcr.io` fails with a 403 at the registry level.
+
+  **Why this is confusing:**
+  - `docker login ghcr.io -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}`
+    SUCCEEDS (read/login is allowed) — the login step passes
+  - The failure occurs on `docker push`, not login
+  - The error message "denied: permission_denied: write_package" or the generic 403
+    does not directly mention the `packages: write` permission or how to add it
+  - The same workflow may work on repositories created before the permission
+    tightening (where `packages: write` was still the default)
+
+  **Additional requirement — linking the package to the repository:**
+  On first publish, the package is created as unlinked. If the workflow runs in a
+  fork or if the package visibility is set to Private with no repository link, the
+  GITHUB_TOKEN push will also fail even with `packages: write`. The package must be
+  linked to the source repository for GITHUB_TOKEN to authenticate.
+
+  Source: SO #70646920 (22 upvotes, 34k views), SO #78342148, GitHub Docs on
+  container registry permissions.
+fix: |
+  Add `packages: write` to the job's `permissions:` block. This is the most common
+  fix and resolves the majority of GHCR push 403 errors:
+
+  ```yaml
+  jobs:
+    build-and-push:
+      runs-on: ubuntu-latest
+      permissions:
+        contents: read
+        packages: write   # Required to push to ghcr.io
+  ```
+
+  **If login succeeds but push still fails:**
+  1. Verify the package is linked to the repository: go to the package on
+     `github.com/{owner}/{package}` → Package settings → "Add Repository"
+  2. Ensure the package visibility matches the repository (private repo → private
+     package, or set the package to public)
+  3. For organization repositories, confirm the organization has not blocked
+     GitHub Actions from creating packages (Org Settings → Actions → General)
+
+  **If using a separate PAT or App token:**
+  GITHUB_TOKEN with `packages: write` is sufficient for pushing to packages owned
+  by the same repository. For cross-repository or org-level package publishing,
+  use a Fine-Grained PAT with "Packages: Read and write" scope or a GitHub App
+  with "Packages: write" permission.
+fix_code:
+  - language: yaml
+    label: 'Correct job-level permissions for docker push to ghcr.io'
+    code: |
+      name: Build and Push Docker Image
+      on:
+        push:
+          branches: [main]
+      jobs:
+        build-push:
+          runs-on: ubuntu-latest
+          permissions:
+            contents: read
+            packages: write   # <-- Required for ghcr.io push
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Log in to GitHub Container Registry
+              uses: docker/login-action@v3
+              with:
+                registry: ghcr.io
+                username: ${{ github.actor }}
+                password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Build and push
+              uses: docker/build-push-action@v6
+              with:
+                context: .
+                push: true
+                tags: ghcr.io/${{ github.repository }}:latest
+  - language: yaml
+    label: 'Workflow-level permissions fallback (if setting per-job is not possible)'
+    code: |
+      name: Build and Push Docker Image
+      on:
+        push:
+          branches: [main]
+
+      # Set at workflow level — applies to ALL jobs
+      permissions:
+        contents: read
+        packages: write
+
+      jobs:
+        build-push:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Log in to ghcr.io
+              uses: docker/login-action@v3
+              with:
+                registry: ghcr.io
+                username: ${{ github.actor }}
+                password: ${{ secrets.GITHUB_TOKEN }}
+            - name: Push image
+              run: |
+                docker build -t ghcr.io/${{ github.repository }}:${{ github.sha }} .
+                docker push ghcr.io/${{ github.repository }}:${{ github.sha }}
+prevention:
+  - "Always add `packages: write` to the job permissions block for any job that pushes images to ghcr.io"
+  - "Note that docker login to ghcr.io succeeds without packages:write — always test the actual push step to validate permissions"
+  - "Check your organization's Actions general settings for any policies that restrict packages creation"
+  - "When using docker/build-push-action with push: true, the packages: write permission is required on the job"
+  - "For fork PRs, packages: write is unavailable — use conditional steps: `if: github.event.pull_request.head.repo.full_name == github.repository`"
+  - "Link the package to its source repository after first creation to enable GITHUB_TOKEN-based pushes in future runs"
+docs:
+  - url: 'https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry'
+    label: 'GitHub Docs: Working with the Container registry (ghcr.io)'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#permissions-for-the-github_token'
+    label: 'GitHub Docs: GITHUB_TOKEN permissions reference'
+  - url: 'https://stackoverflow.com/questions/70646920/github-token-permission-denied-write-package-when-build-and-push-docker-in-githu'
+    label: 'SO #70646920: GITHUB_TOKEN permission denied write_package (22 upvotes, 34k views)'
+  - url: 'https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility'
+    label: 'GitHub Docs: Configuring a package access control and visibility'

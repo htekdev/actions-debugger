@@ -1,0 +1,132 @@
+id: silent-failures-120
+title: 'github.event.schedule returns stale cron expression for 1-2 runs after updating workflow schedule'
+category: silent-failures
+severity: silent-failure
+tags:
+  - schedule
+  - cron
+  - github.event.schedule
+  - stale-value
+  - routing
+  - trigger-payload
+patterns:
+  - regex: 'github\.event\.schedule.*[0-9\*\/\-\,]+'
+    flags: 'i'
+  - regex: 'Unknown schedule:\s+[0-9\*\/\-\, ]+'
+    flags: 'i'
+  - regex: 'Evaluating String.*=>\s+''[0-9\*\/\-\, ]+'''
+    flags: 'i'
+error_messages:
+  - "Error: Unknown schedule: 0 5 * * *"
+  - "##[debug]....=> '0 5 * * *'"
+  - "github.event.schedule evaluates to removed cron expression"
+root_cause: |
+  GitHub's schedule dispatcher caches the cron expression strings associated with
+  each workflow internally. When a workflow's `on.schedule` block is updated (cron
+  expression changed or removed) and pushed to the default branch, the dispatcher's
+  internal state does not immediately sync with the new YAML. For 1-2 scheduled runs
+  after the change, the dispatcher fires the workflow with the OLD cron expression
+  in `github.event.schedule`, even though the executed YAML already contains the
+  updated cron string.
+
+  This means:
+  - A workflow with routing logic such as `if: github.event.schedule == '0 5 * * 1-5'`
+    silently skips those steps during the transition window
+  - A `case`/`switch`-style step that branches on `github.event.schedule` hits an
+    "unknown schedule" branch and logs a confusing error
+  - Multi-schedule workflows that use `github.event.schedule` to dispatch different jobs
+    produce wrong results for 1-2 runs post-update
+
+  The stale value typically clears within the next scheduled trigger cycle once the
+  dispatcher re-reads the updated workflow YAML from the default branch. The actual
+  workflow code that runs is the CURRENT version — only the event payload is stale.
+
+  Source: actions/runner#4241 (Feb 2026) — real-world failure confirmed in
+  ava-labs/firewood with stale '0 5 * * *' firing after update to '0 5 * * 1-5',
+  with debug logs showing the old value in the evaluator.
+fix: |
+  **Option 1 — Use a fallback in cron-routing logic:**
+  When switching cron expressions, treat the transition period gracefully by adding
+  the OLD expression to your routing logic temporarily. After 2-3 scheduled cycles,
+  remove the old branch.
+
+  **Option 2 — Avoid routing on github.event.schedule entirely:**
+  Use separate workflow files for each schedule instead of branching inside one
+  workflow on `github.event.schedule`. Each schedule in its own file has an
+  independent dispatch state.
+
+  **Option 3 — Trigger a manual run after updating the schedule:**
+  After pushing the cron change, trigger the workflow via `workflow_dispatch` once.
+  This forces the dispatcher to re-evaluate the workflow file and typically clears
+  the stale state before the next real scheduled run.
+
+  **Option 4 — Accept and handle the stale run:**
+  Add a default/fallback case to your routing logic that gracefully handles an
+  unexpected `github.event.schedule` value rather than erroring:
+
+  ```yaml
+  - name: Route by schedule
+    run: |
+      case "${{ github.event.schedule }}" in
+        '0 5 * * 1-5') echo "Weekday run" ;;
+        '0 5 * * 6')   echo "Saturday run" ;;
+        *)             echo "Unknown schedule (possibly stale): ${{ github.event.schedule }}; skipping" ;;
+      esac
+  ```
+fix_code:
+  - language: yaml
+    label: 'Use separate workflows per schedule (avoids routing entirely)'
+    code: |
+      # weekday-job.yml
+      on:
+        schedule:
+          - cron: '0 5 * * 1-5'
+      jobs:
+        weekday:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Weekday build"
+
+      # saturday-job.yml
+      on:
+        schedule:
+          - cron: '0 5 * * 6'
+      jobs:
+        saturday:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Saturday build"
+  - language: yaml
+    label: 'Graceful fallback case when routing on github.event.schedule'
+    code: |
+      on:
+        schedule:
+          - cron: '0 5 * * 1-5'
+          - cron: '0 5 * * 6'
+      jobs:
+        dispatch:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Route by schedule
+              run: |
+                case "${{ github.event.schedule }}" in
+                  '0 5 * * 1-5') echo "Weekday build" ;;
+                  '0 5 * * 6')   echo "Saturday build" ;;
+                  # Fallback handles stale values during transition window
+                  *)
+                    echo "Unrecognized schedule value: '${{ github.event.schedule }}'"
+                    echo "This may be a stale value from before a recent schedule update."
+                    echo "Skipping; next run should carry the updated expression."
+                    ;;
+                esac
+prevention:
+  - "Never rely on github.event.schedule routing immediately after updating a cron expression; allow 2-3 cycles for dispatcher state to sync"
+  - "Prefer separate workflow files per schedule rather than branching on github.event.schedule inside a single workflow"
+  - "When routing on github.event.schedule is necessary, always include a default/fallback case that handles unexpected values gracefully"
+  - "Trigger a workflow_dispatch run after updating a cron expression to force dispatcher re-evaluation before the next scheduled cycle"
+  - "Add a debug step that logs github.event.schedule at the start of scheduled workflows to surface stale values immediately"
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#schedule'
+    label: 'GitHub Docs: schedule event'
+  - url: 'https://github.com/actions/runner/issues/4241'
+    label: 'actions/runner#4241: Cron scheduled returns stale cron expression after updating workflow schedule triggers'
