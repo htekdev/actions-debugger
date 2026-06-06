@@ -1,0 +1,149 @@
+id: runner-environment-223
+title: 'macOS-15 Arm64 brew update Fails with Stale lockf Lock When Run Twice'
+category: runner-environment
+severity: error
+tags:
+  - macos
+  - homebrew
+  - brew-update
+  - lockf
+  - arm64
+  - macos-15
+  - regression
+  - concurrent
+patterns:
+  - regex: 'lockf: 200: already locked'
+    flags: 'i'
+  - regex: 'Error: Another `brew update` process is already running\.'
+    flags: 'i'
+  - regex: 'lockf:.*already locked\s*\nError: Another.*brew update.*process is already running'
+    flags: 'im'
+error_messages:
+  - "lockf: 200: already locked"
+  - "Error: Another `brew update` process is already running."
+  - "Please wait for it to finish or terminate it to continue."
+  - "Error: Process completed with exit code 1."
+root_cause: |
+  On macOS-15 Arm64 GitHub Actions hosted runners starting with image version
+  20260422.526 (released ~April 22, 2026), running `brew update` more than once
+  within the same workflow — or across two steps that both call `brew update` —
+  fails on the second invocation with a stale lockf lock error.
+
+  Homebrew uses a lockfile at `/opt/homebrew/Library/Taps/homebrew/homebrew-core/.git/index.lock`
+  (or a similar path) to prevent concurrent updates. In the affected image versions,
+  the first `brew update` completes successfully but leaves the lock file in a
+  state that subsequent `brew update` calls cannot acquire. The `lockf` system
+  call returns errno 200 (EDEADLK on macOS), which Homebrew surfaces as
+  "Another brew update process is already running."
+
+  This is a regression — the same workflow step pattern worked correctly on image
+  version 20260415.520 and earlier.
+
+  Common trigger patterns:
+  1. Explicit double-update in a single step: `brew update && brew update`
+  2. Two separate steps that each call `brew update` before installing different tools
+  3. Parallel jobs on the same runner image that both run `brew update` (less common
+     since each hosted runner job gets a fresh VM, but affects matrix jobs in the
+     same workflow when they share a Homebrew setup step via the action cache)
+  4. A step script that calls `brew update` internally AND the user also calls it
+
+  Note: This affects macOS-15 Arm64 specifically. macOS-14, macOS-26, and x86_64
+  variants were NOT marked as affected in the original bug report (runner-images#13965).
+
+  Source: actions/runner-images#13965 (April 2026, open, under investigation by
+  GitHub runner-images team). Reported with reproducible case from the
+  mullvad/mullvadvpn-app CI pipeline.
+fix: |
+  Option 1 — Run brew update only once per job (preferred):
+
+  Consolidate all your brew installations into a single step and call brew update
+  exactly once before them:
+
+    - name: Install dependencies
+      run: |
+        brew update
+        brew install cmake ninja pkg-config
+
+  Option 2 — Use HOMEBREW_NO_AUTO_UPDATE=1 on steps that don't need fresh formulae:
+
+  If you only need brew update for specific steps, set the env var on all other
+  brew-using steps to prevent automatic update attempts:
+
+    - name: Install specific tool
+      env:
+        HOMEBREW_NO_AUTO_UPDATE: '1'
+      run: brew install your-tool   # Skips the implicit brew update
+
+  Option 3 — Guard the second brew update with a lock check:
+
+    - name: Safe brew update
+      run: |
+        flock -xn /opt/homebrew/Library/Taps/homebrew/homebrew-core/.git/index.lock \
+          brew update || echo "::warning::brew update skipped (lock already held)"
+
+  Option 4 — Use brew upgrade instead of repeated brew update:
+  If you need the latest formula versions, run brew update once and then
+  use brew upgrade to update installed packages:
+
+    - name: Update and upgrade Homebrew
+      run: |
+        brew update        # Run exactly once
+        brew upgrade       # Upgrades installed formulae to latest
+
+  Option 5 — Check for the regression in your image version and pin:
+  If you need to pin to a known-good image version while the fix is pending,
+  see GitHub's runner-images documentation for image version pinning options
+  (note: pinning is not officially supported for GitHub-hosted standard runners).
+fix_code:
+  - language: yaml
+    label: 'Broken — two brew update calls in same workflow (second fails on affected image)'
+    code: |
+      # This fails on macOS-15 Arm64 image 20260422.526+ with lockf: 200: already locked:
+      steps:
+        - name: Install build tools
+          run: |
+            brew update
+            brew install cmake ninja
+
+        - name: Install test tools
+          run: |
+            brew update        # FAILS: Another brew update process is already running
+            brew install lcov
+
+  - language: yaml
+    label: 'Fixed — single brew update before consolidated installs'
+    code: |
+      # Consolidate into one brew update call at the start:
+      steps:
+        - name: Install all Homebrew tools
+          run: |
+            brew update   # Only call once per job
+            brew install cmake ninja lcov
+
+  - language: yaml
+    label: 'Fixed — use HOMEBREW_NO_AUTO_UPDATE=1 on subsequent brew steps'
+    code: |
+      # Or prevent auto-update on steps after the first:
+      steps:
+        - name: Install build tools
+          run: |
+            brew update
+            brew install cmake ninja
+
+        - name: Install test tools (no re-update needed)
+          env:
+            HOMEBREW_NO_AUTO_UPDATE: '1'
+          run: brew install lcov   # Uses existing formula cache; no brew update call
+
+prevention:
+  - 'Call brew update at most once per job. Consolidate all Homebrew installations into a single step with one brew update at the top.'
+  - 'Set HOMEBREW_NO_AUTO_UPDATE=1 as a job-level env var and call brew update explicitly only in the one step that needs it.'
+  - 'Pin to macOS-14 (macos-14-xlarge) or use macOS-26 (which has different Homebrew behavior) if the regression is blocking critical workflows while runner-images#13965 is open.'
+  - 'Check your CI logs for the "lockf: 200: already locked" error if macOS-15 Arm64 workflows started failing around late April 2026 — this regression is the likely cause.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/13965'
+    label: 'actions/runner-images#13965 — Running brew update twice in one workflow breaks (open, April 2026)'
+  - url: 'https://docs.brew.sh/Manpage#environment'
+    label: 'Homebrew docs — HOMEBREW_NO_AUTO_UPDATE environment variable'
+  - url: 'https://github.com/mullvad/mullvadvpn-app/actions/runs/24890005834'
+    label: 'mullvad/mullvadvpn-app — Example failing run (regression confirmed between image 20260415 and 20260422)'

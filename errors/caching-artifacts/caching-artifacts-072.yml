@@ -1,0 +1,137 @@
+id: caching-artifacts-072
+title: 'actions/cache@v5 Restore Rate Limit (429) Silently Treated as Cache Miss'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - cache
+  - rate-limit
+  - 429
+  - restore
+  - cache-miss
+  - silent-failure
+  - v5
+  - performance
+patterns:
+  - regex: 'Warning: You''ve hit a rate limit, your rate limit will reset in \d+ seconds'
+    flags: 'i'
+  - regex: 'Failed to restore:.*GetCacheEntryDownloadURL.*Rate [Ll]imited'
+    flags: 'i'
+  - regex: 'Failed request: \(429\) Too Many Requests: rate limit exceeded'
+    flags: 'i'
+error_messages:
+  - "Warning: You've hit a rate limit, your rate limit will reset in 18 seconds"
+  - "Warning: Failed to restore: Failed to GetCacheEntryDownloadURL: Rate Limited: Failed request: (429) Too Many Requests: rate limit exceeded"
+  - "Cache not found for input keys: goofy-b41b01ad3312fe1358359b7522c43860bfdad754166c7f1d385e51766e57b4c0"
+root_cause: |
+  When the GitHub cache service rate-limits a cache restore lookup request with HTTP
+  429 Too Many Requests, actions/cache@v5 does NOT retry the request. Instead, it
+  prints a warning and immediately treats the response as a cache miss, proceeding
+  with a full build from scratch.
+
+  The cache service includes a Retry-After header in the 429 response that tells the
+  client exactly how many seconds to wait before retrying (often ≤60 seconds). The
+  actions/cache implementation ignores this header entirely — no retry, no backoff,
+  no configurable behavior. The job simply never gets its cached dependencies.
+
+  This is a silent failure in the sense that:
+  1. The job succeeds — it just rebuilds everything from scratch.
+  2. No annotation or error is surfaced in the Actions UI. Only a Warning line in
+     the step log reveals what happened.
+  3. The resulting build artifacts are correct, but the CI run takes 2–10x longer
+     than expected, masking the real cause.
+
+  Most commonly triggered in large matrix builds (20+ parallel jobs) where many jobs
+  simultaneously query the cache service and collectively exhaust the per-repo or
+  per-org cache API rate limit. Also reported on repos with heavy cross-job cache
+  sharing patterns.
+
+  Distinct from caching-artifacts-030 (cache-service-429-upload-ebadf-crash.yml):
+  that entry covers 429 during the cache UPLOAD phase which crashes with EBADF.
+  This entry covers 429 during the cache RESTORE/lookup phase which silently misses
+  — different operation, different error message, different impact, different fix path.
+
+  Source: actions/cache#1758 (May 2026, open); also reported in
+  oxidecomputer/hubris#2535 "CI fails intermittently on Windows while restoring cache"
+  (May 2026).
+fix: |
+  There is no complete fix — this is an open upstream bug (actions/cache#1758).
+  The rate-limit retry path is not implemented in actions/cache. Workarounds:
+
+  Option 1 — Reduce cache API pressure by staggering matrix jobs:
+
+    strategy:
+      matrix: ...
+      max-parallel: 5   # Limit to 5 concurrent jobs instead of all at once
+
+  This reduces the burst of simultaneous restore calls and lowers the chance of
+  hitting the rate limit.
+
+  Option 2 — Add a retry wrapper using actions/cache's restore-keys cascade:
+
+    - uses: actions/cache@v5
+      id: cache
+      with:
+        key: ${{ runner.os }}-deps-${{ hashFiles('**/lockfile') }}
+        restore-keys: |
+          ${{ runner.os }}-deps-
+    - name: Warn on cache rate limit miss
+      if: steps.cache.outputs.cache-hit != 'true'
+      run: |
+        echo "::warning::Cache miss — may be rate limited. Check step log for 429."
+
+  Option 3 — Switch to a self-hosted cache backend to bypass GitHub's rate limits:
+
+    env:
+      ACTIONS_CACHE_URL: https://your-cache-backend.example.com/
+      ACTIONS_RUNTIME_TOKEN: ${{ secrets.CACHE_TOKEN }}
+
+  Option 4 — Accept it and add monitoring. If you frequently see the rate limit
+  warning, consider filing a support ticket to request a higher cache API rate limit
+  for your organization.
+fix_code:
+  - language: yaml
+    label: 'Reduce parallelism to lower cache restore burst pressure'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              target: [linux-x64, linux-arm64, windows-x64, macos-x64, macos-arm64]
+            max-parallel: 4   # Stagger jobs to reduce simultaneous cache restore calls
+          steps:
+            - uses: actions/cache@v5
+              with:
+                path: ~/.cargo/registry
+                key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+  - language: yaml
+    label: 'Add explicit warning step to surface rate limit cache misses clearly'
+    code: |
+      steps:
+        - uses: actions/cache@v5
+          id: cache-restore
+          with:
+            path: |
+              ~/.npm
+              node_modules
+            key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+            restore-keys: |
+              ${{ runner.os }}-node-
+
+        - name: Check for cache rate limit miss
+          if: steps.cache-restore.outputs.cache-hit != 'true'
+          run: |
+            echo "::warning::Cache miss detected — check step log for '429 Too Many Requests' to distinguish rate-limit miss from genuine cache absence."
+
+prevention:
+  - 'Set max-parallel on matrix strategies to limit simultaneous cache restore API calls and avoid triggering the per-org/per-repo cache rate limit.'
+  - 'Monitor the cache restore step logs for the warning message "You''ve hit a rate limit" to distinguish rate-limit misses from genuine cache absences when diagnosing slow CI runs.'
+  - 'Consider using restore-keys fallback chains so that even a rate-limited primary key miss may still succeed with a partial restore from a broader key.'
+  - 'Report rate limit occurrences to GitHub Support with your org name to request a higher cache API rate limit if you encounter this regularly in large workflows.'
+docs:
+  - url: 'https://github.com/actions/cache/issues/1758'
+    label: 'actions/cache#1758 — Handle rate limit (open, May 2026)'
+  - url: 'https://github.com/oxidecomputer/hubris/issues/2535'
+    label: 'oxidecomputer/hubris#2535 — CI fails intermittently on Windows while restoring cache (May 2026)'
+  - url: 'https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows#usage-limits-and-eviction-policy'
+    label: 'GitHub Docs — Caching usage limits and eviction policy'
