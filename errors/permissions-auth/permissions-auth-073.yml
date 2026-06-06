@@ -1,0 +1,127 @@
+id: permissions-auth-073
+title: 'GraphQL "refusing to allow a GitHub App to create or update workflow without `workflows` permission" — misleading error, actual fix is actions: write or App workflow scope'
+category: permissions-auth
+severity: error
+tags:
+  - GitHub-App
+  - workflows
+  - actions-write
+  - GraphQL
+  - pull-request
+  - misleading-error
+  - OAuth-scope
+  - enablePullRequestAutoMerge
+patterns:
+  - regex: "refusing to allow a GitHub App to create or update workflow .+ without .workflows. permission"
+    flags: 'i'
+  - regex: 'GraphQL.+Pull request.+workflow.+without.+workflows.*permission'
+    flags: 'i'
+error_messages:
+  - "GraphQL: Pull request refusing to allow a GitHub App to create or update workflow `.github/workflows/release.yml` without `workflows` permission (enablePullRequestAutoMerge)"
+  - "refusing to allow a GitHub App to create or update workflow `.github/workflows/ci.yml` without `workflows` permission"
+root_cause: |
+  When a GitHub App or the `GITHUB_TOKEN` attempts to enable auto-merge,
+  create a pull request that modifies workflow files, or perform certain
+  pull-request GraphQL mutations (`enablePullRequestAutoMerge`,
+  `createPullRequest`, etc.) on a branch that touches `.github/workflows/`,
+  GitHub's API returns a misleading error:
+
+    `GraphQL: Pull request refusing to allow a GitHub App to create or update
+     workflow '...' without 'workflows' permission`
+
+  The error message references `workflows` as if it were a value you can set
+  in the `permissions:` block of a GitHub Actions workflow. **It is not.**
+  The word `workflows` here refers to the **GitHub App OAuth scope** (which
+  grants the App permission to edit workflow files), not the `actions: write`
+  or any standard GITHUB_TOKEN permission key.
+
+  There are two distinct situations that produce this error:
+
+  1. **GitHub App missing the Workflows permission:** If your GitHub App does
+     not have the "Workflows" repository permission (a GitHub App installation
+     permission distinct from all the `permissions:` block keys), any operation
+     that modifies `.github/workflows/` through the App will be rejected with
+     this message.
+
+  2. **GITHUB_TOKEN used for auto-merge enabling on workflow-touching PRs:**
+     When a workflow uses `gh pr merge --auto` (or the GraphQL
+     `enablePullRequestAutoMerge` mutation) on a PR that modifies workflow
+     files, the GITHUB_TOKEN may lack the necessary scope even with
+     `contents: write`, because enabling auto-merge on workflow-modifying PRs
+     requires the workflows OAuth scope which GITHUB_TOKEN cannot hold.
+
+  The error message's reference to `workflows` is confusing because it is not
+  a recognized key in the YAML `permissions:` block. Developers who try to
+  add `permissions: workflows: write` get a YAML validation error ("Unknown
+  property 'workflows'"), leading to frustration when neither the permissions
+  block nor the token can be directly granted this scope.
+fix: |
+  **For GitHub Apps:**
+  Go to your GitHub App's settings → Permissions & events → Repository
+  permissions → and enable **"Workflows" permission** (set to Read & Write).
+  Then re-install the app on the repository/organization so the new permission
+  takes effect.
+
+  **For GITHUB_TOKEN on auto-merge of workflow-touching PRs:**
+  The GITHUB_TOKEN cannot hold the `workflows` OAuth scope. You must use a
+  Personal Access Token (classic, with the `workflow` scope) or a GitHub App
+  with the Workflows permission. Store either as a repository secret and use it
+  instead of `GITHUB_TOKEN` for the auto-merge step:
+
+  ```yaml
+  - name: Enable auto-merge
+    env:
+      GH_TOKEN: ${{ secrets.MY_PAT_WITH_WORKFLOW_SCOPE }}
+    run: gh pr merge --auto --squash ${{ github.event.pull_request.number }}
+  ```
+
+  **For `actions: write` confusion:**
+  Adding `actions: write` to the `permissions:` block does NOT fix this error.
+  `actions: write` governs artifacts, caches, and workflow runs — NOT the
+  ability to create or modify workflow files.
+fix_code:
+  - language: yaml
+    label: 'Use a PAT with the workflow scope instead of GITHUB_TOKEN for auto-merge on workflow-touching PRs'
+    code: |
+      jobs:
+        auto-merge:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Enable auto-merge
+              # GITHUB_TOKEN cannot hold the 'workflow' OAuth scope.
+              # Use a PAT (classic) with the 'workflow' scope stored as a secret.
+              env:
+                GH_TOKEN: ${{ secrets.PAT_WITH_WORKFLOW_SCOPE }}
+              run: |
+                gh pr merge --auto --squash "${{ github.event.pull_request.number }}"
+  - language: yaml
+    label: 'Use create-github-app-token with Workflows permission to create PRs that modify workflows'
+    code: |
+      jobs:
+        create-update-pr:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Generate App token (App must have Workflows read+write permission)
+              id: app-token
+              uses: actions/create-github-app-token@v1
+              with:
+                app-id: ${{ vars.MY_APP_ID }}
+                private-key: ${{ secrets.MY_APP_PRIVATE_KEY }}
+
+            - name: Create PR modifying a workflow file
+              env:
+                GH_TOKEN: ${{ steps.app-token.outputs.token }}
+              run: |
+                gh pr create --title "Update workflow" --body "..." --base main
+prevention:
+  - 'When your GitHub App or automation needs to create PRs that touch `.github/workflows/`, verify the App installation has the "Workflows" repository permission enabled (App settings → Permissions → Workflows: Read & Write).'
+  - 'Do NOT attempt `permissions: workflows: write` in your workflow YAML — "workflows" is not a valid permission key and will cause a YAML validation error; it is an App-level OAuth scope, not a token permission.'
+  - 'For auto-merge automation on PRs that may modify workflow files, use a classic PAT with the `workflow` scope or a GitHub App with Workflows permission rather than GITHUB_TOKEN.'
+  - 'When debugging this error, the key question is: "Does the token/App have the `workflows` OAuth scope?" — not "Does the job have the right permissions: block?"'
+docs:
+  - url: 'https://github.com/cli/cli/issues/11493'
+    label: 'cli/cli#11493 — Misleading GraphQL error: "without workflows permission" when using enablePullRequestAutoMerge'
+  - url: 'https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/choosing-permissions-for-a-github-app'
+    label: 'GitHub Docs — Choosing permissions for a GitHub App (Workflows permission)'
+  - url: 'https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens'
+    label: 'GitHub Docs — Classic PAT workflow scope for modifying workflow files'
