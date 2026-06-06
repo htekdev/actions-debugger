@@ -1,0 +1,144 @@
+id: concurrency-timing-060
+title: 'cancel-in-progress: false still silently drops older pending run when third concurrent dispatch arrives — GitHub enforces a 1-active + 1-pending hard limit per concurrency group'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - cancel-in-progress
+  - pending
+  - silent-cancel
+  - dispatch
+  - queue
+  - lost-run
+patterns:
+  - regex: 'This run was cancelled'
+    flags: 'i'
+  - regex: 'cancel-in-progress:\s*false'
+    flags: 'i'
+  - regex: 'Run was cancelled'
+    flags: 'i'
+error_messages:
+  - "This run was cancelled."
+  - "Run was cancelled."
+root_cause: |
+  Setting `cancel-in-progress: false` in a concurrency group does NOT mean "queue all
+  runs indefinitely." It means "do not cancel the currently *in-progress* run."
+
+  GitHub Actions enforces a hard internal limit of **1 in-progress + 1 pending** run
+  per concurrency group (when using the default or `cancel-in-progress: false`).
+  When a third concurrent run arrives:
+
+  1. Run A is **in-progress** (held in slot 1).
+  2. Run B is **pending** (held in slot 2, waiting for Run A to finish).
+  3. Run C arrives → GitHub silently cancels Run B to free slot 2, then queues Run C.
+
+  The net effect: Run B is lost. Run C is now pending and will eventually execute.
+  With `cancel-in-progress: false`, *only Run A is protected* from cancellation — not
+  Run B. The arriving run always displaces the previously pending one.
+
+  This surprises developers who read `cancel-in-progress: false` as "let all runs
+  queue and execute in order." The actual semantics are: "don't kill the in-flight
+  run, but still replace any queued-but-not-yet-running run."
+
+  There is no log entry showing Run B was cancelled by Run C's arrival; the cancellation
+  shows as "This run was cancelled" with no attribution.
+
+  To allow more than 1 pending run, use `queue: max` (up to 100 pending slots) — but
+  note that `queue: max` and `cancel-in-progress: true` cannot be combined.
+fix: |
+  Choose the concurrency strategy that matches your desired behavior:
+
+  **Option 1 — Allow up to 100 queued runs (strict ordering, no drops):**
+  Use `queue: max`. Every run is preserved and executes in arrival order. The 101st
+  concurrent run silently cancels the oldest pending run (see concurrency-timing-058
+  for the queue:max overflow edge case).
+
+  **Option 2 — Cancel stale runs, always run the latest (most common for CI):**
+  Use `cancel-in-progress: true`. Stale pending runs are cancelled; only the most
+  recent push/dispatch runs.
+
+  **Option 3 — Fine-grained concurrency keys to prevent grouping:**
+  Include `github.sha` or `github.run_id` in the group key so each run gets its own
+  isolated slot and nothing is ever cancelled or queued against another run.
+
+  **Option 4 — Accept the default behavior:**
+  Understand that `cancel-in-progress: false` means 1-active + 1-pending, and design
+  your pipeline around this. For example, if you need every commit tested, use
+  `cancel-in-progress: true` so you always test the latest commit, or `queue: max`
+  if you need every commit tested in order.
+fix_code:
+  - language: yaml
+    label: 'Broken — cancel-in-progress: false does NOT queue all runs; 3rd run drops 2nd'
+    code: |
+      on: push
+
+      concurrency:
+        group: deploy-${{ github.ref }}
+        cancel-in-progress: false   # ❌ Only protects the in-progress run (slot 1)
+                                    # ❌ Slot 2 (pending) is still replaced when a 3rd run arrives
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./deploy.sh
+
+  - language: yaml
+    label: 'Fixed — use queue: max to preserve all pending runs (up to 100)'
+    code: |
+      on: push
+
+      concurrency:
+        group: deploy-${{ github.ref }}
+        queue: max    # ✅ Up to 100 pending runs preserved, executed in order
+                      # ✅ No run is silently dropped until the 101st arrives
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./deploy.sh
+
+  - language: yaml
+    label: 'Alternative — cancel stale runs, keep only the latest (typical CI pattern)'
+    code: |
+      on: push
+
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: true   # ✅ Latest commit always runs; stale runs cancelled
+
+      jobs:
+        ci:
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./test.sh
+
+  - language: yaml
+    label: 'Alternative — unique key per run (no cancellation, no queueing)'
+    code: |
+      on: push
+
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.run_id }}   # ✅ Each run is isolated
+        cancel-in-progress: false
+
+      jobs:
+        ci:
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./test.sh
+
+prevention:
+  - 'Read `cancel-in-progress: false` as "protect the running job, not all pending jobs."'
+  - 'Use `queue: max` when you need every dispatched run to eventually execute.'
+  - '`queue: max` and `cancel-in-progress: true` cannot be combined — validation error.'
+  - 'Include `github.sha` or `github.run_id` in the group key to give each run its own isolated slot.'
+  - 'Monitor the Actions tab for unexplained cancellations after rapid pushes to confirm you are hitting the 1-pending limit.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs'
+    label: 'GitHub Docs: Control the concurrency of workflows and jobs'
+  - url: 'https://github.com/orgs/community/discussions/5435'
+    label: 'GitHub Community #5435: cancel-in-progress: false still cancels pending runs'
+  - url: 'https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions#concurrency'
+    label: 'GitHub Docs: Workflow syntax — concurrency'

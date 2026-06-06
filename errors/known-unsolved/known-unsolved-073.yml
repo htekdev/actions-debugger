@@ -1,0 +1,172 @@
+id: known-unsolved-073
+title: '`timeout-minutes:` does not accept expressions — must be a literal integer; variables, inputs, and secrets are unsupported'
+category: known-unsolved
+severity: limitation
+tags:
+  - timeout-minutes
+  - expressions
+  - limitation
+  - no-dynamic-value
+  - job-timeout
+  - step-timeout
+  - vars-context
+patterns:
+  - regex: 'timeout-minutes:\s*\$\{\{'
+    flags: 'i'
+  - regex: 'timeout-minutes.*vars\.|timeout-minutes.*inputs\.|timeout-minutes.*env\.'
+    flags: 'i'
+  - regex: 'Unexpected value.*timeout-minutes|timeout-minutes.*invalid'
+    flags: 'i'
+error_messages:
+  - "The workflow is not valid. .github/workflows/ci.yml (Line: N, Col: M): Unexpected value 'true'"
+  - "timeout-minutes: unexpected value"
+  - "Expected Integer, String"
+root_cause: |
+  The `timeout-minutes:` field at both the **job level** and the **step level** only
+  accepts a **literal integer** (e.g., `30`, `120`). GitHub Actions does not evaluate
+  expressions (`${{ }}`) in this field.
+
+  Attempting to use any of the following will either produce a YAML validation error
+  or silently fall back to the default timeout (6 hours for jobs, unlimited for steps):
+
+  - `timeout-minutes: ${{ vars.JOB_TIMEOUT }}`      — variables context
+  - `timeout-minutes: ${{ inputs.timeout }}`         — inputs context
+  - `timeout-minutes: ${{ env.TIMEOUT_MINUTES }}`    — env context
+  - `timeout-minutes: ${{ 30 * 2 }}`                 — arithmetic expression
+  - `timeout-minutes: ${{ matrix.timeout }}`         — matrix value
+
+  This is a long-standing feature request (actions/runner#1242, opened 2021, 500+
+  reactions) with no official resolution as of June 2026. GitHub's position is that
+  expression support in `timeout-minutes:` is not currently planned.
+
+  actionlint (>=1.6.x) correctly flags `timeout-minutes: ${{ ... }}` as a type error:
+  "type of expression at 'timeout-minutes' must be number but found string type."
+  However, some older actionlint versions or CI linting setups may not catch this,
+  allowing the invalid value to reach production where it silently uses the default.
+
+  Common motivation for wanting dynamic timeouts:
+  - Different environments (staging vs production) need different timeouts.
+  - A reusable workflow caller wants to pass a timeout as an input.
+  - Matrix jobs with different test suites need proportional timeouts.
+  - Organizational policies want to set timeouts via repository variables.
+fix: |
+  There is no native fix — expressions in `timeout-minutes:` are not supported.
+
+  **Workaround 1 — Hardcode multiple job variants with `if:` conditions:**
+  Create separate job definitions for each timeout scenario, each with a hardcoded
+  `timeout-minutes:` and an `if:` condition that selects the appropriate one based
+  on the context. This is verbose but fully supported.
+
+  **Workaround 2 — Use a wrapper script with a timeout command:**
+  Instead of relying on job-level timeout, implement a timeout inside the step's run
+  script using the OS `timeout` command (Linux/macOS) or PowerShell's `Wait-Process`:
+  ```yaml
+  steps:
+    - name: Build with dynamic timeout
+      env:
+        BUILD_TIMEOUT: ${{ vars.BUILD_TIMEOUT_SECONDS || '1800' }}
+      run: timeout "$BUILD_TIMEOUT" ./build.sh
+  ```
+  This gives dynamic timeout behavior but does NOT release the runner immediately —
+  the job continues running (idle) after the script times out until the job-level
+  `timeout-minutes:` (hardcoded) fires.
+
+  **Workaround 3 — Hardcode a generous upper bound:**
+  Set `timeout-minutes:` to the maximum acceptable value for any scenario, and rely
+  on internal script logic to exit early when needed. Ensures the runner is eventually
+  released even in worst-case scenarios.
+
+  **Workaround 4 — For reusable workflows, hardcode per caller:**
+  If a reusable workflow needs caller-specified timeouts, duplicate the job definition
+  per timeout tier or create multiple reusable workflows with different timeouts.
+fix_code:
+  - language: yaml
+    label: 'Does NOT work — expression in timeout-minutes is not supported'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          timeout-minutes: ${{ vars.JOB_TIMEOUT_MINUTES }}   # ❌ Expression not supported
+          steps:
+            - run: ./build.sh
+
+      # Also does NOT work:
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          timeout-minutes: ${{ inputs.timeout || 30 }}        # ❌ inputs not supported here
+          steps:
+            - run: ./test.sh
+
+  - language: yaml
+    label: 'Workaround — use OS timeout command inside step for dynamic behavior'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          timeout-minutes: 60    # ✅ Hardcoded upper bound (releases runner if script hangs)
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build with dynamic timeout from variable
+              env:
+                # Variable in seconds: default 1800 (30 min), override via repo var
+                BUILD_TIMEOUT: ${{ vars.BUILD_TIMEOUT_SECONDS || '1800' }}
+              run: timeout "$BUILD_TIMEOUT" ./build.sh
+              # The job-level 60-minute timeout catches runaway cases
+
+  - language: yaml
+    label: 'Workaround — conditional job variants for different timeout requirements'
+    code: |
+      jobs:
+        build-short:
+          if: ${{ github.event_name == 'pull_request' }}
+          runs-on: ubuntu-latest
+          timeout-minutes: 15    # ✅ Short timeout for PR checks
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./build.sh --quick
+
+        build-full:
+          if: ${{ github.ref == 'refs/heads/main' }}
+          runs-on: ubuntu-latest
+          timeout-minutes: 60    # ✅ Full timeout for main branch builds
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./build.sh --full
+
+  - language: yaml
+    label: 'Reusable workflow workaround — hardcode tiers, expose as separate workflows'
+    code: |
+      # .github/workflows/ci-fast.yml — for PRs
+      on:
+        workflow_call:
+      jobs:
+        ci:
+          runs-on: ubuntu-latest
+          timeout-minutes: 15   # ✅ Fast tier
+          steps:
+            - run: ./ci.sh
+
+      # .github/workflows/ci-full.yml — for main branch
+      on:
+        workflow_call:
+      jobs:
+        ci:
+          runs-on: ubuntu-latest
+          timeout-minutes: 60   # ✅ Full tier
+          steps:
+            - run: ./ci.sh
+
+prevention:
+  - 'Accept that `timeout-minutes:` requires a literal integer — design your timeouts with hardcoded values from the start.'
+  - 'Use actionlint in CI to catch `timeout-minutes: ${{ ... }}` during PR review before it reaches production.'
+  - 'Set `timeout-minutes:` to a safe upper bound to ensure runners are eventually released even when scripts hang.'
+  - 'Use step-level `run: timeout N command` for dynamic per-step timeouts without changing job-level `timeout-minutes:`.'
+  - 'Upvote actions/runner#1242 — expression support in timeout-minutes is a high-demand feature request.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idtimeout-minutes'
+    label: 'GitHub Docs: Workflow syntax — jobs.<id>.timeout-minutes (literal integer only)'
+  - url: 'https://github.com/actions/runner/issues/1242'
+    label: 'actions/runner#1242: Support expressions in timeout-minutes (500+ reactions, open since 2021)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idstepstimeout-minutes'
+    label: 'GitHub Docs: Workflow syntax — jobs.<id>.steps[*].timeout-minutes'

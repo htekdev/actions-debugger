@@ -1,0 +1,146 @@
+id: concurrency-timing-059
+title: 'Skipped downstream job satisfies required status check — PR merges despite upstream job failure'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - needs
+  - skipped
+  - required-status-check
+  - branch-protection
+  - dependency
+  - silent-merge
+  - job-conclusion
+patterns:
+  - regex: 'This job was skipped'
+    flags: 'i'
+  - regex: 'Result: skipped'
+    flags: 'i'
+  - regex: 'needs\.[a-zA-Z0-9_-]+\.result.*skipped'
+    flags: 'i'
+error_messages:
+  - "This job was skipped."
+  - "Skipping this job because a previous job in the chain was skipped or failed."
+root_cause: |
+  GitHub Actions marks a downstream job as `skipped` (not `failure`) when an upstream
+  `needs:` dependency fails or is cancelled and the downstream job has no explicit `if:`
+  condition to handle that state.
+
+  Since April 2023, GitHub's branch protection rules treat a `skipped` check conclusion
+  as **passing** — equivalent to `success` — to support the common "aggregator job"
+  pattern. This means:
+
+  1. `build` job fails.
+  2. `test-results` job (which `needs: [build]`) is marked `skipped`.
+  3. Branch protection rule requires `test-results` to pass.
+  4. GitHub sees conclusion = `skipped` → treats it as satisfied → merge is allowed.
+
+  The PR can be merged even though the `build` step failed. There is no warning or
+  error in the UI — the required check shows a green checkmark (or neutral status)
+  rather than a red blocking indicator.
+
+  This behavior is distinct from:
+  - `cancel-in-progress` cancelling a required check (conclusion = `cancelled`, which
+    blocks merging — a separate issue).
+  - Path-filter causing a workflow to never run (check stays "Expected" / pending).
+  - The general skipped-needs cascade (which documents that downstream jobs skip, but
+    not the branch protection bypass consequence).
+fix: |
+  Add an explicit **catch-all aggregator job** that runs whenever any dependency failed
+  or was cancelled, and exits with a non-zero code:
+
+  ```yaml
+  ci-gate:
+    if: ${{ always() && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
+    needs: [build, test, lint]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail — one or more required jobs did not succeed
+        run: |
+          echo "Required jobs: ${{ toJSON(needs.*.result) }}"
+          exit 1
+  ```
+
+  Set `ci-gate` as the sole required status check in branch protection. This aggregator
+  job only runs (and fails) when something upstream fails. When all upstream jobs
+  succeed, `ci-gate` is `skipped` → satisfies the required check. When any upstream
+  fails, `ci-gate` runs and explicitly fails → blocks the merge.
+
+  Alternatively, use the pattern that always runs the aggregator:
+
+  ```yaml
+  ci-gate:
+    if: always()
+    needs: [build, test, lint]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all required jobs passed
+        run: |
+          results='${{ toJSON(needs.*.result) }}'
+          if echo "$results" | grep -qE '"failure"|"cancelled"'; then
+            echo "One or more jobs failed: $results"
+            exit 1
+          fi
+          echo "All required jobs passed."
+  ```
+fix_code:
+  - language: yaml
+    label: 'Broken — downstream skipped check silently satisfies branch protection'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./build.sh   # Fails
+
+        test-results:
+          needs: [build]        # Skipped when build fails
+          runs-on: ubuntu-latest
+          # ⚠ No if: condition — job is skipped when build fails
+          # ⚠ Branch protection requires test-results to "pass"
+          # ⚠ skipped = passing in GitHub's branch protection evaluation
+          steps:
+            - run: ./test.sh
+
+  - language: yaml
+    label: 'Fixed — explicit catch-all aggregator job that fails on upstream failure'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./build.sh
+
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./test.sh
+
+        ci-gate:
+          if: always()
+          needs: [build, test]
+          runs-on: ubuntu-latest
+          steps:
+            - name: All required jobs must succeed
+              run: |
+                results='${{ toJSON(needs.*.result) }}'
+                if echo "$results" | grep -qE '"failure"|"cancelled"'; then
+                  echo "Pipeline failed: $results"
+                  exit 1
+                fi
+                echo "All jobs passed: $results"
+
+      # In branch protection: require "ci-gate" — not "build" or "test" individually
+
+prevention:
+  - 'Use a single aggregator job (`ci-gate`) as the required status check instead of individual job names.'
+  - 'Always include `if: always()` on the aggregator and explicitly check `needs.*.result` for failure/cancelled.'
+  - 'Do NOT rely on `needs:` skipping to propagate failures to branch protection — skipped is treated as passing.'
+  - 'After changing which jobs are required status checks, verify by letting a build fail and confirm the PR is blocked.'
+  - 'actionlint does not detect this misconfiguration — manual testing is required.'
+docs:
+  - url: 'https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/troubleshooting-required-status-checks'
+    label: 'GitHub Docs: Troubleshooting required status checks'
+  - url: 'https://github.com/actions/runner/issues/2566'
+    label: 'actions/runner#2566: Skipped jobs satisfy required checks (many reactions)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-conditions-to-control-job-execution'
+    label: 'GitHub Docs: Using conditions to control job execution'
