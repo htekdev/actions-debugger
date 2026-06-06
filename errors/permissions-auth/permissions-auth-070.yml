@@ -1,0 +1,136 @@
+id: permissions-auth-070
+title: "GITHUB_TOKEN packages:write Cannot Delete GitHub Container Registry Packages"
+category: permissions-auth
+severity: error
+tags:
+  - github-packages
+  - ghcr
+  - container-registry
+  - packages-delete
+  - permissions
+  - pat
+patterns:
+  - regex: 'delete.*package.*403|package.*delete.*forbidden'
+    flags: 'i'
+  - regex: 'Resource not accessible by integration'
+    flags: 'i'
+error_messages:
+  - "Resource not accessible by integration"
+  - "HttpError: Resource not accessible by integration"
+  - "403 Forbidden"
+root_cause: |
+  GitHub Container Registry (ghcr.io) and other granular-permission package
+  registries (npm, NuGet, RubyGems on ghpr) use package-level access control
+  that is separate from repository permissions. The GITHUB_TOKEN workflow
+  permission block supports packages: write, which grants the ability to:
+  - Publish (push) new package versions
+  - Update package metadata and visibility
+
+  However, packages: write does NOT grant the ability to DELETE package
+  versions. Deletion of granular-permission packages requires the delete:packages
+  scope, which exists only on classic personal access tokens (PATs) — there is
+  no equivalent permission in the GITHUB_TOKEN fine-grained model.
+
+  As a result, workflows that use actions/delete-package-versions (or make
+  direct REST API calls to DELETE /user/packages/{type}/{name}/versions/{id}
+  or DELETE /orgs/{org}/packages/{type}/{package_name}/versions/{id}) always
+  fail with 403 "Resource not accessible by integration" even with:
+    permissions:
+      packages: write
+
+  Note: Repository-scoped packages (Apache Maven, legacy Gradle) that inherit
+  repository permissions may behave differently — deletion can work via the
+  repo admin role. Container Registry packages always use granular permissions.
+fix: |
+  Replace GITHUB_TOKEN with a token that carries delete:packages authority.
+
+  Option 1 (recommended for orgs): GitHub App token
+  - Create a GitHub App with "Packages: Read & Write" and "Packages: Admin"
+    permissions
+  - Install the app on the org or repo
+  - Use actions/create-github-app-token to generate a token in the workflow
+  - Pass the token to the deletion step
+
+  Option 2 (simpler for personal/small-team repos): Classic PAT
+  - Generate a classic PAT (Settings > Developer settings > Personal access
+    tokens > Tokens (classic)) with the delete:packages scope
+  - Store as a repository or organization secret
+  - Reference the secret in the deletion step
+
+  Option 3 (repo-scoped packages only — Apache Maven, Gradle):
+  - Ensure the package uses repository-scoped permissions (not granular)
+  - Grant the workflow admin access to the repository
+  - This does NOT apply to ghcr.io container images, which always require
+    a PAT or App approach for deletion
+fix_code:
+  - language: yaml
+    label: "Broken — GITHUB_TOKEN packages:write cannot delete container images"
+    code: |
+      permissions:
+        packages: write  # Grants publish access but NOT delete access
+
+      jobs:
+        cleanup:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Delete old versions
+              uses: actions/delete-package-versions@v5
+              with:
+                package-name: my-image
+                package-type: container
+                min-versions-to-keep: 5
+                token: ${{ secrets.GITHUB_TOKEN }}  # Fails with 403 for container packages
+
+  - language: yaml
+    label: "Fixed — classic PAT with delete:packages scope"
+    code: |
+      permissions:
+        packages: write
+
+      jobs:
+        cleanup:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Delete old versions
+              uses: actions/delete-package-versions@v5
+              with:
+                package-name: my-image
+                package-type: container
+                min-versions-to-keep: 5
+                # Classic PAT must have: write:packages + delete:packages scopes
+                token: ${{ secrets.PAT_DELETE_PACKAGES }}
+
+  - language: yaml
+    label: "Fixed — GitHub App token (recommended for organizations)"
+    code: |
+      jobs:
+        cleanup:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Generate GitHub App token
+              id: app-token
+              uses: actions/create-github-app-token@v1
+              with:
+                app-id: ${{ vars.PACKAGE_CLEANUP_APP_ID }}
+                private-key: ${{ secrets.PACKAGE_CLEANUP_APP_KEY }}
+
+            - name: Delete old container image versions
+              uses: actions/delete-package-versions@v5
+              with:
+                package-name: my-image
+                package-type: container
+                min-versions-to-keep: 5
+                token: ${{ steps.app-token.outputs.token }}
+prevention:
+  - "Never assume packages:write grants deletion rights — it only covers publish and metadata operations."
+  - "Provision a dedicated classic PAT or GitHub App with package admin access for all cleanup/retention workflows."
+  - "Document which secrets are needed for deletion workflows so maintainers do not accidentally replace them with GITHUB_TOKEN."
+  - "Audit all uses of actions/delete-package-versions in your org to confirm each workflow uses an appropriate token."
+  - "Prefer GitHub App tokens over classic PATs for org workflows — PAT credentials are tied to a specific user account."
+docs:
+  - url: "https://docs.github.com/en/packages/learn-github-packages/about-permissions-for-github-packages"
+    label: "GitHub Docs — About permissions for GitHub Packages (granular vs repository-scoped)"
+  - url: "https://github.com/actions/delete-package-versions"
+    label: "actions/delete-package-versions — token requirements"
+  - url: "https://docs.github.com/en/rest/packages/packages"
+    label: "GitHub REST API — Packages DELETE endpoints"
