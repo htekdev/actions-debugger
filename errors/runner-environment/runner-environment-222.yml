@@ -1,0 +1,140 @@
+id: runner-environment-222
+title: 'Windows Self-Hosted Runner V2 Broker Listener Stops Polling After First Job Completion'
+category: runner-environment
+severity: error
+tags:
+  - self-hosted
+  - windows
+  - broker
+  - v2-flow
+  - listener
+  - polling
+  - idle
+  - 2.334.0
+  - BrokerMessageListener
+patterns:
+  - regex: 'BrokerMessageListener.*Get messages has been cancelled using local token source\. Continue to get messages with new status\.'
+    flags: 'i'
+  - regex: 'BrokerMessageListener.*Received job status event\. JobState: Online'
+    flags: 'i'
+error_messages:
+  - "[2026-05-21 14:48:13Z INFO BrokerMessageListener] Get messages has been cancelled using local token source. Continue to get messages with new status."
+  - "[INFO BrokerMessageListener] Received job status event. JobState: Online"
+  - "[INFO BrokerMessageListener] Session created."
+root_cause: |
+  On Windows self-hosted runners using the V2 broker protocol (useV2Flow: true,
+  serverUrlV2: broker.actions.githubusercontent.com), a race condition in the
+  BrokerMessageListener causes the runner to permanently stop polling the broker
+  after the first job completes.
+
+  The sequence that triggers the hang:
+  1. Runner starts, creates a broker session, and begins polling for messages.
+  2. First job arrives → BrokerMessageListener logs "JobState: Busy".
+  3. Job finishes → BrokerMessageListener logs "JobState: Online".
+  4. The Online state transition triggers a cancellation of the current polling
+     loop via a local token source ("Get messages has been cancelled using
+     local token source. Continue to get messages with new status.").
+  5. The listener is supposed to create a new polling loop with fresh state, but
+     due to a bug in the V2 flow state machine, the new polling loop is never
+     started. No further GET /message requests are ever issued.
+
+  The runner process stays alive. OAuth token refreshes continue on schedule (so
+  credentials are not the problem). The runner shows as "Idle" in the GitHub UI.
+  However, it will never pick up another job until the service is manually restarted.
+
+  The bug was introduced in or around v2.334.0 on Windows. It does not affect:
+  - Linux runners (different socket layer — see broker-server-socket-exception-nat-timeout-linux.yml)
+  - macOS runners (see macos-self-hosted-listener-aad-ghost-busy-stall.yml for a
+    separate macOS stall pattern)
+  - V1 flow runners (useV2Flow: false)
+  - GitHub-hosted runners (not affected by self-hosted listener bugs)
+
+  Source: actions/runner#4444 (May 2026, open). Reported on Windows Server 2022
+  x64, v2.334.0, V2 flow. Three reproducible occurrences in 22 hours on a
+  previously stable 6+ day continuous runner.
+fix: |
+  Immediate fix — Restart the runner service to recover:
+
+    Restart-Service actions.runner.*
+
+  Or via the runner management interface:
+    1. Go to repo/org Settings → Actions → Runners
+    2. Force-remove the stale runner registration
+    3. Re-register and restart
+
+  Structural workarounds:
+
+  Option 1 — Switch to ephemeral runners (recommended for most use cases):
+  Ephemeral runners register once, run one job, and exit cleanly. No stale state.
+
+    ./config.sh --url https://github.com/ORG/REPO --token TOKEN --ephemeral
+    ./run.sh
+
+  Or with Actions Runner Controller (ARC):
+    autoscaling.runnerScaleSetListener.minRunners: 1
+
+  Option 2 — Revert to V1 broker flow if ephemeral is not an option:
+  The V1 flow (long-polling, non-broker) does not exhibit this specific hang.
+  Edit the .runner config file and set useV2Flow: false, then restart the service.
+  Note: V1 is deprecated and will eventually be removed.
+
+  Option 3 — Add an automatic service recovery watchdog:
+
+    # Windows Task Scheduler: check every 5 minutes if runner has been Idle >20min
+    # and restart the service if it's stuck
+    $runner = Get-Service "actions.runner.*"
+    if ($runner.Status -eq "Running") {
+      # Check last job timestamp via API; if >20min and jobs queued, restart
+      Restart-Service "actions.runner.*"
+    }
+
+  Option 4 — Pin to a known-good runner version:
+  If v2.334.0+ reliably triggers this, pin the runner to v2.333.x by editing
+  the .runner config and disabling auto-update. Note: outdated versions
+  eventually stop being able to receive messages.
+fix_code:
+  - language: yaml
+    label: 'Use ephemeral runners to avoid stale listener state entirely'
+    code: |
+      # In your workflow:
+      jobs:
+        build:
+          runs-on: [self-hosted, windows-x64]   # Labels for your runner pool
+
+      # Register runners as ephemeral:
+      # ./config.cmd --url https://github.com/ORG/REPO --token TOKEN --ephemeral
+      # Each runner exits after completing one job; a process manager (NSSM, task
+      # scheduler, or ARC) restarts it to accept the next job.
+
+  - language: yaml
+    label: 'Add watchdog step to detect stale listener symptom (queue depth check)'
+    code: |
+      # Optional diagnostic: surface "no runners picked up job for >N minutes" via API
+      # Run this in a separate monitoring workflow:
+      jobs:
+        watchdog:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Check for stuck self-hosted Windows runners
+              env:
+                GH_TOKEN: ${{ secrets.RUNNER_ADMIN_PAT }}
+              run: |
+                # List queued jobs older than 10 minutes that are assigned to self-hosted
+                gh api repos/${{ github.repository }}/actions/runs \
+                  --jq '.workflow_runs[] | select(.status=="queued") | .id' \
+                | while read run_id; do
+                    echo "Queued run: $run_id"
+                  done
+
+prevention:
+  - 'Use ephemeral self-hosted runners — they register, run one job, and exit. No stale listener state can accumulate.'
+  - 'If using long-lived runners on Windows with V2 broker flow, add monitoring to detect runners stuck in the Idle state with queued jobs.'
+  - 'Set up automatic service recovery for the runner service on Windows (e.g., via Windows Service recovery actions: restart after 1st failure).'
+  - 'Monitor actions/runner release notes for a fix to the V2 listener polling regression introduced around v2.334.0.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4444'
+    label: 'actions/runner#4444 — Listener stops polling broker after first job''s Busy→Online transition (2.334.0, Windows, V2 flow)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/running-scripts-before-or-after-a-job'
+    label: 'GitHub Docs — Self-hosted runner configuration'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/autoscaling-with-self-hosted-runners'
+    label: 'GitHub Docs — Autoscaling with self-hosted runners (ephemeral runner pattern)'
