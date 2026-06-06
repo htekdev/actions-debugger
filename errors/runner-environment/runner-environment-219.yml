@@ -1,0 +1,120 @@
+id: runner-environment-219
+title: 'pnpm/action-setup@v6.0.0 Always Installs pnpm v11 Regardless of Requested Version'
+category: runner-environment
+severity: error
+tags:
+  - pnpm
+  - action-setup
+  - pnpm-v11
+  - version-mismatch
+  - path-priority
+  - lockfile
+patterns:
+  - regex: 'ERR_PNPM_UNSUPPORTED_ENGINE.*Unsupported environment'
+    flags: 'i'
+  - regex: 'Expected version:.*Got:.*11\.'
+    flags: 'i'
+  - regex: 'ERR_PNPM_LOCKFILE_CONFIG_MISMATCH.*frozen installation'
+    flags: 'i'
+  - regex: 'ERR_PNPM_BROKEN_LOCKFILE.*expected a single document'
+    flags: 'i'
+error_messages:
+  - "ERR_PNPM_UNSUPPORTED_ENGINE  Unsupported environment (bad pnpm and/or Node.js version)"
+  - "Expected version: 10\n  Got: 11.0.0-beta.4-1"
+  - "ERR_PNPM_LOCKFILE_CONFIG_MISMATCH  Cannot proceed with the frozen installation. The current \"overrides\" configuration doesn't match the value found in the lockfile"
+  - "ERR_PNPM_BROKEN_LOCKFILE  The lockfile at \"<path>/pnpm-lock.yaml\" is broken: expected a single document in the stream, but found more"
+root_cause: |
+  pnpm/action-setup@v6.0.0 introduced a "self-managed" bootstrap mechanism where
+  pnpm installs itself using pnpm. The action downloads a bootstrap binary (pnpm v11)
+  and uses it to self-update to the requested version. However, in v6.0.0 through
+  v6.0.7, a PATH priority bug caused the bootstrap binary to shadow the correctly
+  installed version at runtime:
+
+    addPath(path.join(pnpmHome, 'bin'))  // correct binary installed here
+    addPath(pnpmHome)                    // bootstrap v11 binary lives here
+
+  Because addPath prepends in reverse call order, PNPM_HOME (containing the bootstrap
+  v11 binary) was always first on PATH, shadowing PNPM_HOME/bin (containing the
+  self-updated target version). Any workflow step that ran `pnpm` therefore used v11
+  regardless of the `version:` input.
+
+  Side effects of this bug:
+  1. workflows specifying `version: 10` run with pnpm v11, triggering
+     ERR_PNPM_UNSUPPORTED_ENGINE if engines.pnpm is set in package.json
+  2. pnpm v11 writes `configDependencies` blocks into pnpm-lock.yaml during any
+     install, corrupting the lockfile from pnpm v10's perspective; subsequent
+     `--frozen-lockfile` installs fail with ERR_PNPM_LOCKFILE_CONFIG_MISMATCH
+  3. When using `package_json_file:` input, the wrong version is read because pnpm
+     v11 changed lockfile format, causing ERR_PNPM_BROKEN_LOCKFILE when the v11
+     bootstrap writes partial YAML to the lockfile before the correct version takes
+     over
+
+  The fix (addPath call order swap) was merged in PR #230 and released in v6.0.1.
+  A separate bootstrap bundle update for pnpm 11.0.0-rc.2 was released in v6.0.3.
+  Full stability for most scenarios reached v6.0.8.
+fix: |
+  Upgrade to pnpm/action-setup@v6.0.8 or later. The PATH priority bug and
+  configDependencies lockfile corruption are fixed in v6.0.1+.
+
+  If you cannot upgrade, pin back to v5:
+
+    - uses: pnpm/action-setup@v5
+      with:
+        version: 10
+
+  If you are on v6 and seeing lockfile corruption: delete the corrupted
+  pnpm-lock.yaml and regenerate it with the correct pnpm version locally
+  before re-running CI. Do NOT run pnpm install in the corrupted-lockfile
+  state as it will write a v11 lockfile into your repo.
+fix_code:
+  - language: yaml
+    label: 'Broken — pnpm/action-setup@v6.0.0 installs v11 regardless of version input'
+    code: |
+      - uses: pnpm/action-setup@v6      # v6.0.0: PATH bug installs v11 always
+        with:
+          version: 10                   # Ignored — v11 ends up on PATH
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+      - run: pnpm install --frozen-lockfile
+        # Fails: ERR_PNPM_LOCKFILE_CONFIG_MISMATCH or ERR_PNPM_UNSUPPORTED_ENGINE
+
+  - language: yaml
+    label: 'Fixed — upgrade to v6.0.8+ (PATH priority bug resolved)'
+    code: |
+      - uses: pnpm/action-setup@v6.0.8  # v6.0.8: PATH priority fixed, stable
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+      - run: pnpm install --frozen-lockfile
+
+  - language: yaml
+    label: 'Alternative fix — pin back to v5 until v6 is stable for your project'
+    code: |
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+      - run: pnpm install --frozen-lockfile
+
+prevention:
+  - 'Pin pnpm/action-setup to a specific minor/patch version (e.g. @v6.0.8) rather than @v6 to avoid silent major-bump breakage from Dependabot.'
+  - 'After upgrading pnpm/action-setup, verify `pnpm --version` in the first step matches the requested version before running install.'
+  - 'If pnpm-lock.yaml is corrupted by this bug, delete it and regenerate locally with the correct pnpm version — do not attempt to fix by re-running CI.'
+  - 'Set `engines.pnpm` in package.json to detect unexpected version mismatches early with ERR_PNPM_UNSUPPORTED_ENGINE rather than silent wrong-behavior.'
+docs:
+  - url: 'https://github.com/pnpm/action-setup/issues/225'
+    label: 'pnpm/action-setup#225 — v6.0.0 always installs v11 (51 reactions)'
+  - url: 'https://github.com/pnpm/action-setup/issues/226'
+    label: 'pnpm/action-setup#226 — v6.0.0 modifies pnpm-lock.yaml (lockfile corruption)'
+  - url: 'https://github.com/pnpm/action-setup/pull/230'
+    label: 'pnpm/action-setup#230 — Fix: swap addPath call order (merged)'
+  - url: 'https://github.com/pnpm/action-setup/releases'
+    label: 'pnpm/action-setup releases — v6.0.1 contains the PATH fix'

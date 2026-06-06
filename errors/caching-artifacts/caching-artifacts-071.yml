@@ -1,0 +1,114 @@
+id: caching-artifacts-071
+title: 'actions/cache Fails on Self-Hosted Runner with IPv6 Cache Server URL'
+category: caching-artifacts
+severity: error
+tags:
+  - cache
+  - ipv6
+  - self-hosted
+  - getaddrinfo
+  - ENOTFOUND
+  - internal-cache
+patterns:
+  - regex: 'getaddrinfo ENOTFOUND \[[\da-fA-F:]+\]'
+    flags: 'i'
+  - regex: 'getCacheEntry failed.*getaddrinfo ENOTFOUND'
+    flags: 'i'
+  - regex: 'reserveCache failed.*getaddrinfo ENOTFOUND.*\['
+    flags: 'i'
+error_messages:
+  - "::warning::Failed to restore: getCacheEntry failed: getaddrinfo ENOTFOUND [2001:bc8:1d90:1fc1:dc00:ff:fe2b:3f97]"
+  - "::warning::Failed to save: reserveCache failed: getaddrinfo ENOTFOUND [2001:db8::1]"
+root_cause: |
+  When GitHub Actions self-hosted runner infrastructure uses an IPv6 address for
+  the internal cache service URL (ACTIONS_CACHE_URL), the @actions/http-client
+  in the toolkit fails to connect because it treats the bracketed IPv6 literal
+  as a hostname string instead of an address.
+
+  DNS resolution of `[2001:bc8:...]` fails with ENOTFOUND because the brackets
+  are IANA-standard URL notation for IPv6 literals in HTTP URLs
+  (RFC 2732 / RFC 3986 section 3.2.2), but the toolkit's Node.js http-client
+  was passing the bracketed string directly to `getaddrinfo()` without stripping
+  the brackets first. getaddrinfo does not accept bracket-wrapped IPv6 literals
+  and returns ENOTFOUND.
+
+  This affects any self-hosted runner environment where:
+  - The cache service is configured with an IPv6 address directly in the URL
+    (e.g., ACTIONS_CACHE_URL=http://[2001:bc8::1]:3000/)
+  - This includes ARC (Actions Runner Controller) on IPv6-only Kubernetes clusters,
+    enterprise GitHub Actions server deployments, and any on-prem cache proxy
+    bound to an IPv6 interface
+
+  The fix (strip brackets before passing to http-client) was submitted as PR
+  actions/toolkit#2298. Until merged and released in a new version of actions/cache,
+  the bug is present in actions/cache@v3, v4, and v5.
+fix: |
+  Short-term workarounds (choose one):
+
+  1. Configure the internal cache service to also listen on an IPv4 address or
+     hostname and set ACTIONS_CACHE_URL to use the IPv4 address or hostname:
+       export ACTIONS_CACHE_URL=http://cache.internal:3000/
+       export ACTIONS_CACHE_URL=http://192.168.1.10:3000/
+
+  2. Set ACTIONS_CACHE_URL to use the hostname that resolves to the IPv6 address
+     (DNS-based resolution of the hostname works; the issue is only with bare
+     IPv6 literals in brackets):
+       export ACTIONS_CACHE_URL=http://cache-server.local:3000/
+
+  3. Add the cache service IPv6 address to /etc/hosts with a hostname alias on
+     the runner and use that hostname in ACTIONS_CACHE_URL.
+
+  Long-term: Track actions/toolkit#2298 for the upstream fix. Once merged and
+  actions/cache releases a new version using the patched toolkit, upgrade to
+  that version.
+fix_code:
+  - language: yaml
+    label: 'Broken — ACTIONS_CACHE_URL with IPv6 literal causes ENOTFOUND'
+    code: |
+      # Runner environment configuration (runsvc.sh or .env file):
+      # ACTIONS_CACHE_URL=http://[2001:bc8:1d90:1fc1:dc00:ff:fe2b:3f97]:3000/
+      #
+      # Workflow sees:
+      # ::warning::Failed to restore: getCacheEntry failed: getaddrinfo ENOTFOUND [2001:bc8:...]
+
+      - uses: actions/cache@v5
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('package-lock.json') }}
+      # Warning: cache restore/save fails silently with ENOTFOUND
+
+  - language: yaml
+    label: 'Fixed — set ACTIONS_CACHE_URL to hostname or IPv4 instead of IPv6 literal'
+    code: |
+      # Runner environment configuration — use hostname instead of IPv6 literal:
+      # ACTIONS_CACHE_URL=http://cache.internal:3000/
+      # -or-
+      # ACTIONS_CACHE_URL=http://192.168.1.10:3000/
+      #
+      # The cache action now resolves the hostname normally:
+      - uses: actions/cache@v5
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('package-lock.json') }}
+
+  - language: yaml
+    label: 'Diagnostic — detect IPv6 ENOTFOUND cache failures in workflow output'
+    code: |
+      - name: Check cache URL for IPv6 literal
+        run: |
+          if [[ "${ACTIONS_CACHE_URL:-}" =~ ^\[.*\] ]] || [[ "${ACTIONS_CACHE_URL:-}" == *"["* ]]; then
+            echo "::warning::ACTIONS_CACHE_URL contains an IPv6 literal: ${ACTIONS_CACHE_URL}"
+            echo "::warning::Cache actions will fail with ENOTFOUND. Use a hostname or IPv4 address instead."
+          fi
+
+prevention:
+  - 'Always configure ACTIONS_CACHE_URL with a hostname or IPv4 address, not a bare IPv6 literal in brackets.'
+  - 'When deploying ARC or enterprise runner infrastructure on IPv6-only Kubernetes nodes, set up a hostname alias for the cache service.'
+  - 'Test cache operations with a simple cache-hit workflow on a new self-hosted runner before deploying to production.'
+docs:
+  - url: 'https://github.com/actions/cache/issues/1718'
+    label: 'actions/cache#1718 — Caching fails on IPv6 cache server'
+  - url: 'https://github.com/actions/toolkit/pull/2298'
+    label: 'actions/toolkit#2298 — Fix: correctly handle IPv6 literals in http-client'
+  - url: 'https://www.rfc-editor.org/rfc/rfc3986#section-3.2.2'
+    label: 'RFC 3986 §3.2.2 — IPv6 literals in URL host component (bracket notation)'
