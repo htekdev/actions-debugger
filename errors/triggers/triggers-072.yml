@@ -1,0 +1,150 @@
+id: triggers-072
+title: 'Scheduled workflow silently disabled after 60 days of public repository inactivity — distinct from the fork schedule disabling rule'
+category: triggers
+severity: silent-failure
+tags:
+  - schedule
+  - cron
+  - disabled
+  - inactivity
+  - public-repo
+  - silent-disable
+  - 60-days
+patterns:
+  - regex: 'on:\s*\n\s+schedule:'
+    flags: 'im'
+  - regex: 'This workflow was disabled'
+    flags: 'i'
+  - regex: 'Workflow.*disabled.*inactiv'
+    flags: 'i'
+error_messages:
+  - "This workflow was disabled."
+  - "Scheduled workflows are disabled for repositories with no recent activity."
+root_cause: |
+  GitHub automatically disables scheduled (`on: schedule:`) workflows in **public
+  repositories** that have had no activity for more than **60 days**. "Activity"
+  includes pushes, pull requests, issue comments, or other events that generate
+  a repository event payload. Pure time-passing without any interaction does not
+  reset the timer.
+
+  The disabling happens silently:
+  - No email notification is sent to repository owners or workflow authors.
+  - No GitHub notification appears in the repository's notification feed.
+  - The scheduled run simply does not appear in the Actions run history.
+  - The workflow file is not changed — the `on: schedule:` trigger is still present
+    in the YAML, but the schedule is inactive in GitHub's internal scheduler.
+
+  The Actions tab will show the workflow listed but with a note that it has been
+  disabled. The **"Enable workflow"** button must be clicked manually to re-activate it.
+
+  This behavior is separate from the fork schedule-disabling rule (where ALL
+  scheduled workflows are disabled on forked repos regardless of activity). The
+  inactivity rule applies to non-fork public repositories.
+
+  Common scenarios:
+  - Maintenance scripts (e.g., weekly dependency updates, cleanup jobs) in repos
+    that receive no push activity between runs.
+  - Documentation or static-site repos where content is rarely updated but a nightly
+    build/deploy workflow is expected to run.
+  - Monitoring or alerting workflows in repos with no other CI triggers.
+  - Open-source libraries with stable codebases and monthly or quarterly releases.
+fix: |
+  **Immediate fix:** Navigate to the repository → Actions tab → find the disabled
+  workflow → click "Enable workflow."
+
+  **Prevent future silent disabling — Option 1 (Recommended): Add a dummy commit
+  or workflow_dispatch trigger:**
+  Add `workflow_dispatch:` to the workflow so it can be triggered manually and also
+  resets the inactivity timer. Then use `gh workflow run` or the UI to manually
+  trigger it if needed.
+
+  **Prevent future silent disabling — Option 2: Artificially keep the repo active:**
+  Add a companion workflow that runs on schedule and updates a file (e.g., a
+  `last-run.txt` with the current timestamp) via a commit. This creates repository
+  activity and resets the 60-day timer. Warning: this generates commit noise.
+
+  **Prevent future silent disabling — Option 3: Convert to a self-hosted or
+  external scheduler:**
+  Use an external cron service (e.g., a cron job in a cloud provider) to trigger
+  the workflow via `workflow_dispatch` or `repository_dispatch`. External triggers
+  count as activity and keep the workflow enabled.
+
+  **Long-term design:** For workflows that are truly meant to run on a schedule
+  without any other repo activity, always add `workflow_dispatch:` as a co-trigger.
+  This makes the workflow manually invocable AND provides a path to re-enable it if
+  it is ever silently disabled.
+fix_code:
+  - language: yaml
+    label: 'At-risk — schedule-only workflow in a low-activity public repo'
+    code: |
+      # ⚠ This workflow will be silently disabled after 60 days with no repo activity
+      name: Weekly Dependency Update
+
+      on:
+        schedule:
+          - cron: '0 9 * * 1'   # Every Monday at 09:00 UTC
+
+      jobs:
+        update:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm update && npm audit fix
+
+  - language: yaml
+    label: 'Fixed — add workflow_dispatch to keep the workflow manageable and prevent inactivity disable'
+    code: |
+      name: Weekly Dependency Update
+
+      on:
+        schedule:
+          - cron: '0 9 * * 1'   # Every Monday at 09:00 UTC
+        workflow_dispatch:       # ✅ Allows manual trigger; manual runs also reset the inactivity timer
+
+      jobs:
+        update:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm update && npm audit fix
+
+  - language: yaml
+    label: 'Alternative — heartbeat workflow that commits a timestamp to keep the repo active'
+    code: |
+      name: Activity Heartbeat (prevents schedule auto-disable)
+
+      on:
+        schedule:
+          - cron: '0 0 * * 0'   # Every Sunday midnight UTC — reset 60-day timer
+        workflow_dispatch:
+
+      permissions:
+        contents: write
+
+      jobs:
+        heartbeat:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Update heartbeat timestamp
+              run: |
+                echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > .github/heartbeat.txt
+                git config user.name 'github-actions[bot]'
+                git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+                git add .github/heartbeat.txt
+                git diff --staged --quiet || git commit -m 'chore: activity heartbeat [skip ci]'
+                git push
+
+prevention:
+  - 'Always add `workflow_dispatch:` alongside `on: schedule:` for any workflow that should run reliably in a low-activity repo.'
+  - 'Check the Actions tab after a period of low repository activity to verify scheduled workflows are still enabled.'
+  - 'The 60-day inactivity rule applies to non-fork public repositories — private repos are NOT subject to this rule.'
+  - 'This is distinct from the fork schedule-disabling rule: forks disable schedules immediately on fork creation, not after inactivity.'
+  - 'Set up a GitHub Actions alert or monitoring workflow that notifies you if expected scheduled runs stop appearing.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#schedule'
+    label: 'GitHub Docs: Events that trigger workflows — schedule (inactivity disable note)'
+  - url: 'https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-workflow-runs/disabling-and-enabling-a-workflow'
+    label: 'GitHub Docs: Disabling and enabling a workflow'
+  - url: 'https://github.com/orgs/community/discussions/134086'
+    label: 'GitHub Community #134086: Scheduled workflows not running — inactivity disable reports'
