@@ -1,0 +1,129 @@
+id: runner-environment-230
+title: 'setup-python installs free-threaded Python (3.13t / 3.14t) as broken 0-byte symlink on windows-11-arm64'
+category: runner-environment
+severity: error
+tags:
+  - setup-python
+  - free-threaded
+  - python-3.13t
+  - python-3.14t
+  - windows-11-arm64
+  - symlink
+  - arm64
+  - GIL
+patterns:
+  - regex: 'Remove-Item.+arm64-freethreaded.+python\.exe.+because it does not exist'
+    flags: 'i'
+  - regex: 'Fatal Python error: Failed to import encodings module'
+    flags: 'i'
+  - regex: 'ModuleNotFoundError: No module named .encodings.'
+    flags: 'i'
+  - regex: 'Error happened during pip installation / upgrade'
+    flags: 'i'
+error_messages:
+  - "[error] Remove-Item : Cannot find path 'C:\\hostedtoolcache\\windows\\Python\\3.13.3-freethreaded\\arm64-freethreaded\\python.exe' because it does not exist."
+  - '[error] Fatal Python error: Failed to import encodings module'
+  - '[error] ModuleNotFoundError: No module named ''encodings'''
+  - '[error] Error happened during pip installation / upgrade'
+root_cause: |
+  The `win32-arm64-freethreaded` distribution zip for Python 3.13t and 3.14t
+  contains `python.exe` and `python3.exe` as **symlinks** (Windows reparse
+  points) that point to the version-specific binary (e.g. `python3.13t.exe`).
+
+  When `actions/setup-python` extracts the zip to the tool cache, the symlink
+  target does not exist at the expected relative path inside the extracted
+  directory. This leaves `python.exe` and `python3.exe` as **dangling 0-byte
+  reparse points** rather than working executables.
+
+  The setup script (`setup.ps1`, line 131) then attempts to remove `python.exe`
+  before placing the shim — but because the file is a dangling reparse point,
+  PowerShell cannot find it and throws:
+
+    `Remove-Item : Cannot find path '...\arm64-freethreaded\python.exe'
+     because it does not exist.`
+
+  Even if this error is swallowed, any subsequent attempt to invoke the
+  interpreter fails because the `python.exe` reparse point has no valid target.
+  The interpreter cannot locate its standard library, resulting in:
+
+    `Fatal Python error: Failed to import encodings module`
+
+  Non-free-threaded arm64 builds (`3.11`, `3.12`, `3.13`) are NOT affected
+  because their zips contain real executable files rather than symlinks.
+  x64 free-threaded builds are also unaffected.
+
+  This bug is present in `actions/setup-python` v5.x and v6.x when
+  `windows-11-arm64` runners are used. It was reported in April 2026 and
+  assigned for fix; check actions/setup-python#1307 for the patched release.
+fix: |
+  **Workaround 1 (recommended until patched):** Use a non-arm64 runner for
+  free-threaded Python testing. The x64 free-threaded wheels work correctly on
+  `windows-latest` or `windows-2025`:
+
+    ```yaml
+    runs-on: windows-latest  # x64 runner
+    ```
+
+  **Workaround 2:** Install free-threaded Python from NuGet on arm64 runners
+  rather than using `actions/setup-python`:
+
+    ```powershell
+    nuget install Microsoft.Python.Python.3.13-freethreaded.Arm64 -Version 3.13.3 -OutputDirectory .python
+    ```
+
+  **Workaround 3:** If you need arm64 + free-threaded specifically, test on
+  a Linux arm64 runner (`ubuntu-24.04-arm`) where the free-threaded build
+  does not have the symlink issue.
+
+  **Long-term:** Upgrade to the patched `actions/setup-python` version once
+  released (track actions/setup-python#1307).
+fix_code:
+  - language: yaml
+    label: 'Run free-threaded Python tests on x64 instead of arm64 until fix ships'
+    code: |
+      jobs:
+        test-freethreaded:
+          # Use x64 runner — free-threaded Python on windows-11-arm64 is broken
+          # (setup-python#1307). Switch back when the fix ships.
+          runs-on: windows-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-python@v6
+              with:
+                python-version: '3.13t'  # free-threaded; works on x64
+            - run: python --version
+            - run: python -c "import sys; print(sys._is_gil_enabled())"
+  - language: yaml
+    label: 'Use a matrix to run standard Python on arm64 and free-threaded on x64'
+    code: |
+      jobs:
+        test:
+          strategy:
+            matrix:
+              include:
+                # Standard arm64 — works fine
+                - os: windows-11-arm64
+                  python-version: '3.13'
+                # Free-threaded — x64 only until setup-python#1307 is fixed
+                - os: windows-latest
+                  python-version: '3.13t'
+          runs-on: ${{ matrix.os }}
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-python@v6
+              with:
+                python-version: ${{ matrix.python-version }}
+prevention:
+  - 'When adding free-threaded Python (3.13t, 3.14t) to a matrix, verify the runner OS — windows-11-arm64 has a broken symlink issue; use windows-latest (x64) instead.'
+  - 'Pin actions/setup-python to a known-good version and monitor actions/setup-python#1307 for the fix release before upgrading on arm64 free-threaded jobs.'
+  - 'After setting up free-threaded Python, add a smoke-test step (`python -c "import sys; print(sys.version)"`) early in the job to catch a broken interpreter before the full test suite runs.'
+  - 'Check that python.exe in the tool cache is a real executable, not a 0-byte reparse point, by running `(Get-Item python.exe).Length -gt 0` in a PowerShell step on windows-arm64.'
+docs:
+  - url: 'https://github.com/actions/setup-python/issues/1307'
+    label: 'actions/setup-python#1307 — setup-python fails for free-threaded Python (3.13t / 3.14t) on windows-11-arm64'
+  - url: 'https://github.com/onnx/onnx/actions/runs/24930991133'
+    label: 'Example failing CI run (onnx/onnx)'
+  - url: 'https://docs.python.org/3/whatsnew/3.13.html#free-threaded-cpython'
+    label: 'Python 3.13 — Free-threaded CPython (experimental no-GIL build)'
+  - url: 'https://github.com/actions/setup-python'
+    label: 'actions/setup-python — GitHub repository'

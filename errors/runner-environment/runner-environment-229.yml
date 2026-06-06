@@ -1,0 +1,119 @@
+id: runner-environment-229
+title: 'runner-container-hooks v0.8.0+ breaks local composite actions and event.json in Kubernetes job containers'
+category: runner-environment
+severity: error
+tags:
+  - runner-container-hooks
+  - kubernetes
+  - ARC
+  - local-actions
+  - composite-action
+  - job-container
+  - GITHUB_EVENT_PATH
+patterns:
+  - regex: "Can't find 'action\\.yml', 'action\\.yaml' or 'Dockerfile' under '.+\\.github/actions/.+'"
+    flags: 'i'
+  - regex: 'GITHUB_EVENT_PATH .+/github/workflow/event\\.json does not exist'
+    flags: 'i'
+  - regex: 'Did you forget to run actions/checkout before running your local action'
+    flags: 'i'
+error_messages:
+  - "Error: Can't find 'action.yml', 'action.yaml' or 'Dockerfile' under '/home/runner/_work/<repo>/<repo>/.github/actions/<action-name>'. Did you forget to run actions/checkout before running your local action?"
+  - "GITHUB_EVENT_PATH /github/workflow/event.json does not exist"
+root_cause: |
+  In `runner-container-hooks` v0.8.0 (released with actions-runner v2.334.0),
+  PR #244 replaced the shared PersistentVolumeClaim (PVC) between the runner
+  pod and job pods with exec-based file copying.
+
+  Two distinct regressions were introduced:
+
+  **1. Local composite actions fail ("Can't find action.yml")**
+  In `runScriptStep`, only the `_temp` directory is synced back from the job
+  pod to the runner host after each step. When `actions/checkout` runs inside
+  the job pod, the entire repository (including `.github/actions/`) is written
+  to `/__w/<owner>/<repo>/` inside the pod — but it is never copied back to
+  the runner host filesystem.
+
+  The runner resolves local actions by reading `action.yml` from its own
+  filesystem before dispatching the hook for that step. Since the workspace
+  was never synced back, the runner cannot find the action definition and
+  fails with the "Did you forget to run actions/checkout?" error — even
+  though checkout ran successfully inside the pod.
+
+  `runContainerStep` is not affected: it copies the full `/__w` back from
+  the job pod because container action steps run in a separate pod.
+
+  **2. GITHUB_EVENT_PATH missing for jobs without custom volume mounts**
+  In v0.7.0, `/github/home` and `/github/workflow` were set up as volume
+  subPath mounts on every job container. PR #244 replaced these mounts with
+  a `prepareJobScript` call that copies these directories into place — but
+  only when `args.container.userMountVolumes` is non-empty. If the workflow
+  has no custom `volumes:` in the `container:` block, the script never runs
+  and `/github/workflow/event.json` is never created.
+
+  Any action that reads `GITHUB_EVENT_PATH` (e.g. `dorny/paths-filter`,
+  `tj-actions/changed-files`, `actions/github-script` reading the event
+  payload) then fails because the file does not exist.
+
+  Both regressions affect Kubernetes-based ARC (Actions Runner Controller)
+  setups using runner-container-hooks v0.8.0+. Standard GitHub-hosted runners
+  and self-hosted runners that do NOT use container-hooks are unaffected.
+fix: |
+  **Immediate workaround:**
+  Pin `runner-container-hooks` to v0.7.0 by setting the container hooks
+  image in your ARC `HorizontalRunnerAutoscaler` or `RunnerDeployment`
+  configuration to use the v0.7.0 bundle (included in
+  `ghcr.io/actions/actions-runner:2.333.0`).
+
+  **For the local action failure specifically:**
+  After a fix is available upstream, the recommended approach is to upgrade
+  to a patched version of `runner-container-hooks` that copies `.github/`
+  back from the job pod after each `runScriptStep`.
+
+  **For the GITHUB_EVENT_PATH issue specifically:**
+  Ensure your `container:` block includes at least one `volumes:` entry to
+  trigger `prepareJobScript`, or wait for the upstream fix that unconditionally
+  runs the prepare script.
+
+  Track the upstream fix in actions/runner-container-hooks#337.
+fix_code:
+  - language: yaml
+    label: 'Pin ARC runner to actions-runner v2.333.0 (uses hooks v0.7.0) to avoid regression'
+    code: |
+      # In your HorizontalRunnerAutoscaler spec, pin the runner image
+      # to the last version that uses runner-container-hooks v0.7.0:
+      spec:
+        template:
+          spec:
+            image: ghcr.io/actions/actions-runner:2.333.0
+  - language: yaml
+    label: 'Workaround for GITHUB_EVENT_PATH: add a dummy volume mount to trigger prepareJobScript'
+    code: |
+      jobs:
+        build:
+          runs-on: self-hosted
+          container:
+            image: my-ci-image:latest
+            # Adding any volume entry triggers prepareJobScript and restores
+            # /github/workflow/event.json inside the job container
+            volumes:
+              - /tmp:/tmp
+          steps:
+            - uses: actions/checkout@v4
+            - uses: dorny/paths-filter@v3
+              with:
+                filters: |
+                  src:
+                    - 'src/**'
+prevention:
+  - 'When upgrading ARC runner images, check the bundled runner-container-hooks version and validate that local composite actions still work after the upgrade.'
+  - 'Pin runner images to a specific version tag rather than `latest` so unexpected upgrades do not break your workflows.'
+  - 'After upgrading runner-container-hooks, run a canary workflow that (a) uses a local composite action and (b) uses an action that reads GITHUB_EVENT_PATH to catch both regressions early.'
+  - 'Monitor the actions/runner-container-hooks releases page and the linked issue #337 for the official fix.'
+docs:
+  - url: 'https://github.com/actions/runner-container-hooks/issues/337'
+    label: 'actions/runner-container-hooks#337 — Local actions fail after PR #244 removed shared volume'
+  - url: 'https://github.com/actions/runner-container-hooks/pull/244'
+    label: 'actions/runner-container-hooks#244 — Remove dependency on the runner''s volume (introduced regression)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners-with-actions-runner-controller/about-actions-runner-controller'
+    label: 'GitHub Docs — About Actions Runner Controller'
