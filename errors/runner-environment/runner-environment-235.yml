@@ -1,0 +1,151 @@
+id: runner-environment-235
+title: 'Action download fails with HTTP 429 Too Many Requests during action resolution — "Failed to download action ... Response status code does not indicate success: 429"'
+category: runner-environment
+severity: error
+tags:
+  - action-download
+  - rate-limit
+  - 429
+  - action-resolution
+  - tarball
+  - github-api
+  - outage
+  - retry
+patterns:
+  - regex: 'Failed to download action.*429|Response status code does not indicate success: 429 \(Too Many Requests\)'
+    flags: 'i'
+  - regex: 'Error: Response status code does not indicate success: 429'
+    flags: 'i'
+  - regex: 'Warning: Failed to download action.*tarball'
+    flags: 'i'
+error_messages:
+  - "Warning: Failed to download action 'https://api.github.com/repos/actions/checkout/tarball/11bd71901bbe5b1630ceea73d27597364c9af683'. Error: Response status code does not indicate success: 429 (Too Many Requests)."
+  - "Error: Response status code does not indicate success: 429 (Too Many Requests)."
+  - "Download action repository 'actions/checkout@v4'"
+root_cause: |
+  When a GitHub Actions job starts, the runner downloads each action referenced in the
+  workflow by fetching the action's source tarball from the GitHub API endpoint:
+    GET https://api.github.com/repos/{owner}/{repo}/tarball/{sha}
+
+  This endpoint is subject to GitHub's API rate limits. When many runners start
+  simultaneously — during periods of high load, GitHub infrastructure incidents, or
+  large-scale rollouts — the tarball download requests can be rate-limited, returning
+  HTTP 429 Too Many Requests.
+
+  The runner logs a warning and retries with exponential backoff:
+    "Warning: Failed to download action '...'. Error: Response status code does not
+     indicate success: 429 (Too Many Requests). <correlationId>"
+
+  If the rate limit persists through all retry attempts, the job setup fails and the
+  entire job is marked as failed with "##[error]" on the "Set up job" step. The failure
+  is NOT a problem with the workflow configuration itself — it is a transient GitHub
+  infrastructure issue.
+
+  Contributing factors:
+  1. **GitHub outages or degraded performance** — action downloads share API quota with
+     all other GitHub API traffic from the runner's IP range.
+  2. **High parallel job counts** — organizations running hundreds of parallel jobs on
+     GitHub-hosted runners can exhaust rate limit buckets across a runner fleet.
+  3. **Composite actions with many nested uses** — deeply nested composite actions make
+     many download calls per job, multiplying the per-job API request count. PR #4296
+     in actions/runner (merged 2026-03) adds batching to reduce this.
+  4. **Self-hosted runners without caching** — runners that are freshly provisioned per
+     job always re-download all actions; runners with persistent `_work/_tool` directories
+     can cache downloads across jobs.
+
+  Note: this is distinct from runner-environment-202 (repeated downloads caused by
+  case-sensitivity mismatch in v2.334.0), which causes multiple SUCCESSFUL downloads
+  rather than 429 failures.
+
+  Source: actions/runner#4232 (Feb 2026, open), actions/checkout#2230.
+fix: |
+  **Immediate:** Retry the failed workflow run. 429 errors during action downloads
+  are almost always transient — a re-run a few minutes later usually succeeds.
+
+  **Short-term: Reduce per-job download requests.**
+  Pin actions to a specific commit SHA rather than a mutable tag. Runners maintain an
+  action download cache keyed by commit SHA; pinned SHAs hit the cache more reliably
+  than mutable tags which may require a fresh lookup each run.
+
+  **For self-hosted runners: persist the action cache directory.**
+  The runner caches downloaded actions in `<runner-root>/_work/_tool`. If your runner
+  instances are ephemeral (e.g., provisioned fresh per job on EC2/GKE), mount a shared
+  volume or EFS/EBS on this path to share the cache across instances, reducing
+  download traffic dramatically.
+
+  **For high-parallelism organizations: stagger workflow start times.**
+  Spread out scheduled workflows or push triggers to avoid thousands of jobs starting
+  simultaneously. Use concurrency groups or scheduled-at offsets to distribute load.
+
+  **Self-hosted runners on GHES / GHAE:** Use GHES's internal action caching to serve
+  action downloads locally instead of hitting GitHub.com — this avoids rate limiting
+  entirely.
+
+  **Monitor GitHub status:** Check https://www.githubstatus.com/ when 429 errors appear
+  — they often correlate with incidents listed on the status page.
+fix_code:
+  - language: yaml
+    label: 'Pin actions to commit SHA to maximize cache hits and reduce download requests'
+    code: |
+      # Instead of mutable tags (re-downloaded each time if tag moves):
+      # - uses: actions/checkout@v4
+      # - uses: actions/setup-node@v4
+
+      # Pin to immutable commit SHAs for reliable caching:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af  # v4.1.0
+  - language: yaml
+    label: 'Self-hosted runner: configure RUNNER_TOOL_CACHE to a persistent shared path'
+    code: |
+      # In the runner environment, set the tool cache path before starting the runner:
+      # export RUNNER_TOOL_CACHE=/mnt/shared/runner-tool-cache
+      # ./run.sh
+
+      # Or in the runner .env file (config/.env relative to the runner root):
+      # RUNNER_TOOL_CACHE=/mnt/shared/runner-tool-cache
+
+      # Docker-based self-hosted runner: mount the cache directory:
+      # docker run -v /mnt/shared/runner-tool-cache:/opt/hostedtoolcache ...
+  - language: yaml
+    label: 'Workflow-level retry: re-run the job automatically on setup failure'
+    code: |
+      # Actions does not have a built-in retry for setup failures.
+      # A common workaround: use a retry action in the first step that validates setup.
+      # Alternatively, set up a workflow_run trigger to retry on failure:
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+
+      jobs:
+        retry-on-429:
+          if: github.event.workflow_run.conclusion == 'failure'
+          runs-on: ubuntu-latest
+          steps:
+            - name: Re-trigger the failed workflow
+              uses: actions/github-script@v7
+              with:
+                script: |
+                  await github.rest.actions.createWorkflowDispatch({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    workflow_id: 'ci.yml',
+                    ref: '${{ github.event.workflow_run.head_branch }}'
+                  });
+prevention:
+  - 'Pin all `uses:` references to immutable commit SHAs — this maximises the chance that the runner serves the action from its local download cache rather than calling the GitHub API'
+  - 'For self-hosted runners provisioned per job (ephemeral), mount a persistent shared volume at the runner tool cache path so action downloads are reused across job invocations'
+  - 'Upgrade to actions/runner v2.335.0+ which includes PR#4296 action resolution batching — this reduces the number of download requests per job for workflows using composite actions'
+  - 'When you see 429 errors, check https://www.githubstatus.com/ — they often coincide with GitHub API rate limit incidents affecting the entire platform'
+  - 'Spread scheduled workflows across different minutes using cron expressions like `17 4 * * *` rather than `0 4 * * *` to avoid the stampede effect when many organizations schedule jobs at round-number times'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4232'
+    label: 'actions/runner#4232: Warning: Failed to download action ... 429 Too Many Requests'
+  - url: 'https://github.com/actions/checkout/issues/2230'
+    label: 'actions/checkout#2230: checkout fails with 429 Too Many Requests'
+  - url: 'https://github.com/actions/runner/pull/4296'
+    label: 'actions/runner PR#4296: Batch and deduplicate action resolution across composite depths (reduces 429 risk)'
+  - url: 'https://docs.github.com/en/rest/overview/rate-limits-for-the-rest-api'
+    label: 'GitHub Docs: REST API rate limits'
+  - url: 'https://www.githubstatus.com/'
+    label: 'GitHub Status page — check for active incidents when 429 errors appear'

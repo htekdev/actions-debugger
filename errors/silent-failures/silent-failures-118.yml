@@ -1,0 +1,156 @@
+id: silent-failures-118
+title: 'Reusable workflow jobs.<name>.result is always empty string in on.workflow_call.outputs value'
+category: silent-failures
+severity: silent-failure
+tags:
+  - reusable-workflow
+  - workflow_call
+  - outputs
+  - jobs-result
+  - empty-string
+  - silent-failure
+  - job-outcome
+patterns:
+  - regex: 'value:\s*\$\{\{\s*jobs\.[a-zA-Z0-9_-]+\.result\s*\}\}'
+    flags: 'i'
+  - regex: 'needs\.[a-zA-Z0-9_-]+\.outputs\.[a-zA-Z0-9_-]+.*result'
+    flags: 'i'
+error_messages:
+  - '(no error emitted — needs.<job>.outputs.<name> resolves to empty string in the caller)'
+root_cause: |
+  GitHub Actions documentation states that the `jobs` context is available in
+  reusable workflows and includes `jobs.<job_id>.result` — the job conclusion value
+  ("success", "failure", "cancelled", or "skipped"). Developers use this to expose job
+  outcomes to calling workflows via `on.workflow_call.outputs`.
+
+  However, `jobs.<job_id>.result` does NOT work when used in the `value:` expression of
+  `on.workflow_call.outputs`. It always resolves to an empty string ("") in the caller's
+  `needs.<called_job>.outputs.<name>`.
+
+  This is distinct from the two-level output declaration issue (sf-060) where developers
+  forget to declare outputs at the workflow_call level. Here the developer correctly
+  declares both levels, but uses `jobs.<name>.result` (the job outcome) instead of
+  `jobs.<name>.outputs.<step-output>` (a custom output). The `.result` property is
+  simply not available via this mechanism.
+
+  Workarounds discovered by the community:
+  1. Explicitly capture the outcome as a step output and then chain it through job outputs:
+       steps:
+         - id: capture
+           run: echo "result=${{ job.status }}" >> "$GITHUB_OUTPUT"
+       outputs:
+         result: ${{ steps.capture.outputs.result }}
+  2. Use `fromJSON(toJSON(jobs.build)).result` — this works because it forces the
+     expression evaluator to serialise and deserialise the jobs context object, which
+     happens to populate the result at evaluation time. This is an accidental workaround
+     and not guaranteed to remain stable.
+
+  The root cause is that the `jobs.<job_id>.result` property in the workflow_call outputs
+  `value:` expression is evaluated before job conclusions are fully committed to the
+  expression context, unlike `jobs.<job_id>.outputs.<name>` which goes through a different
+  code path.
+
+  Source: actions/runner#2495 (open since 2023, multiple upvotes),
+  actions/runner#3087 (Cannot access jobs.<id>.result from on.workflow_call.outputs..value).
+fix: |
+  Do NOT use `value: ${{ jobs.<name>.result }}` in on.workflow_call.outputs — it will
+  always be empty in the caller.
+
+  **Option 1 (recommended): Capture outcome via a step output.**
+  Add a final step that writes `job.status` to GITHUB_OUTPUT, then chain it up:
+    step output → job output → workflow_call output
+
+  **Option 2: Use fromJSON(toJSON(jobs.<name>)).result workaround.**
+  The fromJSON/toJSON wrapper forces the jobs context to be serialised at evaluation
+  time, which makes .result available. This is a workaround — prefer option 1.
+
+  **Option 3: Control caller behavior via job success/failure instead of reading result.**
+  If you only need to run downstream caller jobs conditionally based on the reusable
+  workflow succeeding or failing, use `if: needs.<job>.result == 'success'` — the
+  `needs.<job>.result` in the CALLER is always correct and does NOT need to go through
+  workflow_call outputs.
+fix_code:
+  - language: yaml
+    label: 'Broken: value: ${{ jobs.build.result }} is always empty in caller'
+    code: |
+      # .github/workflows/reusable.yml — BROKEN pattern
+      on:
+        workflow_call:
+          outputs:
+            build-result:
+              description: 'Job outcome of the build job'
+              value: ${{ jobs.build.result }}   # always empty string in caller
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - run: make build
+  - language: yaml
+    label: 'Fixed: capture outcome via step output and chain it through job outputs'
+    code: |
+      # .github/workflows/reusable.yml — CORRECT pattern
+      on:
+        workflow_call:
+          outputs:
+            build-result:
+              description: 'Job outcome of the build job'
+              value: ${{ jobs.build.outputs.result }}   # works correctly
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          outputs:
+            result: ${{ steps.capture.outputs.result }}
+          steps:
+            - run: make build
+
+            - id: capture
+              if: always()
+              shell: bash
+              run: echo "result=${{ job.status }}" >> "$GITHUB_OUTPUT"
+  - language: yaml
+    label: 'Alternative workaround: fromJSON(toJSON(jobs.build)).result (fragile, prefer option 1)'
+    code: |
+      # .github/workflows/reusable.yml — accidental workaround (not recommended)
+      on:
+        workflow_call:
+          outputs:
+            build-result:
+              value: ${{ fromJSON(toJSON(jobs.build)).result }}
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - run: make build
+  - language: yaml
+    label: 'Caller: reading needs.<job>.result directly works and does NOT need workflow_call outputs'
+    code: |
+      # .github/workflows/caller.yml
+      # needs.<job>.result in the CALLER is always correct — no need to pass it through outputs
+      jobs:
+        call-build:
+          uses: ./.github/workflows/reusable.yml
+
+        deploy:
+          needs: call-build
+          # This works correctly — reads the reusable workflow conclusion directly
+          if: needs.call-build.result == 'success'
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./deploy.sh
+prevention:
+  - 'Never use `value: ${{ jobs.<name>.result }}` in workflow_call outputs — capture it as a step output first'
+  - 'If you only need to gate downstream caller jobs on reusable workflow success/failure, use `needs.<job>.result` in the caller directly — it works without going through workflow_call outputs'
+  - 'Test output values by printing them in the caller with `run: echo "${{ needs.<job>.outputs.<name> }}"` before relying on them in logic'
+  - 'The `fromJSON(toJSON(...)).result` workaround works today but is fragile — prefer the step-output capture pattern'
+docs:
+  - url: 'https://github.com/actions/runner/issues/2495'
+    label: 'actions/runner#2495: Reusable workflow does not output individual job result'
+  - url: 'https://github.com/actions/runner/issues/3087'
+    label: 'actions/runner#3087: Cannot access jobs.<id>.result from on.workflow_call.outputs..value'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#onworkflow_calloutputs'
+    label: 'GitHub Docs: on.workflow_call.outputs syntax reference'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#jobs-context'
+    label: 'GitHub Docs: jobs context (available only in reusable workflows)'

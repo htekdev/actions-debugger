@@ -1,0 +1,137 @@
+id: silent-failures-117
+title: 'if: always() runs steps even when the workflow is manually cancelled — use success() || failure() to respect cancellation'
+category: silent-failures
+severity: silent-failure
+tags:
+  - if-condition
+  - always
+  - cancelled
+  - cleanup
+  - notification
+  - status-check
+  - silent-failure
+patterns:
+  - regex: 'if:\s*always\(\)'
+    flags: 'i'
+  - regex: 'if:\s*\$\{\{\s*always\(\)\s*\}\}'
+    flags: 'i'
+error_messages:
+  - '(no error emitted — steps run unexpectedly during workflow cancellation)'
+root_cause: |
+  Developers commonly add `if: always()` to steps or jobs that should run even when
+  a previous step fails — for example, uploading test reports after a failed test run,
+  or sending failure notifications.
+
+  The silent failure is that `always()` evaluates to `true` in ALL cases including
+  when the workflow is manually cancelled. When a user or a concurrency group cancellation
+  triggers, any step or job with `if: always()` still executes. This is often unintended:
+  the developer expected "run on failure" not "run even when someone cancels".
+
+  GitHub Actions documentation explicitly warns about this:
+    "Consider using if: !cancelled() if you want the step or job to continue
+     executing when the current run is cancelled. [...] Using always() is not
+     recommended as it causes a step to run when a workflow is cancelled, which
+     can result in unintended behavior."
+
+  Common scenarios where this causes problems:
+  - Test report upload step runs when a PR author cancels a run, unnecessarily consuming
+    runner minutes and potentially posting partial results to a PR check.
+  - Slack/PagerDuty notification fires for a manual cancellation, producing false alerts.
+  - Deploy rollback job runs during a cancellation of a non-deployment workflow, triggering
+    rollback unexpectedly.
+  - Cleanup job executes with only partial data because the workflow was cut short.
+
+  The correct alternative for "run when success OR failure, but NOT when cancelled" is:
+    if: success() || failure()
+  or equivalently:
+    if: ${{ !cancelled() }}
+
+  Source: Stack Overflow q/58858429 (415 upvotes, 327k views), GitHub Docs always() warning,
+  test-summary/action#51 community discussion (Jan 2025).
+fix: |
+  Replace `if: always()` with `if: success() || failure()` for steps and jobs that
+  should run on success or failure but NOT when the workflow is cancelled.
+
+  Use `if: always()` only when you explicitly want the step to run even during
+  cancellation — for example, an emergency teardown that must run regardless.
+
+  Three options depending on intent:
+
+  1. Run on success or failure (skip on cancel): `if: success() || failure()`
+  2. Run on any non-success outcome (skip on cancel): `if: failure()`
+  3. Run always including on cancel (current behaviour): `if: always()`
+
+  GitHub also documents `if: ${{ !cancelled() }}` as equivalent to option 1 in
+  most contexts.
+fix_code:
+  - language: yaml
+    label: 'Before: if: always() fires even on manual cancellation'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - run: pytest --junitxml=results.xml
+
+            - name: Upload test results
+              if: always()          # fires even when the job is cancelled mid-run
+              uses: actions/upload-artifact@v4
+              with:
+                name: test-results
+                path: results.xml
+  - language: yaml
+    label: 'After: if: success() || failure() respects cancellation'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - run: pytest --junitxml=results.xml
+
+            - name: Upload test results
+              if: success() || failure()   # runs on pass or fail; skips on cancel
+              uses: actions/upload-artifact@v4
+              with:
+                name: test-results
+                path: results.xml
+  - language: yaml
+    label: 'Notification job: skip Slack alert on cancellation'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - run: make build
+
+        notify:
+          needs: build
+          # success() || failure() fires on build success or failure, not on cancel
+          if: success() || failure()
+          runs-on: ubuntu-latest
+          steps:
+            - name: Notify Slack
+              run: |
+                echo "Build result: ${{ needs.build.result }}"
+                # Sends alert only on success or failure — not on manual cancel
+
+        # Only use always() when you MUST run on cancellation too:
+        emergency-cleanup:
+          needs: build
+          if: always()       # intentional: must clean up even if cancelled
+          runs-on: ubuntu-latest
+          timeout-minutes: 4 # stay under the 5-min forced-kill window
+          steps:
+            - run: ./cleanup.sh
+prevention:
+  - 'Default to `if: success() || failure()` for upload, notification, and cleanup steps — reserve `if: always()` only for teardown steps that truly must run on cancellation'
+  - 'Remember: `always()` is not "run when failure"; it is "run even when cancelled" — the distinction matters for notification jobs'
+  - 'GitHub docs recommend `if: ${{ !cancelled() }}` as an alternative to `if: success() || failure()` for the same effect'
+  - 'Combine `if: always()` with `timeout-minutes:` on any job that runs after cancellation; GitHub force-kills all jobs after 5 minutes of the cancellation signal'
+  - 'Run a quick cancellation test: manually cancel the workflow and verify whether notification steps fire unexpectedly'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#always'
+    label: 'GitHub Docs: always() status check function — cancellation warning'
+  - url: 'https://stackoverflow.com/questions/58858429/how-to-run-a-github-actions-step-even-if-the-previous-step-fails-while-still-failing-the-job'
+    label: 'Stack Overflow 58858429: Run step on failure while still failing the job (415 votes)'
+  - url: 'https://github.com/test-summary/action/issues/51'
+    label: 'test-summary/action#51: Use success() || failure() instead of always() to prevent running on cancel'
