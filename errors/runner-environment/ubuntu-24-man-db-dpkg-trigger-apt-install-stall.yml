@@ -1,0 +1,94 @@
+id: runner-environment-207
+title: 'ubuntu-24.04 man-db dpkg trigger stalls apt-get install for minutes'
+category: runner-environment
+severity: warning
+tags:
+  - ubuntu-24.04
+  - apt-get
+  - man-db
+  - dpkg-trigger
+  - package-installation
+  - self-hosted
+patterns:
+  - regex: 'Processing triggers for man-db \('
+    flags: 'i'
+  - regex: 'man-db \(2\.1[0-9]\.[0-9]'
+    flags: 'i'
+error_messages:
+  - 'Processing triggers for man-db (2.12.0-4build2) ...'
+  - 'Processing triggers for man-db ...'
+root_cause: |
+  The `man-db` package is pre-installed on ubuntu-24.04 GitHub-hosted runner
+  images (and is commonly present on self-hosted Ubuntu 24.04 runners). When
+  any `apt-get install` step installs or upgrades a package that ships man
+  pages, the dpkg trigger for `man-db` fires automatically and rebuilds the
+  entire manual-page database.
+
+  On ubuntu-24.04 runners, this database regeneration reads and writes several
+  gigabytes of data through the runner's I/O subsystem, which is heavily
+  shared and has limited I/O resources. The trigger typically hangs the step
+  for **1–7+ minutes** even for simple package installs like `cmake` or
+  `libssl-dev`.
+
+  GitHub fixed this in hosted runner image ubuntu24/20251102.99 (November
+  2025) by removing `man-db` from the default image. However, self-hosted
+  runners on Ubuntu 24.04 that predate this fix, Docker-based container jobs
+  using ubuntu:24.04, and pinned runner image versions remain affected.
+
+  The equivalent tzdata hang (`sudo DEBIAN_FRONTEND=noninteractive apt-get ...`)
+  is a separate issue caused by interactive prompts; the man-db issue is
+  distinct — it stalls silently with no interactive prompt.
+fix: |
+  **For self-hosted runners or container jobs (manual fix):**
+
+  Add a step before package installation to remove man-db:
+
+  ```yaml
+  - name: Disable man-db trigger
+    run: sudo rm -f /var/lib/man-db/auto-update
+  ```
+
+  Or uninstall man-db entirely:
+
+  ```yaml
+  - name: Remove man-db
+    run: sudo apt-get remove -y --purge man-db 2>/dev/null || true
+  ```
+
+  **For GitHub-hosted runners:**
+  Upgrade to ubuntu-24.04 runner image version ubuntu24/20251102.99 or later.
+  The latest ubuntu-24.04 label automatically uses a fixed image.
+
+  **Minimal impact workaround (all runners):**
+  Use `DEBIAN_FRONTEND=noninteractive` — this avoids tzdata prompts but does
+  NOT prevent the man-db trigger. You must use the `rm -f /var/lib/man-db/auto-update`
+  approach to suppress the trigger.
+fix_code:
+  - language: yaml
+    label: 'Disable man-db trigger before apt-get install'
+    code: |
+      - name: Remove man-db auto-update trigger
+        run: sudo rm -f /var/lib/man-db/auto-update
+
+      - name: Install dependencies
+        run: sudo apt-get install -y cmake libssl-dev
+  - language: yaml
+    label: 'Uninstall man-db entirely (self-hosted runners)'
+    code: |
+      - name: Remove man-db (prevents dpkg trigger overhead)
+        run: sudo apt-get remove -y --purge man-db 2>/dev/null || true
+
+      - name: Install dependencies
+        run: sudo apt-get install -y cmake libssl-dev
+prevention:
+  - 'Add a man-db removal step at the top of jobs that run apt-get install on self-hosted ubuntu-24.04 runners'
+  - 'On GitHub-hosted runners, always use the current ubuntu-24.04 label (not pinned image SHAs from before November 2025)'
+  - 'For Docker container jobs, use an image that does not pre-install man-db, or add the removal step to your Dockerfile'
+  - 'Set a job-level timeout-minutes so that an unexpected man-db stall does not consume runner quota for hours'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4030'
+    label: 'actions/runner#4030 — man-db trigger severely stalls apt-get on ubuntu-24.04'
+  - url: 'https://github.com/actions/runner-images/issues/10977'
+    label: 'runner-images#10977 — Disable man-db dpkg trigger (fixed in ubuntu24/20251102.99)'
+  - url: 'https://bugs.launchpad.net/ubuntu/+source/man-db/+bug/2073797'
+    label: 'Ubuntu bug #2073797 — man-db trigger performance regression'

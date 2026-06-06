@@ -1,0 +1,114 @@
+id: runner-environment-209
+title: 'Self-hosted runner BrokerServer TaskCanceledException / SocketException — runner stuck in Busy, jobs delayed'
+category: runner-environment
+severity: error
+tags:
+  - self-hosted
+  - broker
+  - TaskCanceledException
+  - SocketException
+  - NAT
+  - kubernetes
+  - ARC
+  - busy-state
+patterns:
+  - regex: 'BrokerServer.*TaskCanceledException'
+    flags: 'i'
+  - regex: 'SocketException \(125\): Operation canceled'
+    flags: 'i'
+  - regex: 'GET request to https://broker\.actions\.githubusercontent\.com.*has been cancelled'
+    flags: 'i'
+error_messages:
+  - '[ERR BrokerServer] System.Threading.Tasks.TaskCanceledException: The operation was canceled.'
+  - '[ERR BrokerServer] System.IO.IOException: Unable to read data from the transport connection: Operation canceled.'
+  - '[ERR BrokerServer] System.Net.Sockets.SocketException (125): Operation canceled'
+  - '[WARN GitHubActionsService] GET request to https://broker.actions.githubusercontent.com/message?sessionId=...&status=Busy&runnerVersion=... has been cancelled.'
+  - '[WARN BrokerServer] Back off 6.934 seconds before next retry. 4 attempt left.'
+root_cause: |
+  The GitHub Actions runner (on Linux, macOS, Kubernetes, and ARC) maintains a
+  persistent long-poll HTTPS connection to `broker.actions.githubusercontent.com`
+  to receive job dispatch messages. This connection is kept open by a blocking
+  GET request that the server holds for up to 90 seconds before responding.
+
+  When the runner operates behind a **NAT gateway, stateful firewall, or cloud
+  provider network** (common in Kubernetes/ARC deployments on EKS, GKE, AKS, or
+  on-premise k8s), the network layer's connection tracking table can expire the
+  idle TLS socket before the server responds. Most cloud NAT tables have a
+  default idle timeout of 30–60 seconds — shorter than the runner's 90-second
+  poll interval.
+
+  When the NAT table entry expires:
+  1. The next packet the runner sends receives an RST from the network (or is
+     silently dropped), causing the underlying `SslStream.ReadAsyncInternal`
+     to throw `SocketException (125): Operation canceled`
+  2. The exception propagates as `TaskCanceledException` through the
+     `BrokerHttpClient.GetRunnerMessageAsync` call chain
+  3. The runner logs `ERR BrokerServer` and backs off exponentially (6–60 s)
+  4. During the back-off, the runner remains in **Busy** status from the broker's
+     perspective, preventing new jobs from being dispatched
+
+  The back-off recovers automatically but delays job pickup by minutes. Under
+  high-frequency job dispatch (CI matrix builds), this causes jobs to queue
+  while the runner is technically idle.
+
+  **Distinct from re-199** (Windows V2 broker listener stops polling after the
+  first job — Windows-specific software bug): this issue affects Linux/macOS/K8s
+  and recovers automatically; re-199 causes a permanent stall requiring service
+  restart.
+fix: |
+  **1. Enable TCP keepalive on the runner host (most effective):**
+
+  Configure the OS to send TCP keepalive probes before the NAT table expires:
+  ```bash
+  # Linux — reduce keepalive idle time from default 7200s to 30s
+  sudo sysctl -w net.ipv4.tcp_keepalive_time=30
+  sudo sysctl -w net.ipv4.tcp_keepalive_intvl=10
+  sudo sysctl -w net.ipv4.tcp_keepalive_probes=3
+  # Make persistent:
+  echo "net.ipv4.tcp_keepalive_time=30" | sudo tee -a /etc/sysctl.conf
+  ```
+
+  **2. Increase NAT idle timeout (infrastructure change):**
+
+  - **AWS EKS:** Set `--conntrack-tcp-timeout-established=300` on kube-proxy,
+    or add a NAT gateway connection tracking timeout of 350 s
+  - **GKE:** Use Cloud NAT with `--nat-tcp-established-idle-timeout=350`
+  - **Azure AKS:** Set `--load-balancer-idle-timeout-in-minutes=10` (default is 4 min)
+  - **On-premise k8s:** Increase `conntrack` timeout or set up a keepalive proxy
+
+  **3. Use a runner proxy with keepalive support:**
+
+  Route runner outbound traffic through an application-level proxy that
+  maintains the connection, preventing the NAT table from expiring the socket.
+
+  **4. Upgrade runner version:**
+
+  Runner v2.326.0+ includes improved broker reconnect logic that reduces the
+  window where the runner stays in Busy state after a socket reset.
+fix_code:
+  - language: yaml
+    label: 'Runner DaemonSet init container — set TCP keepalive before runner starts'
+    code: |
+      # In your ARC runner DaemonSet / Pod spec
+      initContainers:
+        - name: set-sysctl
+          image: busybox
+          securityContext:
+            privileged: true
+          command:
+            - sh
+            - -c
+            - |
+              sysctl -w net.ipv4.tcp_keepalive_time=30
+              sysctl -w net.ipv4.tcp_keepalive_intvl=10
+              sysctl -w net.ipv4.tcp_keepalive_probes=3
+prevention:
+  - 'Set tcp_keepalive_time to 30 s on all Linux self-hosted runner hosts, especially those in Kubernetes'
+  - 'For ARC scale sets in EKS/GKE/AKS, explicitly configure NAT idle timeout to at least 350 seconds'
+  - 'Monitor runner diagnostic logs (Runner_<date>-utc.log) for repeated BrokerServer ERR lines — they indicate this issue'
+  - 'Upgrade runner to v2.326.0+ which has improved back-off and reconnect behavior'
+docs:
+  - url: 'https://github.com/actions/runner/issues/3904'
+    label: 'actions/runner#3904 — Runner fails to connect to broker, TaskCanceledException / SocketException (17 reactions)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners#communication-between-self-hosted-runners-and-github'
+    label: 'GitHub Docs — Self-hosted runner communication requirements'
