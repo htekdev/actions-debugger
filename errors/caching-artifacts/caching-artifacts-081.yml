@@ -1,0 +1,109 @@
+id: "caching-artifacts-081"
+title: "Cache reports 'Cache hit' then immediately 'Cache not found' — eviction race during download"
+category: "caching-artifacts"
+severity: "warning"
+tags:
+  - "cache"
+  - "cache-hit"
+  - "cache-miss"
+  - "race-condition"
+  - "eviction"
+  - "intermittent"
+patterns:
+  - regex: 'Cache hit for:.*\nWarning: Failed to restore'
+    flags: "im"
+  - regex: 'Cache hit for:.*\nCache not found for input keys'
+    flags: "im"
+  - regex: 'Cache not found for input keys:.*##\[warning\]|Warning.*Failed to restore.*\nCache not found'
+    flags: "im"
+error_messages:
+  - "Cache hit for: <cache-key>"
+  - "Warning: Failed to restore: "
+  - "Cache not found for input keys: <cache-key>"
+root_cause: |
+  GitHub's cache service performs a two-phase operation: first it queries the metadata
+  index to find a matching cache entry (reporting "Cache hit for: <key>"), then it
+  generates a signed Azure Blob Storage URL and downloads the blob.
+
+  If the cache entry is evicted from blob storage between the index lookup and the
+  blob download — due to GitHub's 10 GB per-repo cache eviction policy (LRU) or a
+  transient backend inconsistency — the download returns HTTP 400 ("Value for one of
+  the query parameters specified in the request URI is invalid") or 404, and the action
+  emits "Warning: Failed to restore:" followed by "Cache not found for input keys:".
+
+  The result is confusing because the logs show a "Cache hit" at the start of the step,
+  making it appear the cache was restored successfully, while the step actually produces
+  a cold-cache result. Unlike the "An internal error has occurred in cache backend"
+  message (which indicates a platform-side outage), this pattern occurs when the
+  metadata index and blob storage are momentarily out of sync — often during high
+  cache churn on busy repositories or when a large cache has just been evicted.
+
+  This affects `actions/cache`, `actions/cache/restore`, and setup actions that use
+  caching internally (setup-node, setup-python, setup-go, etc.).
+fix: |
+  No workflow change can reliably prevent this — it is a race condition in GitHub's
+  cache infrastructure. Mitigations:
+
+  1. Never assume a "Cache hit for:" log line means the cache was actually restored.
+     Always gate downstream steps on `steps.<id>.outputs.cache-hit == 'true'`.
+  2. Make your build tolerant of cache misses by re-installing dependencies when the
+     cache is absent, rather than short-circuiting on cache-hit.
+  3. Add `restore-keys` as a fallback so a partial key match reduces the blast radius
+     of a full eviction.
+  4. If caches are evicted frequently, increase the `path:` scope to store more
+     per-entry, reducing total entries and churn.
+  5. For highly critical pipelines, use `continue-on-error: true` on the restore step
+     and add a verification step that checks for expected files.
+fix_code:
+  - language: yaml
+    label: "Guard install step on cache-hit output — tolerates false Cache hit"
+    code: |
+      - name: Restore npm cache
+        id: npm-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
+      # Use != 'true' (not == 'false') — cache-hit is empty string on eviction race
+      - name: Install dependencies
+        if: steps.npm-cache.outputs.cache-hit != 'true'
+        run: npm ci
+  - language: yaml
+    label: "Verify cache was actually restored before using it"
+    code: |
+      - name: Restore Python virtualenv
+        id: venv-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .venv
+          key: ${{ runner.os }}-venv-${{ hashFiles('**/requirements*.txt') }}
+
+      - name: Verify cache contents
+        id: verify-cache
+        run: |
+          if [ -d ".venv/lib" ] && [ -f ".venv/bin/python" ]; then
+            echo "valid=true" >> $GITHUB_OUTPUT
+          else
+            echo "valid=false" >> $GITHUB_OUTPUT
+            echo "Cache dir missing or incomplete — will reinstall"
+          fi
+
+      - name: Install dependencies
+        if: steps.verify-cache.outputs.valid != 'true'
+        run: python -m venv .venv && .venv/bin/pip install -r requirements.txt
+prevention:
+  - "Always validate that expected cache files exist after a restore step before relying on them in later steps."
+  - "Use `cache-hit != 'true'` (not `== 'false'`) to guard install steps — the output is empty string on eviction race, not the string 'false'."
+  - "Add `restore-keys` to allow partial hits when an exact entry has been evicted."
+  - "For repositories with many parallel matrix jobs that all use the same cache key, consider sharding the cache key by job to reduce eviction pressure."
+  - "Monitor for the 'Cache hit for:' + 'Cache not found' pattern in logs as a signal of high cache churn."
+docs:
+  - url: "https://github.com/actions/cache/issues/1621"
+    label: "actions/cache#1621 — Random cache restore failure (231 reactions, Jun 2025)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows#usage-limits-and-eviction-policy"
+    label: "GitHub Docs: Cache usage limits and eviction policy (10 GB per repo, LRU)"
+  - url: "https://github.com/actions/cache#outputs"
+    label: "actions/cache — cache-hit output documentation"

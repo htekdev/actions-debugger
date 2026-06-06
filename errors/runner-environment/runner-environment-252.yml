@@ -1,0 +1,106 @@
+id: "runner-environment-252"
+title: "setup-go called twice in the same job fails with tar 'File exists' exit code 2"
+category: "runner-environment"
+severity: "warning"
+tags:
+  - "setup-go"
+  - "cache"
+  - "composite-action"
+  - "tar"
+  - "file-exists"
+  - "go-module-cache"
+patterns:
+  - regex: 'Cannot open: File exists'
+    flags: "i"
+  - regex: 'Failed to restore:.*tar.*failed with error'
+    flags: "i"
+  - regex: 'The process.*tar.*failed with exit code 2'
+    flags: "i"
+error_messages:
+  - "##[warning]Failed to restore: \"/usr/bin/tar\" failed with error: The process '/usr/bin/tar' failed with exit code 2"
+  - "Cannot open: File exists"
+  - "tar: /home/runner/go/pkg/mod/cache: Cannot open: File exists"
+root_cause: |
+  When `actions/setup-go` is called more than once in the same job — for example, from
+  a composite action or a reusable workflow that also calls `setup-go` — the second
+  invocation finds Go already installed in the tool cache and resolves the same cache key.
+  It then attempts to extract the same cached archive (covering `~/go/pkg/mod` and
+  `~/.cache/go-build`) on top of files that already exist on disk.
+
+  Go marks module cache files as read-only by design (`go get` removes write permissions
+  after download). When `tar` tries to overwrite these read-only files, it fails with
+  `Cannot open: File exists` for every file in the archive, eventually exiting with
+  code 2. The action emits `##[warning]Failed to restore:` and continues — so the job
+  does not fail, but the cache restoration is silently skipped.
+
+  The issue is especially hard to diagnose because:
+  - The first `setup-go` call succeeds completely.
+  - The second call appears to succeed at the restore step (no error-level annotation).
+  - The warning appears mid-job, sometimes many steps later.
+  - Composite actions and reusable workflows often call `setup-go` internally without
+    the caller being aware.
+fix: |
+  Disable caching on every `setup-go` call after the first one in the same job. Set
+  `cache: false` explicitly on any secondary call. If you do not control the composite
+  action that calls `setup-go`, wrap it in a job that itself does not use `setup-go`
+  with caching, or split the work across two jobs.
+
+  If both calls are in workflow files you own, identify which one is the "primary"
+  (the one whose language version you need) and set `cache: false` on all others.
+fix_code:
+  - language: yaml
+    label: "Set cache: false on the second setup-go call"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            # First call — owns the cache
+            - uses: actions/setup-go@v6
+              with:
+                go-version-file: go.mod
+                # cache: true (default)
+
+            # Composite action that also calls setup-go internally:
+            - uses: my-org/my-composite@v1
+
+            # If you need a second explicit setup-go, disable its cache
+            - uses: actions/setup-go@v6
+              with:
+                go-version-file: go.mod
+                cache: false  # <-- prevents File exists tar errors
+  - language: yaml
+    label: "Split into two jobs to avoid the duplicate invocation"
+    code: |
+      jobs:
+        lint:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-go@v6
+              with:
+                go-version-file: go.mod
+            - uses: golangci/golangci-lint-action@v6
+
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-go@v6
+              with:
+                go-version-file: go.mod
+            - run: go test ./...
+prevention:
+  - "Audit your composite actions and reusable workflows for internal `setup-go` calls; if they use caching, document that callers must not also enable caching."
+  - "Pin `cache: false` on any `setup-go` step that is known to run after another `setup-go` in the same job."
+  - "Monitor for `##[warning]Failed to restore:` annotations in build logs — they indicate a silent cache failure that may mask slow builds."
+  - "Consider switching to a single shared Go cache managed via `actions/cache` directly when multiple composite actions need Go in the same job."
+docs:
+  - url: "https://github.com/actions/setup-go/issues/722"
+    label: "actions/setup-go#722 — Cache restore fails with File exists when setup-go called twice"
+  - url: "https://github.com/actions/cache/issues/1104"
+    label: "actions/cache#1104 — tar fails with exit code 2 on read-only files (underlying issue)"
+  - url: "https://github.com/actions/setup-go"
+    label: "actions/setup-go README — cache input documentation"
