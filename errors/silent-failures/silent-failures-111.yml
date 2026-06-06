@@ -1,0 +1,107 @@
+id: silent-failures-111
+title: '`helm list` shows all release states by default in Helm 4 — scripts silently return unexpected releases'
+category: silent-failures
+severity: silent-failure
+tags:
+  - helm
+  - helm-4
+  - ubuntu-26
+  - tool-upgrade
+  - output-change
+  - deploy-check
+patterns:
+  - regex: 'helm list'
+    flags: 'i'
+error_messages:
+  - '# No error message — helm list exits 0 but returns FAILED/SUPERSEDED/UNINSTALLED releases alongside DEPLOYED ones'
+root_cause: |
+  In Helm 3, `helm list` (without flags) only returned releases in the DEPLOYED
+  state. To see releases in all states, you had to pass `-a`/`--all`.
+
+  In Helm 4 (installed on ubuntu-26.04), `helm list` returns releases of ALL
+  states by default: DEPLOYED, FAILED, SUPERSEDED, UNINSTALLED, PENDING_INSTALL,
+  PENDING_UPGRADE, PENDING_ROLLBACK. The `-a`/`--all` flag was temporarily removed
+  (helm/helm#31784) and restored as a deprecated no-op in Helm 4.1.1+.
+
+  This causes silent failures in two common patterns:
+
+  1. **Existence check**: `helm list --filter my-release | grep my-release` returns
+     a match even if the release is in a FAILED state, causing a subsequent
+     `helm upgrade` to proceed when `helm install` should have been used instead
+     (or vice versa).
+
+  2. **Release count**: Scripts that count `helm list | wc -l` to assert a number
+     of deployed releases now count more releases than expected.
+
+  3. **CI deploy gate**: Pipelines that run `helm list` to verify a deployment
+     succeeded will see FAILED releases included in output and may incorrectly
+     conclude the deployment is present/healthy.
+
+  No error is thrown — `helm list` exits 0 in all cases. The bug is in the
+  consuming script's assumption about Helm 3 behavior.
+fix: |
+  Filter `helm list` output explicitly by state using the `--deployed` flag
+  or the `--filter`+`--output json` approach to check actual release status.
+
+  In Helm 4, use `helm status <release>` to get the definitive state of a
+  specific release rather than parsing `helm list` output.
+fix_code:
+  - language: yaml
+    label: 'Use --deployed flag to replicate Helm 3 default behavior'
+    code: |
+      - name: Check if release is deployed
+        run: |
+          # Helm 4 on ubuntu-26.04: helm list shows ALL states by default.
+          # Use --deployed to replicate Helm 3 default behavior:
+          DEPLOYED=$(helm list --deployed --filter "^my-release$" --short)
+          if [ -n "$DEPLOYED" ]; then
+            echo "Release is deployed — running upgrade"
+            helm upgrade my-release ./chart
+          else
+            echo "No deployed release found — running install"
+            helm install my-release ./chart
+          fi
+
+  - language: yaml
+    label: 'Use helm status for definitive state check'
+    code: |
+      - name: Check release status
+        run: |
+          # helm status exits non-zero if the release does not exist.
+          # Use --output json to get machine-parseable state:
+          STATUS=$(helm status my-release --output json 2>/dev/null | jq -r '.info.status' || echo "not-found")
+          echo "Release status: $STATUS"
+          if [ "$STATUS" = "deployed" ]; then
+            echo "Healthy — proceeding"
+          elif [ "$STATUS" = "failed" ]; then
+            echo "Previous install failed — rolling back before upgrade"
+            helm rollback my-release 0  # Roll back to last successful
+          else
+            echo "Installing fresh"
+            helm install my-release ./chart
+          fi
+
+  - language: yaml
+    label: 'Use helm list --output json for precise state parsing'
+    code: |
+      - name: List only deployed releases
+        run: |
+          # Explicitly request only DEPLOYED state, output JSON for safe parsing:
+          helm list --deployed --output json | jq '.[] | .name + " (" + .status + ")"'
+          # Do NOT rely on: helm list | grep release-name
+          # In Helm 4, this matches FAILED/SUPERSEDED releases too.
+prevention:
+  - "Never use `helm list | grep <release>` as a deployment check — it matches any release state in Helm 4."
+  - "Use `helm list --deployed` or `helm status <release>` for definitive deployed-state checks."
+  - "When migrating to ubuntu-26.04, audit all scripts that parse `helm list` output."
+  - "Add `--output json` to `helm list` calls and parse `status` field explicitly rather than relying on line-presence checks."
+  - "Pin Helm 3 with `azure/setup-helm` if your scripts are not yet Helm 4 compatible."
+docs:
+  - url: 'https://github.com/helm/helm/issues/31784'
+    label: 'helm/helm#31784 — Breaking change to helm list CLI command in v4'
+  - url: 'https://helm.sh/docs/topics/v4_migration/'
+    label: 'Helm v4 Migration Guide'
+  - url: 'https://helm.sh/docs/helm/helm_list/'
+    label: 'helm list command reference'
+  - url: 'https://github.com/actions/runner-images/commit/9e3319d6b4acc306925295853d0ff41ddd5c40f0'
+    label: 'runner-images commit: ubuntu-26.04 installs Helm 4'
