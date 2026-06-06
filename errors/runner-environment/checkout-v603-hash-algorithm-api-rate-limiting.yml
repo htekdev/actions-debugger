@@ -1,0 +1,100 @@
+id: runner-environment-206
+title: 'actions/checkout v6.0.3 regression — new /hash-algorithm API call on every checkout exhausts rate limits in high-volume orgs'
+category: runner-environment
+severity: error
+tags:
+  - checkout
+  - rate-limit
+  - api-rate-limit
+  - v6
+  - PAT
+  - regression
+  - hash-algorithm
+patterns:
+  - regex: 'API rate limit exceeded'
+    flags: 'i'
+  - regex: 'You have exceeded a secondary rate limit'
+    flags: 'i'
+  - regex: 'HttpError.*API rate limit exceeded'
+    flags: 'i'
+  - regex: 'Rate limit.*exceeded.*403'
+    flags: 'i'
+error_messages:
+  - 'Error: HttpError: API rate limit exceeded for user ID'
+  - 'You have exceeded a secondary rate limit and have been temporarily blocked from content creation'
+  - 'remote: Repository not found.'
+  - 'fatal: repository ''https://github.com/owner/repo/'' not found'
+root_cause: |
+  actions/checkout v6.0.3 (released June 2, 2026, commit 1cce339) introduced a new
+  REST API call to GET /repos/{owner}/{repo}/hash-algorithm on every checkout operation
+  to determine the repository's object hashing algorithm.
+
+  In organizations with high-concurrency workflows, this additional API call multiplies
+  rate-limit consumption significantly. A matrix build with 30 parallel jobs each running
+  checkout makes 30 additional API calls per push event. At the per-user rate limit of
+  5,000 requests/hour, large orgs using PATs (Personal Access Tokens) for cross-repo
+  checkout quickly exhaust their quota across many concurrent pipelines.
+
+  When the /hash-algorithm endpoint returns HTTP 403 (rate limited), the checkout action
+  may interpret the 403 as a resource-not-found condition, producing misleading errors
+  such as "remote: Repository not found" that mask the true rate-limit cause.
+
+  GITHUB_TOKEN is not affected in the same way because it carries per-repository rate
+  limits (15,000 requests/hour for Actions) rather than per-user limits.
+  Source: actions/checkout#2450.
+fix: |
+  Immediate fix — pin to actions/checkout@v6.0.2 until the upstream regression is
+  addressed:
+    uses: actions/checkout@v6.0.2
+
+  Use GITHUB_TOKEN instead of PAT where possible:
+  GITHUB_TOKEN rate limits (15,000 req/hr for GitHub Actions) are scoped per
+  repository and do not aggregate across your organization's other workflows.
+  Reserve PATs for cross-repo or cross-org checkouts only.
+
+  Reduce parallel checkout volume:
+  Add fetch-depth: 1 and/or sparse-checkout to minimize the API surface area
+  per checkout call, reducing the number of API requests triggered per job.
+
+  Monitor actions/checkout#2450 for the upstream fix (caching the hash-algorithm
+  result within a workflow run, or making the call conditional).
+fix_code:
+  - language: yaml
+    label: 'Pin to v6.0.2 to avoid the regression until upstream fix is released'
+    code: |
+      - uses: actions/checkout@v6.0.2
+        with:
+          # Prefer GITHUB_TOKEN over a PAT to use per-repo rate limits
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1         # Shallow fetch reduces ancillary API calls
+  - language: yaml
+    label: 'Cross-repo checkout — use dedicated PAT only where necessary, pin version'
+    code: |
+      - uses: actions/checkout@v6.0.2
+        with:
+          repository: org/other-repo
+          token: ${{ secrets.CROSS_REPO_PAT }}   # PAT required here; rate-limited per user
+          fetch-depth: 1
+  - language: yaml
+    label: 'Monitor rate limit headers in a preflight step (diagnostic aid)'
+    code: |
+      - name: Check remaining GitHub API rate limit
+        run: |
+          remaining=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/rate_limit | jq '.rate.remaining')
+          echo "Remaining API calls: $remaining"
+          if (( remaining < 500 )); then
+            echo "::warning::Low API rate limit — $remaining calls remaining"
+          fi
+prevention:
+  - 'Pin actions/checkout to a specific patch version (e.g., @v6.0.2) in high-volume orgs — patch updates can introduce API regressions like this one'
+  - 'Prefer GITHUB_TOKEN over org-wide PATs for checkout; GITHUB_TOKEN rate limits are per-repository and isolated from other workflows'
+  - 'Monitor your org REST API usage under Settings > Insights > API Requests to detect unexpected call spikes from action updates before they hit production'
+  - 'Add a rate-limit check step to long-running or high-parallelism pipelines to catch exhaustion before it causes misleading errors'
+docs:
+  - url: 'https://github.com/actions/checkout/issues/2450'
+    label: 'actions/checkout#2450: New /hash-algorithm API call causing rate limiting failures in v6.0.3'
+  - url: 'https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api'
+    label: 'GitHub Docs: Rate limits for the REST API'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#permissions-for-the-github_token'
+    label: 'GitHub Docs: GITHUB_TOKEN permissions and rate limits'
