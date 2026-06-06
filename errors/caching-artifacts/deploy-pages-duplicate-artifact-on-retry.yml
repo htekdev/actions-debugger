@@ -1,0 +1,152 @@
+id: caching-artifacts-083
+title: "upload-pages-artifact retry creates duplicate 'github-pages' artifact — deploy-pages fails with 'Multiple artifacts found'"
+category: caching-artifacts
+severity: error
+tags:
+  - deploy-pages
+  - upload-pages-artifact
+  - duplicate-artifact
+  - retry
+  - pages
+  - artifact
+patterns:
+  - regex: 'Multiple artifacts named "github-pages" were unexpectedly found'
+    flags: 'i'
+  - regex: 'Artifact count is \d+'
+    flags: 'i'
+  - regex: 'Found \d+ artifact\(s\).*github-pages.*unexpectedly'
+    flags: 'i'
+error_messages:
+  - 'Error: Error: Multiple artifacts named "github-pages" were unexpectedly found for this workflow run. Artifact count is 2.'
+  - 'Fetching artifact metadata for "github-pages" in this workflow run'
+  - 'Found 2 artifact(s)'
+  - 'Error: Fetching artifact metadata failed. Is githubstatus.com reporting issues with API requests, Pages, or Actions? Please re-run the deployment at a later time.'
+root_cause: |
+  `actions/upload-pages-artifact` and `actions/upload-artifact` do not check whether
+  an artifact with the target name already exists before creating a new one. If the
+  upload step encounters a transient network error after the server has already
+  accepted and stored the artifact, the client-side retry creates a second artifact
+  with the same name ("github-pages").
+
+  `actions/deploy-pages` queries for exactly ONE artifact named "github-pages". When
+  it finds 2 or more, it fails with:
+    "Multiple artifacts named 'github-pages' were unexpectedly found for this workflow
+    run. Artifact count is 2."
+
+  The duplicate is most likely to occur when:
+  1. The job is re-run manually after a partial failure (re-running the build job
+     without also cleaning up artifacts from the previous attempt).
+  2. A transient network failure causes the upload action to complete server-side but
+     fail client-side, triggering an automatic retry that creates a second artifact.
+  3. `upload-pages-artifact` is called twice in the same workflow run (e.g., in a
+     matrix job or via two separate build stages both uploading to "github-pages").
+
+  Source: https://github.com/actions/upload-pages-artifact/issues/97 (open since Feb 2024)
+  Source: https://github.com/actions/deploy-pages/issues/338
+fix: |
+  **Immediate workaround:** Re-run the ENTIRE workflow from scratch (not just the failed
+  job) to start a fresh run with no existing artifacts. The duplicate artifact is bound
+  to the current run — starting a new run avoids it.
+
+  **Structural fix — separate build and deploy into isolated jobs:**
+  If the duplicate comes from a re-run of only the deploy job (while the build job's
+  artifact from the first attempt still exists), restructure the workflow so the entire
+  pipeline reruns together. Use workflow-level concurrency:
+
+  ```yaml
+  concurrency:
+    group: pages
+    cancel-in-progress: true
+  ```
+
+  **Avoid calling upload-pages-artifact in matrix jobs:** Only one job in a run should
+  upload the "github-pages" artifact. If multiple matrix legs need to contribute to
+  the Pages build, merge their outputs first, then upload once.
+
+  **Use artifact_id input (deploy-pages@v4.0.5+):** Newer versions of deploy-pages
+  accept an `artifact_id:` input that bypasses the name-based lookup entirely, avoiding
+  the multiple-artifact ambiguity. Capture the artifact ID from `upload-pages-artifact`
+  outputs and pass it directly.
+fix_code:
+  - language: yaml
+    label: "Correct: use artifact_id to bypass name-based lookup (deploy-pages@v4.0.5+)"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          outputs:
+            artifact_id: ${{ steps.upload.outputs.artifact_id }}
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Build
+              run: npm ci && npm run build
+
+            - name: Upload Pages artifact
+              id: upload
+              uses: actions/upload-pages-artifact@v3
+              with:
+                path: dist/
+
+        deploy:
+          needs: build
+          runs-on: ubuntu-latest
+          permissions:
+            pages: write
+            id-token: write
+          environment:
+            name: github-pages
+            url: ${{ steps.deployment.outputs.page_url }}
+          steps:
+            - name: Deploy to GitHub Pages
+              id: deployment
+              uses: actions/deploy-pages@v4
+              with:
+                # ✅ Bypasses name-based lookup — immune to duplicate-artifact issue
+                artifact_id: ${{ needs.build.outputs.artifact_id }}
+
+  - language: yaml
+    label: "Add workflow-level concurrency to prevent artifact accumulation across re-runs"
+    code: |
+      name: Deploy Pages
+
+      on:
+        push:
+          branches: [main]
+
+      # Cancel any in-progress run for the same branch before starting a new one.
+      # This ensures only one artifact per run exists at any time.
+      concurrency:
+        group: pages-${{ github.ref }}
+        cancel-in-progress: true
+
+      jobs:
+        build-and-deploy:
+          runs-on: ubuntu-latest
+          permissions:
+            pages: write
+            id-token: write
+          environment:
+            name: github-pages
+            url: ${{ steps.deployment.outputs.page_url }}
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm ci && npm run build
+            - uses: actions/upload-pages-artifact@v3
+              with:
+                path: dist/
+            - id: deployment
+              uses: actions/deploy-pages@v4
+prevention:
+  - "Never call upload-pages-artifact more than once per workflow run — each call creates a new artifact with the same name."
+  - "Use workflow-level concurrency groups for Pages deployments to prevent accumulation across concurrent runs."
+  - "When re-running a failed deploy, re-run the full workflow from scratch rather than re-running only the deploy job."
+  - "Capture artifact_id from upload-pages-artifact outputs and pass it to deploy-pages to avoid name-based lookup."
+  - "Avoid triggering upload-pages-artifact from inside matrix jobs — consolidate outputs first."
+docs:
+  - url: "https://github.com/actions/upload-pages-artifact/issues/97"
+    label: "upload-pages-artifact#97: Retry handling leads to duplicated artifacts (open since Feb 2024)"
+  - url: "https://github.com/actions/deploy-pages/issues/338"
+    label: "deploy-pages#338: Multiple artifacts found on re-run"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency"
+    label: "GitHub Docs: Using concurrency to prevent duplicate workflow runs"

@@ -1,0 +1,158 @@
+id: silent-failures-124
+title: "workflow_run fork PR has empty pull_requests[] and synthetic head_sha — check runs posted to wrong commit, branch protection never clears"
+category: silent-failures
+severity: silent-failure
+tags:
+  - workflow_run
+  - fork
+  - pull-request
+  - head-sha
+  - merge-commit
+  - branch-protection
+  - check-runs
+  - status-checks
+patterns:
+  - regex: 'github\.event\.workflow_run\.pull_requests\s*==\s*\[\]'
+    flags: 'i'
+  - regex: 'pull_requests.*\[\].*workflow_run.*fork'
+    flags: 'i'
+  - regex: 'check.*run.*Expected.*required.*never.*pass'
+    flags: 'i'
+error_messages:
+  - "pull_requests: []  # always empty for fork PR-triggered workflow_run"
+  - "Required check 'X' was expected but not found at the PR head commit"
+  - "This check is Expected but has not been reported"
+root_cause: |
+  When a workflow is triggered via `workflow_run` and the triggering workflow ran
+  on a **fork pull request**, two known-design behaviors combine to create a silent
+  failure in branch protection:
+
+  1. **`pull_requests` is always empty for fork PRs** — GitHub intentionally omits
+     the `pull_requests` payload for workflow_run events triggered by fork PR
+     `pull_request` events. This is a security measure to prevent fork workflows from
+     extracting base-repo PR metadata (which could expose information about private
+     branches). For same-repo PRs, `pull_requests[]` is populated correctly.
+
+  2. **`head_sha` is the synthetic merge commit** — `github.event.workflow_run.head_sha`
+     points to the ephemeral `refs/pull/N/merge` commit (the synthetic merge of the
+     PR branch onto the base branch), not the actual PR branch tip commit. This merge
+     SHA is an internal GitHub reference that is not a commit on any named branch.
+
+  The combination means:
+  - You cannot derive the actual PR head commit from the workflow_run event payload.
+  - Any GitHub check run posted to `head_sha` is posted to the synthetic merge SHA.
+  - Branch protection evaluates required checks against the PR branch tip SHA (the
+    last commit on the `feature-branch`), NOT the merge SHA.
+  - The check run therefore never satisfies the required status check — the PR shows
+    the check as "Expected" (or stuck "Pending") forever even after the workflow_run
+    job completes successfully.
+
+  This pattern is especially common with coverage or quality gate workflows that run
+  as privileged `workflow_run` jobs (to access secrets) triggered by unprivileged
+  fork PR CI pipelines.
+
+  Source: https://github.com/actions/runner/issues/3444 (Aug 2024, closed not_planned)
+  Source: https://github.com/jaegertracing/jaeger/commit/ca454134f4291a7703c9ebcdead3fe1ee9ad6e39 (Apr 2026 fix)
+fix: |
+  The canonical fix is to resolve the true PR branch tip SHA via the GitHub REST API,
+  then post check runs to that SHA explicitly.
+
+  **Option A — Resolve PR head SHA via github-script:**
+  Use `github.event.workflow_run.pull_requests[0].head.sha` as a first attempt (works
+  for same-repo PRs), then fall back to querying
+  `GET /repos/{owner}/{repo}/pulls?head={head_branch}&state=open` to find the PR and
+  extract `head.sha` from the API response (works for fork PRs too).
+
+  **Option B — Use pull_request_target instead of workflow_run (with caution):**
+  `pull_request_target` runs in the base repo context with full permissions and always
+  populates `github.event.pull_request.head.sha` with the correct PR branch tip SHA.
+  CAUTION: `pull_request_target` runs untrusted code from forks in a privileged
+  context — never checkout `github.head_ref` and run CI steps with secrets.
+
+  **Option C — Accept the limitation and skip required checks for fork PRs:**
+  Add a job that conditionally creates a passing check run for the expected context
+  when `pull_requests` is empty, signaling that fork PR coverage is intentionally
+  not required.
+fix_code:
+  - language: yaml
+    label: "Resolve true PR head SHA via API for fork PRs — then post check run to correct SHA"
+    code: |
+      jobs:
+        post-coverage-gate:
+          runs-on: ubuntu-latest
+          permissions:
+            checks: write
+            actions: read
+          steps:
+            - name: Resolve PR head SHA (works for both fork and same-repo PRs)
+              id: resolve-sha
+              uses: actions/github-script@v7
+              env:
+                HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+                HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+                HEAD_REPO_OWNER: ${{ github.event.workflow_run.head_repository.owner.login }}
+              with:
+                script: |
+                  // Try pull_requests[] first (populated for same-repo PRs only)
+                  const prs = context.payload.workflow_run.pull_requests;
+                  if (prs && prs.length > 0) {
+                    core.setOutput('sha', prs[0].head.sha);
+                    return;
+                  }
+                  // Fork PR: pull_requests[] is empty; resolve via API
+                  const headBranch = process.env.HEAD_BRANCH;
+                  const headOwner = process.env.HEAD_REPO_OWNER;
+                  const { data: openPRs } = await github.rest.pulls.list({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    state: 'open',
+                    head: `${headOwner}:${headBranch}`,
+                  });
+                  if (openPRs.length > 0) {
+                    core.setOutput('sha', openPRs[0].head.sha);
+                  } else {
+                    // No open PR found — fall back to head_sha (may still be merge commit)
+                    core.setOutput('sha', process.env.HEAD_SHA);
+                  }
+
+            - name: Post coverage check to correct PR head SHA
+              uses: actions/github-script@v7
+              with:
+                script: |
+                  await github.rest.checks.create({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    name: 'Coverage Gate',
+                    head_sha: '${{ steps.resolve-sha.outputs.sha }}',  // correct SHA
+                    status: 'completed',
+                    conclusion: 'success',
+                  });
+
+  - language: yaml
+    label: "Wrong pattern: posting check run to head_sha directly — will land on merge commit, not PR tip"
+    code: |
+      # ❌ head_sha is the synthetic merge commit for fork PRs
+      # Branch protection evaluates required checks against the PR tip, not the merge SHA
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.checks.create({
+              name: 'Coverage Gate',
+              head_sha: context.payload.workflow_run.head_sha,  // ❌ merge commit SHA
+              ...
+            });
+prevention:
+  - "Never assume github.event.workflow_run.pull_requests[] is populated — it is always empty for fork PRs."
+  - "Always resolve the true PR head SHA via the Pulls API when your workflow_run job posts check runs."
+  - "Test your workflow_run gate with a fork PR, not just same-repo PRs — they behave differently."
+  - "Document in the workflow comment that pull_requests[] is empty for forks and head_sha may be a merge commit."
+  - "Consider using workflow_run only for posting check status and use artifacts for data transfer — not for re-checkout."
+docs:
+  - url: "https://github.com/actions/runner/issues/3444"
+    label: "runner#3444: workflow_run triggered by fork PR lacks pull_requests[] in payload (closed not_planned)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run"
+    label: "GitHub Docs: workflow_run trigger — security and payload differences for forks"
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions#accessing-secrets"
+    label: "GitHub Docs: Security hardening — workflow_run and fork PR access patterns"
+  - url: "https://github.com/jaegertracing/jaeger/commit/ca454134f4291a7703c9ebcdead3fe1ee9ad6e39"
+    label: "jaegertracing/jaeger: fix check runs posted to wrong SHA via workflow_run (Apr 2026)"
