@@ -1,0 +1,123 @@
+id: silent-failures-125
+title: 'github.ref returns empty string in release-triggered workflows; use github.event.release.tag_name instead'
+category: silent-failures
+severity: silent-failure
+tags:
+  - release
+  - github-context
+  - github-ref
+  - tag
+  - triggers
+  - regression
+patterns:
+  - regex: 'github\.ref.*\$\{\{\s*github\.ref\s*\}\}.*release|release.*\$\{\{\s*github\.ref\s*\}\}'
+    flags: 'i'
+  - regex: 'if \[\[ "" == refs/tags/'
+    flags: 'i'
+  - regex: 'github\.ref.*=="".*release|echo "".*release'
+    flags: 'i'
+error_messages:
+  - "::error ::Could not determine the version number using ref "
+  - "if [[ \"\" == refs/tags/release/* ]]"
+  - "cut: echo  | cut -c5-"
+root_cause: |
+  When a workflow is triggered by an `on: release:` event, the `github.ref` context
+  variable is expected to contain the full ref of the tag associated with the release
+  (e.g., `refs/tags/v1.2.3`). However, a regression introduced around runner v2.308.0
+  causes `github.ref` to evaluate to an **empty string** for release-triggered
+  workflows, even though the release event DID fire correctly.
+
+  This is a silent failure because:
+  - The workflow triggers correctly (no missed trigger)
+  - No explicit error is thrown about `github.ref` being empty
+  - Steps that use `${{ github.ref }}` in shell scripts receive an empty string
+  - Logic that parses the version from the ref (e.g., `echo ${{ github.ref }} | cut`)
+    silently produces empty output, potentially causing downstream steps to fail with
+    confusing errors rather than pointing to the root cause
+
+  The issue is documented in actions/runner#2788 and related GitHub Community
+  discussions (#64528, #64817) and remains open as of 2026.
+
+  **Safe alternatives** for accessing tag/version information in release workflows:
+  - `github.event.release.tag_name` — the tag name string (e.g., `v1.2.3`)
+  - `github.event.release.name` — the release title
+  - `github.ref_name` — short ref name (tag name without `refs/tags/` prefix)
+
+  Note: `github.ref_name` may also be affected by the same regression. Use
+  `github.event.release.tag_name` as the most reliable source for release tag info.
+fix: |
+  Replace all uses of `${{ github.ref }}` in release-triggered workflows with
+  `${{ github.event.release.tag_name }}` for the tag name, or
+  `refs/tags/${{ github.event.release.tag_name }}` if the full ref format is needed.
+
+  Also replace `${{ github.ref_name }}` with `${{ github.event.release.tag_name }}`
+  in release workflows as a precaution, since ref_name derives from ref.
+fix_code:
+  - language: yaml
+    label: 'BROKEN — uses github.ref which may be empty for release events'
+    code: |
+      on:
+        release:
+          types: [published]
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Extract version
+              run: |
+                # PROBLEM: github.ref may be "" in release-triggered workflows
+                VERSION=$(echo "${{ github.ref }}" | sed 's|refs/tags/||')
+                echo "Deploying version: $VERSION"
+                # Silently deploys empty version string
+  - language: yaml
+    label: 'FIXED — use github.event.release.tag_name for reliable tag access'
+    code: |
+      on:
+        release:
+          types: [published]
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Extract version
+              run: |
+                # CORRECT: event payload is not affected by the regression
+                VERSION="${{ github.event.release.tag_name }}"
+                echo "Deploying version: $VERSION"
+                # Also works for constructing the full ref:
+                FULL_REF="refs/tags/${{ github.event.release.tag_name }}"
+  - language: yaml
+    label: 'Defensive guard — fail fast if tag is empty'
+    code: |
+      on:
+        release:
+          types: [published]
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Validate release tag
+              run: |
+                TAG="${{ github.event.release.tag_name }}"
+                if [[ -z "$TAG" ]]; then
+                  echo "::error::Release tag is empty — cannot deploy"
+                  exit 1
+                fi
+                echo "TAG=$TAG" >> $GITHUB_ENV
+prevention:
+  - "In release-triggered workflows, always use `github.event.release.tag_name` instead of `github.ref` for the release tag."
+  - "Never parse `github.ref` with `cut` or `sed` to extract a version in release workflows — use the structured event payload instead."
+  - "Add a validation step that fails fast if the tag is empty: `if [[ -z \"$TAG\" ]]; then exit 1; fi`."
+  - "Audit all `on: release:` workflows for `${{ github.ref }}` usage and replace with `${{ github.event.release.tag_name }}`."
+docs:
+  - url: 'https://github.com/actions/runner/issues/2788'
+    label: 'actions/runner#2788 — github.ref is empty for workflows triggered by release (65 reactions, open)'
+  - url: 'https://github.com/orgs/community/discussions/64528'
+    label: 'GitHub Community — github.ref empty in release workflows'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#release'
+    label: 'release event — Events that trigger workflows'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context'
+    label: 'github context — Contextual information'
