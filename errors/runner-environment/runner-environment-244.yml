@@ -1,0 +1,136 @@
+id: runner-environment-244
+title: 'macOS 26 — iOS/watchOS/tvOS 26.0 simulator runtimes removed when Xcode 26.4 GA deployed'
+category: runner-environment
+severity: error
+tags:
+  - macos-26
+  - xcode
+  - ios-simulator
+  - simulator-runtime
+  - xcodebuild
+  - runtime-removed
+  - runner-image-update
+patterns:
+  - regex: 'Unable to find a destination matching the provided destination specifier.*OS:26\.0[^.]'
+    flags: 'i'
+  - regex: 'Unable to boot.*Simulator.*26\.0[^.].*unavailable|The destination.*iOS.*26\.0[^.].*not available'
+    flags: 'i'
+  - regex: 'Could not find a simulator runtime for.*26\.0[^.]|No matching destinations for.*OS.*26\.0'
+    flags: 'i'
+  - regex: 'simulator.*OS=26\.0[^.][^0-9].*not found|destination.*platform=iOS Simulator.*OS:26\.0[^.].*unavailable'
+    flags: 'i'
+error_messages:
+  - "xcodebuild: error: Unable to find a destination matching the provided destination specifier: { platform:iOS Simulator, OS:26.0 }"
+  - "Unable to boot the Simulator. The request to boot 'iOS 26.0 Simulator' was denied because the destination is incompatible with this version of Xcode."
+  - "Could not find a simulator runtime for 'iOS 26.0'"
+  - "No matching destinations for { platform:iOS Simulator, OS:26.0 }"
+root_cause: |
+  On April 1, 2026, GitHub merged runner-images PR #13875 which moved Xcode 26.4 from Release
+  Candidate to GA on `macos-26` and `macos-26-arm64` runner images. As part of this change:
+
+  - **Added:** iOS 26.4, watchOS 26.4, tvOS 26.4, visionOS 26.4 simulator runtimes
+  - **Removed:** iOS 26.0.1, watchOS 26.0.1, tvOS 26.0.1, visionOS 26.0.1 simulator runtimes
+
+  GitHub Actions images support **at most three runtime sets per Xcode** due to disk space
+  constraints (documented in macos-15-xcode-simulator-sdk-policy.yml). When a new runtime set
+  is added, the oldest is removed.
+
+  **Affected workflows:**
+  - Workflows that pin `OS:26.0` in xcodebuild `-destination` strings (e.g.,
+    `-destination 'platform=iOS Simulator,name=iPhone 16,OS=26.0'`)
+  - Workflows using `xcrun simctl list runtimes` that previously found `iOS 26.0` and now
+    find only `iOS 26.2` and `iOS 26.4` (or later versions)
+  - `fastlane scan` or similar tools configured with a hardcoded iOS 26.0 simulator target
+  - Any tooling that generates test matrices including `iOS 26.0` destinations
+
+  Simulator runtimes **currently available** on macos-26 after the April 1 change:
+  - iOS 26.2 + watchOS 26.2 + tvOS 26.2 + visionOS 26.2
+  - iOS 26.4 + watchOS 26.4 + tvOS 26.4 + visionOS 26.4
+  (The exact installed runtimes change with each Xcode GA deployment. Always check the runner
+  image Readme for the current set.)
+
+  Source: actions/runner-images PR #13875 (merged April 1, 2026), runner-images#13853
+fix: |
+  **Option 1 — Update destination to use an available runtime version:**
+  Replace `OS:26.0` with `OS:26.4` (or `latest-available`) in xcodebuild destination strings.
+  Pin to a specific available version to avoid future breakage.
+
+  **Option 2 — Use `latest-available` as the OS version:**
+  Some xcodebuild invocations accept `OS:latest-available` as the OS specifier, which picks
+  the newest installed runtime matching the platform. This avoids hard-coding a version.
+
+  **Option 3 — Use the maxim-lobanov/setup-ios-simulator action:**
+  This action can download and install a specific simulator runtime on demand, decoupling
+  your workflow from what is pre-installed on the runner image.
+
+  **Option 4 — Query available runtimes at runtime and select dynamically:**
+  Use `xcrun simctl list runtimes` to discover what is installed before running tests, then
+  construct the `-destination` argument from the actual available runtimes.
+fix_code:
+  - language: yaml
+    label: 'Update destination to latest available simulator runtime'
+    code: |
+      jobs:
+        test-ios:
+          runs-on: macos-26
+          steps:
+            - uses: actions/checkout@v4
+
+            - uses: maxim-lobanov/setup-xcode@v1
+              with:
+                xcode-version: 'latest-stable'
+
+            # Wrong — iOS 26.0 runtime no longer installed:
+            # - run: xcodebuild test -scheme MyApp
+            #            -destination 'platform=iOS Simulator,name=iPhone 16,OS=26.0'
+
+            # Correct — use an installed runtime version:
+            - name: Run iOS tests
+              run: |
+                xcodebuild test \
+                  -scheme MyApp \
+                  -destination 'platform=iOS Simulator,name=iPhone 16,OS=26.4'
+
+  - language: yaml
+    label: 'Use latest-available OS version to avoid future runtime removals'
+    code: |
+      # latest-available picks the newest installed runtime automatically:
+      steps:
+        - name: Run iOS tests
+          run: |
+            xcodebuild test \
+              -scheme MyApp \
+              -destination 'platform=iOS Simulator,name=iPhone 16,OS=latest-available'
+
+  - language: yaml
+    label: 'Discover installed simulator runtimes before running tests'
+    code: |
+      # Add a diagnostic step to see what runtimes are available:
+      steps:
+        - name: List installed simulator runtimes
+          run: xcrun simctl list runtimes
+
+        # Example output after April 2026:
+        # == Runtimes ==
+        # iOS 26.2 (26.2) - com.apple.CoreSimulator.SimRuntime.iOS-26-2
+        # iOS 26.4 (26.4) - com.apple.CoreSimulator.SimRuntime.iOS-26-4
+        # watchOS 26.2 ...
+        # (iOS 26.0 is NO LONGER listed)
+
+        - name: Run tests against iOS 26.4
+          run: |
+            xcodebuild test \
+              -scheme MyApp \
+              -destination 'platform=iOS Simulator,name=iPhone 16,OS=26.4'
+prevention:
+  - 'Never hardcode specific iOS/watchOS/tvOS simulator runtime version numbers in xcodebuild destination strings — use OS:latest-available or dynamically query installed runtimes.'
+  - 'Check the macOS runner image Readme before each Xcode GA update to verify which simulator runtime sets are installed: https://github.com/actions/runner-images/blob/main/images/macos/macos-26-arm64-Readme.md'
+  - 'Subscribe to runner-images announcements and PRs that add new Xcode GA versions — they always remove the oldest simulator runtime set.'
+  - 'If you need to test against a specific older runtime, use maxim-lobanov/setup-ios-simulator to download it on demand rather than relying on pre-installed runtimes.'
+docs:
+  - url: 'https://github.com/actions/runner-images/pull/13875'
+    label: 'runner-images PR #13875 — Xcode 26.4 GA: added 26.4 runtimes, removed 26.0.1 runtimes'
+  - url: 'https://github.com/actions/runner-images/issues/13853'
+    label: 'runner-images#13853 — macos-26-arm64 Xcode 26.4 RC missing iOS 26.4 simulator runtime'
+  - url: 'https://github.com/actions/runner-images/blob/main/images/macos/macos-26-arm64-Readme.md'
+    label: 'macOS 26 arm64 runner image Readme — installed simulators section'
