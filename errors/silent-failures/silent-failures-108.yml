@@ -1,0 +1,108 @@
+id: silent-failures-108
+title: 'Service container entrypoint: key silently clears Dockerfile CMD — Docker Compose semantics differ from Docker CLI'
+category: silent-failures
+severity: silent-failure
+tags:
+  - service-container
+  - docker
+  - entrypoint
+  - command
+  - docker-compose
+  - breaking-change
+  - april-2026
+patterns:
+  - regex: 'service.*container.*unhealthy|health.*check.*failed.*service'
+    flags: 'i'
+  - regex: 'Connection refused.*service|service.*port.*not.*reachable'
+    flags: 'i'
+  - regex: 'exec.*not.*enough.*arguments|usage:.*\[command\].*\[args\]'
+    flags: 'i'
+error_messages:
+  - 'Error: Service container failed health check after entrypoint override'
+  - 'Connection refused: service port not accepting connections'
+  - 'exec: not enough arguments — entrypoint launched without expected CMD'
+root_cause: |
+  GitHub Actions added explicit `entrypoint` and `command` keys for service containers
+  in the Early April 2026 update. These keys use **Docker Compose semantics**, which
+  differ from Docker CLI semantics in one critical way:
+
+  **Docker CLI** (`docker run --entrypoint /wrapper.sh image`):
+  - Overrides the image ENTRYPOINT
+  - **Keeps** the image CMD from the Dockerfile
+
+  **Docker Compose** / GitHub Actions `services.<name>.entrypoint` key:
+  - Overrides the image ENTRYPOINT
+  - **Clears the image CMD** — the container starts with no CMD arguments
+
+  This means that if a developer specifies only `entrypoint:` in a service container
+  (to wrap or replace the image's startup script) and does not also specify `command:`,
+  the container runs the new entrypoint with no arguments. For images that require CMD
+  arguments to function (e.g., a PostgreSQL image running `postgres`, a Redis image
+  running `redis-server`), the container may exit immediately, enter an error loop, or
+  start in a degraded mode.
+
+  The failure is silent because:
+  - The container may still pass a health check if it starts at all
+  - The job continues even if the service is in an unexpected state
+  - No GitHub Actions error is emitted for CMD mismatch
+
+  Example: migrating from `options: --entrypoint /wrapper.sh` (which preserved CMD)
+  to `entrypoint: /wrapper.sh` (which clears CMD) silently changes the container's
+  startup behaviour.
+fix: |
+  Always specify `command:` alongside `entrypoint:` in service container configuration
+  to explicitly provide the CMD arguments that the original Dockerfile would have
+  passed. Do not assume entrypoint-only overrides will inherit the Dockerfile CMD.
+
+  To preserve the original image's CMD, look up the image's Dockerfile CMD
+  (e.g., via `docker inspect <image> --format '{{.Config.Cmd}}'`) and replicate
+  it in the `command:` key.
+fix_code:
+  - language: yaml
+    label: 'Broken — entrypoint only, silently clears CMD (Docker Compose semantics)'
+    code: |
+      services:
+        db:
+          image: postgres:16
+          # WRONG: entrypoint alone clears the Dockerfile CMD ["postgres"]
+          # The container starts /wrapper.sh with no arguments — postgres never runs
+          entrypoint: /wrapper.sh
+
+  - language: yaml
+    label: 'Fixed — specify command: to preserve the intended CMD arguments'
+    code: |
+      services:
+        db:
+          image: postgres:16
+          env:
+            POSTGRES_PASSWORD: test
+          # Wrap the entrypoint AND preserve the original CMD
+          entrypoint: /wrapper.sh
+          command: ["postgres"]  # explicit CMD to preserve what Dockerfile would pass
+
+  - language: yaml
+    label: 'Alternative — use options: --entrypoint if you want to keep Dockerfile CMD'
+    code: |
+      services:
+        db:
+          image: postgres:16
+          env:
+            POSTGRES_PASSWORD: test
+          # Legacy approach: Docker CLI semantics — preserves Dockerfile CMD automatically
+          options: >-
+            --entrypoint /wrapper.sh
+            --health-cmd "pg_isready -U postgres"
+            --health-interval 5s
+
+prevention:
+  - 'When using the new entrypoint: key on a service container, always pair it with an explicit command: key — never rely on the Dockerfile CMD being inherited.'
+  - 'If migrating from options: --entrypoint to the new entrypoint: key, remember that the options: approach preserved CMD while the new key does not.'
+  - 'Test service container health immediately after adding entrypoint: overrides — a passing health check may mask CMD loss if the entrypoint script does not require CMD arguments.'
+  - 'Run docker inspect <image> --format "{{.Config.Cmd}}" locally to discover what CMD values the Dockerfile sets before overriding entrypoint in CI.'
+docs:
+  - url: 'https://github.blog/changelog/2026-04-02-github-actions-early-april-2026-updates/#customizing-entrypoints-for-service-containers'
+    label: 'GitHub Changelog: Customizing entrypoints for service containers (April 2026)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idservicesservice_identrypoint'
+    label: 'GitHub Docs: jobs.<id>.services.<id>.entrypoint syntax'
+  - url: 'https://docs.docker.com/compose/compose-file/05-services/#entrypoint'
+    label: 'Docker Compose docs: entrypoint key clears CMD'

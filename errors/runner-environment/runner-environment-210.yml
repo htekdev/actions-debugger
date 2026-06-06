@@ -1,0 +1,105 @@
+id: runner-environment-210
+title: 'Runner step-log and summary uploads silently stall behind egress-only firewall — .NET BlobClient ignores HTTPS_PROXY'
+category: runner-environment
+severity: silent-failure
+tags:
+  - proxy
+  - https-proxy
+  - blob-storage
+  - self-hosted
+  - egress-firewall
+  - logs-missing
+  - azure-blob
+patterns:
+  - regex: 'productionresultssa\d+\.blob\.core\.windows\.net'
+    flags: 'i'
+  - regex: 'ua=azsdk-net-Storage\.Blobs.*latency=[0-9]{2,3}\.'
+    flags: 'i'
+  - regex: 'step summary.*not.*available|summary.*upload.*failed|diagnostic.*log.*missing'
+    flags: 'i'
+error_messages:
+  - 'Step logs not visible in Actions UI — log upload stalled silently'
+  - 'Job completed but step summary is blank or missing'
+  - 'latency=74.999634s  ua=azsdk-net-Storage.Blobs/12.27.0 (.NET 8.0)'
+  - 'host=productionresultssa6.blob.core.windows.net:443  latency=74.99s'
+root_cause: |
+  The GitHub Actions runner process (v2.333.1 and earlier) creates Azure SDK
+  `BlobClient` instances for uploading step logs, workflow summaries, and diagnostic
+  logs without configuring an `HttpClientTransport` that honours the `HTTPS_PROXY`
+  environment variable.
+
+  In `ResultsHttpClient.cs`, the `GetBlobClient()` and `GetAppendBlobClient()` methods
+  pass only retry/timeout options to `BlobClientOptions` — no `Transport`. The Azure SDK
+  therefore falls back to its internal default HTTP pipeline, which does **not** inherit
+  the runner's `RunnerWebProxy` configuration.
+
+  The impact differs depending on network topology:
+
+  - **Without an egress firewall**: The runner's BlobClient connects directly to
+    `*.blob.core.windows.net` and `*.actions.githubusercontent.com`, bypassing the
+    proxy entirely. Direct egress works, so no error is visible.
+
+  - **With a deny-all egress firewall (proxy-only)**:  The BlobClient attempts a direct
+    connection that the firewall silently drops. Each attempt stalls for ~75 seconds
+    (the TCP connect timeout), then times out. Since log uploads are non-fatal, the job
+    eventually completes — but step logs are absent from the Actions UI and the job
+    takes 5–15 minutes longer than expected.
+
+  This is separate from the `upload-artifact@v6` proxy CONNECT-headers regression
+  (re-208), which affects the Node.js artifact upload path.
+fix: |
+  Add the Azure Blob Storage and Actions results endpoints to the `NO_PROXY` (or
+  `no_proxy`) environment variable so the runner bypasses the proxy for those hosts
+  and connects to them directly.
+
+  This requires that the runner's egress firewall allows direct connections to
+  `*.blob.core.windows.net` and `results-receiver.actions.githubusercontent.com`.
+  If only proxy egress is available, the workaround is to configure the proxy to
+  pass through those hosts without TLS inspection.
+
+  A proper fix (runner-side, not yet released): the `BlobClientOptions.Transport` in
+  `ResultsHttpClient.cs` should be configured with an `HttpClientTransport` wrapping
+  the runner's `RunnerWebProxy` — tracked in actions/runner#4351.
+fix_code:
+  - language: yaml
+    label: 'Self-hosted runner — set NO_PROXY to bypass proxy for Azure Blob endpoints'
+    code: |
+      # Set at the OS level or in the runner's .env file before starting the runner service.
+      # This allows the BlobClient to connect directly while other traffic goes through the proxy.
+      #
+      # On Linux/macOS (add to /etc/environment or runner startup script):
+      # NO_PROXY=.blob.core.windows.net,.actions.githubusercontent.com,results-receiver.actions.githubusercontent.com
+      #
+      # In a workflow (if runner is ephemeral and you can set env per job):
+      jobs:
+        build:
+          runs-on: self-hosted
+          env:
+            HTTPS_PROXY: http://proxy.corp.example.com:3128
+            NO_PROXY: '.blob.core.windows.net,.actions.githubusercontent.com,results-receiver.actions.githubusercontent.com'
+          steps:
+            - uses: actions/checkout@v4
+            - run: echo "Logs will upload correctly now"
+  - language: yaml
+    label: 'ARC / Kubernetes — set NO_PROXY in RunnerDeployment or RunnerScaleSet'
+    code: |
+      apiVersion: actions.summerwind.dev/v1alpha1
+      kind: RunnerDeployment
+      spec:
+        template:
+          spec:
+            env:
+              - name: HTTPS_PROXY
+                value: http://proxy.corp.example.com:3128
+              - name: NO_PROXY
+                value: '.blob.core.windows.net,.actions.githubusercontent.com,results-receiver.actions.githubusercontent.com'
+prevention:
+  - 'When deploying self-hosted runners behind a forward proxy with deny-all egress, always set NO_PROXY to include Azure Blob Storage endpoints — the runner BlobClient does not inherit HTTPS_PROXY.'
+  - 'Monitor Actions step log visibility alongside job exit codes — missing logs with a successful exit often indicate a proxy or network configuration issue, not a code failure.'
+  - 'Run a proxy connectivity diagnostic on a new runner host: confirm .blob.core.windows.net is reachable (directly or via proxy) before routing real workloads to it.'
+  - 'Track actions/runner#4351 for a first-party fix that configures the BlobClient transport to use the runner proxy settings.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4351'
+    label: 'actions/runner #4351 — BlobClient uploads stall through HTTPS proxy (Apr 2026)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/using-a-proxy-server-with-self-hosted-runners'
+    label: 'GitHub Docs: Using a proxy server with self-hosted runners'
