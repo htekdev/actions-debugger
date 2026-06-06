@@ -1,0 +1,149 @@
+id: concurrency-timing-063
+title: "push trigger on merge queue branch cancels merge_group CI run — PR evicted from queue"
+category: concurrency-timing
+severity: error
+tags:
+  - merge-queue
+  - merge_group
+  - push
+  - concurrency
+  - cancel-in-progress
+  - eviction
+  - gh-readonly-queue
+patterns:
+  - regex: 'gh-readonly-queue/.+/pr-\d+'
+    flags: 'i'
+  - regex: 'Run was cancelled.*merge.group\|merge.group.*run.*cancelled'
+    flags: 'i'
+  - regex: 'cancel-in-progress.*merge_group\|merge_group.*cancel-in-progress.*true'
+    flags: 'i'
+error_messages:
+  - "Run was cancelled"
+  - "This check was cancelled"
+  - "Required check 'CI' failed — cancelled by a newer run"
+  - "Pull request was removed from the merge queue because a required check failed"
+root_cause: |
+  When a workflow handles BOTH `on: push:` and `on: merge_group:` triggers AND uses a
+  shared concurrency group with `cancel-in-progress: true`, adding a PR to the merge
+  queue fires TWO concurrent workflow runs from the same commit SHA:
+
+  1. The `merge_group:` trigger fires for the CI gate check (expected behavior).
+  2. The `push:` trigger ALSO fires because GitHub pushes the temporary merge branch
+     (`gh-readonly-queue/<base>/<pr-SHA>`) to the repository as part of the merge queue
+     mechanism. This push event matches the existing `on: push:` trigger.
+
+  Both runs share the same concurrency group (e.g., based on `github.ref` or
+  `github.workflow + github.ref`). With `cancel-in-progress: true`, the second run to
+  start cancels the first. The cancelled run's required check status is reported as
+  "cancelled" (which GitHub treats as a failure), and the merge queue evicts the PR.
+
+  **Why this is confusing:**
+  - The workflow appears to work correctly for regular pull_request events (all checks
+    pass and PRs merge normally without the merge queue).
+  - The failure only manifests when the merge queue is enabled as a branch protection
+    requirement — developers often don't notice until after enabling it.
+  - The cancelled run may appear to be a random transient failure rather than a
+    systematic configuration problem.
+  - Some PRs may succeed (if the merge_group run finishes before the push run starts
+    and acquires the concurrency slot) while others fail, making the issue appear
+    intermittent.
+
+  Source: https://github.com/scratchfoundation/understand-gha-triggers (Feb 2025)
+  Source: https://github.com/ponder-lab/ML/commit/92436f59b6a5b076ba3c0bddf9c2c5d1a199fcdc (May 2026 fix)
+fix: |
+  **Option A (recommended):** Add `branches-ignore: ['gh-readonly-queue/**']` to the
+  `push:` trigger so that pushes to merge queue branches bypass the `push` trigger
+  entirely and route only through `merge_group:`. This eliminates the duplicate run.
+
+  **Option B:** Scope `cancel-in-progress` so it never fires for `merge_group` events.
+  Use a conditional expression that evaluates to `false` for merge_group events.
+
+  **Option C:** Use a unique concurrency group for merge_group events (e.g., keyed on
+  the merge group head SHA) so it never collides with the push-triggered run's group.
+fix_code:
+  - language: yaml
+    label: "Recommended fix: exclude gh-readonly-queue branches from push trigger"
+    code: |
+      on:
+        push:
+          branches:
+            - main
+          branches-ignore:
+            # Prevent push events on merge queue temp branches from duplicating
+            # the merge_group CI run and evicting PRs from the queue.
+            - 'gh-readonly-queue/**'
+        merge_group:
+        pull_request:
+          branches:
+            - main
+
+      concurrency:
+        group: CI-${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: true
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm ci && npm test
+
+  - language: yaml
+    label: "Alternative fix: disable cancel-in-progress for merge_group events"
+    code: |
+      on:
+        push:
+          branches: [main]
+        merge_group:
+        pull_request:
+          branches: [main]
+
+      concurrency:
+        group: CI-${{ github.workflow }}-${{ github.ref }}
+        # Cancel in-progress for push/pull_request, but NEVER for merge_group.
+        # Cancelling a merge_group run marks the required check as failed and
+        # evicts the PR from the merge queue.
+        cancel-in-progress: ${{ github.event_name != 'merge_group' }}
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm ci && npm test
+
+  - language: yaml
+    label: "Wrong: shared concurrency group evicts PRs from merge queue"
+    code: |
+      # This configuration causes intermittent PR eviction from the merge queue:
+      on:
+        push:
+          branches: [main]    # Also fires on gh-readonly-queue/main/* branches!
+        merge_group:          # Fires for CI gate check
+        pull_request:
+          branches: [main]
+
+      concurrency:
+        group: CI-${{ github.ref }}
+        cancel-in-progress: true  # Kills the merge_group run when push fires!
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - run: npm test
+prevention:
+  - "Always add 'branches-ignore: [gh-readonly-queue/**]' to any push: trigger on a repo that uses merge queues."
+  - "Never use 'cancel-in-progress: true' unconditionally on workflows that handle merge_group events — use a conditional expression instead."
+  - "When enabling merge queue on a branch, audit all required-check workflows for push+merge_group trigger combinations."
+  - "Test merge queue behavior in a staging branch before enabling it on a protected main branch."
+  - "See also: concurrency-timing-017 (cancel-in-progress cascading within the merge queue itself)."
+docs:
+  - url: "https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue"
+    label: "GitHub Docs: Managing a merge queue"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/events-that-trigger-workflows#merge_group"
+    label: "GitHub Docs: merge_group event — temp branch naming and event payload"
+  - url: "https://github.com/scratchfoundation/understand-gha-triggers"
+    label: "scratchfoundation/understand-gha-triggers: Push+merge_group race condition analysis (Feb 2025)"
+  - url: "https://github.com/ponder-lab/ML/commit/92436f59b6a5b076ba3c0bddf9c2c5d1a199fcdc"
+    label: "ponder-lab/ML: Real-world fix — add branches-ignore: gh-readonly-queue/** to push trigger (May 2026)"
