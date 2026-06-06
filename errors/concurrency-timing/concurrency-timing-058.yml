@@ -1,0 +1,121 @@
+id: concurrency-timing-058
+title: "concurrency queue:max 100-Slot Overflow Silently Cancels the Oldest Pending Run"
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - queue-max
+  - silent-cancel
+  - pending
+  - overflow
+  - deployment
+patterns:
+  - regex: 'queue.*max|queue:.*max'
+    flags: 'i'
+  - regex: 'This run was cancelled|run.*cancelled'
+    flags: 'i'
+error_messages:
+  - "This run was cancelled."
+  - "Run was cancelled."
+root_cause: |
+  GitHub Actions concurrency queue:max allows up to 100 workflow runs or jobs
+  to wait in a single concurrency group instead of being cancelled immediately.
+  When the 100-slot queue is already full and a new run arrives, the oldest
+  pending run in the queue is silently cancelled to make room.
+
+  The cancelled run shows "This run was cancelled." in the UI with no
+  indication that the cancellation was caused by queue overflow. This message
+  is identical to normal concurrency cancel-in-progress cancellations, making
+  it impossible to distinguish overflow cancellation from intentional
+  cancellation without additional observability.
+
+  This problem surfaces when:
+  - A pipeline is slower than the push rate (runs queue faster than they drain)
+  - A burst of commits or tags fires many workflow runs simultaneously
+  - A monorepo path filter causes many unrelated commits to all queue in the
+    same deployment concurrency group
+  - A workflow is accidentally triggered on every push to any branch and all
+    share a single production-deploy concurrency group
+
+  Note: queue:max and cancel-in-progress:true cannot be combined (validation
+  error). queue:max assumes you want all runs to eventually execute in order.
+fix: |
+  queue:max with 100 slots is generous for most pipelines. If you are hitting
+  the overflow limit, the queue depth is a symptom of a throughput mismatch:
+
+  1. Speed up the job so the queue drains faster than it fills. Profile and
+     optimize the slowest steps (build caching, parallelism inside the job).
+
+  2. Narrow the trigger to reduce unnecessary queuing:
+     - Use paths: filters so only relevant changes trigger the workflow
+     - Only trigger on specific branches (main, release/*) not all branches
+     - Use workflow_dispatch for on-demand deploys instead of automatic pushes
+
+  3. Split into multiple concurrency groups scoped per environment or service
+     component. Each group has its own 100-slot limit, distributing capacity
+     across workloads.
+
+  4. If strict ordering is not required and drops are acceptable, switch back
+     to queue:single (the default) with cancel-in-progress:false so only one
+     pending run is kept, avoiding the 100-slot limit entirely.
+fix_code:
+  - language: yaml
+    label: "queue:max — silently cancels oldest pending run when >100 queued"
+    code: |
+      on:
+        push:
+          branches: ['**']  # Triggers on every push to every branch
+
+      concurrency:
+        group: production-deploy     # All branches share ONE slot — queue fills fast
+        queue: max                   # Up to 100 queued; 101st silently cancels the 1st
+
+  - language: yaml
+    label: "Fixed — scope concurrency group per environment + narrow push trigger"
+    code: |
+      on:
+        push:
+          branches:
+            - main
+            - 'release/**'
+
+      concurrency:
+        # Each environment gets its own 100-slot queue
+        group: deploy-${{ github.event.deployment.environment || 'staging' }}-${{ github.ref_name }}
+        queue: max
+
+  - language: yaml
+    label: "Fixed — add observability step to detect queue overflow"
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          concurrency:
+            group: production-deploy
+            queue: max
+          steps:
+            - name: Check concurrency queue depth
+              env:
+                GH_TOKEN: ${{ github.token }}
+              run: |
+                PENDING=$(gh api \
+                  "repos/${{ github.repository }}/actions/runs?status=waiting&per_page=100" \
+                  --jq '[.workflow_runs[] | select(.name == "${{ github.workflow }}")] | length')
+                echo "Runs currently waiting in concurrency queue: $PENDING"
+                if [ "${PENDING:-0}" -ge 90 ]; then
+                  echo "::warning::Queue near capacity (${PENDING}/100). Oldest run may be dropped on next push."
+                fi
+
+            - name: Deploy
+              run: ./deploy.sh
+prevention:
+  - "Monitor pipeline throughput: if runs consistently back up to 50+ in queue, the job is too slow for the push frequency."
+  - "Narrow workflow triggers with paths: and branches: filters to reduce unnecessary queuing."
+  - "Scope concurrency groups per environment or service to distribute the 100-slot limit across workloads."
+  - "Use queue:max only when strict ordering matters (deployments). For CI checks, cancel-in-progress:true is preferable."
+  - "The combination queue:max and cancel-in-progress:true is a workflow validation error — do not use both."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency"
+    label: "GitHub Docs — Using concurrency (queue:max behavior and 100-slot limit)"
+  - url: "https://docs.github.com/en/actions/reference/limits"
+    label: "GitHub Actions Limits — Concurrency group queue: 100 runs per group"

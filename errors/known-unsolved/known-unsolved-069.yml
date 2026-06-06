@@ -1,0 +1,127 @@
+id: known-unsolved-069
+title: "Matrix Strategy Hard Limit: 256 Jobs Per Workflow Run"
+category: known-unsolved
+severity: error
+tags:
+  - matrix
+  - strategy
+  - job-limit
+  - dynamic-matrix
+  - fromjson
+  - scalability
+patterns:
+  - regex: 'matrix.*generates.*too many|too many.*entries.*matrix'
+    flags: 'i'
+  - regex: 'limited to 256|exceeding.*allowed maximum.*256|256.*jobs.*per.*workflow'
+    flags: 'i'
+error_messages:
+  - "Matrix generates too many entries. Limited to 256."
+root_cause: |
+  GitHub Actions enforces a hard limit of 256 jobs per workflow run across
+  all matrix dimensions. This is calculated as the total Cartesian product of
+  all matrix axes after applying include/exclude entries.
+
+  Common triggers:
+  - Dynamic matrices from fromJSON output that grow over time as new targets
+    are added to a test matrix config file
+  - Multi-dimensional matrices (os x language x version) where the product
+    of all axis sizes exceeds 256
+  - Adding include: entries on top of an already-large base matrix, each
+    include: adds one additional job that counts against the 256 limit
+  - Monorepo CI matrices that test all services x all supported runtimes
+
+  The error fires immediately when the workflow is queued and prevents any
+  jobs from running. GitHub reports the total generated count in the error
+  message: "Matrix generates N entries. Limited to 256."
+
+  This limit applies equally to GitHub-hosted and self-hosted runners and
+  cannot be increased by contacting support.
+fix: |
+  The 256-job-per-run limit is hard and cannot be increased. Options:
+
+  1. Split across multiple workflow files, each handling a subset of targets.
+     Trigger them from a parent coordinator workflow or via separate triggers.
+
+  2. Reduce matrix dimensions: test only meaningful combinations using
+     explicit include: lists rather than full Cartesian products. Not every
+     OS x language x version triplet needs to be tested.
+
+  3. Chunk using workflow_dispatch fan-out: a generator job creates N chunks
+     of at most 256 items and dispatches sub-workflow runs per chunk via
+     repository_dispatch or workflow_dispatch API calls.
+
+  4. Use a single job with a shell loop for some dimensions: instead of
+     separate matrix jobs per version, loop over versions inside one job step.
+     Sacrifices parallelism but avoids the limit entirely.
+fix_code:
+  - language: yaml
+    label: "Broken — Cartesian product silently grows past 256 as versions are added"
+    code: |
+      strategy:
+        matrix:
+          os: [ubuntu-22.04, ubuntu-24.04, windows-2022, macos-14, macos-15]
+          node: [18, 20, 22, 23]
+          python: ['3.9', '3.10', '3.11', '3.12', '3.13']
+          # 5 x 4 x 5 = 100 jobs today — fine, but adding node 24 pushes to 125,
+          # adding python 3.14 pushes to 150, and so on until 256 is silently hit
+
+  - language: yaml
+    label: "Fixed — explicit include list tests only meaningful combinations"
+    code: |
+      strategy:
+        matrix:
+          include:
+            # Test LTS node on primary OS with latest stable Python
+            - os: ubuntu-24.04
+              node: 20
+              python: '3.12'
+            - os: ubuntu-24.04
+              node: 22
+              python: '3.12'
+            # Windows only gets the most recent LTS
+            - os: windows-2022
+              node: 20
+              python: '3.11'
+            # macOS gets one combination
+            - os: macos-15
+              node: 20
+              python: '3.12'
+          # Total: 4 jobs instead of 100+ from full Cartesian product
+
+  - language: yaml
+    label: "Defensive — validate dynamic matrix size before passing to strategy"
+    code: |
+      jobs:
+        generate-matrix:
+          runs-on: ubuntu-latest
+          outputs:
+            matrix: ${{ steps.gen.outputs.matrix }}
+          steps:
+            - id: gen
+              run: |
+                MATRIX=$(cat test-matrix.json)
+                COUNT=$(echo "$MATRIX" | jq '.include | length')
+                if [ "$COUNT" -gt 256 ]; then
+                  echo "::error::Matrix has $COUNT entries (limit: 256). Split into multiple workflows."
+                  exit 1
+                fi
+                echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
+        test:
+          needs: generate-matrix
+          strategy:
+            matrix: ${{ fromJSON(needs.generate-matrix.outputs.matrix) }}
+          runs-on: ${{ matrix.os }}
+          steps:
+            - run: echo "Testing ${{ matrix.os }} / ${{ matrix.version }}"
+prevention:
+  - "Before adding a new matrix axis, calculate the new total job count — it must stay at or below 256."
+  - "For dynamic matrices (fromJSON), validate the output list length in the generator job and fail fast if > 256."
+  - "Prefer explicit include: lists over full Cartesian products when not all dimension combinations are meaningful."
+  - "Monitor matrix job counts over time: a previously-safe matrix silently crosses 256 as new versions are added."
+  - "Document the current job count in a comment next to the matrix block so reviewers notice when PRs push it higher."
+docs:
+  - url: "https://docs.github.com/en/actions/reference/limits"
+    label: "GitHub Actions Limits — Job Matrix: 256 jobs per workflow run"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/running-variations-of-jobs-in-a-workflow"
+    label: "GitHub Docs — Using a matrix for your jobs"
