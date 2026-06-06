@@ -1,0 +1,160 @@
+id: runner-environment-245
+title: 'ARC ephemeral runner pod hangs indefinitely after workflow job cancellation — "Skipping message Job. Job message not found ... job was canceled"'
+category: runner-environment
+severity: error
+tags:
+  - arc
+  - kubernetes
+  - ephemeral-runner
+  - cancellation
+  - stuck-runner
+  - gha-runner-scale-set
+  - job-canceled
+patterns:
+  - regex: 'Skipping message Job\. Job message not found .+ job was canceled'
+    flags: 'i'
+  - regex: 'EphemeralRunner.*status.*Running.*canceled'
+    flags: 'i'
+  - regex: 'Registration .+ was not found\.'
+    flags: 'i'
+  - regex: 'POST request to .+acquirejob failed\. HTTP Status: Conflict'
+    flags: 'i'
+error_messages:
+  - "Skipping message Job. Job message not found 'e420db7b-c780-5ae4-8145-4eea09b87aea'. job was canceled"
+  - "POST request to https://run-actions-*.actions.githubusercontent.com/*/acquirejob failed. HTTP Status: Conflict"
+  - "Registration 470d6c87-f8c4-411f-87d0-6b069233ccc7 was not found."
+root_cause: |
+  When a GitHub Actions workflow job is canceled (manually or by concurrency group
+  cancellation) while an ARC ephemeral runner is in the process of starting up or
+  acquiring the job message, the runner pod enters a broken state:
+
+  1. The broker sends a "job was canceled" message on the runner's job socket.
+  2. The runner logs: "Skipping message Job. Job message not found 'X'. job was canceled"
+  3. **The runner process does not exit** — it waits for a new job message that
+     will never arrive, because ephemeral runners are single-use and the broker
+     considers this runner's slot exhausted.
+  4. The ARC controller sees the EphemeralRunner pod still in `Running` phase with
+     a live runner process. It does NOT delete and recreate the pod.
+  5. The runner slot is held indefinitely. No new job can be dispatched to this slot.
+     Workflows queue but cannot start, consuming queue capacity without making progress.
+
+  **Secondary failure mode**: After the canceled-job hang, the runner may also
+  attempt to re-acquire its registration token. Since the ephemeral runner's
+  registration was already consumed or expired, this fails with:
+  `Registration 'X' was not found.`
+  The BrokerServer then throws repeatedly, producing a growing error log.
+
+  **Impact**: In a scale set with `minRunners > 0`, each canceled job permanently
+  removes one runner slot from the pool until the pod is manually deleted or the
+  scale set is bounced. With frequent cancellations (e.g., PR pushes with concurrency
+  cancel-in-progress), the pool drains completely and CI halts.
+
+  Source: actions/actions-runner-controller#4307 (Nov 2025, 11 reactions, open).
+  Also related: ARC#4468 (scale set queuing delay during burst) — adjacent but distinct.
+fix: |
+  **Option 1 — Delete stuck EphemeralRunner objects manually (immediate relief):**
+  Identify stuck pods — they have been Running for longer than any expected job
+  duration and show "job was canceled" in their logs:
+
+  ```bash
+  kubectl get ephemerals -n arc-runners --sort-by=.metadata.creationTimestamp
+  kubectl logs <stuck-pod-name> -n arc-runners | grep "job was canceled"
+  kubectl delete ephemeralrunner <stuck-pod-name> -n arc-runners
+  ```
+
+  **Option 2 — Add a watchdog sidecar or CronJob to detect and kill stuck runners:**
+  Run a periodic job that identifies EphemeralRunner pods that have been in Running
+  phase beyond `maxRunnerLifetime` and have no active child processes (no build
+  tools, compilers, or test runners as descendants):
+
+  ```bash
+  # Detect hung runners: Running > 30 min with no CPU activity
+  kubectl get ephemerals -n arc-runners -o json | \
+    jq '.items[] | select(.status.phase=="Running") | .metadata.name'
+  ```
+
+  **Option 3 — Configure autoscaling to replace stuck runners via scale-down:**
+  Set `maxRunners` to a value that triggers KEDA scale-down when load is low.
+  Scale-down deletes idle pods, including stuck ones. Ephemeral runners in the
+  "stuck/waiting" state appear idle to KEDA and will be cleaned up on the next
+  scale-down cycle.
+
+  **Option 4 — Use concurrency groups carefully to reduce cancellations:**
+  Each job cancellation risks creating a stuck runner. Reduce cancellation frequency
+  by scoping concurrency groups more narrowly (per-branch rather than per-repo):
+
+  ```yaml
+  concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+  ```
+
+  **Option 5 — Upgrade ARC and runner image:**
+  Track the upstream fix in ARC#4307. Check ARC release notes for a fix to the
+  runner's post-cancellation cleanup path. Ensure runner image is on the latest
+  minor version.
+fix_code:
+  - language: yaml
+    label: 'Kubernetes CronJob watchdog to delete stuck ARC ephemeral runners'
+    code: |
+      apiVersion: batch/v1
+      kind: CronJob
+      metadata:
+        name: arc-runner-watchdog
+        namespace: arc-runners
+      spec:
+        schedule: "*/10 * * * *"
+        jobTemplate:
+          spec:
+            template:
+              spec:
+                serviceAccountName: arc-runner-watchdog-sa
+                containers:
+                  - name: watchdog
+                    image: bitnami/kubectl:latest
+                    command:
+                      - /bin/sh
+                      - -c
+                      - |
+                        TIMEOUT_MINUTES=30
+                        NOW=$(date +%s)
+                        kubectl get ephemeralrunners -n arc-runners -o json | \
+                          jq -r --argjson now "$NOW" --argjson timeout "$((TIMEOUT_MINUTES * 60))" \
+                          '.items[] | select(.status.phase=="Running") |
+                          select(($now - (.metadata.creationTimestamp | fromdateiso8601)) > $timeout) |
+                          .metadata.name' | \
+                          xargs -r -I{} kubectl delete ephemeralrunner {} -n arc-runners
+                restartPolicy: OnFailure
+  - language: yaml
+    label: 'Narrow concurrency groups to reduce job cancellations hitting ARC'
+    code: |
+      name: CI
+      on:
+        push:
+          branches: ['**']
+        pull_request:
+      concurrency:
+        # Scope to branch — only cancels duplicate runs on the same branch,
+        # not across all branches (reduces how often ARC runners get hit by cancellations)
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: true
+      jobs:
+        build:
+          runs-on:
+            group: my-scale-set
+          steps:
+            - uses: actions/checkout@v4
+            - run: make build
+prevention:
+  - "Monitor EphemeralRunner pod ages; any pod in Running phase beyond 2x your longest job duration is likely stuck"
+  - "Use narrow concurrency group scopes (per-branch) to minimize the frequency of job cancellations hitting ARC runners"
+  - "Configure KEDA scale-down (minRunners: 0 during off-hours) to naturally clear stuck runner pods"
+  - "Keep ARC controller and runner image on the latest stable release; the stuck-on-cancel bug has active upstream attention in ARC#4307"
+  - "For high-cancellation workflows (PR push loops), consider using GitHub-hosted runners which handle cancellation cleanup server-side"
+docs:
+  - url: 'https://github.com/actions/actions-runner-controller/issues/4307'
+    label: 'ARC#4307: Ephemeral Runners get stuck when job is canceled or interrupted (11 reactions, open)'
+  - url: 'https://github.com/actions/actions-runner-controller/blob/master/docs/gha-runner-scale-set-controller/README.md'
+    label: 'ARC: GitHub Actions Runner Scale Set documentation'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners-with-actions-runner-controller/troubleshooting-actions-runner-controller-errors'
+    label: 'GitHub Docs: Troubleshooting ARC errors'
