@@ -1,0 +1,93 @@
+id: runner-environment-199
+title: 'Windows self-hosted runner V2 broker listener stops polling after first job (2.334.0)'
+category: runner-environment
+severity: error
+tags:
+  - self-hosted
+  - windows
+  - runner-v2
+  - broker
+  - listener
+  - stuck
+  - message-queue
+  - v2-flow
+patterns:
+  - regex: 'Get messages has been cancelled using local token source\. Continue to get messages with new status'
+    flags: 'i'
+  - regex: 'BrokerMessageListener.*cancel|cancel.*BrokerMessageListener'
+    flags: 'i'
+error_messages:
+  - 'Get messages has been cancelled using local token source. Continue to get messages with new status.'
+root_cause: |
+  On Windows self-hosted runners running v2.334.0 with the V2 broker flow enabled
+  (`useV2Flow: true`, connecting to `broker.actions.githubusercontent.com`), the
+  `BrokerMessageListener` stops issuing GET /message requests after the first job
+  completes and the runner transitions from Busy→Online (idle).
+
+  The root cause is a race condition in the V2 state machine reset path: when the
+  Busy→Online transition fires, the existing `localTokenSource` for the polling loop
+  is cancelled (logging "Get messages has been cancelled using local token source.
+  Continue to get messages with new status."), but the replacement polling loop fails
+  to start due to a missing null-check or async continuation bug on Windows. OAuth
+  token refreshes continue normally (masking the hang — credentials are not the issue),
+  but no new GET /message requests are dispatched.
+
+  The runner UI shows the runner as "Idle" indefinitely. Any jobs queued after the
+  first run sit in "Queued" status and never start until the runner service is manually
+  restarted. The issue is specific to Windows (the identical code path on Linux/macOS
+  appears unaffected) and requires a service start + exactly one job completion to
+  trigger. Reproduced reliably across multiple self-hosted Windows environments.
+
+  Reported against runner v2.334.0, commit f1995ede5d885c997d13d8eca5467c4ce97fe69c.
+  No fix available as of June 2026. Open at actions/runner#4444.
+fix: |
+  Immediate workaround: restart the runner service after each job, or add an automated
+  watchdog that monitors the runner diagnostics log for the stale-listener pattern and
+  triggers a service restart.
+
+  Longer-term: downgrade to runner v2.333.x until actions/runner#4444 is resolved.
+  Check the runner release notes for a fix targeting the V2 BrokerMessageListener
+  state-reset path.
+fix_code:
+  - language: yaml
+    label: 'PowerShell watchdog snippet to restart runner service on listener hang (add to a monitoring script)'
+    code: |
+      # Watchdog: detect stale BrokerMessageListener and restart runner service
+      # Run this as a scheduled task every 5 minutes on the runner host
+
+      $diagDir = "C:\actions-runner\_diag"
+      $logFile = Get-ChildItem $diagDir -Filter "Runner_*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+      $lastMsg = (Get-Content $logFile.FullName -Tail 200 | Select-String "BrokerMessageListener") | Select-Object -Last 1
+
+      # If the last BrokerMessageListener log entry is the cancellation message
+      # and it's more than 10 minutes old, restart the service
+      if ($lastMsg -match "cancelled using local token source") {
+        $entryTime = [datetime]::Parse(($lastMsg -split " ")[0])
+        if ((Get-Date) - $entryTime -gt [TimeSpan]::FromMinutes(10)) {
+          Restart-Service actions.runner.*
+        }
+      }
+  - language: yaml
+    label: 'Pin runner version to 2.333.x in ARC or self-hosted runner config'
+    code: |
+      # For ARC (Actions Runner Controller) — pin runner version in values.yaml
+      githubConfigSecret: pre-defined-secret
+      template:
+        spec:
+          containers:
+            - name: runner
+              env:
+                - name: RUNNER_VERSION
+                  value: "2.333.0"    # Pin below 2.334.0 until #4444 is fixed
+prevention:
+  - "Subscribe to the actions/runner release feed to catch regression fixes; downgrade immediately when a V2-flow listener regression is reported."
+  - "For Windows runner pools, add a service watchdog (Task Scheduler or Prometheus alert) that detects listener staleness via the _diag/Runner_*.log pattern."
+  - "Consider switching to ephemeral JIT runners on Windows — ephemeral runners cannot hit this bug because each runner handles exactly one job then exits."
+  - "Monitor runner queue depth in your autoscaler; an idle runner with > 0 queued jobs is a reliable signal the listener has stalled."
+docs:
+  - url: 'https://github.com/actions/runner/issues/4444'
+    label: 'actions/runner#4444 — Listener stops polling broker after first job (2.334.0, Windows, V2 flow)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners'
+    label: 'About self-hosted runners'
+  - url: 'https://github.com/actions/runner/releases'
+    label: 'Actions Runner release notes'
