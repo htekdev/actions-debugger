@@ -1,0 +1,122 @@
+id: known-unsolved-071
+title: 'Actions cache is repository-scoped — cannot be shared across repositories in the same organization'
+category: known-unsolved
+severity: limitation
+tags:
+  - cache
+  - cross-repo
+  - organization
+  - scope
+  - monorepo
+  - limitation
+  - cache-isolation
+patterns:
+  - regex: 'Cache not found for input keys'
+    flags: 'i'
+  - regex: 'No cache found'
+    flags: 'i'
+error_messages:
+  - 'Cache not found for input keys: ...'
+  - 'No cache found'
+root_cause: |
+  The GitHub Actions cache service scopes all cache entries to the repository where they
+  were created. There is no mechanism to share a cache entry between two different
+  repositories, even within the same organization.
+
+  Cache access rules per the GitHub documentation:
+  - A workflow can restore caches created in the current branch, the default branch (main),
+    or (for pull requests) the base branch including base branches of forks.
+  - "Cross-branch" access is supported within the same repository.
+  - There is NO "cross-repository" access — a cache created in `org/repo-a` is
+    completely invisible to workflows running in `org/repo-b`.
+
+  This affects teams who:
+  - Manage related repositories that share build toolchains (e.g., a shared Go module cache
+    across a dozen microservices).
+  - Have split monorepos where a common library is built separately and cached.
+  - Want to cache a slow Docker layer in one repo and reuse it in a deployment repo.
+
+  The underlying reason is cache isolation as a security boundary: allowing cross-repo
+  cache access could leak build artifacts or credentials stored in the cache between
+  unrelated repositories.
+
+  There is no current GitHub Actions native solution for cross-repo cache sharing. The
+  GitHub roadmap has not publicly committed to this feature as of 2026.
+fix: |
+  There is no built-in fix. Workarounds depend on your use case:
+
+  1. Publish shared artifacts to a package registry (GitHub Packages, npm, PyPI, Docker Hub).
+     Instead of caching, version-tag the shared artifact and consume it as a dependency.
+     This is the recommended approach for shared libraries and Docker base images.
+
+  2. Use a self-hosted runner with a shared filesystem. The runner's local disk or a
+     network share can act as a cross-repo cache. Use the `path:` input of actions/cache
+     pointing to a shared mount. Cache hits and misses are managed manually via key files.
+
+  3. Use a third-party caching backend (S3, GCS, Azure Blob, Artifactory) for build
+     artifacts that must be shared. Upload/download via CLI in workflow steps.
+
+  4. Consolidate the related repositories into a single repository (monorepo).
+     All workflows within the same repo can share cache entries.
+fix_code:
+  - language: yaml
+    label: 'Publish shared Docker base image to GHCR instead of caching across repos'
+    code: |
+      # repo-a: builds and publishes the shared base image
+      jobs:
+        publish-base:
+          runs-on: ubuntu-latest
+          permissions:
+            packages: write
+          steps:
+            - uses: actions/checkout@v4
+            - uses: docker/login-action@v3
+              with:
+                registry: ghcr.io
+                username: ${{ github.actor }}
+                password: ${{ secrets.GITHUB_TOKEN }}
+            - uses: docker/build-push-action@v6
+              with:
+                context: ./base-image
+                push: true
+                tags: ghcr.io/${{ github.repository_owner }}/shared-base:latest
+
+      # repo-b: pulls the published image instead of relying on cache
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          container:
+            image: ghcr.io/myorg/shared-base:latest
+            credentials:
+              username: ${{ github.actor }}
+              password: ${{ secrets.GITHUB_TOKEN }}
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./build.sh
+
+  - language: yaml
+    label: 'Self-hosted runner shared-path cache as a cross-repo workaround'
+    code: |
+      # Both repo-a and repo-b workflows — same self-hosted runner, shared disk at /opt/shared-cache
+      jobs:
+        build:
+          runs-on: [self-hosted, linux, shared-cache]
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/cache@v4
+              with:
+                path: /opt/shared-cache/gradle
+                # Key is independent of the repo — deliberately shared
+                key: gradle-${{ hashFiles('**/*.gradle*') }}
+              # NOTE: This bypasses GitHub's repo-scope isolation.
+              # Ensure the self-hosted runner pool is trusted and isolated.
+            - run: ./gradlew build
+prevention:
+  - 'Design shared build artifacts as versioned dependencies (packages) from the start — avoids cross-repo cache needs entirely.'
+  - 'For Docker base images shared across repos, publish to a registry and reference by digest, not by mutable tags.'
+  - 'When adopting self-hosted runners for cross-repo cache sharing, audit what secrets and artifacts are accessible to all jobs that share the runner to avoid cross-contamination.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows#restrictions-for-accessing-a-cache'
+    label: 'GitHub Docs — Cache access restrictions and scoping'
+  - url: 'https://github.com/actions/cache/blob/main/tips-and-workarounds.md'
+    label: 'actions/cache — Tips and workarounds (cross-branch, cross-OS, but not cross-repo)'

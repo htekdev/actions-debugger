@@ -1,0 +1,143 @@
+id: known-unsolved-072
+title: 'No parallel steps within a single job — all steps execute sequentially'
+category: known-unsolved
+severity: limitation
+tags:
+  - parallel-steps
+  - sequential
+  - performance
+  - job-structure
+  - limitation
+  - roadmap
+patterns:
+  - regex: 'parallel.*steps.*not.*support|steps.*run.*sequentially'
+    flags: 'i'
+error_messages:
+  - 'steps run sequentially — no native parallel step execution within a single job'
+root_cause: |
+  In GitHub Actions, all steps within a single job execute sequentially in the order they
+  are defined. There is no native syntax to declare that two or more steps within the same
+  job should run concurrently.
+
+  This means:
+  - A job that runs `npm install`, `eslint`, and `jest` must run them one after another,
+    even if `eslint` and `jest` are completely independent and could run simultaneously.
+  - A job that runs two independent API calls, file downloads, or build targets must wait
+    for each to complete before starting the next.
+  - The only way to achieve true parallelism in GitHub Actions is to split work across
+    multiple jobs with `needs:` dependencies — but this requires each job to set up its
+    own runner, check out the repository, restore caches, and install dependencies,
+    adding significant overhead for short tasks.
+
+  This is a long-standing community request. GitHub added it to the public roadmap as
+  "Parallel Steps in GitHub Actions" (github/roadmap#1191, GA milestone, 2025).
+
+  Common workarounds add latency (multiple jobs) or complexity (background processes).
+fix: |
+  There is no built-in fix. Workarounds:
+
+  1. Split parallel work into separate jobs using `needs:` and a matrix strategy.
+     Each job adds runner setup overhead (~15-30s), so this is most effective for
+     tasks that take minutes, not seconds.
+
+  2. Run steps as background shell processes and wait for them with `wait` (bash only).
+     This works for independent shell commands that don't need to write to GITHUB_OUTPUT,
+     GITHUB_ENV, or produce step outputs — those mechanisms are not safe for concurrent use.
+
+  3. Use `make -j N` or `./gradlew --parallel` or similar build-tool parallelism within
+     a single shell step. This parallelizes work inside one run: step without needing
+     multiple GitHub Actions steps.
+
+  4. Run a Docker Compose or docker run --detach to start background services, then
+     use a final step to check results.
+fix_code:
+  - language: yaml
+    label: 'Run independent checks in parallel via separate jobs (preferred for long tasks)'
+    code: |
+      jobs:
+        lint:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                node-version: 22
+                cache: npm
+            - run: npm ci
+            - run: npm run lint
+
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                node-version: 22
+                cache: npm
+            - run: npm ci
+            - run: npm test
+
+        type-check:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                node-version: 22
+                cache: npm
+            - run: npm ci
+            - run: npm run typecheck
+
+        # Final gate job waits for all parallel checks
+        ci-complete:
+          needs: [lint, test, type-check]
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "All checks passed"
+
+  - language: bash
+    label: 'Background shell processes for independent shell commands (same job)'
+    code: |
+      # In a single run: step, launch parallel shell processes and wait for all
+      # WARNING: This pattern does not work with GITHUB_OUTPUT/GITHUB_ENV/GITHUB_STEP_SUMMARY
+      # from the background processes — race conditions corrupt the append-mode files.
+      # Use only for commands that write to their own output files.
+
+      ./fetch-data-source-1.sh > /tmp/source1.json &
+      PID1=$!
+
+      ./fetch-data-source-2.sh > /tmp/source2.json &
+      PID2=$!
+
+      wait $PID1 || { echo "Source 1 fetch failed"; exit 1; }
+      wait $PID2 || { echo "Source 2 fetch failed"; exit 1; }
+
+      echo "Both sources fetched in parallel"
+      ./merge-sources.py /tmp/source1.json /tmp/source2.json
+
+  - language: yaml
+    label: 'Use build tool parallelism inside a single step'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-java@v4
+              with:
+                java-version: 21
+                distribution: temurin
+            # Gradle parallel project execution — all subprojects build concurrently
+            - run: ./gradlew build --parallel --max-workers 4
+prevention:
+  - 'Design CI pipelines with parallel jobs from the start — split lint, test, and build into independent jobs to maximize parallelism today.'
+  - 'Use a shared cache with `actions/cache` to minimize the overhead of repeated `npm ci` / `pip install` across parallel jobs.'
+  - 'Track github/roadmap#1191 for the native parallel steps feature — once released, sequential-step bottlenecks can be eliminated without the multi-job overhead.'
+  - 'For build-tool tasks, always prefer build-native parallelism (`make -j`, `--parallel`, `cargo build --jobs`) over workflow-level workarounds.'
+docs:
+  - url: 'https://github.com/github/roadmap/issues/1191'
+    label: 'github/roadmap#1191 — Parallel Steps in GitHub Actions (GA milestone, open 2025)'
+  - url: 'https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#jobsjob_idsteps'
+    label: 'GitHub Docs — jobs.<job_id>.steps (sequential execution model)'
+  - url: 'https://docs.github.com/en/actions/using-jobs/using-a-matrix-for-your-jobs'
+    label: 'GitHub Docs — Using a matrix for parallel jobs as a workaround'
