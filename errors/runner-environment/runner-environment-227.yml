@@ -1,0 +1,106 @@
+id: runner-environment-227
+title: 'Bash script handler unquoted path breaks job hooks and run steps in directories with spaces'
+category: runner-environment
+severity: error
+tags:
+  - bash
+  - hooks
+  - spaces
+  - path
+  - job-hooks
+  - self-hosted
+  - script-handler
+patterns:
+  - regex: 'bash: .+: No such file or directory'
+    flags: 'i'
+  - regex: 'ACTIONS_RUNNER_HOOK_JOB_STARTED.+No such file'
+    flags: 'i'
+  - regex: 'bash.*--noprofile.*--norc.*-e.*-o pipefail'
+    flags: 'i'
+error_messages:
+  - 'bash: /Volumes/My: No such file or directory'
+  - 'bash: Shared Files/hook.sh: No such file or directory'
+  - 'Error: Process completed with exit code 127.'
+root_cause: |
+  In the GitHub Actions runner source code, the default argument template for the bash
+  shell handler (`ScriptHandlerHelpers.cs`) does not quote the script path placeholder:
+
+    _defaultArguments["bash"] = "--noprofile --norc -e -o pipefail {0}";
+
+  When `{0}` is replaced with a path containing spaces — such as
+  `/Volumes/My Shared Files/hook.sh` — the resulting command becomes:
+
+    bash --noprofile --norc -e -o pipefail /Volumes/My Shared Files/hook.sh
+
+  Bash treats this as three separate arguments: `/Volumes/My`, `Shared`, and
+  `Files/hook.sh`. The first token is not a valid path, so bash exits with
+  "No such file or directory" and exit code 127.
+
+  By contrast, the PowerShell and cmd templates DO quote the path:
+    _defaultArguments["pwsh"]       = "-command \"& '{0}'\"";
+    _defaultArguments["powershell"] = "-command \". '{0}'\"";
+    _defaultArguments["cmd"]        = "/D /E:ON /V:OFF /S /C \"CALL \"{0}\"\"";
+
+  Only bash and sh are affected. The affected scenarios include:
+  - Job hooks (ACTIONS_RUNNER_HOOK_JOB_STARTED, ACTIONS_RUNNER_HOOK_JOB_COMPLETED)
+    when the hook script resides in a directory whose path contains spaces — a common
+    case on macOS with Tart VMs that mount shared directories at
+    `/Volumes/My Shared Files/`.
+  - `run:` steps where the runner's _work directory path contains spaces (less common
+    but possible on custom self-hosted runner installations).
+
+  The bug affects all released runner versions (no version introduced it — the
+  template has always been unquoted). A fix was proposed in the issue but had not
+  shipped as of the issue filing date.
+fix: |
+  Workaround: avoid spaces in the path to hook scripts and runner working directories.
+
+  1. Move hook scripts to a path with no spaces (e.g., `/opt/runner-hooks/hook.sh`
+     instead of `/Volumes/My Shared Files/hooks/hook.sh`).
+     Set ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/runner-hooks/job-started.sh in the
+     runner environment (`.env` file or system environment).
+
+  2. On macOS with Tart VMs, use a symlink from a space-free path to the shared
+     volume's hook script:
+       ln -s "/Volumes/My Shared Files/hook.sh" /opt/hooks/job-started.sh
+     Set the env var to the symlink path.
+
+  3. Wrap the script invocation in a no-space wrapper script that calls the real path.
+
+  There is no supported way to override the bash argument template at the user level.
+  The permanent fix requires a runner source code change (quoting `{0}`).
+fix_code:
+  - language: bash
+    label: 'Create a space-free symlink to the actual hook script'
+    code: |
+      # On macOS: create a symlink from a no-space path to the hook in the shared volume
+      mkdir -p /opt/runner-hooks
+      ln -sf "/Volumes/My Shared Files/hooks/job-started.sh" /opt/runner-hooks/job-started.sh
+      ln -sf "/Volumes/My Shared Files/hooks/job-completed.sh" /opt/runner-hooks/job-completed.sh
+
+      # In the runner's .env file (located in the runner install directory):
+      # ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/runner-hooks/job-started.sh
+      # ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/opt/runner-hooks/job-completed.sh
+
+  - language: bash
+    label: 'Move hook scripts to a space-free directory at runner setup time'
+    code: |
+      # Preferred: install hook scripts in a path with no spaces from the start
+      sudo mkdir -p /usr/local/runner-hooks
+      sudo cp ./hooks/job-started.sh /usr/local/runner-hooks/
+      sudo chmod +x /usr/local/runner-hooks/job-started.sh
+
+      # In .env:
+      # ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/runner-hooks/job-started.sh
+prevention:
+  - 'Always install runner hook scripts under paths with no spaces — use /opt/, /usr/local/, or /home/<user>/ prefixes.'
+  - 'On macOS Tart VM hosts, avoid mounting shared directories with spaces in the volume name; use snake_case or hyphenated names (e.g., My_Shared_Files).'
+  - 'After configuring ACTIONS_RUNNER_HOOK_JOB_STARTED, test the hook manually by running bash --noprofile --norc -e -o pipefail <path> to catch path issues before the runner is live.'
+  - 'If the runner work directory path contains spaces, reconfigure the runner with a clean no-space _work path.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4404'
+    label: 'actions/runner#4404 — Bash script handler does not quote the script path'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/running-scripts-before-or-after-a-job'
+    label: 'GitHub Docs — Running scripts before or after a job (job hooks)'
+  - url: 'https://github.com/actions/runner/blob/main/src/Runner.Worker/Handlers/ScriptHandlerHelpers.cs'
+    label: 'actions/runner source — ScriptHandlerHelpers.cs (unquoted bash template)'

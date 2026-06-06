@@ -1,0 +1,116 @@
+id: silent-failures-114
+title: 'upload-artifact@v7 archive:false uploads artifact using filename instead of name input — causes name conflict across jobs'
+category: silent-failures
+severity: silent-failure
+tags:
+  - upload-artifact
+  - archive
+  - artifact-name
+  - v7
+  - matrix
+  - parallel-jobs
+  - name-conflict
+patterns:
+  - regex: 'An artifact with this name already exists on the run'
+    flags: 'i'
+  - regex: 'Artifact name conflict.*archive.*false'
+    flags: 'i'
+  - regex: 'Failed to CreateArtifact.*already exists'
+    flags: 'i'
+error_messages:
+  - 'An artifact with this name already exists on the run'
+  - 'Failed to CreateArtifact: artifact with name already exists'
+root_cause: |
+  In `actions/upload-artifact@v7`, when `archive: false` is set, the action uploads
+  individual files as separate artifact entries rather than bundling them into a zip
+  archive. In this mode, a bug causes the action to use the **uploaded filename** as
+  the artifact name instead of respecting the `name:` input parameter.
+
+  For example, if two parallel jobs both upload `report.html` with `name: report` and
+  `archive: false`, the first job creates an artifact named `report.html` (not `report`).
+  The second job then tries to create another artifact named `report.html` and hits a
+  name collision error:
+    "An artifact with this name already exists on the run"
+
+  In the `archive: true` (default) mode, the `name:` input works correctly and the
+  artifact is a zip named after the `name:` value. The bug is specific to the
+  unarchived upload path introduced in v7.
+
+  This failure is partially silent because:
+  - The first job's upload succeeds (just with the wrong name)
+  - The error only manifests on the second+ job where the collision is detected
+  - The artifact appears in the Actions UI under the filename, not the user-provided name
+  - Users downloading by the `name:` value will find no artifact with that name
+
+  This bug was filed against v7.0.0 and was not fixed at time of filing.
+fix: |
+  Option 1 — Remove archive:false and use the default archive:true behavior.
+  The name: input works correctly when archiving is enabled. This is the recommended
+  fix until the v7 archive:false bug is resolved.
+
+  Option 2 — Use unique name: values per job.
+  If archive:false is required (e.g., for browser-preview of HTML artifacts), give
+  each job a unique artifact name using the matrix value or job index to avoid the
+  filename-collision bug manifesting:
+    name: report-${{ matrix.os }}
+
+  Option 3 — Pin to upload-artifact@v6 or earlier.
+  The archive:false feature did not exist in v6; artifacts were always archived.
+
+  Track actions/upload-artifact#785 for a fix.
+fix_code:
+  - language: yaml
+    label: 'Remove archive:false — use default archive:true (name: input works correctly)'
+    code: |
+      jobs:
+        lint:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./lint.sh > report.html
+            - uses: actions/upload-artifact@v7
+              with:
+                name: lint-report   # works correctly with default archive: true
+                path: report.html
+                # archive: false  <-- remove this line
+
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./test.sh > report.html
+            - uses: actions/upload-artifact@v7
+              with:
+                name: test-report   # different name per job — no collision
+                path: report.html
+
+  - language: yaml
+    label: 'Workaround — unique name per job if archive:false is required'
+    code: |
+      jobs:
+        check:
+          strategy:
+            matrix:
+              component: [lint, test, typecheck]
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./${{ matrix.component }}.sh > report.html
+            - uses: actions/upload-artifact@v7
+              with:
+                # Include matrix value in name to avoid the archive:false collision bug
+                name: report-${{ matrix.component }}
+                path: report.html
+                archive: false
+prevention:
+  - 'When uploading the same filename from multiple parallel jobs, always use a unique name: per job (e.g., name: report-${{ matrix.component }}) regardless of the archive: setting.'
+  - 'Test artifact upload in a single-job workflow first to verify the artifact appears under the expected name before rolling out to parallel matrix jobs.'
+  - 'Monitor actions/upload-artifact#785 and the v7 changelog for a fix to the archive:false + name: input handling bug.'
+  - 'Default to archive:true (the default) unless you specifically need individual file browsing in the UI — the default mode has fewer edge-case bugs.'
+docs:
+  - url: 'https://github.com/actions/upload-artifact/issues/785'
+    label: 'actions/upload-artifact#785 — archive:false does not respect artifact name'
+  - url: 'https://github.com/actions/upload-artifact/blob/main/README.md#inputs'
+    label: 'upload-artifact README — inputs (name, path, archive)'
+  - url: 'https://github.com/actions/upload-artifact/releases/tag/v7.0.0'
+    label: 'upload-artifact v7.0.0 release notes'

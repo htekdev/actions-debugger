@@ -1,0 +1,117 @@
+id: runner-environment-228
+title: 'setup-node@v6 cache detection fails when .yarnrc.yml contains approvedGitRepositories (yarn 4.14+)'
+category: runner-environment
+severity: error
+tags:
+  - setup-node
+  - yarn
+  - cache
+  - yarnrc
+  - approvedGitRepositories
+  - yarn-4
+  - cache-detection
+patterns:
+  - regex: 'Unrecognized or legacy configuration settings found: approvedGitRepositories'
+    flags: 'i'
+  - regex: "The 'yarn config get cacheFolder' command failed with exit code"
+    flags: 'i'
+  - regex: 'yarn config get cacheFolder.*exit code: 1'
+    flags: 'i'
+error_messages:
+  - "Usage Error: Unrecognized or legacy configuration settings found: approvedGitRepositories - run \"yarn config -v\" to see the list of settings supported in Yarn"
+  - "Error: The 'yarn config get cacheFolder' command failed with exit code: 1"
+root_cause: |
+  Yarn 4.14 introduced the `approvedGitRepositories` security setting in `.yarnrc.yml`.
+  This key enforces an allowlist of Git repository URLs that yarn is permitted to fetch
+  packages from, blocking unapproved source URLs with:
+
+    "Request to '<url>' has been blocked because it doesn't match any of the
+    patterns in 'approvedGitRepositories'"
+
+  However, any `.yarnrc.yml` key that is unrecognized or deprecated by the currently
+  installed version of yarn causes yarn to abort ALL config commands with:
+
+    "Usage Error: Unrecognized or legacy configuration settings found: approvedGitRepositories"
+
+  The `actions/setup-node@v6` action detects the yarn cache folder path by executing
+  `yarn config get cacheFolder` early in the action — before any Node.js version is
+  installed and before yarn itself is updated. If the runner's bundled yarn version is
+  older than 4.14, it does not recognize `approvedGitRepositories` and aborts.
+
+  The action catches the non-zero exit code and surfaces the error:
+    "Error: The 'yarn config get cacheFolder' command failed with exit code: 1"
+
+  This failure prevents setup-node from resolving the yarn cache path, breaking the
+  entire step. Users frequently observe this when:
+  - Upgrading to yarn 4.14+ and adding `approvedGitRepositories` to `.yarnrc.yml`
+  - Running on hosted runners where the system yarn version is older than 4.14
+  - Running on self-hosted runners with a frozen yarn version
+
+  The root issue is that yarn's unrecognized-key validation is global — it aborts even
+  read-only config queries when any single key is unrecognized, even if that key is not
+  related to the query.
+fix: |
+  Option 1 — Remove cache:yarn from setup-node (safest immediate fix).
+  Set cache: '' or omit the cache: input entirely. Manage yarn caching with a separate
+  actions/cache step pointed directly at the yarn cache directory.
+
+  Option 2 — Pin the yarn version in the runner environment to match .yarnrc.yml.
+  Ensure the yarn version on the runner is >= 4.14.0 so it recognizes
+  approvedGitRepositories before setup-node calls yarn config get.
+
+  Option 3 — Upgrade setup-node to a version that handles this gracefully.
+  Track actions/setup-node#1534 for a fix that makes cache folder detection resilient
+  to yarn config validation errors.
+
+  Option 4 — Use a separate cache step instead of setup-node's built-in cache.
+  This avoids the setup-node yarn version probe entirely.
+fix_code:
+  - language: yaml
+    label: 'Remove cache:yarn from setup-node and use a standalone cache step'
+    code: |
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          # Do NOT set cache: yarn — it triggers yarn config get cacheFolder
+          # which fails when approvedGitRepositories is in .yarnrc.yml
+
+      # Manage yarn cache manually
+      - name: Get yarn cache directory
+        id: yarn-cache-dir
+        run: echo "dir=$(yarn config get cacheFolder)" >> $GITHUB_OUTPUT
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ steps.yarn-cache-dir.outputs.dir }}
+          key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - run: yarn install --immutable
+
+  - language: yaml
+    label: 'Pin yarn version to 4.14+ before setup-node runs'
+    code: |
+      - name: Enable corepack with matching yarn version
+        run: |
+          corepack enable
+          corepack prepare yarn@4.14.1 --activate
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: yarn   # Now safe — yarn 4.14+ recognizes approvedGitRepositories
+prevention:
+  - 'After adding any new key to .yarnrc.yml, verify it is recognized by running yarn config -v locally and confirming the key appears in the supported list.'
+  - 'When using setup-node cache:yarn with yarn 4+, pin the yarn version via packageManager in package.json or via corepack before the setup-node step.'
+  - 'Monitor actions/setup-node release notes for fixes to yarn cache detection resilience (issue #1534).'
+  - 'If .yarnrc.yml uses security features added in a recent yarn release, document the minimum required yarn version in your repo README and CI setup guide.'
+docs:
+  - url: 'https://github.com/actions/setup-node/issues/1534'
+    label: 'actions/setup-node#1534 — Problem with yarn v4.14 config approvedGitRepositories'
+  - url: 'https://github.com/yarnpkg/berry/issues/7108'
+    label: 'yarnpkg/berry#7108 — approvedGitRepositories config key tracking issue'
+  - url: 'https://yarnpkg.com/configuration/yarnrc#approvedGitRepositories'
+    label: 'Yarn docs — approvedGitRepositories configuration'
+  - url: 'https://github.com/actions/setup-node/blob/main/docs/advanced-usage.md#caching-packages-data'
+    label: 'setup-node — Advanced usage: caching packages data'
