@@ -1,0 +1,110 @@
+id: triggers-070
+title: '`on: pull_request: types: [labeled]` fires for every label applied to a PR —
+  no trigger-level label-name filter exists; must use `if:` condition'
+category: triggers
+severity: silent-failure
+tags:
+  - pull_request
+  - labeled
+  - label
+  - types
+  - label-name-filter
+  - deployment-gate
+patterns:
+  - regex: 'types:\s*[\[\n].*labeled'
+    flags: 'si'
+error_messages:
+  - "No error — workflow runs for every label applied to the PR, including unrelated labels"
+  - "No error — workflow run count is higher than expected; runs appear for all label events"
+root_cause: |
+  When `types: [labeled]` is added to a `pull_request` trigger, the workflow fires for
+  EVERY label applied to the pull request — not only a specific label. There is no
+  trigger-level filter for label names. GitHub Actions does not support syntax like
+  `types: [labeled: 'deploy-preview']` or `label: 'X'` at the trigger level.
+
+  Teams building label-gated workflows (deploy-preview, run-integration-tests,
+  approved-for-staging, force-rebuild) are surprised to find the workflow fires for
+  entirely unrelated labels ('bug', 'enhancement', 'wontfix', 'good first issue').
+  The result is:
+  - Excessive workflow runs that show up in the Actions tab for every label event
+  - Wasted CI minutes for runs that skip all meaningful steps
+  - Unexpected side effects if the workflow performs mutations (deploy, comment, notify)
+    that should only happen for the specific label
+
+  This is distinct from the related issue triggers-030 ("labeled NOT in default types"):
+  - triggers-030: workflow NEVER fires because labeled is missing from default types
+  - triggers-070: workflow fires TOO OFTEN because ALL label events trigger it
+
+  The behavior is documented: `types: [labeled]` is a webhook activity type filter,
+  not a payload content filter. Payload-level filtering (label name, PR author, etc.)
+  must be done via `if:` conditions on jobs or steps.
+fix: |
+  Add a job-level `if:` condition filtering on `github.event.label.name`. This is the
+  only mechanism — no trigger-level label-name filtering exists.
+
+  Key context properties for label-based filtering:
+  - `github.event.action` — 'labeled' or 'unlabeled'
+  - `github.event.label.name` — the label JUST applied (only set for labeled/unlabeled events)
+  - `github.event.pull_request.labels.*.name` — ALL current labels on the PR (useful for
+    opened/synchronize/reopened events where a label may already be present)
+fix_code:
+  - language: yaml
+    label: 'WRONG — fires for every label including unrelated ones'
+    code: |
+      on:
+        pull_request:
+          types: [labeled]
+
+      jobs:
+        deploy-preview:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying preview..."
+            # Runs for EVERY label: 'bug', 'wontfix', 'enhancement', 'deploy-preview', etc.
+  - language: yaml
+    label: 'RIGHT — filter by specific label name with job-level if:'
+    code: |
+      on:
+        pull_request:
+          types: [labeled]
+
+      jobs:
+        deploy-preview:
+          if: github.event.label.name == 'deploy-preview'
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying preview for PR #${{ github.event.pull_request.number }}"
+  - language: yaml
+    label: 'RIGHT — label gate that works for both labeled events AND already-labeled PRs'
+    code: |
+      on:
+        pull_request:
+          types:
+            - opened
+            - synchronize
+            - reopened
+            - labeled       # fires when any label is applied; filter below by name
+
+      jobs:
+        deploy-preview:
+          if: |
+            (github.event.action == 'labeled' && github.event.label.name == 'deploy-preview') ||
+            (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'deploy-preview'))
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying preview..."
+prevention:
+  - "Always pair `types: [labeled]` with `if: github.event.label.name == 'your-label'` at the job
+    level to gate on the specific label."
+  - 'Document which label triggers which workflow in a comment near the trigger definition.'
+  - 'Test label-gated workflows by applying both the expected label AND an unrelated label to verify
+    the `if:` filter correctly skips unintended runs.'
+  - 'Consider using only `types: [labeled]` (not opened/sync/reopened) if the workflow should only
+    run when the label is freshly applied, not on every code push to already-labeled PRs.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request'
+    label: 'GitHub Docs: pull_request event — labeled activity type'
+  - url: 'https://docs.github.com/en/webhooks/webhook-events-and-payloads#pull_request'
+    label: 'GitHub Webhook Docs: pull_request payload (label field)'
+  - url: 'https://stackoverflow.com/questions/62325286/run-github-actions-when-pull-requests-have-a-specific-label'
+    label: 'Stack Overflow: Run GitHub Actions when pull requests have a specific label (43 votes)'
