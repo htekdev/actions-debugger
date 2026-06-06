@@ -1,0 +1,124 @@
+id: known-unsolved-068
+title: "Step outcome cannot distinguish timeout from failure — both report as 'failure' in steps context"
+category: known-unsolved
+severity: limitation
+tags:
+  - timeout-minutes
+  - outcome
+  - conclusion
+  - continue-on-error
+  - steps-context
+  - retry
+  - known-limitation
+  - no-fix
+patterns:
+  - regex: 'steps\.\w+\.outcome\s*==\s*.failure.'
+    flags: 'i'
+  - regex: 'timeout-minutes.*continue-on-error|continue-on-error.*timeout-minutes'
+    flags: 'im'
+  - regex: 'The process.*timed out after \d+ minutes'
+    flags: 'i'
+error_messages:
+  - "Error: The process '/usr/bin/bash' failed with exit code 1"
+  - 'Error: Process completed with exit code 1'
+root_cause: |
+  GitHub Actions exposes two result fields for completed steps in the steps context:
+
+  - steps.<id>.outcome: the raw result before continue-on-error is applied.
+    Possible values: success, failure, cancelled, skipped.
+  - steps.<id>.conclusion: the final result after continue-on-error is applied.
+    When continue-on-error: true is set on a failed step, conclusion becomes 'success'
+    even if outcome is 'failure'.
+
+  Neither field distinguishes between a step that failed because the process exited with a
+  non-zero code and a step that failed because it hit its timeout-minutes limit. Both
+  scenarios set outcome to 'failure'. There is no 'timed_out' value, no
+  steps.<id>.timed_out boolean, and no built-in expression function to query the reason
+  for failure.
+
+  This means workflows cannot natively:
+  - Retry only on timeout while failing fast on real errors
+  - Alert with different severity for timeouts vs application failures
+  - Auto-escalate timeout-minutes only when a timeout (not a logic error) occurred
+
+  The limitation has been a known open request in the GitHub Actions community since at
+  least 2022 with no current implementation timeline from GitHub.
+fix: |
+  No native fix exists within GitHub Actions expressions. Two manual workarounds are
+  available in bash-based steps:
+
+  1. Record start time and compute elapsed duration at the next step to infer timeout:
+     Compare elapsed seconds against the timeout-minutes threshold. A step that used
+     approximately 100% of its time budget likely timed out.
+
+  2. Write a sentinel file just before the critical work; check for its absence afterward.
+     A timed-out step never reaches the sentinel-write line after the long-running command,
+     while a normally-failing step (which exits immediately on error) may or may not.
+
+  Neither workaround is exact — both have race conditions and edge cases. The most
+  reliable approach is to implement timeout detection inside the script itself using
+  shell signals or test-framework timeout flags.
+fix_code:
+  - language: yaml
+    label: 'Workaround 1: Infer timeout via elapsed time'
+    code: |
+      - name: Start timer
+        id: timer
+        run: echo "start=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Run slow tests
+        id: tests
+        timeout-minutes: 10
+        continue-on-error: true
+        run: npm test
+
+      - name: Classify failure type
+        if: steps.tests.outcome == 'failure'
+        env:
+          START: ${{ steps.timer.outputs.start }}
+        run: |
+          elapsed=$(( $(date +%s) - START ))
+          timeout_secs=600   # 10 minutes in seconds
+          threshold=$(( timeout_secs - 30 ))  # within 30s of limit → likely timeout
+          if [ "$elapsed" -ge "$threshold" ]; then
+            echo "::warning::Step likely timed out (elapsed ${elapsed}s, limit ${timeout_secs}s)"
+            # Handle timeout-specific logic here (e.g., don't fail, just warn)
+          else
+            echo "::error::Step failed (exit code, not timeout — elapsed ${elapsed}s)"
+            exit 1
+          fi
+  - language: yaml
+    label: 'Workaround 2: Sentinel file to detect timeout vs normal failure'
+    code: |
+      - name: Run tests with sentinel
+        id: tests
+        timeout-minutes: 10
+        continue-on-error: true
+        run: |
+          # The long-running command:
+          npm test
+          # Only reached on clean exit (not timeout, not error):
+          touch /tmp/test-completed
+
+      - name: Check failure reason
+        if: steps.tests.outcome == 'failure'
+        run: |
+          if [ ! -f /tmp/test-completed ]; then
+            echo "Step timed out or failed before completing"
+            # Inspect logs for timeout keyword:
+            # If the runner log shows "The process timed out after N minutes" → it was timeout
+          else
+            echo "Step completed but exited non-zero — application failure"
+            exit 1
+          fi
+prevention:
+  - 'Log test durations inside the script itself; test framework flags like --testTimeout (Jest) or --timeout (Mocha) provide per-test granularity inside logs.'
+  - 'Use separate jobs for steps with different timeout characteristics — a dedicated integration-test job with a high timeout-minutes and a unit-test job with a low one makes failures easier to categorize.'
+  - 'If the step runs a single long command, wrap it in a shell timeout with a slightly shorter duration than timeout-minutes; the shell timeout exit code (124) is detectable inside the same step.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#steps-context'
+    label: 'GitHub Docs: steps context — outcome and conclusion fields'
+  - url: 'https://stackoverflow.com/questions/78233438/github-action-cannot-get-timeout-status-from-previous-step'
+    label: 'SO: Cannot get timeout status from previous step (Mar 2024)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-conditions-to-control-job-execution'
+    label: 'GitHub Docs: Status check functions (failure, success, cancelled, always)'

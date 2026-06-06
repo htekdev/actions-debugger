@@ -1,0 +1,94 @@
+id: caching-artifacts-070
+title: "setup-python Post step fails — pip cache directory doesn't exist on disk"
+category: caching-artifacts
+severity: error
+tags:
+  - setup-python
+  - pip
+  - cache
+  - post-step
+  - cache-miss
+  - no-dependencies
+  - python-version-bump
+patterns:
+  - regex: 'Cache folder path is retrieved for pip but doesn.t exist on disk'
+    flags: 'i'
+  - regex: 'likely indicates that there are no dependencies to cache'
+    flags: 'i'
+  - regex: 'Post Setup Python.*fail|Post.*setup-python.*error'
+    flags: 'i'
+error_messages:
+  - "Cache folder path is retrieved for pip but doesn't exist on disk: /home/runner/.cache/pip. This likely indicates that there are no dependencies to cache. Consider removing the cache step if it is not needed."
+root_cause: |
+  When actions/setup-python is configured with cache: 'pip', the action records the expected
+  pip cache directory path at setup time (/home/runner/.cache/pip on Linux, equivalent on
+  macOS/Windows). The Post Setup Python step runs at job end and attempts to save the cache
+  to that path. If the directory does not exist on disk at save time, the Post step fails
+  with this error.
+
+  Two common causes:
+
+  1. No pip install ran in the job: The job uses cache: 'pip' but only runs linting or other
+     pre-installed tools without installing any Python packages. Pip never creates its cache
+     directory, so there is nothing to save. The job's actual steps appear green while the
+     Post step fails and turns the overall workflow run red.
+
+  2. Python version bump causes cache key miss: When the Python patch version changes (e.g.,
+     from 3.13.5 to 3.13.6), the setup-python cache key changes and the first run after the
+     bump experiences a full cache miss. If pip install runs but writes packages to a virtual
+     environment rather than the global pip cache (/home/runner/.cache/pip), the expected
+     directory remains empty and the Post step fails. Subsequent runs after the new cache is
+     warmed succeed.
+
+  The failure is deceptive because it surfaces in the Post Setup Python cleanup step — well
+  after the test or build steps have already succeeded — making it easy to overlook the root
+  cause.
+fix: |
+  - Remove cache: 'pip' from any setup-python step in jobs that do not call pip install.
+    Linting-only jobs, type-check-only jobs, and jobs that rely entirely on pre-installed
+    system Python do not benefit from pip caching.
+  - If pip install does run, ensure it runs against the global pip (not a virtualenv that
+    bypasses /home/runner/.cache/pip) so the post step can find and save the cache.
+  - Upgrade to actions/setup-python@v5 or later: newer versions emit a warning annotation
+    instead of failing the step when the cache directory is missing.
+  - After a Python version bump, the first run is expected to cache-miss; monitor for Post
+    step failures on that first run and confirm subsequent runs succeed.
+fix_code:
+  - language: yaml
+    label: 'Fix: Remove cache when no pip install runs'
+    code: |
+      # WRONG: cache: pip set but job only lints — no pip install → Post step fails
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+          cache: 'pip'            # ← REMOVE when no pip install follows
+      - name: Lint
+        run: flake8 .             # no pip install; /home/runner/.cache/pip never created
+
+      # CORRECT: omit cache when the job does not install packages
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+          # no cache key — Post step skips cache save attempt entirely
+      - name: Lint
+        run: flake8 .
+  - language: yaml
+    label: 'Fix: Upgrade to setup-python@v5 for graceful handling'
+    code: |
+      # CORRECT: v5+ emits a warning annotation instead of failing when cache path missing
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+prevention:
+  - 'Only set cache: pip on jobs that actually run pip install — linting-only jobs should omit it.'
+  - 'Use actions/setup-python@v5 or later; it handles missing cache directories with a warning instead of a failure.'
+  - 'After bumping the Python patch version in python-version:, expect one cache-miss run and watch for Post step failures on that run only.'
+  - 'When using virtual environments (venv/pipenv/poetry), ensure pip still writes to the global cache or configure cache-dependency-path appropriately.'
+docs:
+  - url: 'https://github.com/actions/setup-python/issues/1169'
+    label: 'setup-python#1169: Cache folder path doesn''t exist on disk (Aug 2025)'
+  - url: 'https://github.com/actions/setup-python'
+    label: 'actions/setup-python: Caching packages documentation'
