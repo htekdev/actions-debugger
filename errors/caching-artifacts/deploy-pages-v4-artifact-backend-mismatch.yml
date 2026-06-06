@@ -1,0 +1,113 @@
+id: caching-artifacts-081
+title: "deploy-pages@v4 reports 'No artifacts named github-pages were found' — upload-pages-artifact version too old"
+category: caching-artifacts
+severity: error
+tags:
+  - deploy-pages
+  - upload-pages-artifact
+  - artifact-backend
+  - pages
+  - version-mismatch
+  - v4
+patterns:
+  - regex: 'No artifacts named "github-pages" were found for this workflow run'
+    flags: 'i'
+  - regex: 'Ensure artifacts are uploaded with actions/(?:upload-artifact|artifact)@v4 or later'
+    flags: 'i'
+  - regex: 'Found 0 artifact\(s\)'
+    flags: 'i'
+error_messages:
+  - 'Error: Error: No artifacts named "github-pages" were found for this workflow run. Ensure artifacts are uploaded with actions/artifact@v4 or later.'
+  - 'Error: Fetching artifact metadata failed. Is githubstatus.com reporting issues with API requests, Pages, or Actions? Please re-run the deployment at a later time.'
+  - 'Found 0 artifact(s)'
+  - 'List artifact count: 0'
+root_cause: |
+  `actions/deploy-pages@v4` switched to the new GitHub artifact service backend
+  (the same service introduced by `actions/upload-artifact@v4`). This new API
+  queries a different storage endpoint than the legacy Gzip+multipart backend.
+
+  `actions/upload-pages-artifact@v1` and `@v2` use the old artifact backend.
+  An artifact uploaded by either of those versions is invisible to
+  `deploy-pages@v4`'s list call — the query returns an empty artifact list, and
+  the action fails with "Found 0 artifact(s)" even though the artifact is clearly
+  visible in the workflow run's Artifacts section in the GitHub UI.
+
+  This version boundary causes silent incompatibility: the workflow appears to
+  upload successfully (upload step exits 0), but the deploy step fails because it
+  cannot see the artifact at all.
+
+  The confusing error text "Ensure artifacts are uploaded with actions/artifact@v4
+  or later" refers to the @actions/toolkit artifact SDK version used internally,
+  not to `actions/upload-artifact@v4`. The correct user-facing fix is to upgrade
+  `upload-pages-artifact` to @v3 or later.
+
+  Source: https://github.com/actions/deploy-pages/issues/305 (open since Jan 2024)
+  Source: https://github.com/actions/upload-pages-artifact/issues/89 (closed Feb 2024)
+fix: |
+  Upgrade `actions/upload-pages-artifact` to `@v3` or later. Version 3 switched to
+  the new artifact backend that `deploy-pages@v4` queries.
+
+  If you have a custom upload step using `actions/upload-artifact` directly (instead
+  of `upload-pages-artifact`), ensure it is also `@v4` or later AND that the artifact
+  name is exactly `github-pages` (the hardcoded name deploy-pages@v4 looks for).
+
+  Ensure your deploy job also has the environment block specifying `github-pages` so
+  that the deployment URL is correctly associated.
+fix_code:
+  - language: yaml
+    label: "Correct: upgrade upload-pages-artifact to @v3 to match deploy-pages@v4 backend"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Build site
+              run: npm ci && npm run build
+
+            # ✅ Use @v3 — matches deploy-pages@v4's new artifact backend
+            - name: Upload Pages artifact
+              uses: actions/upload-pages-artifact@v3
+              with:
+                path: dist/
+
+        deploy:
+          needs: build
+          runs-on: ubuntu-latest
+          permissions:
+            pages: write
+            id-token: write
+          environment:
+            name: github-pages
+            url: ${{ steps.deployment.outputs.page_url }}
+          steps:
+            - name: Deploy to GitHub Pages
+              id: deployment
+              uses: actions/deploy-pages@v4
+
+  - language: yaml
+    label: "Wrong: using upload-pages-artifact@v2 with deploy-pages@v4 — artifact backend mismatch"
+    code: |
+      # ❌ This combination FAILS — v2 uses old backend, v4 queries new backend
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v2  # old backend
+        with:
+          path: dist/
+      # ...
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4           # new backend — cannot see v2 artifact
+prevention:
+  - "Pin both upload-pages-artifact and deploy-pages to the same generation: v1+v1, v2+v2, v3+v4."
+  - "When updating deploy-pages, also audit upload-pages-artifact — they must stay compatible."
+  - "Prefer actions/starter-workflows Pages templates which always use matching versions."
+  - "If using actions/upload-artifact directly for Pages, name the artifact exactly 'github-pages' and use @v4+."
+docs:
+  - url: "https://github.com/actions/deploy-pages/issues/305"
+    label: "deploy-pages#305: No artifacts named github-pages (open issue)"
+  - url: "https://github.com/actions/upload-pages-artifact/issues/89"
+    label: "upload-pages-artifact#89: No artifacts found — resolved by upgrading to v3"
+  - url: "https://github.com/actions/starter-workflows/tree/main/pages"
+    label: "GitHub Starter Workflows — Pages templates with correct version combinations"
+  - url: "https://docs.github.com/en/actions/use-cases-and-examples/deploying/deploying-to-github-pages"
+    label: "GitHub Docs: Deploying to GitHub Pages"

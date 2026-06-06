@@ -1,0 +1,125 @@
+id: permissions-auth-077
+title: "download-artifact cross-workflow 'Artifact not found' — missing actions: read permission"
+category: permissions-auth
+severity: error
+tags:
+  - download-artifact
+  - cross-workflow
+  - actions-read
+  - permissions
+  - run-id
+  - workflow_run
+  - artifact
+patterns:
+  - regex: 'Artifact not found for name:.*run.id'
+    flags: 'i'
+  - regex: 'Unable to download artifact.*Artifact not found for name'
+    flags: 'i'
+  - regex: 'No artifacts found.*run-id'
+    flags: 'i'
+error_messages:
+  - "Error: Unable to download artifact(s): Artifact not found for name: my-artifact"
+  - "Downloading single artifact"
+  - "Error: Artifact not found for name: build-output"
+  - "Found 0 artifact(s) matching the provided name in this run"
+root_cause: |
+  `actions/download-artifact@v4+` uses the REST API endpoint
+  `GET /repos/{owner}/{repo}/actions/runs/{run_id}/artifacts` to list available
+  artifacts when a `run-id:` input is provided (for cross-workflow/cross-run downloads).
+  This API endpoint requires the `actions: read` scope on the token used.
+
+  By default, GITHUB_TOKEN in a `workflow_run`-triggered workflow has `actions: none`
+  unless the job's `permissions:` block explicitly grants it. Without `actions: read`,
+  the API call returns an empty artifact list, and the action silently reports
+  "Artifact not found for name: X" — even though the artifact is clearly visible in
+  the GitHub UI under the source run's Artifacts section.
+
+  This is counterintuitive because:
+  1. The error message ("Artifact not found") looks like the artifact doesn't exist, not
+     a permissions error.
+  2. The artifact IS visible to humans browsing the UI but invisible to the API call.
+  3. In a same-run download (no run-id:), this permission is not required, so the issue
+     only manifests when switching to cross-run artifact sharing patterns.
+
+  A common scenario: a `workflow_run`-triggered deployment job tries to download the
+  build artifacts uploaded by the triggering CI run (using
+  `run-id: ${{ github.event.workflow_run.id }}`), and the download fails because
+  `actions: read` was not declared.
+
+  Source: https://github.com/go-swagger/go-swagger/commit/5981d75858c489b8f82974c47f7fa7089deb66d2
+  Source: https://github.com/actions/download-artifact/issues/457
+fix: |
+  Add `actions: read` to the `permissions:` block of the job that runs
+  `download-artifact`. Also pass `github-token: ${{ secrets.GITHUB_TOKEN }}` to the
+  action's `with:` block so the action uses the job token explicitly.
+
+  If the workflow downloads from a DIFFERENT repository, you must also provide a
+  token with `actions: read` access to that repository (a PAT or GitHub App token),
+  and specify `repository:` in the `with:` block.
+fix_code:
+  - language: yaml
+    label: "Add actions: read permission for cross-workflow artifact download"
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          permissions:
+            contents: read
+            actions: read      # ✅ Required for listing artifacts via run-id
+          steps:
+            - name: Download build artifact from triggering run
+              uses: actions/download-artifact@v4
+              with:
+                name: build-output
+                run-id: ${{ github.event.workflow_run.id }}
+                github-token: ${{ secrets.GITHUB_TOKEN }}  # ✅ Explicit token
+                path: dist/
+
+  - language: yaml
+    label: "Cross-repo download — requires PAT or app token with actions: read on target repo"
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          permissions:
+            actions: read
+          steps:
+            - name: Download artifact from another repo's run
+              uses: actions/download-artifact@v4
+              with:
+                name: release-package
+                run-id: ${{ inputs.upstream_run_id }}
+                repository: my-org/my-other-repo
+                # PAT or GitHub App token with actions: read on my-other-repo
+                github-token: ${{ secrets.CROSS_REPO_TOKEN }}
+                path: package/
+
+  - language: yaml
+    label: "Wrong: missing actions: read — download silently reports 'Artifact not found'"
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          permissions:
+            contents: read          # ❌ actions: read is missing
+          steps:
+            - uses: actions/download-artifact@v4
+              with:
+                name: build-output
+                run-id: ${{ github.event.workflow_run.id }}
+                # Without actions: read, the API returns an empty list and the
+                # action reports "Artifact not found for name: build-output"
+prevention:
+  - "Whenever using run-id: in download-artifact@v4+, always include 'actions: read' in the job permissions block."
+  - "Pass 'github-token: ${{ secrets.GITHUB_TOKEN }}' explicitly so the action uses the job token with correct scopes."
+  - "For cross-repo downloads, use a dedicated PAT or GitHub App installation token — GITHUB_TOKEN is scoped to the current repo."
+  - "Distinguish 'Artifact not found' errors from permissions errors by checking whether the artifact is visible in the UI."
+docs:
+  - url: "https://github.com/actions/download-artifact?tab=readme-ov-file#usage"
+    label: "actions/download-artifact README — cross-workflow usage and github-token parameter"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/controlling-permissions-for-github_token"
+    label: "GitHub Docs: Controlling permissions for GITHUB_TOKEN"
+  - url: "https://github.com/go-swagger/go-swagger/commit/5981d75858c489b8f82974c47f7fa7089deb66d2"
+    label: "go-swagger fix: add actions: read for cross-workflow artifact download (May 2026)"
+  - url: "https://github.com/actions/download-artifact/issues/457"
+    label: "download-artifact#457: Unable to download artifacts from another run"
