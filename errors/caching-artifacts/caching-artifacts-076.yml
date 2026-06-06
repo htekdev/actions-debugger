@@ -1,0 +1,141 @@
+id: caching-artifacts-076
+title: 'actions/cache 429 rate limit on restore not retried — workflow silently falls through to cache miss'
+category: caching-artifacts
+severity: warning
+tags:
+  - actions-cache
+  - rate-limit
+  - 429
+  - restore
+  - cache-miss
+  - silent-fallthrough
+patterns:
+  - regex: 'Failed to restore.*Rate limited.*429|rate limit exceeded.*GetCacheEntryDownloadURL'
+    flags: 'i'
+  - regex: 'You.ve hit a rate limit.*rate limit will reset'
+    flags: 'i'
+  - regex: 'Failed to GetCacheEntryDownloadURL.*Too Many Requests'
+    flags: 'i'
+error_messages:
+  - "Warning: You've hit a rate limit, your rate limit will reset in 18 seconds"
+  - "Warning: Failed to restore: Failed to GetCacheEntryDownloadURL: Rate limited: Failed request: (429) Too Many Requests: rate limit exceeded"
+  - "Cache not found for input keys: <key>"
+root_cause: |
+  When the GitHub Actions cache service returns HTTP 429 (Too Many Requests) on the
+  **restore/download path**, `actions/cache` does NOT implement retry logic for this
+  specific error. Instead, it:
+
+  1. Logs `Warning: You've hit a rate limit, your rate limit will reset in X seconds`
+  2. Logs `Warning: Failed to restore: Failed to GetCacheEntryDownloadURL: Rate limited`
+  3. Falls through to `Cache not found for input keys: <key>` — treating it as a cache miss
+  4. Continues workflow execution as if the cache doesn't exist
+
+  **Important distinction from upload 429:** The existing entry `cache-service-429-upload-ebadf-crash.yml`
+  covers HTTP 429 during cache UPLOAD causing an EBADF crash (a different, harder failure).
+  This entry covers 429 during cache RESTORE, which silently falls through without crashing
+  but causes unnecessary full rebuilds.
+
+  **Impact:** Workflows with many concurrent runs hitting the same cache key simultaneously
+  (e.g. a heavily-used monorepo's `node_modules` or `~/.cargo/registry` cache) can exceed
+  the per-key request rate limit. All concurrent runs that get rate-limited then execute a
+  full dependency install/build from scratch, multiplying CI time and cost. The 429 response
+  includes a reset time in the warning message but `actions/cache` ignores it.
+
+  **When it happens:** Most commonly seen in:
+  - Monorepos with many parallel jobs all restoring the same cache key
+  - High-frequency push workflows where many runs are active simultaneously
+  - Nightly builds on large teams where multiple jobs race for the same cache
+
+  Source: actions/cache#1758 (May 13, 2026), also reported via oxidecomputer/hubris#2535
+fix: |
+  No retry mechanism exists in `actions/cache` for restore-path 429 errors. The
+  following strategies reduce exposure:
+
+  **Option 1: Add job-level cache-key uniqueness to reduce simultaneous key contention**
+
+  Use a cache key that includes the job name or runner index, so parallel runs don't all
+  hit the exact same cache entry at once.
+
+  **Option 2: Add a retry wrapper around the restore step**
+
+  Use a loop + `cache-hit` output check to retry on miss within a reasonable window.
+
+  **Option 3: Use `actions/cache/restore` + `actions/cache/save` split and add `fail-on-cache-miss: false`**
+
+  Explicitly handle the miss and emit a warning rather than silently rebuilding.
+
+  **Option 4: File a +1 on actions/cache#1758**
+
+  The correct fix is for `actions/cache` to detect the 429 reset time and wait/retry
+  instead of falling through. Adding reactions encourages prioritization.
+fix_code:
+  - language: yaml
+    label: 'Recognize the 429 pattern and add explicit retry logic'
+    code: |
+      # The standard cache step falls through silently on 429.
+      # Add a retry wrapper to explicitly detect and retry:
+      steps:
+        - name: Restore cache (with 429 retry)
+          id: cache-restore
+          uses: actions/cache@v4
+          with:
+            path: ~/.npm
+            key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+            restore-keys: |
+              ${{ runner.os }}-node-
+
+        # Detect rate-limit fallthrough: cache appears to miss but key exists
+        - name: Retry cache if rate-limited
+          if: steps.cache-restore.outputs.cache-hit != 'true'
+          uses: actions/cache/restore@v4
+          with:
+            path: ~/.npm
+            key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+            restore-keys: |
+              ${{ runner.os }}-node-
+
+  - language: yaml
+    label: 'Reduce cache contention — add job index to key for parallel runs'
+    code: |
+      # When many parallel jobs restore the same cache key, add job uniqueness
+      # to distribute reads across different cache entries:
+      strategy:
+        matrix:
+          shard: [1, 2, 3, 4]
+
+      steps:
+        - uses: actions/cache@v4
+          with:
+            path: ~/.npm
+            # Use matrix shard to reduce simultaneous same-key requests
+            key: ${{ runner.os }}-node-shard${{ matrix.shard }}-${{ hashFiles('**/package-lock.json') }}
+            restore-keys: |
+              ${{ runner.os }}-node-shard${{ matrix.shard }}-
+              ${{ runner.os }}-node-
+  - language: yaml
+    label: 'Observe the rate limit in workflow logs'
+    code: |
+      # What the rate limit looks like in workflow output:
+      # (these are Warning lines, not Error — easy to miss)
+      #
+      # Run actions/cache@v4
+      # Received 0 cache(s) from cache.githubusercontent.com
+      # Warning: You've hit a rate limit, your rate limit will reset in 18 seconds
+      # Warning: Failed to restore: Failed to GetCacheEntryDownloadURL: Rate limited:
+      #          Failed request: (429) Too Many Requests: rate limit exceeded
+      # Cache not found for input keys: linux-node-abc123, linux-node-
+      #
+      # The workflow then continues as if cache was never created.
+      # Silent "success" hides wasted rebuild time.
+prevention:
+  - "When running many parallel jobs on a shared cache key, add per-job cache key suffixes (e.g. matrix index, job name) to distribute read load across different cache entries."
+  - "Monitor CI timing for unexplained slowdowns — a sudden increase in dependency install time across all parallel jobs is a signal that cache restoration is being rate-limited."
+  - "Cache keys with very high read frequency (multiple runs per minute across many jobs) are most susceptible. Use granular keys to avoid this."
+  - "Check that your cache key is stable (not changing per-run) — flapping keys force repeated cache service requests for new key registrations, increasing rate limit exposure."
+docs:
+  - url: 'https://github.com/actions/cache/issues/1758'
+    label: 'actions/cache#1758 — Handle rate limit on restore (no retry implemented)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows#usage-limits-and-eviction-policy'
+    label: 'GitHub Docs: Cache usage limits and eviction policy'
+  - url: 'https://github.com/actions/cache'
+    label: 'actions/cache repository'
