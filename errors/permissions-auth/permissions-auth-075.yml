@@ -1,0 +1,137 @@
+id: permissions-auth-075
+title: 'OIDC token missing `repository_custom_property_*` claim — custom property must be defined at org level, not just repo level'
+category: permissions-auth
+severity: silent-failure
+tags:
+  - OIDC
+  - custom-properties
+  - trust-policy
+  - AWS
+  - Azure
+  - claim-missing
+  - org-level
+  - AccessDenied
+  - cloud-auth
+patterns:
+  - regex: 'repository_custom_property'
+    flags: 'i'
+  - regex: '(?:AccessDenied|is not authorized).+sts:AssumeRoleWithWebIdentity'
+    flags: 'i'
+  - regex: 'OpenIDConnectTokenVerificationFailed|sub.*claim.*condition.*failed|conditions.*not.*met'
+    flags: 'i'
+error_messages:
+  - 'Error: User: arn:aws:sts::ACCOUNT:assumed-role/... is not authorized to perform: sts:AssumeRoleWithWebIdentity'
+  - 'Could not assume role with OIDC: Not authorized to perform sts:AssumeRoleWithWebIdentity'
+  - 'ClientAssertionCredential authentication failed: AADSTS70021'
+  - 'Error: No federated identity credential with issuer https://token.actions.githubusercontent.com matches'
+root_cause: |
+  GitHub Actions OIDC tokens gained support for `repository_custom_property_*` claims in
+  March 2026 (GA April 2, 2026 changelog). These claims allow trust policies on AWS, Azure,
+  and other cloud providers to filter access based on how a repository is classified within
+  an organization (e.g., `repository_custom_property_environment: production`).
+
+  However, there is a critical prerequisite that is not prominently documented:
+  **custom property definitions must be created at the organization level** — not just at the
+  repository level — for the corresponding claims to appear in OIDC tokens.
+
+  Specifically:
+  1. The custom property must be defined in the organization's custom properties schema
+     (Settings → Custom properties at the org level).
+  2. The property must be set/assigned a value for the repository in question.
+
+  When a property is created only at the **repository level** (via repo-specific custom
+  properties without an org-level schema entry), or when the property exists at the org
+  level but has no value set for the specific repository, the `repository_custom_property_*`
+  claim is simply **absent** from the OIDC token rather than being set to null or an empty
+  string.
+
+  Trust policies that include a condition requiring a specific `repository_custom_property_*`
+  claim evaluate to no-match and deny authentication. The cloud provider returns a generic
+  `AccessDenied` / `is not authorized` error with no indication that the claim is missing.
+  The workflow author sees a cloud authentication failure with no clear link to the OIDC
+  token contents.
+
+  This is a silent configuration error: the workflow appears to run normally until the
+  authentication step fails, and there is no warning during workflow setup or YAML validation
+  that the property is misconfigured.
+fix: |
+  **Step 1: Verify the OIDC token contents.**
+  Add a debug step to print the OIDC token claims before the cloud auth step:
+
+  ```yaml
+  - name: Debug OIDC claims
+    run: |
+      TOKEN=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+        "$ACTIONS_ID_TOKEN_REQUEST_URL" | jq -r '.value')
+      echo "$TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null | jq .
+  ```
+
+  If `repository_custom_property_*` claims are absent, the property is not defined at the
+  org level or has no value for this repository.
+
+  **Step 2: Define the custom property at the organization level.**
+  Navigate to the GitHub organization → Settings → Custom properties and create the property
+  definition there. Repository-level-only properties do NOT produce OIDC claims.
+
+  **Step 3: Assign a value to the property for the target repository.**
+  After creating the org-level property definition, explicitly set the value for each
+  repository that needs the claim by going to the repository's Settings → Custom properties
+  or using the REST API.
+
+  **If you cannot use org-level properties:** Fall back to other OIDC sub-claim conditions
+  such as `repository`, `ref`, `environment`, or `job_workflow_ref` which are always present
+  in Actions OIDC tokens.
+fix_code:
+  - language: yaml
+    label: 'Add OIDC debug step to inspect claims before cloud auth'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          permissions:
+            id-token: write
+            contents: read
+          steps:
+            - name: Debug OIDC token claims (remove after debugging)
+              run: |
+                TOKEN=$(curl -sS \
+                  -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+                  "$ACTIONS_ID_TOKEN_REQUEST_URL" | jq -r '.value')
+                # Print decoded payload (base64url decode the second segment)
+                echo "$TOKEN" | cut -d. -f2 | \
+                  python3 -c "import sys,base64,json; data=sys.stdin.read().strip(); \
+                    padded=data+'=='*((-len(data))%4); \
+                    print(json.dumps(json.loads(base64.urlsafe_b64decode(padded)), indent=2))"
+
+            - name: Configure AWS credentials via OIDC
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-to-assume: arn:aws:iam::ACCOUNT:role/my-role
+                aws-region: us-east-1
+  - language: yaml
+    label: 'AWS trust policy condition using repository_custom_property_* (requires org-level property)'
+    code: |
+      # AWS IAM trust policy condition requiring a custom property claim.
+      # PREREQUISITE: The property must be defined at org level AND set on the repository.
+      # If the claim is absent, AWS returns AccessDenied with no indication of missing claim.
+      {
+        "Condition": {
+          "StringEquals": {
+            "token.actions.githubusercontent.com:repository_custom_property_environment": "production"
+          }
+        }
+      }
+prevention:
+  - 'Always create custom property definitions at the **organization level** (Org Settings → Custom properties), not just at the repository level. Repo-level-only properties do NOT appear in OIDC tokens.'
+  - 'After creating an org-level property, explicitly set a value for each target repository. A property defined but not assigned a value for a repo is also absent from the OIDC token.'
+  - 'Before deploying trust policies that use `repository_custom_property_*` conditions, verify the claim is present in the OIDC token by printing decoded token claims in a debug step.'
+  - 'When trust policy conditions reference `repository_custom_property_*`, always have a fallback monitoring alert for `AccessDenied` / `is not authorized` errors to catch misconfigured or unset properties quickly.'
+docs:
+  - url: 'https://github.com/github/docs/issues/43779'
+    label: 'github/docs#43779 — custom properties docs gap: org-level definition required for OIDC claims'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect#defining-trust-conditions-on-cloud-roles-using-oidc-claims'
+    label: 'GitHub Docs — About security hardening with OIDC: defining trust conditions using claims'
+  - url: 'https://github.blog/changelog/2026-04-02-github-actions-early-april-2026-updates/'
+    label: 'GitHub Changelog — April 2026: Actions OIDC tokens now support repository custom properties'
+  - url: 'https://docs.github.com/en/organizations/managing-organization-settings/managing-custom-properties-for-repositories-in-your-organization'
+    label: 'GitHub Docs — Managing custom properties for repositories in your organization'

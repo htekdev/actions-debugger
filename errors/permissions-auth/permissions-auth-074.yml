@@ -1,0 +1,106 @@
+id: permissions-auth-074
+title: 'Composer leaks new-format GITHUB_TOKEN (ghs_APPID_JWT) to stderr in CI logs — CVE-2026-45793 / GHSA-f9f8-rm49-7jv2'
+category: permissions-auth
+severity: error
+tags:
+  - composer
+  - GITHUB_TOKEN
+  - token-disclosure
+  - ghs-token
+  - php
+  - setup-php
+  - CVE-2026-45793
+  - security
+  - token-format-rollout
+patterns:
+  - regex: 'Your github oauth token for .+ contains invalid characters'
+    flags: 'i'
+  - regex: 'UnexpectedValueException.+github oauth token.+invalid characters'
+    flags: 'i'
+  - regex: 'contains invalid characters: "ghs_'
+    flags: 'i'
+error_messages:
+  - 'Your github oauth token for github.com contains invalid characters: "ghs_AppID_eyJhbGc..."'
+  - '[InvalidArgumentException] Your github oauth token for github.com contains invalid characters: "ghs_..."'
+root_cause: |
+  Starting April 27, 2026, GitHub began rolling out a new stateless token format for
+  GITHUB_TOKEN and GitHub App installation tokens. The new format is `ghs_<AppID>_<JWT>`,
+  approximately 520 characters long, and uses base64url encoding which includes hyphens (`-`)
+  and underscores.
+
+  Composer versions >=2.3.0 <2.9.8 (and >=1.0 <1.10.28, >=2.0.0 <2.2.28) validate GitHub OAuth
+  tokens with the regex `^[.A-Za-z0-9_]+$`. This regex does not permit hyphens. The new
+  `ghs_APPID_JWT` token format routinely contains hyphens (base64url RFC 4648 §5 uses `-` and `_`
+  as URL-safe replacements for `+` and `/`).
+
+  When the token fails this validation, Composer throws an `UnexpectedValueException` that
+  interpolates the raw token verbatim into the error message:
+
+    `Your github oauth token for github.com contains invalid characters: "ghs_<full-token>"`
+
+  Symfony Console then prints this exception to stderr. GitHub Actions' built-in secret masker
+  matches registered values as exact substrings, but Symfony Console may wrap the message, embed
+  it in framing text (`In BaseIO.php line N:`), or interleave ANSI control sequences. As a result,
+  the masker does not redact the token, and the plaintext credential reaches the CI log.
+
+  This affects any PHP workflow that uses Composer with GITHUB_TOKEN registered as a GitHub OAuth
+  credential. Many widely-used Actions — including `shivammathur/setup-php` — automatically
+  register `GITHUB_TOKEN` into Composer's global `auth.json`, so the leak triggers without
+  any explicit user configuration.
+
+  CVSS score: 7.5 (High). CVE-2026-45793 / GHSA-f9f8-rm49-7jv2.
+fix: |
+  **Primary fix: Upgrade Composer to a patched version.**
+  - Composer 2.x (mainline): upgrade to >=2.9.8
+  - Composer 2.2.x (LTS): upgrade to >=2.2.28
+  - Composer 1.x: upgrade to >=1.10.28
+
+  The patched versions update the token validation regex to accept hyphens, preventing the
+  disclosure.
+
+  **Secondary workaround (if upgrading is not immediately possible):**
+  Explicitly unset the GitHub token from Composer's auth config before running Composer, then
+  set it via a token-safe mechanism, or use a classic `ghp_` PAT which uses the old format
+  unaffected by this regression:
+
+  ```yaml
+  - name: Remove GITHUB_TOKEN from Composer auth (workaround)
+    run: composer config --global --unset github-oauth.github.com
+  ```
+
+  **If using `shivammathur/setup-php`:** The action pins a Composer version; ensure you're on
+  a version that ships Composer >=2.9.8.
+fix_code:
+  - language: yaml
+    label: 'Pin Composer to patched version in GitHub Actions workflow'
+    code: |
+      - name: Install dependencies
+        run: |
+          # Ensure Composer is on a patched version before running install.
+          # Composer 2.9.8+ fixes CVE-2026-45793 (GITHUB_TOKEN disclosure with new ghs_ format)
+          composer self-update --2 2.9.8
+          composer install --no-interaction --prefer-dist
+  - language: yaml
+    label: 'Use shivammathur/setup-php with Composer version pinned to patched release'
+    code: |
+      - name: Set up PHP and Composer
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          tools: composer:2.9.8  # Pin to patched version fixing CVE-2026-45793
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+prevention:
+  - 'Always pin Composer to a specific patched version in CI (e.g., `composer:2.9.8` in setup-php tools). Do not rely on "latest" which may ship a vulnerable version during the rollout window.'
+  - 'Audit your workflow logs for lines matching `contains invalid characters` — these indicate a credential has been disclosed to the log.'
+  - 'Be aware that `shivammathur/setup-php` auto-registers `GITHUB_TOKEN` into Composer auth by default; upgrading to a patched Composer is the only reliable mitigation.'
+  - 'For repositories that do not need Composer to make authenticated GitHub API calls, you can disable auto-registration: `COMPOSER_AUTH: ''{}''` in the env block prevents auto-injection.'
+docs:
+  - url: 'https://github.com/advisories/GHSA-f9f8-rm49-7jv2'
+    label: 'GHSA-f9f8-rm49-7jv2 — Composer leaks GITHUB_TOKEN in CI logs (CVE-2026-45793)'
+  - url: 'https://github.com/composer/composer/security/advisories/GHSA-f9f8-rm49-7jv2'
+    label: 'composer/composer security advisory — GHSA-f9f8-rm49-7jv2 details and affected versions'
+  - url: 'https://github.blog/changelog/2026-04-24-notice-about-upcoming-new-format-for-github-app-installation-tokens/'
+    label: 'GitHub Changelog — Notice about new format for GitHub App installation tokens (April 2026)'
+  - url: 'https://github.com/composer/composer/issues/12849'
+    label: 'composer/composer#12849 — New format for GitHub Tokens (upstream issue report)'
