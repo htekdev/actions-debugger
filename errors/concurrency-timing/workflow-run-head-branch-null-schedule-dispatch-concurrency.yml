@@ -1,0 +1,135 @@
+id: concurrency-timing-055
+title: '`github.event.workflow_run.head_branch` is null for `schedule`- and `workflow_dispatch`-triggered
+  parent workflows — concurrency group key collapses all downstream runs into one slot'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - workflow_run
+  - concurrency
+  - head_branch
+  - schedule
+  - null-key
+  - deployment
+patterns:
+  - regex: 'on:\s+workflow_run:'
+    flags: 'si'
+  - regex: 'group:.*event\.workflow_run\.head_branch'
+    flags: 'i'
+error_messages:
+  - "Canceling since a higher priority waiting run was found for the same concurrency group"
+  - "This run has been cancelled. Concurrency group: deploy-"
+root_cause: |
+  `github.event.workflow_run.head_branch` is null/empty when the triggering (upstream)
+  workflow was itself triggered by `schedule`, `workflow_dispatch`, `repository_dispatch`,
+  or any other non-branch event. Only workflows triggered by branch-based events (push,
+  pull_request, etc.) produce a non-null head_branch value.
+
+  The standard recommendation for workflow_run-triggered workflows (see also
+  concurrency-timing-045) is to key the concurrency group on head_branch:
+
+      concurrency:
+        group: deploy-${{ github.event.workflow_run.head_branch }}
+
+  For branch-based parent triggers this works correctly. For schedule- or
+  workflow_dispatch-triggered parent workflows, head_branch is null, making the
+  concurrency group key evaluate to `deploy-` (empty suffix). Every downstream run
+  where the parent was triggered by schedule or dispatch shares the SAME concurrency
+  slot. The second scheduled downstream run cancels the first — silently, because
+  `${{ null }}` evaluates to an empty string in GitHub Actions expressions with no
+  warning or error.
+
+  This is commonly introduced when teams follow a deploy-after-CI pattern where the
+  nightly build (schedule) triggers a downstream deploy/notify workflow_run workflow
+  and copy the branch-scoped concurrency pattern from another workflow.
+fix: |
+  Add a fallback value to handle null head_branch, or use a more robust key.
+
+  Option 1 — head_branch with workflow_run.id fallback (recommended):
+    Use head_branch when available (branch-based parent) and fall back to the unique
+    workflow_run id (schedule/dispatch parent) to guarantee no cross-run collisions.
+
+  Option 2 — workflow_run.id only:
+    If the workflow_run-triggered downstream workflow is exclusively for non-branch
+    parents (schedule, dispatch), key the group on github.event.workflow_run.id.
+    Every downstream run gets its own unique slot.
+
+  Option 3 — Restrict trigger with branches: filter:
+    Limit the workflow_run trigger to branch-based parent runs using `branches:`.
+    Schedule/dispatch-triggered completions are silently ignored so there is no
+    concurrency collision to manage.
+fix_code:
+  - language: yaml
+    label: 'WRONG — head_branch is null for schedule-triggered parents; all runs share one slot'
+    code: |
+      on:
+        workflow_run:
+          workflows: ["Nightly Build"]
+          types: [completed]
+
+      concurrency:
+        group: deploy-${{ github.event.workflow_run.head_branch }}
+        cancel-in-progress: true
+
+      jobs:
+        deploy:
+          if: github.event.workflow_run.conclusion == 'success'
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying..."
+  - language: yaml
+    label: 'RIGHT — fallback to workflow_run.id prevents slot collision for schedule parents'
+    code: |
+      on:
+        workflow_run:
+          workflows: ["Nightly Build"]
+          types: [completed]
+
+      # head_branch is populated for push/pull_request-triggered parents
+      # workflow_run.id is always unique — prevents cross-run collision for schedule/dispatch parents
+      concurrency:
+        group: deploy-${{ github.event.workflow_run.head_branch || github.event.workflow_run.id }}
+        cancel-in-progress: true
+
+      jobs:
+        deploy:
+          if: github.event.workflow_run.conclusion == 'success'
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying commit ${{ github.event.workflow_run.head_sha }}"
+  - language: yaml
+    label: 'RIGHT — restrict workflow_run to branch-based parents only'
+    code: |
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+          branches: [main, 'release/**']
+          # schedule- and workflow_dispatch-triggered parent completions have no branch;
+          # the branches: filter excludes them, so no null head_branch issue
+
+      concurrency:
+        group: deploy-${{ github.event.workflow_run.head_branch }}
+        cancel-in-progress: true
+
+      jobs:
+        deploy:
+          if: github.event.workflow_run.conclusion == 'success'
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying branch ${{ github.event.workflow_run.head_branch }}"
+prevention:
+  - 'Always check whether parent workflows may be triggered by schedule or workflow_dispatch before
+    keying a workflow_run downstream concurrency group on head_branch.'
+  - 'Add a || fallback for any workflow_run context property that may be null — head_branch, head_sha,
+    and pull_requests are null for schedule/dispatch-triggered parents.'
+  - 'Add a debug step that echoes github.event.workflow_run.head_branch early in the workflow to verify
+    it is populated for all expected parent trigger types during initial rollout.'
+  - 'Use branches: on the workflow_run trigger to restrict to branch-based events if schedule/dispatch
+    parent completions do not need to be handled.'
+docs:
+  - url: 'https://docs.github.com/en/webhooks/webhook-events-and-payloads#workflow_run'
+    label: 'GitHub Webhook Docs: workflow_run payload — head_branch property'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run'
+    label: 'GitHub Docs: workflow_run event trigger'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency'
+    label: 'GitHub Docs: Using concurrency'

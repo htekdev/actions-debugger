@@ -1,0 +1,130 @@
+id: yaml-syntax-071
+title: 'Duplicate `id:` values within the same job or composite action cause instant
+  workflow validation failure'
+category: yaml-syntax
+severity: error
+tags:
+  - step-id
+  - duplicate
+  - validation
+  - composite-action
+  - copy-paste
+patterns:
+  - regex: 'The identifier .* may not be used more than once within the same scope'
+    flags: 'i'
+  - regex: 'TemplateValidationException.*may not be used more than once'
+    flags: 'i'
+error_messages:
+  - "The workflow is not valid. .github/workflows/ci.yml (Line: N, Col: N): The identifier 'checkout'
+    may not be used more than once within the same scope."
+  - "The identifier 'meta' may not be used more than once within the same scope."
+  - "GitHub.DistributedTask.ObjectTemplating.TemplateValidationException: The template is not valid."
+root_cause: |
+  Step IDs (`id:`) must be unique within a single job or composite action. If two or more
+  steps within the same scope share the same `id:` value, GitHub Actions rejects the entire
+  workflow before any step runs, throwing a `TemplateValidationException`.
+
+  Step IDs form the keys of the `steps` context object. Duplicate keys would make
+  `${{ steps.checkout.outputs.ref }}` ambiguous — the platform rejects this ambiguity at
+  parse time rather than silently choosing one arbitrarily at runtime.
+
+  The most common root cause is copy-pasting steps within a job — particularly repeating
+  `actions/checkout`, `docker/metadata-action`, or `actions/setup-node` blocks — without
+  updating or removing the `id:` field on the duplicate. Composite action authors also
+  hit this when a second action step is added without checking existing IDs.
+
+  The error message reports only the SECOND occurrence's line and column, not both —
+  making it harder to locate the original conflicting step in long step lists.
+  (Tracked as actions/runner#3121 as an open bug requesting improved error reporting.)
+fix: |
+  Ensure every step that declares an `id:` uses a unique value within its job or composite
+  action scope. Steps that are not referenced by later steps can omit `id:` entirely —
+  only steps whose outputs are used in expressions (`${{ steps.X.outputs.Y }}`) need an ID.
+fix_code:
+  - language: yaml
+    label: 'WRONG — duplicate id: "meta" causes TemplateValidationException'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Extract metadata for Docker Hub
+              id: meta                          # first declaration
+              uses: docker/metadata-action@v5
+              with:
+                images: myorg/myapp
+
+            - name: Extract metadata for GHCR
+              id: meta                          # DUPLICATE — workflow rejected
+              uses: docker/metadata-action@v5
+              with:
+                images: ghcr.io/myorg/myapp
+
+            - uses: docker/build-push-action@v6
+              with:
+                tags: ${{ steps.meta.outputs.tags }}
+  - language: yaml
+    label: 'RIGHT — unique IDs for each step'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Extract metadata for Docker Hub
+              id: meta-dockerhub
+              uses: docker/metadata-action@v5
+              with:
+                images: myorg/myapp
+
+            - name: Extract metadata for GHCR
+              id: meta-ghcr
+              uses: docker/metadata-action@v5
+              with:
+                images: ghcr.io/myorg/myapp
+
+            - name: Build and push to Docker Hub
+              uses: docker/build-push-action@v6
+              with:
+                tags: ${{ steps.meta-dockerhub.outputs.tags }}
+                labels: ${{ steps.meta-dockerhub.outputs.labels }}
+
+            - name: Build and push to GHCR
+              uses: docker/build-push-action@v6
+              with:
+                tags: ${{ steps.meta-ghcr.outputs.tags }}
+                labels: ${{ steps.meta-ghcr.outputs.labels }}
+  - language: yaml
+    label: 'RIGHT — omit id: on steps whose outputs are never referenced'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              # No id: needed — outputs not referenced by other steps
+
+            - uses: actions/setup-node@v4
+              with:
+                node-version: '20'
+              # No id: needed — only referenced outputs need a step id
+
+            - id: version
+              run: echo "version=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+
+            - run: echo "Building version ${{ steps.version.outputs.version }}"
+prevention:
+  - 'When copy-pasting steps within a job, immediately update or remove the `id:` field on
+    the duplicate to avoid the conflict.'
+  - 'Use actionlint or a YAML linter locally before pushing — both catch duplicate step IDs
+    and report the error with line numbers for both occurrences.'
+  - 'Only assign `id:` to steps whose outputs are referenced in expressions elsewhere in the
+    job; leave unreferenced steps without `id:`.'
+  - 'Apply the same uniqueness rule to composite actions — step IDs within a composite action
+    must also be unique within the action file.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idstepsid'
+    label: 'GitHub Docs: jobs.<job_id>.steps[*].id'
+  - url: 'https://github.com/actions/runner/issues/3121'
+    label: 'actions/runner#3121 — Request to improve duplicate step ID error message (Jan 2024)'
+  - url: 'https://ghlint.twisterrob.net/issues/default/DuplicateStepId/'
+    label: 'GH-Lint: DuplicateStepId rule documentation'
