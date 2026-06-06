@@ -1,0 +1,99 @@
+id: silent-failures-106
+title: 'windows-11-arm shell: bash Steps Intermittently Produce Zero Output and Exit 0'
+category: silent-failures
+severity: silent-failure
+tags:
+  - windows-11-arm
+  - bash
+  - composite-action
+  - arm64
+  - wow64
+  - silent-failure
+  - intermittent
+patterns:
+  - regex: 'error: no such command: `[a-z]'
+    flags: 'i'
+  - regex: 'error: no such subcommand: `[a-z]'
+    flags: 'i'
+  - regex: 'error\[E0463\]: can''t find crate for `[a-z]'
+    flags: 'i'
+error_messages:
+  - 'error: no such command: `make`'
+  - 'error: no such command: `expand`'
+  - 'error: no such subcommand: `make`'
+root_cause: |
+  On `windows-11-arm` runners, `shell: bash` resolves to `C:\Program Files\Git\bin\bash.EXE`,
+  which is an x86_64 binary running under WoW64 (Windows-on-Windows 64-bit) ARM64
+  emulation. The `actions/runner` binary on this platform is a **native ARM64** process.
+  When the native ARM64 runner spawns the x86_64 bash.EXE as a child process, an
+  intermittent failure in the WoW64 cross-architecture process launch causes the bash
+  process to start but never execute its script body. The step logs the command invocation
+  and environment dump, then exits 0 with zero script output — the script never ran.
+
+  Key characteristics:
+  - Failure is transient per-process-invocation: two consecutive bash steps in the same
+    job can have one succeed and one fail, ruling out image or runner misconfiguration.
+  - Zero-output steps take 0-3 seconds; successful steps take 2-7 seconds.
+  - Only occurs on `windows-11-arm`; `windows-latest` (amd64) is unaffected.
+  - The downstream step then fails with "no such command" or "not installed" errors because
+    the tool that was supposed to be installed by the bash step is missing.
+  - Reported across multiple independent Microsoft repositories
+    (microsoft/Windows-rust-driver-samples, microsoft/windows-drivers-rs), confirming
+    this is a platform-level runner bug, not a workflow configuration issue.
+
+  Root cause: intermittent x86_64 process execution failure under ARM64 WoW64 emulation
+  when launched from a native ARM64 parent process. No fix from the platform side as of
+  April 2026; actions/runner issue is open in partner-runner-images.
+fix: |
+  Option 1 (recommended): invoke bash from PowerShell as a workaround. Wrapping the bash
+  call in a pwsh step bypasses the native-arm64 → x86_64 WoW64 launch that triggers the
+  bug, because PowerShell on windows-11-arm is itself x86_64, so spawning x86_64 bash
+  from x86_64 pwsh does not cross the ARM64/x86_64 boundary:
+
+    - name: Run script via pwsh workaround
+      shell: pwsh
+      run: |
+        $result = & 'C:\Program Files\Git\bin\bash.EXE' -c "./your-script.sh"
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  Option 2: use `shell: pwsh` for the entire step and rewrite the logic in PowerShell.
+
+  Option 3: add a retry wrapper that re-runs the composite action step if the output
+  is unexpectedly empty (e.g. check for absence of the installed binary before proceeding
+  and re-invoke if missing).
+
+  Option 4: avoid `windows-11-arm` in the runner matrix until the platform bug is fixed
+  upstream, or pin to `windows-latest` (amd64) for bash-heavy composite actions.
+fix_code:
+  - language: yaml
+    label: 'Invoke bash from pwsh to avoid the WoW64 ARM64 launch bug'
+    code: |
+      - name: Install tool (windows-11-arm workaround)
+        shell: pwsh
+        run: |
+          # Call x86_64 bash from x86_64 pwsh — avoids native-arm64 → x86_64 WoW64 issue
+          & 'C:\Program Files\Git\bin\bash.EXE' --noprofile --norc `
+            "${env:GITHUB_ACTION_PATH}/main.sh"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  - language: yaml
+    label: 'Exclude windows-11-arm from bash-heavy matrix jobs'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              os: [windows-latest, ubuntu-latest, macos-latest]
+              # windows-11-arm excluded: shell: bash intermittent zero-output bug
+              # See: https://github.com/actions/partner-runner-images/issues/169
+prevention:
+  - 'Test composite actions on windows-11-arm at scale before relying on them in production CI.'
+  - 'Add post-step verification that checks for the installed binary; fail explicitly rather than silently continuing.'
+  - 'Monitor taiki-e/install-action release notes for the official workaround (pwsh retry wrapper) if using that action.'
+  - 'Prefer shell: pwsh over shell: bash for setup/install scripts in composite actions targeting windows-11-arm.'
+docs:
+  - url: 'https://github.com/actions/partner-runner-images/issues/169'
+    label: '[windows-11-arm] Composite action bash steps intermittently produce zero output and exit 0'
+  - url: 'https://github.com/taiki-e/install-action/issues/1562'
+    label: 'On windows-11-arm, sometimes does nothing, but succeeds'
+  - url: 'https://github.com/taiki-e/install-action/pull/1647'
+    label: 'Call main.sh from pwsh on Windows to work around windows-11-arm runner bug'
