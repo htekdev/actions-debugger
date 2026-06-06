@@ -1,0 +1,106 @@
+id: runner-environment-248
+title: '`actions/checkout` causes "Duplicate header: Authorization" — git returns 400 on subsequent git operations'
+category: runner-environment
+severity: error
+tags:
+  - checkout
+  - git
+  - authorization
+  - http-extraheader
+  - credentials
+  - 400
+  - duplicate-header
+patterns:
+  - regex: 'Duplicate header.*Authorization|remote.*Duplicate header.*Authorization'
+    flags: 'i'
+  - regex: 'fatal.*unable to access.*The requested URL returned error: 400'
+    flags: 'i'
+  - regex: 'http\.extraheader.*AUTHORIZATION.*duplicate|duplicate.*AUTHORIZATION.*extraheader'
+    flags: 'i'
+error_messages:
+  - "remote: Duplicate header: \"Authorization\""
+  - "fatal: unable to access 'https://github.com/org/repo/': The requested URL returned error: 400"
+  - "Error: The process '/usr/bin/git' failed with exit code 128"
+root_cause: |
+  When `actions/checkout` runs, it configures git credentials by setting an
+  `http.extraheader` entry containing an `AUTHORIZATION: bearer <token>` header.
+  This header is added to git's global or repository-level config so that all
+  subsequent git operations over HTTPS are authenticated.
+
+  The "Duplicate header: Authorization" error occurs when a second Authorization
+  header is injected on top of the one already set by checkout. This can happen in
+  two scenarios:
+
+  1. **Pin to @main or an unstable tag**: Using `actions/checkout@main` (or any
+     edge/pre-release revision) picks up unreleased changes that may change the
+     credential injection mechanism. In some checkout versions, the http.extraheader
+     is written in a way that stacks with git's built-in credential manager, sending
+     two conflicting Authorization headers in the same HTTP request.
+
+  2. **Multiple checkout calls with persist-credentials: true** (the default):
+     The first checkout sets the global http.extraheader. A second checkout step
+     (e.g., checking out a second repository) may add a new header without first
+     removing the existing one, depending on the git version and checkout version.
+
+  GitHub's servers reject HTTP requests with two Authorization headers with HTTP 400,
+  returning "Duplicate header: Authorization" in the response. Git then reports
+  `fatal: unable to access ... The requested URL returned error: 400`.
+
+  The bug was reported in checkout#2299 (Nov 2025, 10 reactions) and checkout#2215
+  (Jul 2025, 8 reactions) and remained open as of June 2026.
+fix: |
+  Option 1 — Pin to a stable released version tag instead of @main:
+  Replace `actions/checkout@main` with a specific release tag (e.g.,
+  `actions/checkout@v4` or `actions/checkout@v4.2.2`). The stable release series
+  has known credential injection behaviour that does not produce duplicate headers.
+
+  Option 2 — Clear http.extraheader between checkout steps:
+  If you must run multiple checkout steps, add a step between them to clear the
+  credential header before the second checkout:
+  ```yaml
+  - name: Clear git credentials before second checkout
+    run: git config --global --unset-all http.extraheader || true
+  ```
+
+  Option 3 — Use token: input only on the checkout that needs it and set
+  persist-credentials: false on checkouts that do not need to push:
+  ```yaml
+  - uses: actions/checkout@v4
+    with:
+      persist-credentials: false
+  ```
+fix_code:
+  - language: yaml
+    label: "Pin to stable checkout version to avoid duplicate header bug"
+    code: |
+      - name: Checkout repository
+        uses: actions/checkout@v4   # Pin to stable tag, NOT @main
+        with:
+          fetch-depth: 0
+
+  - language: yaml
+    label: "Clear git extraheader between multiple checkout steps"
+    code: |
+      - uses: actions/checkout@v4
+        with:
+          repository: org/first-repo
+
+      - name: Clear git credentials
+        run: git config --global --unset-all http.extraheader || true
+
+      - uses: actions/checkout@v4
+        with:
+          repository: org/second-repo
+          path: second-repo
+prevention:
+  - "Never pin actions to @main or mutable tags — always use immutable version tags (e.g., @v4 or @v4.2.2)"
+  - "If using multiple checkout steps, set persist-credentials: false on steps that don't require pushing"
+  - "Check git config --global --list | grep extraheader if unexpected 400 errors occur on git operations"
+  - "Upgrade to the latest stable actions/checkout release when a new version is available"
+docs:
+  - url: "https://github.com/actions/checkout/issues/2299"
+    label: "checkout#2299 — Duplicate header: Authorization (Nov 2025, 10 reactions)"
+  - url: "https://github.com/actions/checkout/issues/2215"
+    label: "checkout#2215 — actions/checkout@v4 fails with Duplicate header: Authorization, 400 (Jul 2025, 8 reactions)"
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions#using-an-intermediate-environment-variable"
+    label: "GitHub Actions security hardening — credential best practices"

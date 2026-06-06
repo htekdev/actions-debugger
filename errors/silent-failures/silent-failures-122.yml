@@ -1,0 +1,102 @@
+id: silent-failures-122
+title: '`fetch-tags: false` is silently ignored when `fetch-depth: 0` — all tags are still fetched'
+category: silent-failures
+severity: silent-failure
+tags:
+  - checkout
+  - fetch-tags
+  - fetch-depth
+  - git
+  - tags
+  - shallow-clone
+  - option-conflict
+patterns:
+  - regex: 'fetch-tags.*false.*fetch-depth.*0|fetch-depth.*0.*fetch-tags.*false'
+    flags: 'i'
+  - regex: 'tags.*still.*fetched|fetching.*tags.*despite.*false'
+    flags: 'i'
+error_messages:
+  - "# No error message — tags are silently fetched despite fetch-tags: false"
+root_cause: |
+  `actions/checkout` provides two related but conflicting inputs:
+  - `fetch-depth: 0` — fetches ALL commits and branches (unshallow clone); this
+    implicitly fetches ALL tags as well because full history requires resolving all
+    tag references
+  - `fetch-tags: false` — instructs the action NOT to fetch tags
+
+  When BOTH options are used together (`fetch-depth: 0` and `fetch-tags: false`),
+  `fetch-tags: false` is silently ignored. The full-history fetch that `fetch-depth: 0`
+  triggers uses a git fetch command that includes tag references, and the action does
+  not apply a `--no-tags` flag in this code path.
+
+  As a result, all repository tags end up in the local clone even though the workflow
+  explicitly requested `fetch-tags: false`. There is no error, warning, or annotation
+  — the tags are simply present.
+
+  This is a code-path gap in actions/checkout rather than a documented design decision.
+  The issue was reported in checkout#2195 (Jun 2025, 10 reactions) and remained open
+  as of June 2026.
+
+  Common situations where this matters:
+  - Workflows that use `git describe` and want to avoid picking up pre-release or
+    unrelated tags from the full history
+  - Versioning scripts that filter by tag presence to determine release status
+  - Workflows that check `git tag -l` to decide whether to create a new tag
+fix: |
+  Since `fetch-tags: false` is not honoured with `fetch-depth: 0`, the workaround is
+  to explicitly delete the fetched tags in a step immediately after checkout:
+
+  ```yaml
+  - uses: actions/checkout@v4
+    with:
+      fetch-depth: 0
+      fetch-tags: false  # Has no effect — tags are fetched anyway
+
+  - name: Remove all fetched tags (workaround for fetch-depth:0 + fetch-tags:false bug)
+    run: git tag -d $(git tag -l) || true
+  ```
+
+  Alternatively, if the goal is to avoid tag resolution during git operations, use
+  `--no-tags` in subsequent git fetch calls:
+  ```yaml
+  - run: git fetch --no-tags origin
+  ```
+
+  If the full commit history is needed but not all tags, also consider filtering
+  the specific tags needed using `git fetch origin refs/tags/<specific-tag>:refs/tags/<specific-tag>`
+  after deleting the unwanted ones.
+fix_code:
+  - language: yaml
+    label: "Delete all fetched tags after checkout when fetch-tags: false is needed with full history"
+    code: |
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: false  # NOTE: currently ignored with fetch-depth: 0
+
+      - name: Delete all tags (workaround — fetch-tags:false ignored with fetch-depth:0)
+        run: |
+          TAGS=$(git tag -l)
+          if [ -n "$TAGS" ]; then
+            git tag -d $TAGS
+          fi
+
+  - language: yaml
+    label: "Fetch full history via explicit git command with --no-tags as an alternative"
+    code: |
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1  # Shallow initial checkout
+
+      - name: Fetch full history without tags
+        run: git fetch --unshallow --no-tags
+prevention:
+  - "Do not rely on fetch-tags: false to suppress tag fetching when fetch-depth: 0 is also set — it has no effect"
+  - "If tag presence affects workflow logic, explicitly verify the tag state with git tag -l after checkout"
+  - "Track checkout#2195 for a fix in future actions/checkout releases"
+  - "As a workaround, delete all tags after checkout using: git tag -d $(git tag -l) || true"
+docs:
+  - url: "https://github.com/actions/checkout/issues/2195"
+    label: "checkout#2195 — fetch-tags: false still fetches tags if fetch-depth is 0 (Jun 2025, 10 reactions)"
+  - url: "https://github.com/actions/checkout#usage"
+    label: "actions/checkout Usage — fetch-depth and fetch-tags inputs"
