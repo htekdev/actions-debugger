@@ -1,0 +1,123 @@
+id: runner-environment-256
+title: 'CMake 4.0+ removes support for cmake_minimum_required VERSION < 3.5 — hard error'
+category: runner-environment
+severity: error
+tags:
+  - cmake
+  - cmake-4
+  - cmake-minimum-required
+  - c-cpp
+  - windows-2025-vs2026
+  - macos-26
+  - breaking-change
+patterns:
+  - regex: 'Compatibility with CMake < 3\.5 has been removed from CMake'
+    flags: 'i'
+  - regex: 'cmake_minimum_required.*Compatibility with CMake'
+    flags: 'i'
+  - regex: 'CMAKE_POLICY_VERSION_MINIMUM=3\.5 to try configuring anyway'
+    flags: 'i'
+  - regex: 'Update the VERSION argument <min> value.*cmake_minimum_required'
+    flags: 'i'
+error_messages:
+  - "CMake Error at CMakeLists.txt:1 (cmake_minimum_required): Compatibility with CMake < 3.5 has been removed from CMake."
+  - "Compatibility with CMake < 3.5 has been removed from CMake. Update the VERSION argument <min> value. Or, use the <min>...<max> syntax to tell CMake that the project requires at least <min> but has been updated to work with policies introduced by <max> or earlier. Or, add -DCMAKE_POLICY_VERSION_MINIMUM=3.5 to try configuring anyway."
+  - "CMake Error at build/_deps/doctest-src/CMakeLists.txt:1 (cmake_minimum_required): Compatibility with CMake < 3.5 has been removed from CMake."
+root_cause: |
+  CMake 4.0 (released February 2025) removed backward compatibility for projects that declare
+  `cmake_minimum_required(VERSION X)` where X is below 3.5. In earlier CMake versions this
+  produced only a deprecation warning; CMake 4.0+ turns it into a **hard error** that aborts
+  the configure step immediately.
+
+  **Affected GitHub Actions runners:**
+  - **windows-2025-vs2026** (`windows-latest` and `windows-2025` from June 8–15 2026 onwards)
+    ships CMake 4.3.2.
+  - **macos-26** (`macos-latest` from June 15 2026 onwards) ships CMake 4.3+.
+  - Ubuntu runners (ubuntu-22.04, ubuntu-24.04) still use CMake 3.x from apt — NOT affected.
+
+  **Common scenarios:**
+  1. A project's top-level `CMakeLists.txt` uses `cmake_minimum_required(VERSION 2.8)` or
+     `cmake_minimum_required(VERSION 3.4)`.
+  2. A dependency fetched with `FetchContent` or `add_subdirectory` (e.g., doctest, Catch2 older
+     versions, zeromq) declares a low minimum version.
+  3. A CMake module or third-party tool bundled in the repository was written years ago and
+     hasn't been updated.
+
+  Even if the project itself uses a high minimum, a transient FetchContent dependency with a low
+  minimum declaration will fail the configure step.
+fix: |
+  **Option 1 (best): Update cmake_minimum_required to ≥ 3.5 in every CMakeLists.txt.**
+  ```cmake
+  cmake_minimum_required(VERSION 3.5)
+  ```
+  Or use the modern range syntax to declare the tested CMake range without breaking older
+  installs:
+  ```cmake
+  cmake_minimum_required(VERSION 3.5...4.5)
+  ```
+
+  **Option 2: Set CMAKE_POLICY_VERSION_MINIMUM environment variable.**
+  For projects or dependencies you cannot modify (e.g., fetched via FetchContent), set the
+  environment variable before CMake runs:
+  ```yaml
+  env:
+    CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  ```
+  This allows CMake to configure the project as if the minimum was declared as 3.5, but does
+  NOT fix any actual use of CMake features deprecated before 3.5.
+
+  **Option 3: Pass -DCMAKE_POLICY_VERSION_MINIMUM=3.5 to cmake.**
+  ```bash
+  cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -B build .
+  ```
+
+  **Option 4: Pin CMake to 3.x using an action.**
+  ```yaml
+  - name: Install CMake 3.31
+    uses: jwlawson/actions-setup-cmake@v2
+    with:
+      cmake-version: '3.31'
+  ```
+fix_code:
+  - language: yaml
+    label: 'Set CMAKE_POLICY_VERSION_MINIMUM env var to handle legacy FetchContent dependencies'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          env:
+            CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                submodules: recursive
+            - name: Configure
+              run: cmake -B build -DCMAKE_BUILD_TYPE=Release .
+            - name: Build
+              run: cmake --build build
+  - language: cmake
+    label: 'Update cmake_minimum_required in CMakeLists.txt to use range syntax'
+    code: |
+      # Old (breaks on CMake 4.0+):
+      cmake_minimum_required(VERSION 3.0)
+
+      # New — supports CMake 3.5 through latest, applying policies up to 4.5:
+      cmake_minimum_required(VERSION 3.5...4.5)
+prevention:
+  - 'Audit your `cmake_minimum_required()` calls across all CMakeLists.txt and vendored dependencies — any VERSION below 3.5 will fail on CMake 4.x runners.'
+  - 'When using `FetchContent`, check the fetched project''s `CMakeLists.txt` for outdated minimum version declarations; use `CMAKE_POLICY_VERSION_MINIMUM=3.5` as a short-term workaround while upstreaming a fix.'
+  - 'If your workflow must support both Ubuntu (CMake 3.x) and macOS 26 / windows-2025-vs2026 (CMake 4.x), use the `VERSION <min>...<max>` range syntax which is valid in CMake 3.12+ and forwards-compatible with 4.x.'
+  - 'Pin the CMake version in your workflow with `jwlawson/actions-setup-cmake` or `lukka/get-cmake` if you need a consistent CMake version across all runner images.'
+docs:
+  - url: 'https://stackoverflow.com/questions/79534856/cannot-build-cmake-project-because-compatibility-with-cmake-3-5-has-been-remo'
+    label: 'Stack Overflow #79534856 — "Cannot build CMake project because Compatibility with CMake < 3.5 has been removed" (score 16, 41,590 views)'
+  - url: 'https://cmake.org/cmake/help/latest/release/4.0.html'
+    label: 'CMake 4.0 Release Notes — Deprecated and Removed Features'
+  - url: 'https://cmake.org/cmake/help/latest/variable/CMAKE_POLICY_VERSION_MINIMUM.html'
+    label: 'CMake docs — CMAKE_POLICY_VERSION_MINIMUM variable'
+  - url: 'https://cmake.org/cmake/help/latest/command/cmake_minimum_required.html'
+    label: 'CMake docs — cmake_minimum_required() command'
+  - url: 'https://github.com/zeromq/libzmq/issues/4844'
+    label: 'zeromq/libzmq #4844 — Compatibility with CMake < 3.5 has been removed'
+  - url: 'https://github.com/actions/runner-images/issues/14017'
+    label: 'runner-images #14017 — windows-latest migration to Visual Studio 2026 (ships CMake 4.3.2)'

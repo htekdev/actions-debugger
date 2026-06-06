@@ -1,0 +1,108 @@
+id: yaml-syntax-082
+title: 'actionlint and act report "Unknown Property queue" for concurrency.queue — false positive'
+category: yaml-syntax
+severity: warning
+tags:
+  - actionlint
+  - act
+  - concurrency
+  - queue
+  - false-positive
+  - schema-lag
+  - local-tooling
+patterns:
+  - regex: 'Unknown Property queue'
+    flags: 'i'
+  - regex: 'concurrency-mapping.*Unknown Property queue|Unknown Property queue.*concurrency'
+    flags: 'i'
+  - regex: 'Failed to match concurrency-mapping.*Unknown Property queue'
+    flags: 'i'
+error_messages:
+  - "Line: 6 Column 3: Unknown Property queue"
+  - "Failed to match string: Line: 4 Column 3: Expected a scalar got mapping\nLine: 4 Column 3: Failed to match concurrency-mapping: Line: 6 Column 3: Unknown Property queue\nActions YAML Schema Validation Error detected:"
+  - "workflow is not valid. 'queue.yml': Line: 4 Column 3: Failed to match string: Line: 4 Column 3: Expected a scalar got mapping\nLine: 4 Column 3: Failed to match concurrency-mapping: Line: 6 Column 3: Unknown Property queue"
+root_cause: |
+  GitHub added the `queue` property to the `concurrency` block in May 2026, allowing
+  workflows to configure how many pending runs are allowed:
+
+  ```yaml
+  concurrency:
+    group: ${{ github.workflow }}
+    queue: max   # up to 100 pending runs; "single" is the default
+  ```
+
+  Local workflow validation tooling (actionlint and act) lagged behind and do not recognize
+  `queue` in their `concurrency-mapping` schema, causing them to reject valid workflows with
+  a false-positive schema validation error.
+
+  **Affected tool versions:**
+  - **actionlint** ≤ v0.7.9 (schema fix PR #654 / #661 open; upgrade to latest once merged)
+  - **act** ≤ v0.2.88 (schema fix PR #6096 / #6097 in progress; `pkg/schema/workflow_schema.json`
+    concurrency-mapping definition only includes `group` and `cancel-in-progress`)
+
+  The workflow runs correctly on GitHub.com — only local tooling is affected.
+
+  **Note:** Using `queue: max` together with `cancel-in-progress: true` is explicitly
+  disallowed by GitHub and will produce a workflow validation error at runtime on GitHub.com.
+  These two options are mutually exclusive (max-queue means retain pending runs, while
+  cancel-in-progress means cancel them).
+fix: |
+  **Option 1 (recommended): Upgrade actionlint and act to a version with the fix.**
+  - actionlint: upgrade to the version that includes PR #661 (v0.7.10+)
+  - act: upgrade to the version that includes PR #6097 (v0.2.89+)
+
+  **Option 2: Suppress the false positive in actionlint using a comment annotation.**
+  ```yaml
+  concurrency:
+    group: ${{ github.workflow }}
+    queue: max  # actionlint:ignore
+  ```
+
+  **Option 3: Skip act's schema validation for workflows using queue.**
+  Pass `--no-schema-validation` or equivalent flag to act when running workflows locally
+  that use `concurrency.queue`.
+
+  The workflow is valid and runs correctly on GitHub.com regardless of what the local
+  tooling reports.
+fix_code:
+  - language: yaml
+    label: 'Valid workflow using concurrency.queue: max (runs correctly on GitHub)'
+    code: |
+      name: Deploy to production
+      on:
+        push:
+          branches: [main]
+
+      concurrency:
+        group: production-deploy
+        queue: max   # up to 100 pending runs; do NOT combine with cancel-in-progress: true
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Deploy
+              run: ./deploy.sh
+  - language: yaml
+    label: 'Upgrade actionlint in CI to avoid false positive blocking your lint step'
+    code: |
+      - name: Run actionlint
+        uses: docker://rhysd/actionlint:latest  # always latest; or pin to >=1.7.10 once released
+        with:
+          args: '-color'
+prevention:
+  - 'Keep actionlint and act updated to avoid schema-lag false positives; GitHub adds new workflow syntax regularly and tooling takes days to weeks to catch up.'
+  - 'Do NOT combine `queue: max` with `cancel-in-progress: true` — this is an invalid combination that will cause a GitHub workflow validation error at runtime.'
+  - 'When local tooling reports a schema error but the workflow runs successfully on GitHub.com, first check whether the syntax was recently added to the GitHub Actions spec before spending time debugging the workflow itself.'
+docs:
+  - url: 'https://github.com/rhysd/actionlint/issues/657'
+    label: 'actionlint #657 — "Actionlint does not know about queue: key for concurrency" (2 reactions)'
+  - url: 'https://github.com/nektos/act/issues/6095'
+    label: 'act #6095 — "Workflows using concurrency.queue fail schema validation (Unknown Property queue)"'
+  - url: 'https://docs.github.com/en/actions/how-tos/writing-workflows/choosing-when-your-workflow-runs/control-the-concurrency-of-workflows-and-jobs'
+    label: 'GitHub docs — Control the concurrency of workflows and jobs (queue property)'
+  - url: 'https://github.com/rhysd/actionlint/pull/661'
+    label: 'actionlint PR #661 — feat: support concurrency queue and job.workflow_* contexts'
+  - url: 'https://github.com/nektos/act/pull/6097'
+    label: 'act PR #6097 — fix: add queue field to concurrency-mapping schema'
