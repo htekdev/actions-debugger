@@ -1,0 +1,125 @@
+id: runner-environment-250
+title: '`dotnet-version: 10.0.x` resolves to non-existent patch version — aka.ms redirect misconfigured during .NET release cycle'
+category: runner-environment
+severity: error
+tags:
+  - setup-dotnet
+  - dotnet
+  - version-not-found
+  - aka-ms-redirect
+  - install-scripts
+  - wildcard-version
+  - net10
+patterns:
+  - regex: 'Could not find \.NET Core (SDK|Runtime) with version = \d+\.\d+\.\d+'
+    flags: 'i'
+  - regex: 'dotnet-install: The resource at aka\.ms link.*is not available'
+    flags: 'i'
+  - regex: 'Failed to install dotnet.*exit code: 1.*Could not find.*version = \d+\.\d+\.\d+'
+    flags: 'ims'
+  - regex: 'Attempting to download using aka\.ms link.*dotnet-(sdk|runtime)-\d+\.\d+\.\d+-.*\.tar\.gz.*404'
+    flags: 'ims'
+error_messages:
+  - "dotnet_install: Error: Could not find `.NET Core SDK` with version = 10.0.201"
+  - "dotnet_install: Error: Could not find `.NET Core Runtime` with version = 10.0.5"
+  - "dotnet-install: The resource at aka.ms link 'https://builds.dotnet.microsoft.com/dotnet/Sdk/10.0.201/dotnet-sdk-10.0.201-linux-x64.tar.gz' is not available."
+  - "Error: Failed to install dotnet, exit code: 1."
+  - "curl: (22) The requested URL returned error: 404 Not Found"
+root_cause: |
+  `actions/setup-dotnet` and the underlying `dotnet/install-scripts` use `aka.ms` redirect
+  URLs maintained by Microsoft to resolve the "latest" version for a given channel (e.g.,
+  `10.0.x`, `LTS`, `STS`). These redirects point to a specific patch version build URL.
+
+  When Microsoft publishes a new .NET patch version, the `aka.ms` redirects are briefly updated
+  to point to the new version's build artifacts. If the redirect is updated BEFORE the actual
+  build artifacts are published to `builds.dotnet.microsoft.com`, every workflow using a wildcard
+  version spec (e.g., `dotnet-version: 10.0.x` or `dotnet-version: LTS`) will attempt to
+  download a version that doesn't exist yet, receiving a 404.
+
+  This race condition between the redirect update and the artifact publication means that all
+  GitHub Actions workflows using `actions/setup-dotnet` with wildcard versions simultaneously
+  fail for a period of 15 minutes to several hours until the artifacts are published.
+
+  The pattern recurred:
+  - **March 10, 2026**: `LTS` redirect pointed to `10.0.5` / SDK `10.0.201` before they existed
+  - **May 16, 2026**: Same issue returned, confirmed by multiple users
+
+  The `dotnet-install.sh` script constructs the download URL directly from the version number
+  returned by the `aka.ms` redirect, so there is no fallback to the previous known-good version.
+
+  Note: This is distinct from the `.NET 6/7 EOL` version-not-found issue (`runner-environment-166`),
+  which is caused by Microsoft permanently removing old build artifacts. This issue is a transient
+  race condition during new-version rollout and typically self-resolves within hours.
+fix: |
+  **Immediate action**: Re-run failed workflow jobs — the issue is transient and self-resolves
+  once Microsoft finishes publishing the new .NET artifacts (usually within 1-4 hours).
+
+  **Pin to an exact version** to avoid hitting the redirect race condition:
+  Use `dotnet-version: '10.0.4'` (or whichever the last confirmed-working patch is) instead of
+  `dotnet-version: '10.0.x'`. Check https://dotnet.microsoft.com/en-us/download/dotnet/10.0 for
+  the latest stable version.
+
+  **Use the global.json approach** with a `rollForward` policy instead of the wildcard spec:
+  Create a `global.json` file with a safe `latestPatch` roll-forward policy that lets the
+  installed SDK satisfy your version requirement without fetching a specific patch.
+
+  **File an issue at dotnet/core** if the outage persists — the root cause is in the aka.ms
+  redirect management maintained by the .NET team at Microsoft.
+fix_code:
+  - language: yaml
+    label: 'Pin to an exact .NET 10 version instead of wildcard to avoid redirect race'
+    code: |
+      - uses: actions/setup-dotnet@v4
+        with:
+          # Exact version — immune to aka.ms redirect race conditions
+          dotnet-version: '10.0.4'
+          # Or use global.json for project-level version pinning:
+          # dotnet-version-file: 'global.json'
+
+  - language: yaml
+    label: 'Use global.json with latestPatch roll-forward for safer version resolution'
+    code: |
+      # global.json at repo root:
+      # {
+      #   "sdk": {
+      #     "version": "10.0.100",
+      #     "rollForward": "latestPatch"
+      #   }
+      # }
+
+      # In your workflow:
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version-file: 'global.json'    # resolves from the file, not aka.ms
+
+  - language: yaml
+    label: 'Add retry logic with continue-on-error + fallback to cached SDK'
+    code: |
+      - name: Setup .NET (with retry)
+        id: setup-dotnet
+        uses: actions/setup-dotnet@v4
+        continue-on-error: true
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Fallback — install pinned .NET if wildcard failed
+        if: steps.setup-dotnet.outcome == 'failure'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.4'    # last known-good version
+
+prevention:
+  - 'Prefer exact version pins (`10.0.4`) over wildcards (`10.0.x`) in production CI — reduces exposure to aka.ms redirect race conditions'
+  - 'Use `dotnet-version-file: global.json` with `rollForward: latestPatch` for project-level SDK pinning that avoids direct aka.ms resolution'
+  - 'Monitor https://github.com/dotnet/install-scripts and https://github.com/actions/setup-dotnet for known regressions before major .NET patch days'
+  - 'Subscribe to dotnet/core announcements to anticipate .NET patch releases — aka.ms redirects are updated around Patch Tuesday each month'
+  - 'Add `continue-on-error: true` + a fallback step to tolerate transient outages without blocking CI entirely'
+docs:
+  - url: 'https://github.com/actions/setup-dotnet/issues/711'
+    label: 'actions/setup-dotnet#711 — dotnet-version: 10.0.x tries to download non-existent version 10.0.5 (March 2026, 48 reactions)'
+  - url: 'https://github.com/dotnet/install-scripts'
+    label: 'dotnet/install-scripts — underlying install script that resolves aka.ms redirects'
+  - url: 'https://dotnet.microsoft.com/en-us/download/dotnet/10.0'
+    label: '.NET 10 download page — latest stable SDK/runtime versions'
+  - url: 'https://learn.microsoft.com/en-us/dotnet/core/tools/global-json'
+    label: 'global.json overview — SDK version selection with rollForward policies'
