@@ -1,0 +1,114 @@
+id: runner-environment-234
+title: "actions/checkout v6 credential helper overrides embedded PAT in cross-repo git push — 403 Permission denied to github-actions[bot]"
+category: runner-environment
+severity: error
+tags:
+  - checkout
+  - v6
+  - credential-helper
+  - cross-repo
+  - PAT
+  - git-push
+  - extraheader
+  - 403
+  - permission-denied
+patterns:
+  - regex: 'remote: Permission to .+\.git denied to github-actions\[bot\]'
+    flags: 'i'
+  - regex: 'fatal: unable to access .+github\.com.+: The requested URL returned error: 403'
+    flags: 'i'
+  - regex: 'Permission denied to github-actions\[bot\]\.'
+    flags: 'i'
+error_messages:
+  - 'remote: Permission to owner/nightly-releases.git denied to github-actions[bot].'
+  - 'fatal: unable to access ''https://github.com/owner/repo/'': The requested URL returned error: 403'
+root_cause: |
+  When a workflow uses actions/checkout v6 and then manually adds a second git remote
+  whose URL embeds a Personal Access Token (PAT), the cross-repo git push fails with
+  a 403 even though the PAT is valid and has the required scope.
+
+  actions/checkout injects a GitHub token (GITHUB_TOKEN by default) into the local
+  git configuration as an HTTP Authorization header for `https://github.com/` URLs
+  via `http.https://github.com/.extraheader`. A common pattern to push to a separate
+  repository using a PAT is to:
+    1. Add a remote with the PAT embedded in the URL:
+         git remote add nightly_repo https://TOKEN@github.com/owner/repo.git
+    2. Remove the checkout-injected extraheader to prevent it from conflicting:
+         git config --unset-all http.https://github.com/.extraheader
+    3. Push via the PAT URL remote.
+
+  This pattern worked correctly with actions/checkout v4 and v5. In v6, the sequence
+  fails because the action now also registers a git credential helper
+  (`credential.https://github.com.helper`) alongside the extraheader. When the
+  extraheader is manually unset in step 2, the credential helper remains configured.
+  Git consults the credential helper for all `https://github.com/` requests —
+  including the push to the PAT URL remote — and the helper returns GITHUB_TOKEN
+  (authenticated as `github-actions[bot]`). This token overrides the PAT embedded
+  in the remote URL, and since `github-actions[bot]` does not have write access to
+  the target repository, the push fails with HTTP 403.
+
+  The root distinction from earlier versions: unsetting `http.extraheader` alone is
+  no longer sufficient to fully remove checkout's credential injection in v6.
+
+  Source: actions/checkout#2424 (April 2026, open).
+fix: |
+  **Option 1 (recommended): Use `persist-credentials: false` in checkout.**
+  This prevents checkout from configuring any git credentials at all. The subsequent
+  git push uses the PAT embedded in the remote URL without interference.
+
+  **Option 2: Explicitly clear the credential helper after checkout.**
+  After the checkout step, unset both the extraheader AND the credential helper:
+    git config --unset-all http.https://github.com/.extraheader || true
+    git config --global --unset credential.https://github.com.helper || true
+    git config --global --unset credential.helper || true
+
+  Note: the exact helper key may vary; inspect `git config --list` to see all keys
+  set by checkout before unsetting.
+
+  **Option 3: Provide the PAT via the checkout `token:` input instead.**
+  If the PAT has access to both the primary repo and the target cross-repo, pass it
+  as the `token:` input so checkout configures it as the credential for all
+  github.com pushes. This avoids the need to inject a second credential entirely.
+fix_code:
+  - language: yaml
+    label: 'Recommended: use persist-credentials: false and embed PAT in remote URL'
+    code: |
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false   # prevents checkout from injecting any git credentials
+
+      - name: Push tags to nightly releases repository
+        env:
+          NIGHTLY_PAT: ${{ secrets.NIGHTLY_PAT }}
+        run: |
+          git remote add nightly_repo \
+            "https://${NIGHTLY_PAT}@github.com/owner/nightly-releases.git"
+          git tag -f nightly
+          git push -f nightly_repo nightly
+  - language: yaml
+    label: 'Alternative: pass PAT to checkout token: input (when PAT has access to primary repo)'
+    code: |
+      - uses: actions/checkout@v6
+        with:
+          # If CROSS_REPO_PAT has access to the checked-out repo as well,
+          # checkout will configure it for all github.com credential requests.
+          token: ${{ secrets.CROSS_REPO_PAT }}
+
+      - name: Push tags to nightly releases repository
+        run: |
+          git remote add nightly_repo \
+            "https://${{ secrets.CROSS_REPO_PAT }}@github.com/owner/nightly-releases.git"
+          git tag -f nightly
+          git push -f nightly_repo nightly
+prevention:
+  - 'Use `persist-credentials: false` in any checkout step that is followed by a cross-repo git push using a PAT, to avoid checkout credential helpers interfering with the push'
+  - 'When debugging 403 errors on git push, check `git config --list` to see all credential-related configuration; look for any helper or extraheader keys referencing github.com'
+  - 'Avoid relying on unsetting only `http.https://github.com/.extraheader` to remove checkout credentials in v6+; the set of keys checkout writes has changed across versions'
+  - 'When migrating from actions/checkout v4/v5 to v6, test all workflows that manually manipulate git credentials or push to cross-repo remotes'
+docs:
+  - url: 'https://github.com/actions/checkout/issues/2424'
+    label: 'actions/checkout#2424 — Unable to create tags in another repo with v6 (403 Permission denied)'
+  - url: 'https://github.com/actions/checkout#usage'
+    label: 'actions/checkout README — persist-credentials input'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication'
+    label: 'GitHub Docs — GITHUB_TOKEN automatic token authentication'
