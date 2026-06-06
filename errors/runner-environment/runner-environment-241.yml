@@ -1,0 +1,154 @@
+id: runner-environment-241
+title: 'Docker container fails with "openat etc/passwd: path escapes from parent" on containerd v2.2+'
+category: runner-environment
+severity: error
+tags:
+  - containerd
+  - docker
+  - healthcheck
+  - path-escapes
+  - nixos
+  - absolute-symlink
+  - runner-image-update
+patterns:
+  - regex: 'openat etc/passwd: path escapes from parent'
+    flags: 'i'
+  - regex: 'openat etc/group: path escapes from parent'
+    flags: 'i'
+  - regex: 'ExitCode.*-1.*path escapes|path escapes.*ExitCode.*-1'
+    flags: 'i'
+  - regex: 'mount callback failed.*path escapes from parent'
+    flags: 'i'
+error_messages:
+  - "openat etc/passwd: path escapes from parent"
+  - "openat etc/group: path escapes from parent"
+  - "mount callback failed on /tmp/containerd-mount...: openat etc/passwd: path escapes from parent"
+  - "ExitCode: -1 (exit code -1)"
+root_cause: |
+  containerd v2.2.0+ (built with Go 1.24) introduced stricter path validation via Go 1.24's
+  `os.Root` API. When Docker starts or runs a health check on a container whose image has
+  `/etc/passwd` or `/etc/group` symlinked to an **absolute path** (e.g., NixOS images where
+  `/etc/passwd → /nix/store/.../passwd`), containerd misinterprets the symlink target as
+  escaping the container root filesystem and raises:
+  `openat etc/passwd: path escapes from parent`.
+
+  **Affected container images:**
+  - **NixOS-based images** (e.g., `nixos/nix:latest`) — `/etc/passwd → /nix/store/.../passwd`
+  - **ngrok container images** — use absolute symlinks for system files
+  - **Android emulator images** — `/etc` itself may be an absolute symlink to `/system/etc`
+  - Any image where the symlink target for `/etc/passwd` or `/etc/group` starts with `/`
+
+  **Impact on GitHub Actions workflows:**
+  1. Service containers with HEALTHCHECK definitions fail with `ExitCode: -1` even when the
+     service is actually running correctly
+  2. Container jobs (`container: image: nixos/nix:latest`) fail at startup before any steps run
+  3. Docker `run` steps using affected images fail with `path escapes from parent` in logs
+
+  **Status on GitHub-hosted runners:**
+  - **Windows runners** (windows-2022, windows-2025, windows-11-arm64): containerd v2.2.x
+    shipped with Docker 29 on February 9, 2026 — **currently affected**
+  - **Ubuntu runners**: containerd v2.2.x deployed February 9, 2026 then **rolled back on
+    February 20, 2026** due to this and related issues (runner-images#13682, #13684, #13691);
+    tracked for re-deployment in runner-images#14105
+
+  A partial fix was merged in containerd v2.2.2 (commit 85b5418e) addressing the case where
+  `/etc/passwd` itself is a direct absolute symlink. However, the case where an **intermediate
+  directory** (e.g., `/etc` is an absolute symlink to `/system/etc`) remains broken and open
+  in containerd#13382 as of May 2026.
+
+  Source: actions/runner-images#13682 (Feb 2026), containerd/containerd#12683,
+  reubeno/brush#999 (real-world GitHub Actions failure)
+fix: |
+  **Option 1 — Convert absolute symlinks to relative in a pre-step (most portable fix):**
+  Add a step before any Docker operations that resolves absolute `/etc/passwd` and
+  `/etc/group` symlinks to relative equivalents inside the container. This approach works
+  even when you cannot modify the container image.
+
+  **Option 2 — Build a derived image with relative symlinks:**
+  Create a `Dockerfile` that `FROM` the affected image and replaces the absolute symlinks
+  with relative ones. This is the most reliable long-term fix when you own the workflow.
+
+  **Option 3 — Use an alternative image without absolute symlinks:**
+  Standard Ubuntu, Debian, and Alpine images use regular files (not symlinks) for
+  `/etc/passwd` and `/etc/group` — they are unaffected. If the workflow can use a
+  different base image, this sidesteps the issue entirely.
+
+  **Option 4 — Pin containerd to v2.1.x on self-hosted runners:**
+  On self-hosted runners where you control Docker/containerd versions, remain on
+  containerd v1.7.x or v2.1.x until containerd v2.2.3+ resolves all absolute symlink cases.
+fix_code:
+  - language: yaml
+    label: 'Workaround — convert absolute /etc symlinks in a pre-step (NixOS/ngrok containers)'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          container:
+            image: nixos/nix:latest
+          steps:
+            - name: Fix absolute /etc symlinks (containerd v2.2+ workaround)
+              run: |
+                for f in /etc/passwd /etc/group; do
+                  if [ -L "$f" ]; then
+                    target=$(readlink "$f")
+                    if echo "$target" | grep -q '^/'; then
+                      # Convert absolute symlink to relative
+                      rel=$(python3 -c "import os; print(os.path.relpath('$target', '/etc'))")
+                      ln -sf "$rel" "$f"
+                    fi
+                  fi
+                done
+            - name: Run tests
+              run: nix run nixpkgs#hello
+
+  - language: yaml
+    label: 'Build a derived image that replaces absolute symlinks with relative ones'
+    code: |
+      # Dockerfile.fixed — used for CI to avoid the containerd v2.2 regression:
+      # FROM nixos/nix:latest
+      # RUN for f in /etc/passwd /etc/group; do \
+      #       if [ -L "$f" ]; then \
+      #         target=$(readlink "$f"); \
+      #         rel=$(python3 -c "import os; print(os.path.relpath('$target', '/etc'))"); \
+      #         ln -sf "$rel" "$f"; \
+      #       fi; \
+      #     done
+
+      # In workflow — build derived image first:
+      steps:
+        - name: Build patched image
+          run: docker build -f Dockerfile.fixed -t my-nix-fixed .
+
+        - name: Use patched image
+          run: docker run --rm my-nix-fixed nix run nixpkgs#hello
+
+  - language: yaml
+    label: 'Use Alpine or Debian service container instead of NixOS/ngrok'
+    code: |
+      # Unaffected base images (no absolute symlinks for /etc/passwd):
+      # redis:7-alpine, postgres:16-alpine, debian:bookworm-slim, ubuntu:24.04
+      jobs:
+        test:
+          runs-on: windows-2025    # Docker 29 + containerd v2.2 — always active on Windows
+          services:
+            redis:
+              image: redis:7-alpine
+              options: >-
+                --health-cmd "redis-cli ping"
+                --health-interval 10s
+                --health-timeout 5s
+                --health-retries 5
+prevention:
+  - 'Never use NixOS, ngrok, or Android emulator container images as service containers on Windows runners without the absolute-symlink workaround — Windows runners have had containerd v2.2.x since Feb 2026.'
+  - 'Check if your container image uses absolute /etc/passwd symlinks with: `docker run --rm <image> readlink /etc/passwd`. If the output starts with "/", it will fail on containerd v2.2+.'
+  - 'Use official distribution base images (Alpine, Debian, Ubuntu) for service containers when possible — they use regular files for /etc/passwd and are unaffected.'
+  - 'Monitor runner-images#14105 for the Ubuntu Docker 29 re-deployment timeline — once Ubuntu runners re-deploy Docker 29, this issue will re-appear on Linux jobs as well.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/13682'
+    label: 'runner-images#13682 — Container healthchecks failing with path escapes on Ubuntu runners'
+  - url: 'https://github.com/containerd/containerd/issues/12683'
+    label: 'containerd#12683 — v2.2.0 fails to create containers with /etc/passwd as absolute symlink'
+  - url: 'https://github.com/containerd/containerd/issues/13382'
+    label: 'containerd#13382 — v2.2+ fails when /etc directory itself is an absolute symlink'
+  - url: 'https://github.com/reubeno/brush/issues/999'
+    label: 'brush#999 — Real-world GitHub Actions failure with nixos/nix container'

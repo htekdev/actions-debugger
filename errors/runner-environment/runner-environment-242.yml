@@ -1,0 +1,131 @@
+id: runner-environment-242
+title: 'Docker Engine v29 raises minimum API to 1.44 — old SDK clients fail with "client version X is too old"'
+category: runner-environment
+severity: error
+tags:
+  - docker
+  - docker-29
+  - api-version
+  - sdk
+  - windows
+  - runner-image-update
+  - python-docker
+patterns:
+  - regex: 'client version \d+\.\d+ is too old\. Minimum supported API version is 1\.4[4-9]'
+    flags: 'i'
+  - regex: 'Error response from daemon: client version.*Minimum supported API version is 1\.4[4-9]'
+    flags: 'i'
+  - regex: 'minimum supported API version.*1\.4[4-9]|API version.*too old.*upgrade your client'
+    flags: 'i'
+error_messages:
+  - "Error response from daemon: client version 1.41 is too old. Minimum supported API version is 1.44, please upgrade your client to a newer version"
+  - "Error response from daemon: client version 1.43 is too old. Minimum supported API version is 1.44, please upgrade your client to a newer version"
+  - "Error response from daemon: client version 1.24 is too old. Minimum supported API version is 1.44, please upgrade your client to a newer version"
+root_cause: |
+  Docker Engine v29.0 (released November 2025) raised the **minimum supported Docker daemon
+  API version from 1.24 to 1.44**. Any Docker SDK client that negotiates API version 1.43 or
+  lower receives:
+  `"Error response from daemon: client version 1.41 is too old. Minimum supported API version
+  is 1.44, please upgrade your client to a newer version"`.
+
+  **API version 1.44 corresponds to Docker Engine 23.0**. Any SDK client built against Docker
+  < 23.0 will fail when the daemon is Docker Engine v29+.
+
+  **Impact on GitHub Actions — current status:**
+  - **Windows runners** (windows-2022, windows-2025, windows-11-arm64): Docker 29.x deployed
+    February 9, 2026 — **currently affected on Windows workflows**
+  - **Ubuntu runners**: Docker 29.x rolled back February 20, 2026 due to related issues
+    (runner-images#13682, #13684); re-deployment tracked in runner-images#14105
+
+  **Affected tools and workflows:**
+  - Python `docker` library ≤ 6.1.3 (negotiates API 1.41 by default) — upgrade to ≥ 7.0.0
+  - `google/oss-fuzz` CIFuzz action — uses internal Python docker client negotiating API 1.41;
+    affected every project using `google/oss-fuzz/infra/cifuzz/actions/build_fuzzers@master`
+  - Go `github.com/docker/docker/client` packages pinned to Docker < 23.0 API
+  - Any workflow tool, action, or custom script that embeds its own Docker SDK rather than
+    invoking the CLI `docker` command
+  - GitHub Codespaces dev container CI workflows using Docker SDK library in test scripts
+
+  **Note:** This is distinct from the Docker Compose v1/v2 breaking changes (see
+  `docker-29-compose-v2-40-breaking.yml` / re-031), which covers Compose CLI changes.
+  This entry covers SDK API negotiation failures from non-CLI Docker clients.
+
+  Source: google/oss-fuzz#14945 (Feb 2026), actions/runner-images#13474, docker/docs#23910
+fix: |
+  **Option 1 — Upgrade Python docker library to ≥ 7.0.0:**
+  The most common case. Python docker SDK ≥ 7.0.0 negotiates API 1.47+ which is compatible
+  with Docker Engine 29.
+
+  **Option 2 — Use the Docker CLI instead of SDK calls:**
+  Replace Python/Go SDK calls with `docker build`, `docker run`, etc. via `run:` steps. The
+  Docker CLI always negotiates the correct API version with the daemon automatically.
+
+  **Option 3 — Set DOCKER_API_VERSION environment variable:**
+  Some SDKs honor `DOCKER_API_VERSION=1.44` as an override. However this only works if the
+  SDK actually implements the 1.44 protocol — just setting the env var won't upgrade an
+  SDK that doesn't support 1.44.
+
+  **Option 4 — Pin the affected tool to an updated version:**
+  For CIFuzz: the fix was deployed to `google/oss-fuzz` within hours of the issue being
+  reported. Pin `@master` to get the fix, or wait for a tagged release. For any other
+  action/tool embedding Docker SDK, check for an updated release that bumps the SDK.
+fix_code:
+  - language: yaml
+    label: 'Upgrade Python docker SDK in workflow before using it'
+    code: |
+      # The error appears in workflows using Python docker library <= 6.1.3
+      # Example error:
+      #   Error response from daemon: client version 1.41 is too old.
+      #   Minimum supported API version is 1.44
+      steps:
+        - name: Upgrade Docker Python SDK
+          run: pip install 'docker>=7.0.0'
+
+        - name: Run Docker-based tests
+          run: python -m pytest tests/docker/
+
+  - language: yaml
+    label: 'Replace SDK docker.from_env() calls with Docker CLI'
+    code: |
+      # Instead of Python SDK:
+      #   import docker
+      #   client = docker.from_env()
+      #   client.images.build(path='.', tag='my-image')
+      # Use the CLI directly via shell steps:
+      steps:
+        - name: Build Docker image
+          run: docker build -t my-image:latest .
+
+        - name: Run container
+          run: docker run --rm my-image:latest ./run-tests.sh
+
+        - name: Push to registry
+          run: docker push my-image:latest
+
+  - language: yaml
+    label: 'Check Docker API version compatibility in your workflow'
+    code: |
+      # Run this step to diagnose version negotiation issues:
+      steps:
+        - name: Show Docker version information
+          run: |
+            docker version
+            # Server.APIVersion: 1.47  (what the daemon offers)
+            # Client.APIVersion: 1.47  (what the CLI uses — always current)
+            # If using Python sdk: python3 -c "import docker; c=docker.from_env(); print(c.version())"
+            # If sdk prints error about client version, upgrade docker>=7.0.0
+prevention:
+  - 'Avoid embedding Docker SDK client calls in workflow scripts — always prefer the Docker CLI via run: steps, which auto-negotiates the correct API version.'
+  - 'When the Python docker library IS required, pin it to >=7.0.0 in requirements.txt or install it explicitly in a workflow step before use.'
+  - 'Test workflows on windows-2025 before ubuntu re-deployment of Docker 29 — Windows runners already expose the Docker 29 min API 1.44 constraint.'
+  - 'If using google/oss-fuzz CIFuzz, ensure you reference a recent commit — the fix for API 1.41 incompatibility was deployed in Feb 2026.'
+  - 'When adding new tool dependencies that use Docker, check the docker-py version they require and whether it supports API >= 1.44.'
+docs:
+  - url: 'https://github.com/google/oss-fuzz/issues/14945'
+    label: 'oss-fuzz#14945 — CIFuzz fails with client version 1.41 too old after Docker v29 update'
+  - url: 'https://github.com/actions/runner-images/issues/13474'
+    label: 'runner-images#13474 — Docker 29.1.* update announcement (Feb 9, 2026)'
+  - url: 'https://docs.docker.com/reference/api/engine/'
+    label: 'Docker Engine API reference — version compatibility matrix'
+  - url: 'https://github.com/actions/runner-images/issues/14105'
+    label: 'runner-images#14105 — Docker v29 Ubuntu re-deployment tracking issue'
