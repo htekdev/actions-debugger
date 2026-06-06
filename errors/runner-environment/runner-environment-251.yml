@@ -1,0 +1,141 @@
+id: runner-environment-251
+title: '.NET SDK 10.0.200+ requires MSBuild 18.0 but `windows-2022` only ships MSBuild 17 (VS 2022)'
+category: runner-environment
+severity: error
+tags:
+  - dotnet
+  - msbuild
+  - windows-2022
+  - net10
+  - visual-studio-2022
+  - version-incompatibility
+  - setup-dotnet
+patterns:
+  - regex: 'Version \d+\.0\.\d{3} of the \.NET SDK requires at least version 18\.0\.0 of MSBuild'
+    flags: 'i'
+  - regex: 'The current available version of MSBuild is 17\.\d+\.\d+'
+    flags: 'i'
+  - regex: 'Could not resolve SDK.*Microsoft\.NET\.Sdk.*version 18\.0\.0 of MSBuild'
+    flags: 'i'
+  - regex: 'MSBuild version.*requires.*18\.0.*current.*17\.'
+    flags: 'i'
+error_messages:
+  - "Version 10.0.200 of the .NET SDK requires at least version 18.0.0 of MSBuild. The current available version of MSBuild is 17.14.40.60911."
+  - "D:\\a\\...\\MyApp.csproj : error : Could not resolve SDK \"Microsoft.NET.Sdk\"."
+  - "Change the .NET SDK specified in global.json to an older version that requires the MSBuild version currently available."
+  - "error MSB4236: The SDK 'Microsoft.NET.Sdk.Web' specified could not be found."
+root_cause: |
+  Starting with .NET SDK **10.0.200** (released around March 2026), the .NET SDK toolchain
+  requires **MSBuild 18.0 or later** to build projects. This requirement was introduced because
+  .NET SDK 10.0.200 includes MSBuild features that depend on capabilities added in MSBuild 18.
+
+  The `windows-2022` GitHub Actions runner ships with **Visual Studio 2022**, which provides
+  MSBuild 17.x (currently 17.14.x). MSBuild 18.0 is only included in **Visual Studio 2026**
+  (VS 18.x), which ships with `windows-2025-vs2026` and `windows-latest` (as of June 2026).
+
+  Trigger scenario:
+  1. Workflow uses `runs-on: windows-2022` (deliberately pinned or using legacy config)
+  2. Workflow installs .NET 10 SDK via `actions/setup-dotnet` with `dotnet-version: '10.0.x'`
+     or `dotnet-version: '10.x'`
+  3. `dotnet build`, `dotnet restore`, or NuGet restore attempts to invoke MSBuild
+  4. MSBuild 17.14 is found on PATH from VS 2022 installation
+  5. .NET SDK rejects MSBuild 17.x and throws the version incompatibility error
+
+  Note: This does NOT affect `windows-latest` users as of June 8, 2026, because `windows-latest`
+  now resolves to VS 2026 (MSBuild 18.x). The issue is specific to workflows explicitly pinning
+  to `windows-2022` (which keeps VS 2022/MSBuild 17.x) while also installing .NET SDK 10.0.200+.
+
+  NuGet-based restores (e.g., via `NuGetCommand@2` or `nuget.exe`) are also affected because
+  NuGet's MSBuild auto-detection picks up the VS 2022 MSBuild binary and .NET SDK 10.0.200+
+  then rejects it during SDK resolution.
+fix: |
+  **Option 1 — Switch to windows-latest or windows-2025-vs2026** (recommended):
+  These runner labels ship with Visual Studio 2026 (MSBuild 18.x), which satisfies the
+  .NET SDK 10.0.200+ MSBuild requirement.
+
+  **Option 2 — Pin to an older .NET SDK that supports MSBuild 17.x**:
+  .NET SDK 10.0.100 (the initial .NET 10 release) works with MSBuild 17.x. Pin via `global.json`
+  or `dotnet-version: '10.0.100'` if you must stay on `windows-2022`.
+
+  **Option 3 — Install VS Build Tools 2026 in your workflow**:
+  Install the VS 2026 Build Tools workload as a workflow step to get MSBuild 18.x on
+  `windows-2022`. This is slow (~5-10 min) but avoids the runner label change.
+
+  **Option 4 — Use the .NET SDK's bundled MSBuild**:
+  When you call `dotnet build` (not `msbuild` directly), .NET SDK 10.0.200+ uses its own
+  bundled MSBuild. This bypasses the VS 2022 MSBuild detection. Use `dotnet build` instead
+  of `msbuild` to work around the issue on `windows-2022`.
+fix_code:
+  - language: yaml
+    label: 'Switch to windows-latest (VS 2026, MSBuild 18.x) — simplest fix'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-latest     # now VS 2026 + MSBuild 18.x as of June 2026
+          # was: runs-on: windows-2022  ← VS 2022, MSBuild 17.x — incompatible with .NET 10.0.200+
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-dotnet@v4
+              with:
+                dotnet-version: '10.0.x'
+            - run: dotnet build
+
+  - language: yaml
+    label: 'Pin .NET SDK to 10.0.100 (MSBuild 17-compatible) if staying on windows-2022'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-2022       # VS 2022 / MSBuild 17.x
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-dotnet@v4
+              with:
+                # Pin to 10.0.100 — the last .NET 10 SDK version that works with MSBuild 17.x
+                dotnet-version: '10.0.100'
+            - run: dotnet build       # uses dotnet's bundled MSBuild, not VS 2022 MSBuild
+
+  - language: yaml
+    label: 'Use dotnet build (bundled MSBuild) instead of msbuild.exe directly'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-2022
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-dotnet@v4
+              with:
+                dotnet-version: '10.0.x'
+            # Use 'dotnet build' — uses the SDK's bundled MSBuild (18.x), not VS 2022's MSBuild
+            - run: dotnet build MyApp.sln /p:Configuration=Release
+            # Avoid: msbuild MyApp.sln — this finds VS 2022's MSBuild 17.x and fails
+
+  - language: yaml
+    label: 'Matrix build — test against both windows-2022 and windows-latest'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              os: [windows-2022, windows-latest]
+          runs-on: ${{ matrix.os }}
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-dotnet@v4
+              with:
+                dotnet-version: '10.0.x'
+            - run: dotnet build
+prevention:
+  - 'Use `windows-latest` for .NET 10+ workflows — as of June 2026 it ships with VS 2026 (MSBuild 18.x)'
+  - 'Call `dotnet build` / `dotnet publish` instead of invoking `msbuild.exe` directly — the SDK bundled MSBuild always matches the SDK requirements'
+  - 'When pinning to `windows-2022`, also pin the .NET SDK to a version compatible with MSBuild 17.x (10.0.100 or earlier) if you need both'
+  - 'Check MSBuild version compatibility before upgrading .NET SDK patch versions: dotnet.microsoft.com/en-us/download/dotnet/10.0'
+  - 'Subscribe to actions/runner-images announcements to know when `windows-latest` changes its VS version so you can plan migrations'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/13789'
+    label: 'runner-images#13789 — NuGet restore fails with NET 10 starting after March 9, 2026 update'
+  - url: 'https://github.com/actions/runner-images/issues/14017'
+    label: 'runner-images#14017 — windows-latest and windows-2025 migrate to VS 2026 in June 2026'
+  - url: 'https://learn.microsoft.com/en-us/dotnet/core/tools/sdk-errors/netsdk1045'
+    label: 'NETSDK1045 — The current .NET SDK does not support targeting .NET X.0'
+  - url: 'https://dotnet.microsoft.com/en-us/download/dotnet/10.0'
+    label: '.NET 10 download — SDK/Runtime version history'

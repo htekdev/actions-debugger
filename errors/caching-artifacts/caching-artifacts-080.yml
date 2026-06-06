@@ -1,0 +1,116 @@
+id: caching-artifacts-080
+title: 'Windows runner silently exits during `actions/cache` restore — job proceeds without cached content'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - actions-cache
+  - windows
+  - silent-failure
+  - cache-restore
+  - node-crash
+  - post-job
+patterns:
+  - regex: 'Cache hit for:.*\nPost job cleanup\.'
+    flags: 'im'
+  - regex: 'Cache hit for:.*\nPost job cleanup\.\s*\nPost job cleanup\.\s*\nCache up-to-date\.'
+    flags: 'ims'
+  - regex: 'punycode.*DeprecationWarning.*\nPost job cleanup\.'
+    flags: 'im'
+error_messages:
+  - "Cache hit for: <key>"
+  - "Post job cleanup."
+  - "Cache up-to-date."
+  - "(node:1288) [DEP0040] DeprecationWarning: The `punycode` module is deprecated."
+root_cause: |
+  On Windows runners (`windows-latest`, `windows-2022`, `windows-2025`), `actions/cache` can
+  silently exit immediately after reporting a cache hit, without actually extracting the cached
+  content into the workspace.
+
+  The observable log pattern:
+  1. `Cache hit for: <key>` — cache entry is found on the server
+  2. Immediately followed by `Post job cleanup.` (out of order — should appear at end of all steps)
+  3. `Cache up-to-date.` — the save post-step fires but there is nothing to save
+  4. A Node.js `[DEP0040] DeprecationWarning: The punycode module is deprecated` message appears
+
+  The result: the job continues with an EMPTY workspace as if the cache was never restored.
+  No error is thrown, the step exit code is 0, and subsequent build steps fail with "file not
+  found" errors that appear unrelated to caching.
+
+  Root cause: The `actions/cache` Node.js process running in the runner encounters an unhandled
+  internal rejection during archive extraction on Windows and exits silently. The `punycode`
+  deprecation warning appearing alongside the premature `Post job cleanup` is a telltale signature
+  of this failure mode — it indicates the Node.js process used for the cache action is crashing
+  before extraction completes. This pattern is observed sporadically on all Windows runner images
+  and correlates with periods of elevated artifact service latency or specific image versions.
+
+  Reported by multiple projects (Rust/Cargo workflows, f3d, RustPython, linktime) as a roughly
+  5% failure rate increase on Windows beginning May 2026.
+fix: |
+  1. **Add `continue-on-error: true` as an immediate workaround** — this prevents the workflow
+     from failing hard on the cache step. Your build will be slower (no cache hit) but will not
+     fail.
+
+  2. **Re-run the failed job** — the failure is transient and intermittent. Most re-runs succeed.
+
+  3. **Upgrade `actions/cache` to the latest version** — the `actions/cache@v5` release line
+     includes improved error handling for Windows. Pin to `v5.4.0` or later.
+
+  4. **Use `save-always: false` and add a diagnostic step** — log the cache extraction result
+     explicitly to detect silent failures:
+     ```yaml
+     - run: |
+         if (-not (Test-Path "expected-file-from-cache")) {
+           Write-Host "##[warning]Cache may not have been restored (file missing)"
+         }
+       shell: pwsh
+     ```
+
+  5. **Split cache and build into separate jobs** — this forces a fresh runner for the build
+     job and avoids the Windows Node.js process issue affecting the current runner slot.
+fix_code:
+  - language: yaml
+    label: 'Immediate workaround — add continue-on-error to cache step'
+    code: |
+      - name: Restore Cargo cache
+        id: cache-cargo
+        uses: actions/cache@v5
+        continue-on-error: true    # ← prevents silent exit from blocking the job
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Verify cache restoration
+        shell: pwsh
+        run: |
+          if (Test-Path "$env:USERPROFILE\.cargo\registry\index") {
+            Write-Host "Cache restored successfully"
+          } else {
+            Write-Host "##[warning]Cache not restored — building from scratch"
+          }
+
+  - language: yaml
+    label: 'Use actions/cache@v5 with latest patch version'
+    code: |
+      - uses: actions/cache@v5          # v5.4.0+ has improved Windows extraction error handling
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+prevention:
+  - 'Always pin `actions/cache` to a recent v5.x release — older versions have known Windows Node.js crash issues'
+  - 'Add `continue-on-error: true` to cache restore steps to prevent silent failures from blocking CI'
+  - 'Add a post-cache verification step on Windows to confirm expected files exist before running the build'
+  - 'Monitor Windows job failure rates — a sudden 3-5% increase often signals a cache extraction regression'
+  - 'Use `ACTIONS_RUNNER_DEBUG=true` in repository secrets to surface the Node.js exit code diagnostic line'
+docs:
+  - url: 'https://github.com/actions/cache/issues/1754'
+    label: 'actions/cache#1754 — Windows runner randomly dies in actions/cache (May 2026)'
+  - url: 'https://github.com/actions/cache'
+    label: 'actions/cache — GitHub Actions caching documentation'
+  - url: 'https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows'
+    label: 'GitHub Docs — Caching dependencies to speed up workflows'
