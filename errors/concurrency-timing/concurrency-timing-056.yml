@@ -1,0 +1,127 @@
+id: concurrency-timing-056
+title: 'Workflow-level and job-level concurrency share same group key — deadlock cancellation fires immediately'
+category: concurrency-timing
+severity: error
+tags:
+  - concurrency
+  - deadlock
+  - workflow-level
+  - job-level
+  - reusable-workflow
+  - workflow-call
+  - github-workflow-context
+patterns:
+  - regex: 'Canceling since a deadlock for concurrency group .* was detected between'
+    flags: 'i'
+  - regex: 'deadlock.*concurrency group|concurrency group.*deadlock'
+    flags: 'i'
+error_messages:
+  - "Canceling since a deadlock for concurrency group 'ci-refs/heads/main' was detected between 'top level workflow' and 'deploy'"
+  - "Canceling since a deadlock for concurrency group 'release-refs/heads/main' was detected between 'top level workflow' and 'api'"
+root_cause: |
+  GitHub Actions fires a deadlock error and immediately cancels the offending job when the
+  same concurrency group name is held simultaneously by two levels within a single workflow
+  execution. Two distinct scenarios trigger this:
+
+  Scenario 1 — Same-workflow self-deadlock: A workflow file defines concurrency: at the
+  workflow level AND one of its jobs also defines jobs.<id>.concurrency: using an expression
+  that evaluates to the same string:
+
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}   # workflow-level slot
+
+    jobs:
+      deploy:
+        concurrency:
+          group: ${{ github.workflow }}-${{ github.ref }}  # same string → deadlock
+        runs-on: ubuntu-latest
+
+  Scenario 2 — Reusable callee inherits caller context: A calling workflow has workflow-level
+  concurrency using ${{ github.workflow }}-${{ github.ref }}. The called reusable workflow
+  also defines workflow-level concurrency with the same expression. Because github.workflow
+  inside a reusable workflow inherits the CALLER's workflow name (not the callee's filename),
+  both evaluate to the identical group key and GitHub detects a deadlock.
+
+  github.workflow_ref also inherits from the top-level caller and does NOT produce a unique
+  value in the callee context; it cannot be used to distinguish caller from callee.
+fix: |
+  Scenario 1 — Remove the duplicate concurrency block. Keep either the workflow-level OR
+  the job-level declaration, not both with the same key. If per-job isolation is needed,
+  append ${{ github.job }} to the job-level group name:
+
+    jobs:
+      deploy:
+        concurrency:
+          group: ${{ github.workflow }}-${{ github.ref }}-${{ github.job }}
+
+  Scenario 2 — Remove the concurrency: block entirely from the reusable workflow. The
+  caller's workflow-level concurrency already governs the entire execution. If the callee
+  needs standalone concurrency when triggered via workflow_dispatch, use a hardcoded unique
+  prefix instead of ${{ github.workflow }}:
+
+    concurrency:
+      group: deploy-${{ github.ref }}   # hardcoded prefix avoids collision with any caller
+      cancel-in-progress: true
+fix_code:
+  - language: yaml
+    label: 'Scenario 1 fix: remove duplicate job-level concurrency'
+    code: |
+      # WRONG — identical group at workflow level and job level → deadlock
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: true
+
+      jobs:
+        deploy:
+          concurrency:
+            group: ${{ github.workflow }}-${{ github.ref }}  # ← DELETE THIS
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo deploying
+
+      # CORRECT — concurrency only at workflow level
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: true
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo deploying
+  - language: yaml
+    label: 'Scenario 2 fix: remove concurrency from reusable workflow'
+    code: |
+      # deploy.yml (reusable) — WRONG: workflow-level concurrency collides with caller
+      # because github.workflow returns the CALLER's name in reusable context
+      on:
+        workflow_call:
+        workflow_dispatch:
+      # concurrency:               ← DELETE this entire block from the reusable workflow
+      #   group: ${{ github.workflow }}-${{ github.ref }}
+      #   cancel-in-progress: true
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo deploying
+
+      # If standalone concurrency is needed for workflow_dispatch calls, use hardcoded prefix:
+      # concurrency:
+      #   group: deploy-${{ github.ref }}   # hardcoded "deploy-" avoids collision
+      #   cancel-in-progress: true
+prevention:
+  - 'Before adding concurrency: to a reusable workflow, check if it will be called via workflow_call — if so, remove it or use a hardcoded prefix.'
+  - 'Never use the same concurrency group expression at both the workflow level and job level in the same file.'
+  - 'Note that ${{ github.workflow }} and ${{ github.workflow_ref }} both return the top-level caller''s values inside a reusable workflow; neither provides the callee''s filename.'
+  - 'Use actionlint to statically detect identical concurrency groups — issue actionlint#538 tracks adding this check.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs'
+    label: 'GitHub Docs: Controlling the concurrency of workflows and jobs'
+  - url: 'https://stackoverflow.com/questions/78101326/github-actions-concurrency-deadlock'
+    label: 'SO: GitHub Actions concurrency deadlock (Score 6, 1.7K views)'
+  - url: 'https://stackoverflow.com/questions/79511940/using-workflow-filename-in-concurrency-group-for-workflows-started-by-workflow-c'
+    label: 'SO: Using workflow filename in concurrency group for workflow_call (Score 3)'
+  - url: 'https://github.com/github/vscode-github-actions/issues/135'
+    label: 'vscode-github-actions#135: Identical concurrency groups cause silent never-run (14 reactions)'
