@@ -1,0 +1,117 @@
+id: known-unsolved-067
+title: 'ubuntu-24.04 Runner df Reports 12-15 GB Ghost Disk Usage — Invisible to du/lsof'
+category: known-unsolved
+severity: silent-failure
+tags:
+  - ubuntu-24
+  - disk-space
+  - enospc
+  - runner-agent
+  - diagnostics
+  - phantom-disk
+  - playwright
+  - hosted-runner
+patterns:
+  - regex: 'ENOSPC:\s*no space left on device'
+    flags: 'i'
+  - regex: 'df\s+/\s+.*\d{4,5}M\s+.*\d+%'
+    flags: 'i'
+  - regex: 'No space left on device'
+    flags: 'i'
+error_messages:
+  - 'ENOSPC: no space left on device, write'
+  - 'No space left on device'
+  - 'df: cannot read table of mounted file systems: No space left on device'
+root_cause: |
+  On ubuntu-24.04 hosted runners, `df /` can report 12–15 GB of disk used
+  during heavy test runs (particularly those spawning many short-lived child
+  processes or producing large volumes of stdout, such as Playwright WebKit /
+  WPE test suites). This usage CANNOT be accounted for by:
+
+  - `du -shx /` (sum of all directories does not grow)
+  - `lsof +L1` (deleted-but-open files show only kernel /memfd:* entries)
+  - /proc/<PID>/maps (only kernel memfd entries)
+  - /proc/<PID>/io write_bytes (single-digit MB cumulative)
+
+  The ghost usage RECOVERS fully ~40 seconds after the job's main process
+  exits — gradually, over ~10 seconds — even though all child processes are
+  already reaped at recovery start. This rules out lingering processes holding
+  mmap'd files.
+
+  Best-guess root cause (unconfirmed by GitHub team as of June 2026): the
+  runner agent's diagnostic/log buffers are flushed periodically on the host
+  and the flushed bytes are counted in the container's `df` view but are not
+  visible from inside the runner's PID namespace. The ~40-second recovery delay
+  is consistent with a periodic flush cycle on the agent side.
+
+  This issue is non-deterministic and tied to the state of the underlying host
+  VM. The same workload run locally on ubuntu-24.04 does not reproduce.
+
+  Affected environments:
+  - Native `ubuntu-24.04` hosted runner
+  - Containers running on the `ubuntu-24.04` runner (which share the host's /)
+  - Does NOT reproduce on self-hosted ubuntu-24.04 VM locally
+
+  Tracked upstream: https://github.com/actions/runner/issues/4448 (open, May 2026)
+fix: |
+  There is NO user-side fix for the phantom disk usage itself — this is
+  infrastructure-level behaviour outside the workflow's control.
+
+  Mitigations to prevent ENOSPC failures:
+
+  1. Use a larger runner (8-core or 16-core) — larger runner classes have
+     more disk allocated on different host hardware.
+
+  2. Reduce stdout volume by adding --quiet / --silent flags to test runners
+     and package managers (npm ci --quiet, pytest -q, etc.).
+
+  3. Pre-clean the runner's docker layer cache and tool downloads that are
+     not needed:
+       - name: Free disk space
+         run: |
+           sudo rm -rf /usr/share/dotnet
+           sudo rm -rf /opt/ghc
+           sudo rm -rf /usr/local/lib/android
+           docker system prune -af
+
+  4. Split the job into smaller parallel matrix jobs to reduce per-job output.
+
+  5. Monitor disk in a background step to detect the ghost spike early and
+     correlate it with failures.
+fix_code:
+  - language: yaml
+    label: 'Pre-clean unused runner tools to reclaim disk headroom'
+    code: |
+      steps:
+        - name: Free runner disk space
+          run: |
+            sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+            sudo apt-get clean
+            docker system prune -af --volumes || true
+            df -h /   # confirm headroom before heavy tests
+
+        - name: Run Playwright tests
+          run: npx playwright test
+  - language: yaml
+    label: 'Use a larger runner with more disk allocation'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest-8-cores   # or ubuntu-24.04-x64-8-cores
+          steps:
+            - run: npx playwright test
+prevention:
+  - 'Add `df -h /` before and after heavy test steps to measure actual disk
+    consumption and detect when the ghost spike occurs.'
+  - 'Reduce test output verbosity — the agent diagnostic buffer hypothesis
+    correlates large stdout volumes with larger phantom disk readings.'
+  - 'For Playwright/WebKit CI that regularly sees ENOSPC: switch to
+    `ubuntu-24.04` larger runners or use `--reporter=dot` to minimise output.'
+  - 'Do not rely on `du -shx /` for disk capacity planning on hosted runners —
+    `df /` may show significantly more usage than du can account for during
+    heavy-output jobs.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4448'
+    label: 'runner #4448 — df reports 12-15 GB ghost disk usage on ubuntu-24.04 runner (open, May 2026)'
+  - url: 'https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners/about-github-hosted-runners#supported-runners-and-hardware-resources'
+    label: 'GitHub Docs — Hosted runner hardware resources (disk sizes per runner class)'
