@@ -1,0 +1,144 @@
+id: permissions-auth-071
+title: 'OIDC token not available in pull_request events from forks — id-token: write cannot be granted'
+category: permissions-auth
+severity: error
+tags:
+  - oidc
+  - fork
+  - pull-request
+  - id-token
+  - attestation
+  - aws
+  - azure
+  - workload-identity
+patterns:
+  - regex: 'Unable to get ACTIONS_ID_TOKEN_REQUEST_URL env variable'
+    flags: 'i'
+  - regex: 'Could not fetch an OIDC token.*id-token.*write'
+    flags: 'i'
+  - regex: 'Error: Action failed with error: Error: Error message: Unable to get ACTIONS_ID_TOKEN_REQUEST_URL'
+    flags: 'i'
+error_messages:
+  - 'Error: Error message: Unable to get ACTIONS_ID_TOKEN_REQUEST_URL env variable'
+  - 'Could not fetch an OIDC token. Did you remember to add `id-token: write` to your workflow permissions?'
+  - 'Error: Action failed with error: Error: Error message: Unable to get ACTIONS_ID_TOKEN_REQUEST_URL env variable'
+root_cause: |
+  GitHub Actions workflows triggered by `pull_request` events from forked repositories cannot
+  mint OIDC tokens, even when `id-token: write` is explicitly set in the workflow `permissions:` block.
+
+  The restriction is enforced by GitHub's security model for fork pull requests:
+  - Fork PRs run with the permissions of the fork, not the base repository.
+  - GitHub documentation states: "You can use the permissions key to add and remove read
+    permissions for forked repositories, but typically you can't grant write access."
+  - The `id-token: write` scope is a WRITE permission. The ACTIONS_ID_TOKEN_REQUEST_URL
+    environment variable is only set when the runtime has write-level token access.
+  - When the variable is absent, any action or toolkit call to `core.getIDToken()` fails with
+    "Unable to get ACTIONS_ID_TOKEN_REQUEST_URL env variable".
+
+  This commonly impacts:
+  - Cloud provider OIDC authentication (AWS configure-aws-credentials, Azure login, GCP auth)
+  - actions/attest-build-provenance and actions/attest for build attestation on PRs
+  - Any action that relies on `@actions/core` `getIDToken()` for OIDC federation
+
+  The restriction exists to prevent malicious fork contributors from using OIDC tokens to
+  authenticate against production cloud accounts or push malicious artifacts.
+fix: |
+  Option 1 — Use `pull_request_target` instead of `pull_request` (CAUTION required).
+  `pull_request_target` runs in the context of the base repository and CAN mint OIDC tokens.
+  However, it executes in the base repo's context with full access to base repo secrets —
+  this is a significant security risk if the workflow checks out or executes fork code without
+  proper isolation. Read all security guides before using this trigger.
+
+  Option 2 — Split the workflow into two parts.
+  Use `pull_request` for the build/test phase (no OIDC). Use a separate workflow triggered
+  by `workflow_run` or manual approval to perform OIDC-protected operations (attestation, deploy)
+  after verifying the PR code is safe.
+
+  Option 3 — Use a GitHub App token with explicit repository permissions for operations
+  that do not strictly require OIDC (e.g., package publishing). This avoids the OIDC
+  restriction entirely.
+
+  Option 4 — Only run OIDC-dependent steps on `push` events to protected branches (post-merge),
+  not on `pull_request` events from forks. Guard OIDC steps with:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+fix_code:
+  - language: yaml
+    label: 'Guard OIDC steps — skip for fork PRs, run only for same-repo PRs or push'
+    code: |
+      jobs:
+        build-and-attest:
+          runs-on: ubuntu-latest
+          permissions:
+            id-token: write
+            contents: read
+            attestations: write
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Build artifact
+              run: ./build.sh
+
+            # OIDC-dependent steps: skip if fork PR (id-token write not available)
+            - name: Attest build provenance
+              if: >
+                github.event_name != 'pull_request' ||
+                github.event.pull_request.head.repo.full_name == github.repository
+              uses: actions/attest-build-provenance@v2
+              with:
+                subject-path: './dist/app'
+
+  - language: yaml
+    label: 'Split workflow: use workflow_run to run OIDC steps after fork PR merges'
+    code: |
+      # Workflow 1: runs on pull_request — builds and uploads artifact (no OIDC)
+      on:
+        pull_request:
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./build.sh
+            - uses: actions/upload-artifact@v4
+              with:
+                name: build-output
+                path: ./dist/
+
+      ---
+
+      # Workflow 2: runs after workflow 1 completes — performs OIDC operations
+      on:
+        workflow_run:
+          workflows: ['Build']
+          types: [completed]
+      jobs:
+        attest:
+          # Only runs on base-repo push events completing after a merge
+          if: github.event.workflow_run.conclusion == 'success'
+          runs-on: ubuntu-latest
+          permissions:
+            id-token: write
+            attestations: write
+          steps:
+            - uses: actions/download-artifact@v4
+              with:
+                name: build-output
+                run-id: ${{ github.event.workflow_run.id }}
+                github-token: ${{ secrets.GITHUB_TOKEN }}
+            - uses: actions/attest-build-provenance@v2
+              with:
+                subject-path: './dist/app'
+prevention:
+  - 'Never assume `id-token: write` is sufficient — fork PRs override write permissions to read-only regardless of the workflow `permissions:` block.'
+  - 'Add an explicit `if:` guard on every OIDC-dependent step to skip it for fork PRs: `if: github.event.pull_request.head.repo.fork == false`.'
+  - 'Use `pull_request_target` only after thoroughly reading the security hardening guide — it runs in base repo context and is vulnerable to pwn requests if fork code is checked out.'
+  - 'For attestation workflows, run attestation as a post-merge step on `push` to the default branch, not on PRs from forks.'
+docs:
+  - url: 'https://github.com/actions/attest-build-provenance/issues/99'
+    label: 'actions/attest-build-provenance#99 — OIDC unavailable in fork PR workflows (open)'
+  - url: 'https://github.com/aws-actions/configure-aws-credentials/issues/373'
+    label: 'aws-actions/configure-aws-credentials#373 — OIDC fails for pull request from fork'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#permissions-for-the-github_token'
+    label: 'GitHub Docs — GITHUB_TOKEN permissions for forked repos'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions#using-pull_request_target-safely'
+    label: 'GitHub Docs — Security hardening for pull_request_target'

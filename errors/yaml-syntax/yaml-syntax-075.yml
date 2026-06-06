@@ -1,0 +1,128 @@
+id: yaml-syntax-075
+title: 'environment: shorthand string format silently rejects needs.* and jobs.* contexts — use environment.name form'
+category: yaml-syntax
+severity: error
+tags:
+  - environment
+  - dynamic-environment
+  - needs-context
+  - expression
+  - shorthand
+  - template-validation
+patterns:
+  - regex: 'Unrecognized named-value.*needs.*environment'
+    flags: 'i'
+  - regex: "Unrecognized named-value: 'needs'.*position.*expression.*needs\\."
+    flags: 'i'
+  - regex: 'TemplateValidationException.*Unrecognized named-value.*needs'
+    flags: 'i'
+error_messages:
+  - "The workflow is not valid. .github/workflows/deploy.yml (Line: 15, Col: 18): Unrecognized named-value: 'needs'. Located at position 1 within expression: needs.set_environment.outputs.my_env"
+  - "Unrecognized named-value: 'needs'. Located at position 1 within expression: needs.X.outputs.env"
+root_cause: |
+  The GitHub Actions workflow parser supports two forms for specifying a job environment:
+
+  1. Shorthand string: `environment: production` or `environment: ${{ some.expression }}`
+  2. Explicit mapping: `environment:\n  name: ${{ expression }}\n  url: ${{ expression }}`
+
+  The shorthand string form (`environment: ${{ ... }}`) supports only a limited expression
+  context and does NOT support the `needs.*` or `jobs.*` contexts, even when the job
+  has `needs:` declared. Attempting to use `needs.X.outputs.Y` inside the shorthand
+  produces a TemplateValidationException at workflow parse time:
+
+    "Unrecognized named-value: 'needs'. Located at position 1 within expression: needs.X.outputs.Y"
+
+  The explicit mapping form (`environment:\n  name: ${{ ... }}`) DOES support the `needs.*`
+  context fully — this is the documented way to set a dynamic environment name or URL.
+
+  This trips up developers who:
+  - Copy the shorthand form from documentation examples and add an expression.
+  - Want to choose between staging/production environments based on the branch output
+    of an earlier job.
+  - Try to set a dynamic environment URL using `needs.deploy.outputs.url`.
+
+  The error appears only at workflow validation time (not at job runtime), which means
+  the entire workflow is rejected before any jobs run.
+fix: |
+  Use the explicit `environment:` mapping format with `name:` and optionally `url:` sub-keys
+  instead of the shorthand string with a `${{ }}` expression.
+
+  The shorthand `environment: ${{ expression }}` is only for literal strings or simple
+  expressions without `needs.*` / `jobs.*`. Once you need cross-job outputs, switch to
+  the explicit form.
+fix_code:
+  - language: yaml
+    label: 'Broken — shorthand with needs.* context causes TemplateValidationException'
+    code: |
+      jobs:
+        determine-env:
+          runs-on: ubuntu-latest
+          outputs:
+            target: ${{ steps.pick.outputs.env }}
+          steps:
+            - id: pick
+              run: echo "env=production" >> $GITHUB_OUTPUT
+
+        deploy:
+          needs: determine-env
+          runs-on: ubuntu-latest
+          # ❌ BROKEN: shorthand does not support needs.* context
+          environment: ${{ needs.determine-env.outputs.target }}
+          steps:
+            - run: echo "deploying"
+
+  - language: yaml
+    label: 'Fixed — explicit environment.name form supports needs.* context'
+    code: |
+      jobs:
+        determine-env:
+          runs-on: ubuntu-latest
+          outputs:
+            target: ${{ steps.pick.outputs.env }}
+          steps:
+            - id: pick
+              run: |
+                if [[ "${{ github.ref_name }}" == "main" ]]; then
+                  echo "env=production" >> $GITHUB_OUTPUT
+                else
+                  echo "env=staging" >> $GITHUB_OUTPUT
+                fi
+
+        deploy:
+          needs: determine-env
+          runs-on: ubuntu-latest
+          # ✅ FIXED: explicit name: sub-key supports needs.* context
+          environment:
+            name: ${{ needs.determine-env.outputs.target }}
+            url: ${{ needs.deploy.outputs.deploy_url }}
+          steps:
+            - run: echo "deploying to ${{ needs.determine-env.outputs.target }}"
+
+  - language: yaml
+    label: 'Dynamic environment from workflow_dispatch input — correct form'
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            environment:
+              required: true
+              type: environment
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          # ✅ Use explicit name: when referencing inputs.* or needs.* contexts
+          environment:
+            name: ${{ inputs.environment }}
+          steps:
+            - run: echo "deploying to ${{ inputs.environment }}"
+prevention:
+  - 'Always use the `environment:\n  name: ${{ }}` form (never the shorthand string) when the environment name is dynamic or derived from another job.'
+  - 'Remember: `environment: ${{ expression }}` is valid syntax but only for literal strings — it silently ignores `needs.*` context at parse time, producing a hard error.'
+  - 'Lint with actionlint (v1.7.0+) which detects this pattern before pushing.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/998'
+    label: 'actions/runner#998 — Setting job environment dynamically fails with needs context in shorthand form'
+  - url: 'https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#jobsjob_idenvironment'
+    label: 'GitHub Docs — jobs.<job_id>.environment syntax reference'
+  - url: 'https://stackoverflow.com/questions/65826284/use-dynamic-input-value-for-environment-in-github-actions-workflow-job'
+    label: 'Stack Overflow — Dynamic environment in GitHub Actions workflow job (many upvotes)'
