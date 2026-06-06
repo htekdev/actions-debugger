@@ -1,0 +1,145 @@
+id: runner-environment-221
+title: 'actions/checkout@v6 Hangs at git-credential-osxkeychain on macOS Self-Hosted Runners with Concurrent Jobs'
+category: runner-environment
+severity: error
+tags:
+  - checkout
+  - macos
+  - osxkeychain
+  - credential-helper
+  - deadlock
+  - self-hosted
+  - concurrent
+  - v6
+  - hang
+patterns:
+  - regex: 'trace: start_command:.*git-credential-osxkeychain store'
+    flags: 'i'
+  - regex: 'trace: run_command: .?git credential-osxkeychain store.?$'
+    flags: 'im'
+  - regex: 'credential-osxkeychain store.*\n.*\n.*\n.*\n.*checkout.*hang'
+    flags: 'im'
+error_messages:
+  - "trace: run_command: 'git credential-osxkeychain store'"
+  - "trace: start_command: /bin/sh -c 'git credential-osxkeychain store' 'git credential-osxkeychain store'"
+  - "trace: exec: git-credential-osxkeychain store"
+  - "trace: start_command: /opt/homebrew/opt/git/libexec/git-core/git-credential-osxkeychain store"
+root_cause: |
+  On macOS self-hosted runners, Git uses git-credential-osxkeychain as the default
+  credential helper. When actions/checkout@v6 runs with persist-credentials: true
+  (the default), it stores the GITHUB_TOKEN in the macOS Keychain via the osxkeychain
+  credential helper.
+
+  The macOS Keychain grants exclusive write locks to one process at a time. When two or
+  more jobs run actions/checkout@v6 concurrently on the same self-hosted runner machine,
+  both jobs attempt to call `git credential-osxkeychain store` simultaneously. One process
+  acquires the Keychain lock and proceeds; the other blocks indefinitely waiting for the
+  lock to be released — which never happens because the macOS Keychain's IPC mechanism
+  can deadlock under concurrent access from multiple git processes sharing the same runner
+  session.
+
+  The hung checkout step produces no error output — the last visible log lines are the
+  `git-credential-osxkeychain store` trace entries. The job appears to be running but
+  makes no progress. Without a step-level timeout, GitHub's 6-hour job timeout eventually
+  cancels it.
+
+  Affected environment:
+  - actions/checkout@v6 (v6.0.x, the version that changed credential handling)
+  - macOS self-hosted runners, including macOS 26 Tahoe (runner 2.331.0+)
+  - Reproduced when ≥2 jobs on the same runner machine execute checkout concurrently
+  - Not specific to runner 2.331.0 — also reported on earlier macOS self-hosted setups
+    since checkout@v2, but became more frequent with v6's credential handling changes
+
+  Distinct from runner-environment-032 (persist-credentials: false breaks subsequent
+  git push auth — the opposite direction: fixing the push but needing credentials).
+fix: |
+  Two workarounds — try Option 1 first, fall back to Option 2 if the deadlock persists:
+
+  Option 1 — Disable credential persistence for checkout (avoids Keychain writes):
+
+    - uses: actions/checkout@v6
+      with:
+        persist-credentials: false
+
+  This prevents checkout from calling `git credential-osxkeychain store` entirely,
+  eliminating the deadlock. Note: if your workflow's later steps need to push changes
+  to the repo using git directly (not via GH_TOKEN env var), you must pass the token
+  explicitly in the remote URL or use a separate authentication step.
+
+  Option 2 — Clean workspace before checkout (forces clean lock state):
+
+    - name: Clean workspace before checkout
+      run: |
+        find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + \
+          || echo "::warning::Workspace cleanup had warnings (non-fatal)"
+    - uses: actions/checkout@v6
+
+  This removes any pre-existing files that might be holding Git process locks
+  from a previous job, allowing checkout to complete cleanly. This is an uglier
+  workaround but more effective when persist-credentials: false alone does not help.
+
+  Option 3 — Disable the macOS credential helper globally for CI git operations:
+
+    - name: Disable osxkeychain credential helper for CI
+      run: git config --global credential.helper ''
+    - uses: actions/checkout@v6
+
+  For git push steps that use an explicit token URL, also set GIT_TERMINAL_PROMPT=0:
+
+    - name: Push changes
+      env:
+        GIT_TERMINAL_PROMPT: '0'
+      run: |
+        git -c credential.helper='' push --force \
+          "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" \
+          HEAD:gh-pages
+fix_code:
+  - language: yaml
+    label: 'Fix 1 — persist-credentials: false prevents Keychain write (preferred)'
+    code: |
+      steps:
+        - uses: actions/checkout@v6
+          with:
+            persist-credentials: false  # Avoids git-credential-osxkeychain store call
+
+  - language: yaml
+    label: 'Fix 2 — clean workspace before checkout to resolve concurrent lock conflicts'
+    code: |
+      steps:
+        - name: Clean workspace before checkout
+          run: |
+            find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + \
+              || echo "::warning::Cleanup warnings are non-fatal"
+
+        - uses: actions/checkout@v6
+
+  - language: yaml
+    label: 'Fix 3 — disable osxkeychain globally and use explicit token for git push'
+    code: |
+      steps:
+        - name: Disable macOS keychain credential helper for CI
+          run: git config --global credential.helper ''
+
+        - uses: actions/checkout@v6
+
+        # Later, for git push steps:
+        - name: Push to gh-pages
+          env:
+            GIT_TERMINAL_PROMPT: '0'
+          run: |
+            git -c credential.helper='' push --force \
+              "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" \
+              HEAD:gh-pages
+
+prevention:
+  - 'Always set persist-credentials: false on actions/checkout@v6 for macOS self-hosted runners if your jobs do not need subsequent git operations using the GITHUB_TOKEN credential helper.'
+  - 'Add a timeout-minutes: on checkout steps on macOS self-hosted runners to bound hang duration (e.g., timeout-minutes: 5) rather than waiting for the 6-hour job timeout.'
+  - 'Serialize concurrent jobs on the same macOS runner using a concurrency group, or ensure jobs that checkout concurrently run on different runner instances.'
+  - 'Set GIT_TERMINAL_PROMPT=0 in macOS self-hosted runner environments to prevent git from waiting for interactive input from any credential helper.'
+docs:
+  - url: 'https://github.com/actions/checkout/issues/550'
+    label: 'actions/checkout#550 — Actions checkout gets stuck forever randomly (open, 2021–2026)'
+  - url: 'https://stackoverflow.com/questions/79881327/github-actions-self-hosted-runner-on-macos-tries-to-checkout-repository-forever'
+    label: 'SO q/79881327 — Github Actions self hosted runner on macOS tries to checkout repository forever (Feb 2026)'
+  - url: 'https://github.com/actions/checkout#usage'
+    label: 'actions/checkout README — persist-credentials input documentation'
