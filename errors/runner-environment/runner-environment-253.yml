@@ -1,0 +1,123 @@
+id: "runner-environment-253"
+title: "Self-hosted runner safe_sleep.sh infinite CPU busy-loop during auto-update"
+category: "runner-environment"
+severity: "error"
+tags:
+  - "self-hosted"
+  - "auto-update"
+  - "safe_sleep"
+  - "cpu-spin"
+  - "runner-update"
+  - "stuck"
+patterns:
+  - regex: 'safe_sleep\.sh.*\d+'
+    flags: "i"
+  - regex: 'safe_sleep\.sh\s+1.*\d{2,4}:\d{2} COMMAND'
+    flags: "im"
+  - regex: '96\.\d+.*safe_sleep|99\.\d+.*safe_sleep'
+    flags: "i"
+error_messages:
+  - "actions+   72298 96.3  0.0   4372  3328 ?        R    Apr02 1988:54 /bin/bash /home/actions-runner/safe_sleep.sh 1"
+  - "safe_sleep.sh 1"
+root_cause: |
+  The GitHub Actions runner uses a shell script called `safe_sleep.sh` during its
+  auto-update process to wait between retry attempts. The script is designed to avoid
+  relying on the `sleep` utility, so it busy-loops on `$SECONDS` instead:
+
+  ```bash
+  while (( SECONDS < target )); do :; done
+  ```
+
+  Due to a bug in the loop logic, if the runner process is not scheduled during the
+  one-second window where `$SECONDS` would equal the target value (for example, because
+  the host machine is overloaded or overcommitted in a cloud environment), the loop
+  condition is never satisfied and `safe_sleep.sh` spins indefinitely at 96–99% CPU.
+
+  This typically manifests when:
+  - The self-hosted runner auto-updates itself to a new version.
+  - The host machine is under heavy load during the update.
+  - The runner is running in a resource-constrained cloud VM.
+
+  The stuck `safe_sleep.sh` process holds the runner in an update state; no new jobs
+  are dispatched. The runner remains registered and appears as "Idle" or "Active" in
+  the GitHub UI but never picks up work. Manual intervention is required.
+
+  The bug was reported in actions/runner#3792 (77 reactions, April 2025) and fixed in
+  runner v2.322.0. Older pinned runner images or systems that disable auto-update may
+  still be affected.
+fix: |
+  Immediate fix (running runner):
+  1. Identify the stuck process: `ps aux | grep safe_sleep`
+  2. Kill it: `kill <PID>`
+  3. The runner service should automatically recover and resume.
+
+  Permanent fix:
+  - Upgrade the runner to v2.322.0 or later, which ships a corrected `safe_sleep.sh`.
+  - If you use ARC (Actions Runner Controller) with pinned image tags, update to an
+    image built on v2.322.0+.
+  - Ensure auto-update is not disabled (`--disableupdate` flag) on self-hosted runners,
+    so the runner can self-update to the patched version.
+  - On resource-constrained hosts, reserve CPU headroom during runner updates by
+    lowering runner concurrency or using a larger VM for runner hosts.
+fix_code:
+  - language: yaml
+    label: "Add a liveness watchdog step to detect stuck runners (systemd)"
+    code: |
+      # /etc/systemd/system/actions-runner-watchdog.service
+      # Monitors for safe_sleep.sh spinning >60 seconds and kills it
+      #
+      # [Unit]
+      # Description=GitHub Actions runner safe_sleep watchdog
+      # After=actions.runner.*.service
+      #
+      # [Service]
+      # Type=simple
+      # ExecStart=/usr/local/bin/runner-watchdog.sh
+      # Restart=always
+      #
+      # runner-watchdog.sh:
+      # #!/bin/bash
+      # while true; do
+      #   PID=$(pgrep -f 'safe_sleep.sh' 2>/dev/null)
+      #   if [ -n "$PID" ]; then
+      #     START=$(ps -o lstart= -p "$PID" 2>/dev/null)
+      #     AGE=$(( $(date +%s) - $(date -d "$START" +%s 2>/dev/null || echo 0) ))
+      #     if (( AGE > 60 )); then
+      #       kill "$PID" && echo "Killed stuck safe_sleep.sh (PID $PID, age ${AGE}s)"
+      #     fi
+      #   fi
+      #   sleep 30
+      # done
+  - language: yaml
+    label: "ARC runner image — pin to v2.322.0+ to avoid the bug"
+    code: |
+      # values.yaml for ARC
+      controllerManager:
+        manager:
+          env:
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: controller-manager
+                  key: github_token
+
+      githubConfigUrl: "https://github.com/YOUR_ORG"
+
+      template:
+        spec:
+          containers:
+            - name: runner
+              image: ghcr.io/actions/actions-runner:2.322.0  # or later
+prevention:
+  - "Upgrade self-hosted runners to v2.322.0+ to receive the corrected safe_sleep.sh."
+  - "Avoid pinning runner images to versions older than 2.322.0."
+  - "Do not use the --disableupdate flag unless you have a process to manually update runners frequently."
+  - "Monitor runner CPU usage on the host with Prometheus node_exporter or similar; alert on processes consuming >90% CPU for >30 seconds."
+  - "On cloud VMs, provision runners on instances with at least 2 vCPUs to prevent scheduling gaps that trigger the busy-loop."
+docs:
+  - url: "https://github.com/actions/runner/issues/3792"
+    label: "actions/runner#3792 — safe_sleep.sh rarely hangs indefinitely (77 reactions)"
+  - url: "https://github.com/actions/runner/blob/main/src/Misc/layoutroot/safe_sleep.sh"
+    label: "actions/runner — safe_sleep.sh source (patched in v2.322.0)"
+  - url: "https://github.com/actions/runner/releases/tag/v2.322.0"
+    label: "actions/runner v2.322.0 release notes"
