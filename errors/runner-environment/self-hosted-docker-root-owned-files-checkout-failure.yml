@@ -1,0 +1,114 @@
+id: runner-environment-254
+title: 'Self-hosted runner Docker step creates root-owned files that fail checkout cleanup in subsequent runs'
+category: runner-environment
+severity: error
+tags:
+  - self-hosted
+  - docker
+  - permissions
+  - git-clean
+  - checkout
+  - root-owned
+patterns:
+  - regex: 'warning: could not open directory .+: Permission denied'
+    flags: 'i'
+  - regex: 'rm: cannot remove .+: Permission denied'
+    flags: 'i'
+  - regex: 'warning: failed to remove .+: Directory not empty'
+    flags: 'i'
+  - regex: 'Unable to clean or reset the repository.*Permission denied'
+    flags: 'i'
+error_messages:
+  - "warning: could not open directory 'foo/': Permission denied"
+  - "warning: failed to remove foo/: Directory not empty"
+  - "##[warning]Unable to clean or reset the repository. The repository will be recreated instead."
+  - "rm: cannot remove '/home/runner/work/repo/foo': Permission denied"
+  - "Error: Command failed: rm -rf \"/home/runner/work/my-repo/my-repo/dist\""
+root_cause: |
+  When a Docker container step (a step using `uses: some-action` backed by a Docker
+  image, or a step with `container:` in its job definition that mounts the workspace)
+  writes files to `$GITHUB_WORKSPACE`, those files are created with the UID/GID of
+  the user INSIDE the container — typically `root` (UID 0). The self-hosted runner
+  process, however, runs as an unprivileged user (e.g., `runner`, `ubuntu`, `actions`)
+  that does NOT have write permission to root-owned files.
+
+  On the FIRST affected run the checkout action's `git clean -ffdx` encounters these
+  root-owned paths, receives `Permission denied` from the OS, and falls back to
+  `rm -rf` — which also fails. Subsequent runs skip `git clean` entirely and go
+  straight to `rm -rf`, which also fails. The repository workspace becomes permanently
+  corrupted from the runner's perspective, and every future checkout on that runner
+  will fail until the files are manually removed as root.
+
+  This issue does NOT affect GitHub-hosted runners because each run starts with a
+  fresh ephemeral VM. It ONLY affects persistent self-hosted runners where the
+  workspace directory is reused between runs.
+
+  **Root cause summary**: Docker containers on Linux run as root by default. The
+  host runner user lacks write access to root-owned files created inside the workspace
+  by previous container steps. `git clean` and `rm -rf` both fail with
+  `Permission denied`.
+fix: |
+  **Option 1 (recommended): Add a cleanup step after every container step.**
+  Add a step immediately after any step that runs inside a Docker container to
+  fix permissions on the workspace before the job ends:
+
+  **Option 2: Use a job-level container so runner and containers share the same user.**
+  If using `container:` at the job level, all steps run inside the container as the
+  same user, eliminating the permission mismatch.
+
+  **Option 3: Set RUNNER_ALLOW_RUNASROOT and run runner as root.**
+  Not recommended for security reasons, but eliminates the UID mismatch.
+
+  **Option 4: Configure Docker userns-remap on the daemon.**
+  Remaps container UIDs to unprivileged host UIDs. Requires host-level Docker
+  daemon configuration and is not available on GitHub-hosted runners.
+fix_code:
+  - language: yaml
+    label: 'Add a post-step to fix permissions after container steps'
+    code: |
+      jobs:
+        build:
+          runs-on: self-hosted
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Run container step (writes files as root)
+              uses: docker://node:20
+              with:
+                args: npm run build
+
+            # Fix ownership before job ends so next run can clean up
+            - name: Fix workspace permissions
+              if: always()
+              run: |
+                sudo chown -R $USER:$USER $GITHUB_WORKSPACE || true
+  - language: yaml
+    label: 'Use a job-level container to avoid the UID mismatch entirely'
+    code: |
+      jobs:
+        build:
+          runs-on: self-hosted
+          container:
+            image: node:20
+            # All steps now run as the same user inside the container
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm run build
+  - language: yaml
+    label: 'One-time manual fix to recover a corrupted workspace'
+    code: |
+      # Run this directly on the self-hosted runner machine to unblock stuck runs
+      sudo chown -R $(whoami):$(whoami) /home/runner/work/my-repo/
+      # Then re-run the failing workflow
+prevention:
+  - "Always add a `sudo chown -R $USER:$USER $GITHUB_WORKSPACE` step (with `if: always()`) after any step that uses a Docker container image on self-hosted runners."
+  - "Prefer job-level `container:` over step-level Docker images on self-hosted runners to keep all file ownership consistent."
+  - "Audit self-hosted runner workspace directories periodically for root-owned files: `find /home/runner/work -not -user $(whoami) 2>/dev/null`."
+  - "Consider setting `clean: false` on checkout ONLY after confirming workspace permissions are managed by a pre-step chmod, not as a general workaround."
+docs:
+  - url: 'https://github.com/actions/runner/issues/434'
+    label: 'actions/runner#434 — Self-hosted runner with Docker step creates files that trip up checkout (131 reactions)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners'
+    label: 'About self-hosted runners'
+  - url: 'https://docs.docker.com/engine/security/userns-remap/'
+    label: 'Docker user namespace remapping (advanced mitigation)'

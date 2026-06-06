@@ -1,0 +1,134 @@
+id: triggers-075
+title: 'on.pull_request.paths-ignore evaluates the full PR diff (base vs head), not per-commit; any commit outside the filter triggers the workflow for the entire PR'
+category: triggers
+severity: silent-failure
+tags:
+  - paths-ignore
+  - pull_request
+  - diff
+  - trigger-filter
+  - silent
+  - pr-level
+patterns:
+  - regex: 'paths-ignore.*pull_request|pull_request.*paths-ignore'
+    flags: 'i'
+  - regex: 'on\.pull_request.*paths.ignore|paths.ignore.*on\.pull_request'
+    flags: 'i'
+error_messages: []
+root_cause: |
+  The `on.pull_request.paths-ignore` filter evaluates whether to trigger based on
+  the **entire diff between the PR base branch and the PR head branch** — NOT on
+  individual commits pushed to the PR branch.
+
+  This means:
+  - If ANY commit in the PR's history (from base to head) changed a file that is
+    NOT in the `paths-ignore` list, the workflow WILL trigger when any new commit
+    is pushed to that PR — even if the new commit ONLY touches files that ARE in
+    the `paths-ignore` list.
+  - The filter is re-evaluated on each push to the PR head branch, but against the
+    cumulative diff, not the incremental change.
+
+  **Common confusion scenario**:
+  A developer pushes commit A (modifies `src/app.ts`) → workflow triggers as expected.
+  Then pushes commit B (modifies only `README.md`, which is in paths-ignore) →
+  workflow STILL triggers because the overall PR diff still includes `src/app.ts`.
+
+  This behavior is by design: the paths filter guards against triggering for PRs whose
+  net effect is limited to the ignored paths. Once the PR introduces changes outside
+  paths-ignore, GitHub considers the PR "relevant" to the workflow for all subsequent
+  pushes to that PR, until those changes are removed.
+
+  This can cause unexpected CI runs when:
+  - Workflows are used as required status checks
+  - Developers expect `paths-ignore` to suppress CI for documentation-only pushes
+    in an otherwise code-heavy PR
+  - Automated dependency PRs mix code and docs changes
+
+  Note: `on.push.paths-ignore` behaves differently — it evaluates per push event
+  against only the commits in that push, not accumulated PR history.
+fix: |
+  There is no way to change the PR-level diff evaluation behavior for paths-ignore.
+  The approaches below help manage the behavior:
+
+  **Option 1**: Use the `dorny/paths-filter` action to implement per-commit or
+  per-job paths filtering inside the workflow, instead of at the trigger level.
+
+  **Option 2**: Split the workflow — use a separate workflow for documentation-only
+  changes. Add both a `paths:` filter (only docs) AND a `paths-ignore:` filter (only
+  non-docs) on the same event, or use two separate workflow files.
+
+  **Option 3**: Accept the behavior and use `skip-ci` commit conventions to prevent
+  runs, or skip steps conditionally based on `github.event.pull_request.changed_files`.
+fix_code:
+  - language: yaml
+    label: 'EXPECTED behavior — once src/ is changed, README-only pushes still trigger'
+    code: |
+      # This workflow triggers even for README-only pushes IF the PR also touches src/
+      on:
+        pull_request:
+          paths-ignore:
+            - 'README.md'
+            - 'docs/**'
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - run: npm test
+  - language: yaml
+    label: 'Use dorny/paths-filter for per-push file change detection inside the workflow'
+    code: |
+      on:
+        pull_request:
+
+      jobs:
+        filter:
+          runs-on: ubuntu-latest
+          outputs:
+            src: ${{ steps.changes.outputs.src }}
+          steps:
+            - uses: actions/checkout@v4
+            - uses: dorny/paths-filter@v3
+              id: changes
+              with:
+                filters: |
+                  src:
+                    - 'src/**'
+                    - '!docs/**'
+                    - '!README.md'
+
+        test:
+          needs: filter
+          if: needs.filter.outputs.src == 'true'
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+  - language: yaml
+    label: 'Split into separate workflows — one for docs, one for code'
+    code: |
+      # docs-only.yml — only fires for docs-only changes
+      on:
+        pull_request:
+          paths:
+            - 'docs/**'
+            - 'README.md'
+
+      # ci.yml — fires whenever non-docs files change
+      on:
+        pull_request:
+          paths-ignore:
+            - 'docs/**'
+            - 'README.md'
+prevention:
+  - "Understand that `on.pull_request.paths-ignore` filters on the cumulative PR diff, not per-commit. Once a file outside paths-ignore is changed anywhere in the PR, the filter no longer suppresses runs."
+  - "For fine-grained per-push skip logic, use `dorny/paths-filter` (or similar) as an in-workflow step instead of relying on trigger-level paths-ignore."
+  - "Do NOT use `paths-ignore` as a required-check bypass for documentation PRs if the PR also contains code changes — the bypass will not work reliably."
+  - "When creating PRs that mix documentation and code, expect the CI workflow to trigger for all pushes to that PR regardless of paths-ignore."
+docs:
+  - url: 'https://github.com/actions/runner/issues/2324'
+    label: 'actions/runner#2324 — on.pull_request.paths-ignore not respected after commit outside filter (65 reactions, open)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#onpushpull_requestpull_request_targetpathspaths-ignore'
+    label: 'on.<push|pull_request>.paths-ignore — Workflow syntax'
+  - url: 'https://github.com/dorny/paths-filter'
+    label: 'dorny/paths-filter — per-push file change detection action'

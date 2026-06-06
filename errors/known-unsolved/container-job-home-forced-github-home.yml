@@ -1,0 +1,124 @@
+id: known-unsolved-079
+title: 'Container job HOME environment variable forcibly set to /github/home, cannot be overridden via env:'
+category: known-unsolved
+severity: limitation
+tags:
+  - container-jobs
+  - HOME
+  - environment-variable
+  - docker
+  - non-root
+  - known-limitation
+patterns:
+  - regex: '/github/home'
+    flags: 'i'
+  - regex: 'HOME.*github.home|github.home.*HOME'
+    flags: 'i'
+  - regex: 'No such file or directory.*/github/home|permission denied.*/github/home'
+    flags: 'i'
+error_messages:
+  - "bash: /github/home/.bashrc: Permission denied"
+  - "fatal: detected dubious ownership in repository at '/github/home'"
+  - "error: could not create leading directories of '/github/home/.gitconfig'"
+  - "/github/home/.npmrc: Permission denied"
+root_cause: |
+  When a job uses a Docker container (`container:` at the job level or `image:` inside
+  `jobs.<job_id>.container`), the GitHub Actions runner hard-codes the HOME environment
+  variable to `/github/home` for ALL steps running inside that container. This override
+  happens in the runner's `ContainerOperationProvider.cs` AFTER any `env:` block is
+  evaluated, meaning:
+
+  - Setting `HOME: /home/myuser` in the job's `env:` block has NO effect.
+  - Setting `HOME: /home/myuser` at the step level `env:` also has NO effect for
+    pre-configured tooling that reads HOME at startup.
+  - The runner creates `/github/home` on the host and mounts it into the container,
+    regardless of whether the container user's actual home directory exists there.
+
+  This causes failures in several scenarios:
+  1. **Non-root container users**: The container runs as a custom user (e.g., via
+     `options: '--user myuser'`) whose actual home is `/home/myuser`. Tools that
+     write to `$HOME` (npm, pip, cargo, git) get directed to `/github/home` which
+     the custom user may not have write access to.
+  2. **Dotfile tools**: `git config --global`, `npm config set`, and similar tools
+     write to `$HOME` and may fail if `/github/home` is owned by root.
+  3. **Read-only container images**: Images that don't allow writes to arbitrary
+     paths will fail when tools try to create files in `/github/home`.
+
+  This is intentional runner behavior — `/github/home` is part of the standard
+  GitHub Actions container contract along with `/github/workspace`, `/github/workflow`,
+  and `/github/file_commands`. It is unlikely to be changed as it would break the
+  standardized container layout.
+fix: |
+  There is no way to prevent the runner from setting HOME=/github/home for container
+  jobs. However, several workarounds exist:
+
+  **Workaround 1**: Override HOME in a run step using `$GITHUB_ENV` (persists across
+  subsequent steps in the same job):
+
+  **Workaround 2**: Configure tools explicitly to use a different config path instead
+  of relying on HOME (e.g., `GIT_CONFIG_GLOBAL`, `NPM_CONFIG_USERCONFIG`).
+
+  **Workaround 3**: Ensure the container image creates `/github/home` with the correct
+  permissions for the container user, or add a setup step to `chown` it.
+
+  **Workaround 4**: Use a `--user root` container option if security constraints allow,
+  since root owns `/github/home` by default.
+fix_code:
+  - language: yaml
+    label: 'Override HOME via GITHUB_ENV in a setup step (persists for remaining steps)'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          container:
+            image: myimage:latest
+            options: '--user myuser'  # myuser's real HOME is /home/myuser
+          steps:
+            - name: Fix HOME for container user
+              run: echo "HOME=/home/myuser" >> $GITHUB_ENV
+
+            # All subsequent steps now see HOME=/home/myuser
+            - run: npm install  # writes to /home/myuser/.npm, not /github/home
+  - language: yaml
+    label: 'Use tool-specific env vars to bypass HOME dependency'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          container:
+            image: myimage:latest
+            options: '--user myuser'
+          env:
+            # Point tools to explicit config paths instead of $HOME
+            GIT_CONFIG_GLOBAL: /home/myuser/.gitconfig
+            NPM_CONFIG_USERCONFIG: /home/myuser/.npmrc
+            CARGO_HOME: /home/myuser/.cargo
+          steps:
+            - uses: actions/checkout@v4
+            - run: cargo build
+  - language: yaml
+    label: 'Pre-create /github/home with correct ownership in a root step'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          container:
+            image: myimage:latest
+            options: '--user myuser'
+          steps:
+            - name: Fix /github/home ownership
+              # This step runs as the container default user before --user takes effect
+              # for subsequent steps; adjust as needed for your image
+              run: chown myuser:myuser /github/home
+prevention:
+  - "Be aware that container jobs always set `HOME=/github/home` — design container images or workflow steps to accommodate this."
+  - "When running containers with a non-root user, add an explicit HOME override via `$GITHUB_ENV` as the first step."
+  - "Prefer tool-specific config path environment variables (`GIT_CONFIG_GLOBAL`, `NPM_CONFIG_USERCONFIG`, `CARGO_HOME`) over relying on `$HOME` in container jobs."
+  - "If building a custom Docker image for use in GitHub Actions, pre-create `/github/home` and set its ownership to the expected run-as user."
+docs:
+  - url: 'https://github.com/actions/runner/issues/863'
+    label: 'actions/runner#863 — HOME is overridden for containers (124 reactions, open)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idcontainer'
+    label: 'jobs.<job_id>.container — Workflow syntax'
+  - url: 'https://docs.github.com/en/actions/sharing-automations/creating-actions/dockerfile-support-for-github-actions#environment-variables'
+    label: 'Environment variables in Dockerfile actions — GitHub-managed paths'
