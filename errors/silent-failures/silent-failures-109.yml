@@ -1,0 +1,119 @@
+id: silent-failures-109
+title: 'electron-forge make Silently Exits 0 on Node.js 24.16.0+ — No .exe, No Error'
+category: silent-failures
+severity: silent-failure
+tags:
+  - electron-forge
+  - nodejs
+  - node24
+  - extract-zip
+  - toolcache
+  - regression
+  - windows
+  - packaging
+patterns:
+  - regex: 'Invalid input file path.{0,80}\.exe'
+    flags: 'i'
+  - regex: 'Finalizing package\s*$'
+    flags: 'im'
+  - regex: 'electron-forge make.{0,60}exit(?:ed)? (?:with )?(?:code )?0'
+    flags: 'i'
+  - regex: 'exec\: node\: not found'
+    flags: 'i'
+error_messages:
+  - 'Error: Invalid input file path - apps/desktop/out/<AppName>-win32-x64/<App>.exe'
+  - '❯ Finalizing package'
+  - 'exec: node: not found'
+  - '> Packaging for x64 on win32'
+root_cause: |
+  On the ubuntu-24.04 image update from 20260518.149.1 → 20260525.161.1 and
+  the Windows Server 2022/2025 image update from 20260518 → 20260525, the
+  cached Node.js toolcache version was bumped from 24.15.0 to 24.16.0. Node.js
+  24.16.0 contains an upstream regression in the readable-stream.destroy()
+  lifecycle that breaks yauzl (a ZIP reading library) and extract-zip which
+  depends on it.
+
+  `electron-forge make` uses extract-zip internally during the "Finalizing
+  package" phase to extract the Electron binary archive. When running under
+  Node.js 24.16.0 or 26.1.0+, the forge process:
+  1. Enters all packaging subtasks within ~5 ms (each spinner shows up instantly)
+  2. Exits with code 0 — no checkmarks, no error, no output
+  3. Produces no .exe in `out/<AppName>-win32-x64/`
+
+  The same regression affects other tools that use extract-zip internally:
+  - jsvu (JS engine version updater)
+  - Any npm package that has not yet migrated away from the 6-year-old
+    unmaintained extract-zip package
+
+  The affected subtasks (Copying files → Preparing native dependencies →
+  Finalizing package) complete within milliseconds instead of minutes, which
+  is the visible telltale sign — none receive a ✓ checkmark.
+
+  Upstream issues:
+  - https://github.com/nodejs/node/issues/63487 (yauzl/extract-zip partial extraction)
+  - https://github.com/nodejs/node/issues/63638 (libuv regression on Windows)
+  - https://github.com/electron/forge/issues/4277
+fix: |
+  Pin Node.js to 24.15.0 (last unaffected 24.x release) until Node.js 24.17.0
+  ships the upstream fix and it is rolled into the runner toolcache via
+  actions/node-versions:
+
+    - uses: actions/setup-node@v6
+      with:
+        node-version: '24.15.0'
+
+  Alternatively, downgrade to Node.js 22 LTS which is unaffected:
+
+    - uses: actions/setup-node@v6
+      with:
+        node-version: '22'
+
+  For jsvu users, the same pin applies. Track the upstream fix at
+  https://github.com/nodejs/node/issues/63487 and
+  https://github.com/electron/forge/issues/4277 for when to unpin.
+fix_code:
+  - language: yaml
+    label: 'Pin Node.js to 24.15.0 until extract-zip regression is fixed'
+    code: |
+      steps:
+        - uses: actions/checkout@v6
+
+        - name: Set up Node.js (pin to last unaffected 24.x)
+          uses: actions/setup-node@v6
+          with:
+            node-version: '24.15.0'   # 24.16.0+ breaks extract-zip / electron-forge
+            cache: 'npm'
+
+        - name: Install dependencies
+          run: npm ci
+
+        - name: Package (electron-forge)
+          run: npx electron-forge make --platform win32 --arch x64
+  - language: yaml
+    label: 'Fallback to Node.js 22 LTS (unaffected by regression)'
+    code: |
+      steps:
+        - uses: actions/setup-node@v6
+          with:
+            node-version: '22'   # LTS — unaffected by 24.16.0 extract-zip regression
+prevention:
+  - 'Pin exact Node.js minor versions in actions/setup-node — semver ranges like
+    "24" silently upgrade to patch/minor releases that may carry regressions.'
+  - 'Watch https://github.com/nodejs/node/issues/63487 and
+    https://github.com/electron/forge/issues/4277 for when the regression is
+    fixed in both Node.js upstream and electron-forge itself.'
+  - 'If forge make exits 0 but produces no output files, check whether the Node.js
+    version in use is >=24.16.0 or >=26.1.0 — the silent exit is the diagnostic.'
+  - 'Consider using a lock-file approach: pin node-version in setup-node AND add
+    a post-step assertion that the expected .exe exists before continuing.'
+docs:
+  - url: 'https://github.com/nodejs/node/issues/63487'
+    label: 'nodejs/node #63487 — yauzl/extract-zip hang and partial extraction (readable-stream regression)'
+  - url: 'https://github.com/nodejs/node/issues/63638'
+    label: 'nodejs/node #63638 — libuv regression in Node.js 24.16.0 on Windows'
+  - url: 'https://github.com/electron/forge/issues/4277'
+    label: 'electron/forge #4277 — make exits 0 silently on Node.js 24.16.0 / extract-zip regression'
+  - url: 'https://github.com/actions/runner-images/issues/14174'
+    label: 'runner-images #14174 — Windows 2022/2025 May 25 image: electron-forge make silent exit'
+  - url: 'https://github.com/actions/runner-images/issues/14173'
+    label: 'runner-images #14173 — Puppeteer broken in ubuntu-24.04 20260525 (same root cause)'
