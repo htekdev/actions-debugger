@@ -1,0 +1,144 @@
+id: caching-artifacts-084
+title: 'Cache restore 429 rate limit silently treated as cache miss — builds from scratch'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - cache
+  - rate-limit
+  - 429
+  - cache-miss
+  - silent-failure
+  - actions-cache
+patterns:
+  - regex: 'You.ve hit a rate limit.*rate limit will reset'
+    flags: 'i'
+  - regex: 'Failed to restore.*Rate[- ][Ll]imited.*429|Failed to GetCacheEntryDownloadURL.*Rate'
+    flags: 'i'
+  - regex: 'Failed request: \(429\) Too Many Requests: rate limit exceeded'
+    flags: 'i'
+  - regex: 'rate limit exceeded.*Cache not found for input keys'
+    flags: 'i'
+error_messages:
+  - "Warning: You've hit a rate limit, your rate limit will reset in 18 seconds"
+  - "Warning: Failed to restore: Failed to GetCacheEntryDownloadURL: Rate Limited: Failed request: (429) Too Many Requests: rate limit exceeded"
+  - "Cache not found for input keys: goofy-b41b01ad3312fe1358359b7522c43860bfdad754166c7f1d385e51766e57b4c0"
+root_cause: |
+  When the GitHub cache service rate-limits a cache restore (download URL lookup) request with
+  HTTP 429, `actions/cache` emits a warning and immediately falls through to a **cache miss**
+  — reporting `Cache not found for input keys: <key>` — even though the cache entry exists
+  and will be available after the rate limit resets (typically < 60 seconds).
+
+  The action does NOT retry or wait before giving up, so the job proceeds without the cache
+  hit. This is different from `caching-artifacts-030` which covers the upload (save) path
+  failing with 429 + EBADF crash:
+  - **This entry (084):** cache RESTORE fails with 429 → silent cache miss → full build from
+    scratch → no job error, just a wasted rebuild.
+  - **ca-030:** cache SAVE fails with 429 → EBADF crash on file stream → job error.
+
+  **When this happens:**
+  - Many parallel jobs in a matrix trigger cache restore requests simultaneously, exceeding
+    the per-workflow or per-repo cache API rate limit.
+  - A brief cache service degradation causes a transient 429 spike.
+  - High-frequency push workflows reuse the same cache key and hit the restore endpoint
+    faster than the rate limit window.
+
+  The silent fallback to cache miss is by design in the current `actions/cache`
+  implementation — it avoids blocking the job indefinitely but sacrifices cache hit
+  performance when hits would have been available after a short wait.
+fix: |
+  **Option 1 (immediate): Add a retry wrapper around the cache restore step.**
+  Use a loop or `nick-fields/retry` to retry the cache step up to 3 times with a 30-second
+  sleep between attempts:
+
+  ```yaml
+  - name: Cache restore with retry
+    uses: nick-fields/retry@v3
+    with:
+      timeout_minutes: 5
+      max_attempts: 3
+      retry_wait_seconds: 30
+      command: |
+        # Use actions/cache/restore directly for retry-ability
+        gh actions-cache list --key "${{ env.CACHE_KEY }}"
+  ```
+
+  **Option 2: Use actions/cache/restore and handle failure gracefully.**
+  Split the cache action into restore + save and add `continue-on-error: true` on the restore
+  step, then detect the cache miss and log a notice:
+
+  ```yaml
+  - uses: actions/cache/restore@v5
+    id: cache-restore
+    continue-on-error: true
+    with:
+      key: ${{ runner.os }}-build-${{ hashFiles('**/lockfiles') }}
+      path: .build-cache
+  - if: steps.cache-restore.outcome == 'failure'
+    run: echo "::notice::Cache restore hit rate limit — building from scratch"
+  ```
+
+  **Option 3: Reduce parallel matrix size to lower simultaneous cache restore pressure.**
+  Stagger jobs using a matrix `max-parallel` setting to reduce concurrent restore hits on
+  the same cache endpoint.
+
+  **Option 4: Shard cache keys to distribute across cache service partitions.**
+  Use a hash suffix in the cache key to avoid all matrix jobs hitting the same partition.
+fix_code:
+  - language: yaml
+    label: 'Split restore from save, continue-on-error on restore to surface rate limit events'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Restore cache
+              id: cache-restore
+              uses: actions/cache/restore@v5
+              continue-on-error: true  # prevents rate-limit 429 from blocking the job
+              with:
+                path: ~/.gradle/caches
+                key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*') }}
+                restore-keys: gradle-${{ runner.os }}-
+
+            - name: Notice on cache miss due to rate limit
+              if: steps.cache-restore.outcome == 'failure'
+              run: echo "::warning::Cache restore failed (possible rate limit) — building without cache"
+
+            - name: Build
+              run: ./gradlew build
+
+            - name: Save cache
+              if: steps.cache-restore.outputs.cache-hit != 'true'
+              uses: actions/cache/save@v5
+              with:
+                path: ~/.gradle/caches
+                key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*') }}
+  - language: yaml
+    label: 'Reduce parallel matrix cache pressure with max-parallel'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest, macos-latest]
+            max-parallel: 2  # stagger to reduce simultaneous cache restore requests
+          runs-on: ${{ matrix.os }}
+          steps:
+            - uses: actions/cache@v5
+              with:
+                path: ~/.npm
+                key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+prevention:
+  - 'Use `continue-on-error: true` on `actions/cache/restore` steps in large matrix builds to prevent a transient rate limit from blocking the entire job.'
+  - 'Limit `max-parallel` in strategy.matrix to reduce simultaneous cache restore requests when running many parallel jobs against the same cache key.'
+  - 'Shard cache keys by job index (e.g., append `${{ strategy.job-index }}`) if different matrix legs can produce independent cache entries rather than sharing one.'
+  - 'Monitor the warning "You''ve hit a rate limit" in workflow logs — if it appears frequently, consider reducing cache restore frequency or switching to a custom cache backend for high-parallelism workflows.'
+docs:
+  - url: 'https://github.com/actions/cache/issues/1758'
+    label: 'actions/cache #1758 — Handle rate limit: cache restore 429 should retry not immediately fall to cache miss'
+  - url: 'https://github.com/actions/cache/issues/1710'
+    label: 'actions/cache #1710 — Cache indexing lag / API propagation delay (related: cache miss after recent save)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows#usage-limits-and-eviction-policy'
+    label: 'GitHub docs — Caching dependencies: usage limits and eviction policy'
