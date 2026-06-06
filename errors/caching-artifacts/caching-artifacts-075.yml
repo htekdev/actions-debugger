@@ -1,0 +1,172 @@
+id: caching-artifacts-075
+title: '`actions/cache` entries saved by GitHub-hosted runners are not accessible from self-hosted runners — cache lookup returns miss despite matching key'
+category: caching-artifacts
+severity: error
+tags:
+  - actions-cache
+  - self-hosted
+  - github-hosted
+  - cache-miss
+  - cross-runner
+  - ACTIONS_CACHE_URL
+  - cache-backend
+patterns:
+  - regex: 'Cache not found for input keys'
+    flags: 'i'
+  - regex: 'No cache found.*self.hosted'
+    flags: 'i'
+  - regex: 'ACTIONS_CACHE_URL.*self.hosted'
+    flags: 'i'
+  - regex: 'cache.*miss.*self.hosted|self.hosted.*cache.*miss'
+    flags: 'i'
+error_messages:
+  - "Cache not found for input keys: my-cache-key-abc123"
+  - "Warning: Cache restore failed."
+  - "No cache found for key my-cache-key on self-hosted runner"
+root_cause: |
+  `actions/cache` stores and retrieves cache entries via a **runner-specific
+  `ACTIONS_CACHE_URL` endpoint** that is injected into each job by the Actions
+  infrastructure. The cache URL for a GitHub-hosted runner points to GitHub's
+  hosted cache service, while the cache URL for a self-hosted runner may point to
+  a different endpoint (e.g., GHES cache, Actions Runner Controller cache proxy,
+  or a completely different ACTIONS_CACHE_URL configured by the runner operator).
+
+  When a GitHub-hosted runner saves a cache entry:
+  - The entry is stored at GitHub's hosted cache service endpoint.
+  - The entry IS visible via the GitHub Cache REST API and the repository's
+    Actions → Caches UI.
+
+  When a self-hosted runner tries to restore the same key:
+  - The runner uses its own `ACTIONS_CACHE_URL`, which may point to a different
+    service.
+  - The cache lookup returns "Cache not found" even though the entry is visible
+    in the UI.
+  - No error is surfaced — the action silently reports a cache miss and the job
+    continues.
+
+  This is commonly encountered when:
+  1. **ARC (Actions Runner Controller) on Kubernetes** — ARC runners use a
+     `gha-cache-server` proxy sidecar that fronts GitHub's cache API; the proxy's
+     cache scope or URL differs from the GitHub-hosted ACTIONS_CACHE_URL.
+  2. **GHES (GitHub Enterprise Server)** — On-prem GHES cache is a separate
+     service from github.com hosted cache.
+  3. **Mixed runner pools** — Some jobs run on GitHub-hosted (`ubuntu-latest`)
+     and others on self-hosted runners; they do not share cache entries.
+  4. **Self-hosted runners with custom ACTIONS_CACHE_URL** — Operators configure
+     a custom cache backend (e.g., Artifactory, Nexus) that doesn't contain entries
+     from GitHub's hosted cache.
+
+  Related: actions/cache#1595 (open since April 2025).
+
+  The cache entries ARE there (visible via REST API) but are stored at a different
+  cache service endpoint than the one the self-hosted runner queries.
+fix: |
+  **Option 1 (Recommended) — Ensure all cache-sharing jobs use the same runner type:**
+  If a job saves a cache on a GitHub-hosted runner, ensure the job that needs to
+  restore it also runs on a GitHub-hosted runner. Do not rely on cross-runner-type
+  cache sharing.
+
+  **Option 2 — Configure a shared external cache backend:**
+  For mixed runner environments, configure all runners (GitHub-hosted and self-hosted)
+  to use a shared external cache backend. This requires customizing `ACTIONS_CACHE_URL`
+  on your self-hosted runners to point to the same service.
+
+  **Option 3 — Re-populate cache from self-hosted runners:**
+  Have the self-hosted runner job save its own cache entry with the same key on first
+  miss. Subsequent self-hosted runner runs will hit this entry. The GitHub-hosted and
+  self-hosted entries may diverge if they have different paths.
+
+  **Option 4 — Use artifact-based sharing instead of cache:**
+  If the data must cross runner types, use `actions/upload-artifact` and
+  `actions/download-artifact` instead of cache. Artifacts are stored and retrieved
+  via the same GitHub API endpoint regardless of runner type.
+fix_code:
+  - language: yaml
+    label: 'Broken — cache saved by GitHub-hosted runner, restored by self-hosted (misses)'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest          # GitHub-hosted runner saves cache
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/cache@v4
+              with:
+                path: ~/.npm
+                key: npm-${{ hashFiles('**/package-lock.json') }}
+            - run: npm ci
+
+        test:
+          runs-on: self-hosted            # ✗ Self-hosted runner cannot access
+          needs: build                    #   github-hosted runner's cache entry
+          steps:
+            - uses: actions/cache@v4
+              with:
+                path: ~/.npm
+                key: npm-${{ hashFiles('**/package-lock.json') }}
+                # → Always "Cache not found for input keys: npm-..."
+            - run: npm test
+
+  - language: yaml
+    label: 'Fixed — both jobs on the same runner type share cache entries'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest          # ✓ Both jobs use GitHub-hosted runners
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/cache@v4
+              with:
+                path: ~/.npm
+                key: npm-${{ hashFiles('**/package-lock.json') }}
+            - run: npm ci
+
+        test:
+          runs-on: ubuntu-latest          # ✓ Same runner type = same cache backend
+          needs: build
+          steps:
+            - uses: actions/cache@v4
+              with:
+                path: ~/.npm
+                key: npm-${{ hashFiles('**/package-lock.json') }}
+                # ✓ Cache hit — saved by github-hosted, restored by github-hosted
+            - run: npm test
+
+  - language: yaml
+    label: 'Alternative — use upload-artifact / download-artifact for cross-runner sharing'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest          # GitHub-hosted builds the artifacts
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm ci && npm run build
+            - uses: actions/upload-artifact@v4
+              with:
+                name: build-output
+                path: dist/
+
+        test:
+          runs-on: self-hosted            # ✓ Artifacts are accessible from any runner type
+          needs: build
+          steps:
+            - uses: actions/download-artifact@v4
+              with:
+                name: build-output
+                path: dist/
+            - run: npm test
+
+prevention:
+  - 'Treat `actions/cache` entries as scoped to the runner type that created them — GitHub-hosted and self-hosted runners do not share a cache backend by default.'
+  - 'Design workflows so that cache-save and cache-restore jobs run on the same runner type (both GitHub-hosted or both self-hosted).'
+  - 'When mixing runner types, use `actions/upload-artifact` + `actions/download-artifact` for data that must cross the runner boundary.'
+  - 'Verify cache access in ARC (Actions Runner Controller) setups: ARC uses a gha-cache-server proxy that may have different scope from the GitHub-hosted cache.'
+  - 'Inspect `ACTIONS_CACHE_URL` in debug logs (`ACTIONS_RUNNER_DEBUG=true`) to confirm both runners are pointing to the same cache endpoint.'
+docs:
+  - url: 'https://github.com/actions/cache/issues/1595'
+    label: 'actions/cache#1595: GitHub-hosted runner cache not found from self-hosted runner (open 2025)'
+  - url: 'https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows#restrictions-for-accessing-a-cache'
+    label: 'GitHub Docs: Cache access restrictions'
+  - url: 'https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows'
+    label: 'GitHub Docs: Caching dependencies to speed up workflows'
+  - url: 'https://github.com/actions/actions-runner-controller/blob/main/docs/gha-runner-scale-set-controller/README.md'
+    label: 'ARC docs: Runner Scale Set — cache proxy configuration'

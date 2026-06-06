@@ -1,0 +1,173 @@
+id: triggers-073
+title: '`on: workflow_run: branches:` filter matches head_branch of triggering run — PR merge triggers are silently skipped when head_branch is the PR branch, not the merge target'
+category: triggers
+severity: silent-failure
+tags:
+  - workflow_run
+  - branches-filter
+  - head-branch
+  - pr-merge
+  - silent-skip
+  - trigger-not-firing
+  - deploy-workflow
+patterns:
+  - regex: 'workflow_run:[\s\S]{0,200}branches:'
+    flags: 'im'
+  - regex: 'github\.event\.workflow_run\.head_branch'
+    flags: 'i'
+  - regex: 'workflow_run.*branches.*\[.*main.*\]'
+    flags: 'i'
+error_messages:
+  - "workflow not triggering after PR merge"
+  - "workflow_run with branches filter not firing on merge to main"
+root_cause: |
+  The `branches:` filter in an `on: workflow_run:` trigger compares against
+  `github.event.workflow_run.head_branch` — the branch the **source workflow** ran on.
+
+  When a pull request is opened, the source workflow (e.g., CI) runs with
+  `head_branch` = the feature branch name (e.g., `feat/my-change`). When GitHub
+  handles the PR merge, it creates a push to `main`, but it **reuses the PR's existing
+  check suite** rather than creating a new check run for the merge commit. As a result,
+  the `workflow_run` event that fires after the merge has:
+
+  ```
+  github.event.workflow_run.head_branch = "feat/my-change"  # PR branch, not "main"
+  github.event.workflow_run.head_sha    = "<merge-commit-sha>"
+  ```
+
+  If a downstream workflow has `branches: [main]`, this filter is evaluated against
+  `head_branch` = `"feat/my-change"`. The filter does NOT match — the downstream
+  workflow **silently never runs** after the PR merge.
+
+  This is counterintuitive because developers expect `branches: [main]` to mean
+  "trigger my deployment workflow only when CI ran on the main branch," not "only
+  when the source workflow's head_branch exactly equals main." The distinction matters
+  specifically for PR merges, where the push IS to main but the check run is attributed
+  to the PR branch.
+
+  **Who is affected:**
+  - Any deploy-on-merge pattern using `workflow_run` with `branches: [main]` or
+    `branches: [master]`
+  - Workflows that use `workflow_run` to chain CI → deploy only for the default branch
+
+  **Note:** Workflows triggered by a direct push to `main` (not a PR merge) DO have
+  `head_branch = "main"` and ARE correctly triggered by the `branches: [main]` filter.
+  The problem is specific to PR merges that go through the PR check-suite flow.
+
+  Source: observed in production deployments (commit Skretzo/shortest-path@8254fb4),
+  GitHub docs issue github/docs#42813 (Feb 2026).
+fix: |
+  **Remove `branches:` from the `workflow_run` trigger** and instead enforce the branch
+  restriction in a **job-level `if:` condition** that explicitly checks
+  `github.event.workflow_run.head_branch`:
+
+  ```yaml
+  on:
+    workflow_run:
+      workflows: ["CI"]
+      types: [completed]
+      # ✗ Remove: branches: [main]
+
+  jobs:
+    deploy:
+      # ✓ Check head_branch here instead — this sees the actual branch
+      if: >-
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_branch == 'main'
+  ```
+
+  This approach works for both direct pushes to main AND PR merges to main,
+  because the `if:` condition is evaluated at job execution time with the full
+  `workflow_run` event payload, while the `branches:` filter is evaluated at
+  trigger time and uses different matching semantics.
+
+  Alternatively, use the `workflow_run` trigger WITHOUT a branches filter and
+  rely entirely on job conditions to control which branches proceed to deployment.
+fix_code:
+  - language: yaml
+    label: 'Broken — branches: [main] silently blocks PR merge triggers'
+    code: |
+      # .github/workflows/deploy.yml
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+          branches: [main]    # ✗ Matches head_branch of triggering run
+                              #   PR merges have head_branch = PR branch name
+                              #   → deploy never fires after PR merges to main
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          if: github.event.workflow_run.conclusion == 'success'
+          steps:
+            - run: ./deploy.sh
+
+  - language: yaml
+    label: 'Fixed — remove branches filter; check head_branch in job condition'
+    code: |
+      # .github/workflows/deploy.yml
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+          # ✓ No branches filter — let all workflow_run events through
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          # ✓ Check head_branch in the if: condition
+          #   head_branch == 'main' correctly identifies merges to main
+          if: >-
+            github.event.workflow_run.conclusion == 'success' &&
+            github.event.workflow_run.head_branch == 'main'
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.workflow_run.head_sha }}
+            - run: ./deploy.sh
+
+  - language: yaml
+    label: 'Pattern — full deploy-on-merge via workflow_run with branch guard'
+    code: |
+      # .github/workflows/deploy.yml
+      # Runs after CI completes successfully on any branch,
+      # but only deploys when it ran on main (direct push OR PR merge)
+      name: Deploy
+
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+
+      jobs:
+        deploy:
+          name: Deploy to production
+          runs-on: ubuntu-latest
+          if: >-
+            github.event.workflow_run.conclusion == 'success' &&
+            github.event.workflow_run.head_branch == 'main'
+
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                # ✓ Check out the exact commit that CI ran on
+                ref: ${{ github.event.workflow_run.head_sha }}
+
+            - name: Deploy
+              run: |
+                echo "Deploying commit ${{ github.event.workflow_run.head_sha }}"
+                ./deploy.sh
+
+prevention:
+  - 'Never use `branches:` in `on: workflow_run:` if your deployment pattern relies on PR merges — always enforce branch restrictions in `jobs.<id>.if` conditions instead.'
+  - 'Test the pattern by creating a PR, merging it, and checking the Actions tab — the `workflow_run` event should appear even without a `branches` filter.'
+  - 'Use `github.event.workflow_run.head_branch` in the `if:` condition to distinguish deploy-worthy runs from feature-branch CI runs.'
+  - 'Document this behavior in your workflow comments so future contributors understand why the `branches:` filter is not used.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run'
+    label: 'GitHub Docs: workflow_run trigger — branches filter behavior'
+  - url: 'https://github.com/github/docs/issues/42813'
+    label: 'github/docs#42813: Clarify branches filter on workflow_run (Feb 2026)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#using-data-from-the-triggering-workflow'
+    label: 'GitHub Docs: Using data from the triggering workflow'

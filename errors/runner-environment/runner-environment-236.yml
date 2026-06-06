@@ -1,0 +1,146 @@
+id: runner-environment-236
+title: '`ubuntu-slim` runner has Docker CLI but no Docker daemon — docker build/pull and Dockerfile container actions fail'
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-slim
+  - docker
+  - docker-daemon
+  - container-action
+  - docker-build
+  - dockerfile
+  - lightweight-runner
+patterns:
+  - regex: 'Cannot connect to the Docker daemon at unix:///var/run/docker\.sock'
+    flags: 'i'
+  - regex: 'docker\.sock.*no such file or directory'
+    flags: 'i'
+  - regex: 'ERROR: Cannot connect to the Docker daemon'
+    flags: 'i'
+  - regex: 'ubuntu-slim.*docker|docker.*ubuntu-slim'
+    flags: 'i'
+error_messages:
+  - "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"
+  - "ERROR: Cannot connect to the Docker daemon at unix:///var/run/docker.sock: connect: no such file or directory"
+  - "Docker build failed with exit code 1, back off 3.588 seconds before retry."
+  - "failed to connect to the docker API at unix:///var/run/docker.sock; check if the path is correct and if the daemon is running: dial unix /var/run/docker.sock: connect: no such file or directory"
+  - "/usr/bin/docker build ... ERROR: Cannot connect to the Docker daemon"
+root_cause: |
+  The `ubuntu-slim` GitHub-hosted runner image (added January 2026 via runner-images
+  PR#13542) is a **lightweight Ubuntu image intentionally stripped of the Docker daemon**.
+  It is designed for fast, low-overhead CI jobs (linting, unit tests, scripting) that
+  do not need container tooling.
+
+  **What ubuntu-slim DOES have:**
+  - Docker CLI (`docker` command is on `PATH`)
+  - Standard shell tooling, git, curl, Node.js, Python
+
+  **What ubuntu-slim does NOT have:**
+  - Docker daemon (no `/var/run/docker.sock` socket)
+  - Docker daemon service (not running — not even stopped, just not installed)
+  - BuildKit / buildx (requires daemon)
+
+  This affects several common patterns:
+  1. **`docker build` / `docker run` / `docker pull` in `run:` steps** — All fail
+     immediately because there is no daemon to dispatch commands to.
+  2. **Container actions** (`uses: some-org/docker-action@v1` where the action has a
+     `Dockerfile`) — The Actions runner tries to build the action's `Dockerfile` using
+     the host Docker daemon before executing the step. On `ubuntu-slim`, this fails during
+     job setup with "Cannot connect to the Docker daemon."
+  3. **`docker/setup-buildx-action`** — Fails because BuildKit requires a Docker daemon.
+  4. **Service containers** (`services:` block using Docker images) — Fail because
+     pulling and starting service containers requires the Docker daemon.
+
+  GitHub has closed requests to add Docker daemon to ubuntu-slim as "not_planned"
+  (runner-images#13583 Feb 2026), confirming this is **by design**.
+
+  This is distinct from `runner-environment-030` (ubuntu-arm64-docker-not-preinstalled),
+  which covers ARM64 partner runners where Docker CLI itself is missing. On ubuntu-slim,
+  Docker CLI IS present — only the daemon is absent.
+fix: |
+  **Option 1 (Recommended) — Switch to `ubuntu-latest` or `ubuntu-24.04`:**
+  If your workflow uses Docker in any form (docker build, container actions, service
+  containers), use a full Ubuntu image. Docker daemon is pre-installed and running
+  on `ubuntu-latest` and `ubuntu-24.04`.
+
+  **Option 2 — Conditionally skip Docker-dependent steps:**
+  If you want to use ubuntu-slim for most of a workflow but have one Docker step, you
+  cannot run that step on ubuntu-slim. Restructure into two jobs: one on ubuntu-slim for
+  fast non-Docker steps, one on ubuntu-latest for Docker steps.
+
+  **Option 3 — Use a Docker-in-Docker container (advanced, not recommended):**
+  You can run a `dind` (Docker-in-Docker) container as a service and set `DOCKER_HOST`
+  to point to it, but this is complex, slow, and defeats the purpose of ubuntu-slim.
+
+  **Option 4 — Replace Dockerfile container actions with JS/composite alternatives:**
+  Some Docker-based third-party actions have JavaScript equivalents that don't require
+  a daemon. Check if the action you're using has a non-Docker version.
+fix_code:
+  - language: yaml
+    label: 'Broken — docker commands and container actions fail on ubuntu-slim'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-slim    # ✗ No Docker daemon available
+
+          steps:
+            - uses: actions/checkout@v4
+
+            # ✗ Fails: "Cannot connect to the Docker daemon at unix:///var/run/docker.sock"
+            - name: Build Docker image
+              run: docker build -t myapp:latest .
+
+            # ✗ Also fails: action uses Dockerfile, requires Docker daemon to build
+            - name: Run Docker-based action
+              uses: some-org/docker-based-action@v2
+
+  - language: yaml
+    label: 'Fixed — use ubuntu-latest for any workflow that needs Docker'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest    # ✓ Docker daemon pre-installed and running
+
+          steps:
+            - uses: actions/checkout@v4
+
+            # ✓ Works: Docker daemon available on ubuntu-latest
+            - name: Build Docker image
+              run: docker build -t myapp:latest .
+
+            # ✓ Works: container actions can build their Dockerfiles
+            - name: Run Docker-based action
+              uses: some-org/docker-based-action@v2
+
+  - language: yaml
+    label: 'Pattern — split jobs to use ubuntu-slim for fast steps, ubuntu-latest for Docker'
+    code: |
+      jobs:
+        lint:
+          runs-on: ubuntu-slim      # ✓ Fast, no Docker needed for lint
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm run lint
+
+        docker-build:
+          runs-on: ubuntu-latest    # ✓ Docker available for build/push steps
+          needs: lint
+          steps:
+            - uses: actions/checkout@v4
+            - run: docker build -t myapp:latest .
+            - run: docker push myregistry/myapp:latest
+
+prevention:
+  - 'Before switching to `ubuntu-slim`, audit your workflow for `docker` commands, Dockerfile-based `uses:` steps, and `services:` blocks — any of these require a Docker daemon.'
+  - 'Container actions (actions with a `Dockerfile`) silently fail during job setup on ubuntu-slim, making the error appear before any step runs — check the "Set up job" section of the logs.'
+  - 'Check the ubuntu-slim software list at https://github.com/actions/runner-images to confirm Docker daemon is not present before migrating workflows.'
+  - '`service containers` defined in the `services:` block also require the Docker daemon — they will also fail on ubuntu-slim.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/13583'
+    label: 'runner-images#13583: Docker pull failed on ubuntu-slim (closed as not_planned — by design)'
+  - url: 'https://github.com/actions/runner-images/pull/13542'
+    label: 'runner-images PR#13542: Add ubuntu-slim image (Jan 2026)'
+  - url: 'https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners/about-github-hosted-runners'
+    label: 'GitHub Docs: About GitHub-hosted runners'
+  - url: 'https://docs.github.com/en/actions/creating-actions/creating-a-docker-container-action'
+    label: 'GitHub Docs: Creating a Docker container action'
