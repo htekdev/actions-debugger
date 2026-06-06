@@ -1,0 +1,138 @@
+id: concurrency-timing-061
+title: '`github.workflow` in reusable workflow (`workflow_call`) returns caller''s name — shared concurrency group causes deadlock'
+category: concurrency-timing
+severity: error
+tags:
+  - concurrency
+  - reusable-workflow
+  - workflow-call
+  - github-workflow-context
+  - deadlock
+  - concurrency-group
+patterns:
+  - regex: 'Canceling since a deadlock for concurrency group .+ was detected between .+ and .+'
+    flags: 'i'
+  - regex: 'deadlock.*concurrency group.*detected'
+    flags: 'i'
+error_messages:
+  - "Canceling since a deadlock for concurrency group 'CI-refs/heads/main' was detected between 'CI workflow' and 'deploy'"
+  - "Canceling since a deadlock for concurrency group 'test-refs/heads/master' was detected between 'test workflow' and 'deploy'"
+root_cause: |
+  When a caller workflow invokes a reusable workflow via `uses:` (the `workflow_call` trigger),
+  the `github.workflow` context variable inside the CALLEE resolves to the CALLER's workflow
+  name — not the callee's own filename. This is documented behavior but it directly undermines
+  the widely recommended concurrency group pattern of `${{ github.workflow }}-${{ github.ref }}`.
+
+  If both the caller and the callee define:
+  ```yaml
+  concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+  ```
+
+  Both workflows compute the SAME group key (because `github.workflow` is the caller's name in
+  both). GitHub detects that two workflow instances are competing for the same concurrency slot
+  in a way that cannot resolve — one is waiting for the other which is waiting for the first —
+  treats it as a deadlock, and cancels one of the runs.
+
+  **Why this is especially confusing:**
+  The fix recommended for general concurrency group collisions (`${{ github.workflow }}-${{ github.ref }}`)
+  is itself the cause of this deadlock when applied naively to reusable workflows. Teams that
+  copy the "safe" concurrency pattern from caller to callee introduce the bug.
+
+  **Real-world evidence:**
+  - actions/runner#3205: `github.workflow` returns parent workflow name in child workflows
+  - vergil-project/vergil-actions#176: ci-push.yml calls ci.yml via workflow_call; both use
+    `${{ github.workflow }}-${{ github.ref }}`; deadlock detected on every push
+  - github/gh-aw#35173: workflow_call fan-out cancellations due to shared concurrency namespace
+  - SO #78101326 (6 upvotes, 1738 views): "GitHub Actions concurrency deadlock" — 6 answers
+    confirming the root cause is `github.workflow` returning the caller name
+fix: |
+  Use `github.workflow_ref` instead of `github.workflow` in the CALLEE (reusable) workflow.
+  `github.workflow_ref` contains the full workflow file path (e.g.
+  `.github/workflows/deploy.yml@refs/heads/main`), which is unique per callee file and
+  does NOT inherit the caller's name.
+
+  **Preferred approach:** Define concurrency ONLY in the caller workflow and remove it from the
+  callee entirely. The callee runs as part of the caller's run and does not need its own
+  concurrency group. This is the cleanest fix and matches GitHub's recommendations for
+  reusable workflow design.
+
+  **Avoid:** Defining concurrency in both caller and callee with the same expression — this
+  is the root cause of the deadlock regardless of which context variable is used for the group
+  key, unless the keys are guaranteed to differ.
+fix_code:
+  - language: yaml
+    label: 'Callee (reusable workflow): use github.workflow_ref — unique per callee file'
+    code: |
+      # .github/workflows/deploy.yml (callee — reusable workflow)
+      name: Deploy
+
+      on:
+        workflow_call:
+
+      # ✅ github.workflow_ref includes the full path, NOT the caller's name
+      concurrency:
+        group: ${{ github.workflow_ref }}-${{ github.ref }}
+        cancel-in-progress: true
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./deploy.sh
+  - language: yaml
+    label: 'Preferred: define concurrency only in the caller, none in the callee'
+    code: |
+      # .github/workflows/ci.yml (caller workflow)
+      name: CI
+
+      on:
+        push:
+          branches: [main]
+
+      # Concurrency defined only in the caller
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: true
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - run: npm test
+
+        deploy:
+          needs: test
+          # ✅ No concurrency block here — the reusable workflow has no concurrency group
+          uses: ./.github/workflows/deploy.yml
+
+      ---
+      # .github/workflows/deploy.yml (callee — reusable workflow)
+      name: Deploy
+
+      on:
+        workflow_call:
+
+      # ✅ No concurrency block — inherit scheduling from caller
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./deploy.sh
+prevention:
+  - "Never use `github.workflow` in a reusable workflow's concurrency group — it resolves to the caller's name, not the callee's"
+  - "Use `github.workflow_ref` in callee workflows if a concurrency group is truly needed there"
+  - "Prefer defining concurrency only in the caller when calling reusable workflows via `uses:` — keep callee stateless"
+  - "Audit all reusable workflows for concurrency groups that use `github.workflow` and replace with `github.workflow_ref`"
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs'
+    label: 'GitHub Docs: Control the concurrency of workflows and jobs'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context'
+    label: 'GitHub Docs: github context — github.workflow_ref field'
+  - url: 'https://github.com/actions/runner/issues/3205'
+    label: 'actions/runner#3205: github.workflow returns parent name in child workflows (closed not_planned)'
+  - url: 'https://stackoverflow.com/questions/78101326/github-actions-concurrency-deadlock'
+    label: 'SO #78101326: GitHub Actions concurrency deadlock in reusable workflows (6 upvotes, 1738 views)'
