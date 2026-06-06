@@ -1,0 +1,133 @@
+id: known-unsolved-066
+title: 'Node Action Post Step Receives Wrong INPUT_* Env Vars When Called Through Nested Composite Action'
+category: known-unsolved
+severity: error
+tags:
+  - composite-actions
+  - post-step
+  - node-action
+  - nested
+  - inputs
+  - runner-bug
+  - savestate
+patterns:
+  - regex: 'Input required and not supplied:\s*\S+'
+    flags: 'i'
+  - regex: 'Post job cleanup\.\s*\n.*Input required'
+    flags: 'im'
+  - regex: 'post.*wrong.*input|INPUT_.*post.*ancestor'
+    flags: 'i'
+error_messages:
+  - 'Input required and not supplied: token'
+  - 'Input required and not supplied: test'
+  - 'Error: Input required and not supplied: <input-name>'
+  - 'Post job cleanup.'
+root_cause: |
+  Runner bug (actions/runner#3514, actions/runner#2030, open since 2022): when a Node.js
+  action that has a `post:` step is invoked through one or more composite action layers,
+  the runner restores the wrong `INPUT_*` environment variables for the post step execution.
+
+  At post-step execution time, the runner sets environment variables from the nearest
+  ancestor composite action's inputs, not from the inputs actually passed to the Node
+  action itself. For example:
+
+    Workflow → outer-composite (inputs: image-tag: "foo") → inner-composite
+      → node-action (inputs: image-tag: "foo")
+
+  The node action's main step correctly sees INPUT_IMAGE_TAG=foo.
+  In the post step, INPUT_IMAGE_TAG is absent or overwritten by the outer composite's
+  INPUT_IMAGE_TAG value (or another ancestor composite's value), causing:
+  - Required inputs to appear missing → visible error in post cleanup
+  - Optional inputs to resolve to wrong values → silent wrong behavior (e.g.,
+    devcontainers/ci pushes image with wrong tag; codeql-action uploads SARIF with
+    wrong token)
+
+  This affects ANY Node action with a post step that is called through composite
+  action nesting (depth ≥ 2). First-party actions affected include github/codeql-action
+  (fixed via workaround in codeql-action#2557) and pnpm/action-setup (issue #253).
+fix: |
+  GitHub has not fixed the runner bug. The canonical workaround is to persist inputs
+  in the action's main step using `core.saveState()` and read them back in the post
+  step using `core.getState()` instead of `core.getInput()`.
+
+  Actions consuming this workaround pattern:
+  - github/codeql-action (PR #2557): saveState for upload inputs
+  - Any action that reads inputs in its post step
+
+  If you maintain a Node action with a post step, add to your main.ts:
+    core.saveState('my-input', core.getInput('my-input'));
+  And in your post.ts:
+    const val = core.getState('my-input');  // use this instead of core.getInput
+
+  If you are a workflow author calling a third-party action through composite layers
+  and seeing wrong post-step behavior, check whether the action uses `core.getInput`
+  in its post step. If so, file an issue with the action maintainer referencing
+  actions/runner#3514 and the saveState workaround.
+fix_code:
+  - language: typescript
+    label: 'Action main.ts — persist inputs to state before post step runs'
+    code: |
+      import * as core from '@actions/core';
+
+      async function run() {
+        // Read inputs normally in main
+        const token = core.getInput('token', { required: true });
+        const imageName = core.getInput('image-name');
+
+        // Persist for post step (workaround for runner#3514)
+        core.saveState('token', token);
+        core.saveState('image-name', imageName);
+
+        // ... rest of main logic
+      }
+
+      run();
+  - language: typescript
+    label: 'Action post.ts — read from state, NOT core.getInput'
+    code: |
+      import * as core from '@actions/core';
+
+      async function runPost() {
+        // Use getState, NOT getInput — inputs are wrong in post step
+        // when called through nested composite action (runner#3514)
+        const token = core.getState('token');
+        const imageName = core.getState('image-name');
+
+        // ... post step logic using state values
+      }
+
+      runPost();
+  - language: yaml
+    label: 'action.yml — declare post step'
+    code: |
+      name: 'My Action'
+      inputs:
+        token:
+          required: true
+        image-name:
+          required: false
+      runs:
+        using: 'node20'
+        main: 'dist/main.js'
+        post: 'dist/post.js'
+        post-if: always()
+prevention:
+  - 'In any Node action with a post: step, always use core.saveState/core.getState for
+    inputs consumed in post, never core.getInput — this is defensive programming regardless
+    of nesting depth'
+  - 'Test your action in a composite action wrapper (at least 2 layers deep) to catch
+    this bug before publishing'
+  - 'Check release notes of actions/runner for fixes to this bug before assuming
+    the built-in behavior is fixed'
+  - 'When using actions with known post-step input bugs through composite layers,
+    consider calling them directly from the workflow (not nested in a composite) as
+    a temporary workaround'
+docs:
+  - url: 'https://github.com/actions/runner/issues/3514'
+    label: 'actions/runner#3514 — Wrong environment passed to node post when called by composite called by composite'
+  - url: 'https://github.com/actions/runner/issues/2030'
+    label: 'actions/runner#2030 — Composite: Nested actions post steps have the wrong context (open since 2022)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions#sending-values-to-the-pre-and-post-actions'
+    label: 'GitHub Docs — Sending values to pre and post actions (saveState/getState)'
+  - url: 'https://github.com/github/codeql-action/pull/2557'
+    label: 'codeql-action#2557 — Fix: persist inputs between upload action and post step (reference implementation)'

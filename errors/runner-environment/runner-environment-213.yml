@@ -1,0 +1,142 @@
+id: runner-environment-213
+title: 'Self-Hosted Runner Stuck in Active State Indefinitely When Job Process Hangs Without Exiting'
+category: runner-environment
+severity: error
+tags:
+  - self-hosted
+  - runner
+  - active-state
+  - hung-process
+  - child-process
+  - stuck
+  - service-restart
+  - timeout-minutes
+patterns:
+  - regex: 'Waiting for a runner to pick up this job'
+    flags: 'i'
+  - regex: 'Runner\.Worker.*hung|Worker.*process.*running|active.*runner.*blocking'
+    flags: 'i'
+  - regex: 'sudo systemctl restart actions\.runner'
+    flags: 'i'
+error_messages:
+  - 'Waiting for a runner to pick up this job...'
+  - 'Runner shows as Active in GitHub UI; new jobs remain Queued indefinitely'
+root_cause: |
+  On self-hosted runners, the Runner.Worker process tracks the lifecycle of the running
+  job. When a job step spawns a child process (e.g., a test runner like `vitest --coverage`,
+  a long network operation, or a background daemon) that does not exit cleanly, the
+  Runner.Worker stays alive waiting for the child to terminate.
+
+  While Runner.Worker is alive, the parent Runner.Listener considers the runner slot
+  occupied (busy=true) and does not accept new job messages from the broker. The runner
+  appears as "Active" in the GitHub UI and all queued jobs for that runner remain
+  in "Waiting for a runner to pick up this job..." state indefinitely.
+
+  This differs from:
+  - GitHub-hosted runners: these have a hard 6-hour job timeout enforced by the platform;
+    the job is cancelled and the slot freed automatically
+  - Self-hosted runners WITH timeout-minutes set: once timeout-minutes elapses the
+    job is cancelled and the runner sends SIGTERM to the worker — but if the child
+    process ignores SIGTERM (common with some test runners), the worker still hangs
+
+  Common triggers:
+  - vitest --coverage, jest --forceExit not used, pytest hanging due to unclosed resources
+  - npm/yarn scripts that spawn background processes not tied to the shell session
+  - Docker commands (docker run without --rm) that keep running after the step exits
+  - Network calls blocked by firewall with no connection timeout
+  - Interactive prompts waiting for stdin input in a CI non-interactive context
+
+  Automatic recovery does NOT occur. The runner stays Active until either:
+  1. The hung child process eventually exits on its own
+  2. An operator manually restarts the runner service
+  3. A watchdog script kills the orphaned worker process
+fix: |
+  Immediate recovery: restart the runner service to free the stuck slot.
+    sudo systemctl restart actions.runner.<scope>.<name>.service   # Linux systemd
+    launchctl unload ~/Library/LaunchAgents/actions.runner.*.plist  # macOS
+    .\svc.sh stop && .\svc.sh start                                 # Windows
+
+  Prevention (preferred):
+  1. Add timeout-minutes to ALL jobs on self-hosted runners to cap maximum runtime.
+     Even if the worker hangs, the platform cancels the job and sends SIGTERM after
+     the timeout. Pair with process group kill to catch SIGTERM-resistant children.
+
+  2. Ensure test commands force-exit when done:
+     - vitest: add --forceExit flag
+     - jest: use jest --forceExit or --detectOpenHandles to identify hanging handles
+     - pytest: add timeout fixtures via pytest-timeout plugin
+
+  3. Use process groups (setsid / start new session) so SIGTERM cascades to children:
+     run: |
+       setsid bash -c 'npm test' &
+       CHILD_PID=$!
+       wait $CHILD_PID
+
+  4. Deploy a runner watchdog that monitors Worker processes with no active child
+     CPU activity for > N minutes and kills them:
+     - Check elapsed time + zero CPU descendants
+     - SIGKILL stale Worker processes
+     - Trigger runner service restart via systemd or equivalent
+fix_code:
+  - language: yaml
+    label: 'Add timeout-minutes to prevent indefinite runner lock'
+    code: |
+      jobs:
+        test:
+          runs-on: self-hosted
+          timeout-minutes: 30   # Always set on self-hosted runners
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run tests
+              run: npm test
+  - language: yaml
+    label: 'Force-exit test runner so worker process completes cleanly'
+    code: |
+      jobs:
+        test:
+          runs-on: self-hosted
+          timeout-minutes: 30
+          steps:
+            - name: Run Vitest tests
+              run: npx vitest run --forceExit
+
+            - name: Run Jest tests
+              run: npx jest --forceExit
+
+            - name: Run pytest with timeout
+              run: pytest --timeout=300
+  - language: yaml
+    label: 'Watchdog step — kill orphaned background processes after main step'
+    code: |
+      jobs:
+        test:
+          runs-on: self-hosted
+          timeout-minutes: 30
+          steps:
+            - name: Run tests
+              run: npm test
+              continue-on-error: true
+            - name: Kill orphaned processes
+              if: always()
+              run: |
+                # Kill any remaining node processes owned by this runner user
+                pkill -u "$(whoami)" -f "vitest|jest|mocha" || true
+prevention:
+  - 'Always set timeout-minutes on self-hosted runner jobs — without it there is no
+    platform-enforced maximum and a hung process can block the runner indefinitely'
+  - 'Use --forceExit with Jest/Vitest; use --timeout with pytest; audit any test suite
+    that takes longer than expected for open handles (jest --detectOpenHandles)'
+  - 'Avoid spawning background daemons in run: steps without explicit cleanup in an
+    if: always() cleanup step'
+  - 'Consider running self-hosted runners as ephemeral (ephemeral: true with ARC or
+    JIT tokens) — an ephemeral runner terminates after one job, so a hung runner
+    does not affect other jobs (a new runner pod is provisioned for each job)'
+  - 'Monitor runner Active state duration via GitHub REST API (GET /repos/{owner}/{repo}/actions/runners)
+    and alert when busy: true persists beyond expected max job duration'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4312'
+    label: 'actions/runner#4312 — Self-hosted runner gets stuck in active state, blocking queued jobs'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/monitoring-and-troubleshooting-self-hosted-runners'
+    label: 'GitHub Docs — Monitoring and troubleshooting self-hosted runners'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idtimeout-minutes'
+    label: 'GitHub Docs — timeout-minutes syntax reference'
