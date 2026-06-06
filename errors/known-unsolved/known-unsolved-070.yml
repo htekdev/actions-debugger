@@ -1,0 +1,83 @@
+id: known-unsolved-070
+title: 'ubuntu-24.04 image 20260513.135 breaks WireMock-Spring dynamic port binding in @ConfigurationProperties tests'
+category: known-unsolved
+severity: limitation
+tags:
+  - ubuntu
+  - ubuntu-24.04
+  - spring-boot
+  - wiremock
+  - configurationproperties
+  - regression
+  - java
+  - test
+patterns:
+  - regex: 'foo\.bar\.service\.url=http://localhost:\d+'
+    flags: i
+  - regex: 'http://localhost:9008'
+    flags: i
+  - regex: '@ConfigurationProperties'
+    flags: i
+  - regex: 'wiremock-spring-boot'
+    flags: i
+error_messages:
+  - 'foo.bar.service.url=http://localhost:<random>'
+  - 'The @ConfigurationProperties(prefix = "foo.bar.service") bean ends up bound to the static fallback URL from application-integration-test.yml (http://localhost:9008).'
+  - 'The HTTP client then hits localhost:9008 and the test times out.'
+root_cause: |
+  Starting with Ubuntu 24.04 image `20260513.135`, some Spring Boot integration tests that rely on
+  `wiremock-spring-boot` dynamic port injection regress in GitHub Actions even though the same commit,
+  same JDK, and same test pass on `ubuntu-22.04` and on the older Ubuntu 24.04 image `20260413.86`.
+
+  The observed behavior is:
+  1. WireMock starts and publishes a dynamic property such as `foo.bar.service.url=http://localhost:<port>`.
+  2. The property is visible in logs before the Spring banner.
+  3. The `@ConfigurationProperties` bean still binds to the static fallback value from YAML
+     (`http://localhost:9008`).
+  4. The client calls the fallback URL and the test times out.
+
+  The exact platform-level trigger inside the updated runner image has not been isolated yet. The issue
+  is deterministic on the affected image family, reproducible across multiple repositories, and still open.
+  At the time of writing there is no confirmed runner-side fix or single root cause from GitHub.
+fix: |
+  There is no confirmed upstream fix yet.
+
+  Current workarounds:
+  - pin the workflow to `ubuntu-22.04` while the Ubuntu 24.04 regression is investigated
+  - avoid test setups that rely on `@ConfigurationProperties` picking up a dynamically injected URL
+  - pass the WireMock URL through `@DynamicPropertySource`, a test-specific bean, or direct
+    `Environment` reads closer to the HTTP client wiring
+fix_code:
+  - language: yaml
+    label: 'Pin the test job to Ubuntu 22.04 until the regression is fixed'
+    code: |
+      jobs:
+        integration-tests:
+          runs-on: ubuntu-22.04
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-java@v4
+              with:
+                distribution: temurin
+                java-version: '21'
+            - name: Run integration tests
+              run: ./mvnw test
+
+  - language: java
+    label: 'Inject the dynamic WireMock URL through DynamicPropertySource'
+    code: |
+      @DynamicPropertySource
+      static void registerWireMockProperties(DynamicPropertyRegistry registry) {
+          registry.add("foo.bar.service.url", wireMockServer::baseUrl);
+      }
+prevention:
+  - 'Treat Ubuntu image rollouts as a possible source of Java integration-test regressions, even when your dependencies are unchanged.'
+  - 'Prefer explicit test-time property injection over fallback YAML values when the URL must come from a dynamically started mock server.'
+  - 'Keep a side-by-side `ubuntu-22.04` control job available when debugging new `ubuntu-latest` regressions.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14136'
+    label: 'actions/runner-images#14136 — ubuntu-24.04 image 20260513.135 breaks WireMock-Spring dynamic ports'
+  - url: 'https://docs.spring.io/spring-framework/reference/testing/testcontext-framework/ctx-management/dynamic-property-sources.html'
+    label: 'Spring Docs — @DynamicPropertySource'
+  - url: 'https://github.com/wiremock/wiremock-spring-boot'
+    label: 'wiremock-spring-boot project'

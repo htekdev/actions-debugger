@@ -1,0 +1,91 @@
+id: runner-environment-226
+title: '.NET MAUI iOS publish on macOS-26 can fail because Xcode 26.5 lacks the simulator runtime actool expects'
+category: runner-environment
+severity: error
+tags:
+  - macos
+  - macos-26
+  - maui
+  - dotnet
+  - ios
+  - xcode
+  - actool
+  - runner-image
+patterns:
+  - regex: 'No simulator runtime version from \["23B86", "23C54", "23E254a"\] available to use with iphonesimulator SDK version 23F5054d'
+    flags: i
+  - regex: 'xcrun: error: unable to find utility "actool"'
+    flags: i
+  - regex: 'This version of \.NET for iOS \(26\.5\.9001\) requires Xcode 26\.5'
+    flags: i
+error_messages:
+  - 'No simulator runtime version from ["23B86", "23C54", "23E254a"] available to use with iphonesimulator SDK version 23F5054d'
+  - 'xcrun: error: unable to find utility "actool"'
+  - 'This version of .NET for iOS (26.5.9001) requires Xcode 26.5'
+root_cause: |
+  On the early macOS 26 hosted image rollout, users building .NET MAUI iOS apps with
+  `Microsoft.iOS.Sdk` 26.5.9001 were forced into an impossible toolchain combination.
+
+  `Microsoft.iOS.Sdk` 26.5.9001 requires Xcode 26.5, so downgrading to Xcode 26.4.1 is not a valid
+  long-term fix. But the Xcode 26.5 paths that were present on the image had two different failure
+  modes:
+  - selecting `/Applications/Xcode_26.5.app` or `/Applications/Xcode_26.5.0.app` could not resolve
+    `actool`
+  - selecting `/Applications/Xcode_26.5_beta_2.app` resolved `actool`, but the required simulator
+    runtime for SDK `23F5054d` was not installed
+
+  GitHub later confirmed that the Xcode 26.5 runtime would arrive on the next image update. Until
+  that rollout completed, the hosted image simply did not provide a fully working Xcode 26.5 + MAUI
+  iOS 26.5.9001 combination.
+fix: |
+  There is no complete workflow-only fix when the hosted image is missing the runtime that Xcode and
+  the .NET iOS workload require.
+
+  Current options:
+  - wait for the next runner-image rollout that includes the Xcode 26.5 runtime
+  - temporarily downgrade the .NET iOS workload to a version compatible with Xcode 26.4.1
+  - add a preflight check so the job fails fast with a clear message instead of burning minutes in publish
+fix_code:
+  - language: yaml
+    label: 'Fail fast if the required Xcode 26.5 simulator runtime is absent'
+    code: |
+      jobs:
+        publish-ios:
+          runs-on: macos-26
+          steps:
+            - uses: actions/checkout@v4
+            - name: Check installed runtimes
+              run: |
+                xcrun simctl list runtimes
+                xcodebuild -version
+            - name: Guard against missing Xcode 26.5 runtime
+              run: |
+                xcrun simctl list runtimes | grep '23F5054d' || {
+                  echo 'Required Xcode 26.5 simulator runtime is missing on this image.'
+                  exit 1
+                }
+
+  - language: yaml
+    label: 'Pin Xcode 26.4.1 while using a matching older iOS workload'
+    code: |
+      jobs:
+        publish-ios:
+          runs-on: macos-26
+          steps:
+            - uses: actions/checkout@v4
+            - uses: maxim-lobanov/setup-xcode@v1
+              with:
+                xcode-version: '26.4.1'
+            - name: Publish with a workload version that matches Xcode 26.4.1
+              run: dotnet publish -f net9.0-ios -c Release -r ios-arm64
+prevention:
+  - 'Check `xcrun simctl list runtimes` whenever you adopt a new Xcode or .NET iOS workload on hosted macOS images.'
+  - 'Pin both Xcode and the .NET iOS workload version together during Apple platform transitions.'
+  - 'Add a fast runtime preflight before long `dotnet publish` steps so broken image rollouts fail immediately.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14128'
+    label: 'actions/runner-images#14128 — macOS-26 hosted image missing simulator runtime required by Xcode 26.5'
+  - url: 'https://github.com/actions/runner-images/pull/14114'
+    label: 'runner-images pull request referenced in the fix confirmation'
+  - url: 'https://learn.microsoft.com/en-us/dotnet/maui/ios/deployment/'
+    label: 'Microsoft Docs — .NET MAUI iOS deployment'
