@@ -1,0 +1,113 @@
+id: runner-environment-201
+title: 'macOS 26 Homebrew python@3 ships Python 3.13 — removed stdlib modules (cgi, imghdr, aifc, telnetlib) cause ModuleNotFoundError'
+category: runner-environment
+severity: error
+tags:
+  - macos
+  - macos-26
+  - python
+  - homebrew
+  - stdlib
+  - runner-image
+  - breaking-change
+patterns:
+  - regex: 'ModuleNotFoundError: No module named ''(cgi|imghdr|aifc|chunk|nntplib|telnetlib|uu|xdrlib|sndhdr|sunau|mailcap|msilib|pipes|crypt|spwd|ossaudiodev)'''
+    flags: 'i'
+  - regex: 'ImportError.*No module named.*cgi|No module named.*imghdr|No module named.*telnetlib'
+    flags: 'i'
+  - regex: 'python.*3\.13.*deprecated.*module|removed.*python.*3\.13'
+    flags: 'i'
+error_messages:
+  - 'ModuleNotFoundError: No module named ''cgi'''
+  - 'ModuleNotFoundError: No module named ''imghdr'''
+  - 'ModuleNotFoundError: No module named ''aifc'''
+  - 'ModuleNotFoundError: No module named ''telnetlib'''
+  - 'ModuleNotFoundError: No module named ''chunk'''
+  - 'ModuleNotFoundError: No module named ''nntplib'''
+root_cause: |
+  macOS 26 runner images ship Homebrew python@3 pointing to Python 3.13.x. Python
+  3.13 removed the following stdlib modules that were deprecated since Python 3.11:
+
+    cgi, cgitb, aifc, chunk, crypt, imghdr, mailcap, msilib (Windows only),
+    nntplib, ossaudiodev, pipes, sndhdr, spwd, sunau, telnetlib, uu, xdrlib
+
+  Workflows that call bare python3 (resolved to Homebrew Python 3.13 on macOS 26)
+  and import any of these modules fail with ModuleNotFoundError at runtime.
+
+  This affects:
+  - Scripts using cgi or cgitb for HTTP form parsing
+  - Image-type detection using imghdr (commonly used with Pillow-based workflows)
+  - Legacy FTP/NNTP clients using nntplib or telnetlib
+  - Audio file handling using aifc, sunau, or sndhdr
+
+  Workflows that previously ran on macos-14 or macos-15 (Homebrew Python 3.11/3.12)
+  are affected when the job label is macos-26 or when macos-latest migrates to
+  macOS 26. The failure is not immediately obvious because the error occurs at
+  import time inside Python, not at the runner level, and the runner step exits
+  with a non-zero code that may be mistaken for a test failure rather than an
+  environment regression.
+
+  Note: actions/setup-python@v5+ with an explicit python-version is unaffected —
+  this issue only affects scripts that rely on the system/Homebrew python3 binary.
+fix: |
+  Option 1 (recommended) — Pin Python with actions/setup-python:
+    Always use actions/setup-python with an explicit version to get the exact
+    Python version your code requires. This bypasses the Homebrew python@3 symlink.
+
+  Option 2 — Replace removed modules with modern equivalents:
+    - cgi        → urllib.parse + email.parser (or the 3rd-party 'cgi' backport)
+    - imghdr     → imghdr is available as the 3rd-party 'imghdr' backport on PyPI,
+                   or use python-magic / filetype for image detection
+    - telnetlib  → use telnetlib3 (PyPI) or asyncio-based Telnet
+    - aifc/sunau → use soundfile or wave for audio I/O
+
+  Option 3 — Pin Homebrew Python to 3.12 on macos-26 (temporary):
+    brew install python@3.12
+    brew link python@3.12 --force
+    echo "/usr/local/opt/python@3.12/bin" >> $GITHUB_PATH
+fix_code:
+  - language: yaml
+    label: 'Fix: pin Python version with actions/setup-python to avoid Homebrew python@3'
+    code: |
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'   # pins to 3.12; immune to Homebrew python@3 upgrade
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run script
+        run: python script.py   # uses setup-python's 3.12, not Homebrew 3.13
+  - language: yaml
+    label: 'Fix: install removed modules from PyPI backports'
+    code: |
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install backported removed modules
+        run: |
+          pip install imghdr       # PyPI backport of imghdr for Python 3.13+
+          # pip install telnetlib3 # if using Telnet
+      - name: Run script
+        run: python script.py
+  - language: yaml
+    label: 'Temporary: install and use python@3.12 from Homebrew on macos-26'
+    code: |
+      - name: Pin Homebrew Python to 3.12
+        run: |
+          brew install python@3.12
+          echo "/usr/local/opt/python@3.12/libexec/bin" >> $GITHUB_PATH
+      - name: Verify Python version
+        run: python3 --version   # should print Python 3.12.x
+prevention:
+  - 'Always use actions/setup-python with an explicit version — never rely on bare python3 pointing to Homebrew python@3'
+  - 'Audit scripts for imports of modules removed in Python 3.13: cgi, imghdr, aifc, telnetlib, nntplib, chunk, uu'
+  - 'Run pyupgrade --py313-plus locally before the macos-26 migration to catch deprecated imports'
+  - 'Add python --version to diagnostic steps to catch unexpected Python version changes early'
+docs:
+  - url: 'https://docs.python.org/3/whatsnew/3.13.html#removed-modules'
+    label: 'Python 3.13: Removed modules (official docs)'
+  - url: 'https://peps.python.org/pep-0594/'
+    label: 'PEP 594: Removing dead batteries from the standard library'
+  - url: 'https://github.com/actions/setup-python'
+    label: 'actions/setup-python: Pin a specific Python version'
