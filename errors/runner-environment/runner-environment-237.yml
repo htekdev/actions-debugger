@@ -1,0 +1,146 @@
+id: runner-environment-237
+title: 'Container job `$HOME` is hardcoded to `/github/home` — Docker images built with `/root` home break silently'
+category: runner-environment
+severity: error
+tags:
+  - container
+  - HOME
+  - docker
+  - self-hosted
+  - environment-variable
+  - tool-cache
+patterns:
+  - regex: '\$HOME.*github/home'
+    flags: 'i'
+  - regex: 'Could not find.*\$HOME.*plugin|command not found.*HOME.*github'
+    flags: 'i'
+  - regex: 'no such file.*github/home|Permission denied.*github/home'
+    flags: 'i'
+error_messages:
+  - "The reason `bluebase plugins` doesn't work is because it depends on `$HOME` pointing to `/root` but now GitHub Actions has changed it to `/github/home`."
+  - "Error: Could not find plugin at /github/home/.cache/@bluebase"
+  - "rust: command not found"
+  - "cargo: command not found"
+  - "go: command not found"
+root_cause: |
+  When using `jobs.<name>.container`, the GitHub Actions runner mounts a host volume at
+  `/github/home` and unconditionally overrides the `HOME` environment variable to point there,
+  regardless of:
+  - The Docker image's configured user or home directory
+  - Any `env: HOME:` value set in the container spec
+  - The container image's `ENV HOME` instruction
+
+  This is hard-coded in ContainerOperationProvider.cs:
+    `-v "/runner/work/_temp/_github_home":"/github/home"`
+    `HOME=/github/home`
+
+  The volume mount overwrites whatever was at `/github/home` inside the container, and
+  the forced HOME env var points to that empty/host-controlled directory.
+
+  **Impact on pre-installed tools**: Any CLI tool or plugin manager that stores
+  state relative to `$HOME` during the Docker image build (e.g. `npm global`, Rust's
+  `cargo`, Go binaries in `~/go/bin`, Homebrew cellar, Python user installs at
+  `~/.local`) will no longer find its data because HOME now points to `/github/home`
+  instead of `/root` or the image user's home.
+
+  Source: actions/runner#863 (124 reactions, open since 2021)
+fix: |
+  **Option 1 (recommended): Prefix affected commands with `HOME=/root`**
+
+  Temporarily reset HOME to the original image home for each step that relies on
+  pre-installed tools. Do NOT set HOME permanently in the workflow — the runner
+  depends on `/github/home` for internal state.
+
+  **Option 2: Rebuild Docker image with `/github/home` as the home directory**
+
+  Set `ENV HOME /github/home` in the Dockerfile before installing tools.
+  Note: if `/github/home` is empty at build time (it is), tools install there, and
+  the volume mount at runtime will still OVERWRITE the directory. This does not work.
+
+  **Option 3: Copy tool state in a setup step**
+
+  Add an entrypoint or a workflow step that copies `/root/.config`, `/root/.cache`,
+  `/root/go`, etc. to `/github/home` before the steps that need them run.
+
+  **Option 4: Avoid container jobs for images with pre-installed tools**
+
+  Use a Docker action (`uses: docker://image`) instead of `jobs.<name>.container`
+  — Docker actions do not override HOME.
+fix_code:
+  - language: yaml
+    label: "Broken — pre-installed cargo/rust not found in container job"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          container:
+            image: my-rust-tools:latest  # Built with cargo installed at /root/.cargo
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build
+              run: cargo build --release  # ❌ FAILS: cargo not found — HOME=/github/home
+
+  - language: yaml
+    label: "Fixed — reset HOME per-step for pre-built tool invocations"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          container:
+            image: my-rust-tools:latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build
+              run: HOME=/root cargo build --release  # ✅ HOME temporarily reset to where cargo is
+
+            # Or use env: at the step level:
+            - name: Run tests
+              env:
+                HOME: /root
+              run: cargo test
+
+  - language: yaml
+    label: "Fixed — rebuild Docker image with tools installed at github/home path"
+    code: |
+      # Dockerfile — install tools where GHA will point HOME
+      FROM ubuntu:22.04
+
+      # Install Rust to /github/home/.cargo (matches runtime HOME)
+      RUN mkdir -p /github/home
+      ENV HOME=/github/home
+      RUN curl https://sh.rustup.rs -sSf | sh -s -- -y
+
+      # In workflow, no HOME override needed:
+      # cargo is at /github/home/.cargo/bin — BUT runtime mount overwrites!
+      # This approach ONLY works if you add the PATH explicitly:
+      ENV PATH="/github/home/.cargo/bin:${PATH}"
+
+      # Better: install to /usr/local/bin which is not affected by HOME mount
+      RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
+      RUN cp -r /github/home/.cargo/bin/* /usr/local/bin/
+
+  - language: yaml
+    label: "Alternative — use Docker action instead of container job (HOME not overridden)"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build in custom container
+              uses: docker://my-rust-tools:latest  # ✅ HOME not overridden by runner
+              with:
+                args: cargo build --release
+
+prevention:
+  - "When building Docker images for use in `jobs.<name>.container`, install binaries to `/usr/local/bin` or another PATH location not dependent on `$HOME`."
+  - "Test container images locally by running `docker run -e HOME=/github/home <image> <command>` to reproduce the GHA HOME override before using them in workflows."
+  - "Prefer Docker actions (`uses: docker://image`) over container jobs if your image relies on a specific HOME directory — Docker actions do not override HOME."
+  - "Read actions/runner#863 before publishing a Docker image intended for use as a GHA container job."
+docs:
+  - url: 'https://github.com/actions/runner/issues/863'
+    label: 'actions/runner#863 — HOME is overridden for containers (124 reactions, open since 2021)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/running-jobs-in-a-container'
+    label: 'GitHub Docs: Running jobs in a container'
+  - url: 'https://stackoverflow.com/questions/58516181/missing-installed-dependencies-when-docker-image-is-used'
+    label: 'Stack Overflow: Missing installed dependencies when Docker image is used (Score: 3)'

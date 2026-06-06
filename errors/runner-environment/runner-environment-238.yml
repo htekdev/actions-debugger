@@ -1,0 +1,151 @@
+id: runner-environment-238
+title: 'Self-hosted runner with Docker container steps creates root-owned files in workspace — `git clean` fails on next run'
+category: runner-environment
+severity: error
+tags:
+  - self-hosted
+  - docker
+  - container
+  - workspace
+  - permissions
+  - checkout
+  - root-owned
+patterns:
+  - regex: 'warning: could not open directory.*Permission denied'
+    flags: 'i'
+  - regex: 'failed to remove.*Directory not empty|rm.*cannot remove.*Permission denied'
+    flags: 'i'
+  - regex: 'Unable to clean or reset the repository.*recreated'
+    flags: 'i'
+error_messages:
+  - "warning: could not open directory 'foo/': Permission denied"
+  - "warning: failed to remove foo/: Directory not empty"
+  - "##[warning]Unable to clean or reset the repository. The repository will be recreated instead."
+  - "##[error]Command failed: rm -rf \"/home/runner/_work/repo/repo/foo\""
+  - "rm: cannot remove '/home/runner/_work/repo/repo/foo': Permission denied"
+  - "error: failed to run 'git clean -ffdx': exit code 1"
+root_cause: |
+  When a GitHub Actions workflow on a **self-hosted runner** uses a Docker-based step
+  (either `container:` jobs or `uses: docker://` actions), files written to the
+  workspace during that step are owned by `root:root` — because most Docker containers
+  run as root by default.
+
+  The self-hosted runner process runs as a non-root user (e.g., `github-runner`, `ubuntu`).
+  On the **next workflow run**, `actions/checkout` attempts to clean the workspace by
+  running `git clean -ffdx`. Git's clean-up calls `stat()` on root-owned directories.
+  Because stat succeeds (files are visible) but `rm` is blocked (not root), `git clean`
+  reports the directory but cannot remove it. Git then falls back to `rm -rf` via the
+  runner, which also fails with `Permission denied`.
+
+  The checkout action logs a warning "Unable to clean or reset the repository. The
+  repository will be recreated instead." — then `rm -rf` of the entire workspace also
+  fails because root-owned directories are nested inside. The job fails permanently
+  until a human manually removes the root-owned files on the runner host.
+
+  **Why GitHub-hosted runners don't hit this**: GitHub-hosted runners are ephemeral —
+  the workspace is destroyed after every job, so there's no cross-run persistence of
+  root-owned files. Self-hosted runners persist the workspace by default.
+
+  Source: actions/runner#434 (131 reactions, open since 2020)
+fix: |
+  **Option 1 (recommended): Run the container as the same UID as the host runner user**
+
+  Pass `--user $(id -u):$(id -g)` to Docker options so files are written with the
+  runner's UID/GID. Most images support this without modification.
+
+  **Option 2: Add a cleanup step before checkout**
+
+  Add a step at the start of the workflow that removes workspace contents using sudo.
+  Requires configuring passwordless sudo for the runner user.
+
+  **Option 3: Configure the container to run as root but add a post-step chown**
+
+  After container steps, add a step that runs `sudo chown -R $USER:$USER .` to
+  reclaim ownership. Still requires sudo access.
+
+  **Option 4: Use ephemeral (one-shot) self-hosted runners**
+
+  Ephemeral runners create a fresh workspace per job. No cross-run file persistence
+  means root-owned files from Docker steps never accumulate.
+
+  **Option 5: Set `clean: false` on checkout and handle cleanup yourself**
+
+  Disable automatic workspace cleaning in checkout and add your own robust cleanup
+  step that can handle permission errors.
+fix_code:
+  - language: yaml
+    label: "Fixed — run Docker container as host runner's UID"
+    code: |
+      jobs:
+        build:
+          runs-on: [self-hosted, linux]
+          container:
+            image: node:20
+            options: '--user 1001:1001'  # ✅ Match runner UID — no root-owned files
+
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm ci && npm run build
+
+  - language: yaml
+    label: "Fixed — run container as current user dynamically"
+    code: |
+      jobs:
+        build:
+          runs-on: [self-hosted, linux]
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Build in container (current user)
+              run: |
+                docker run --rm \
+                  --user "$(id -u):$(id -g)" \
+                  -v "${{ github.workspace }}:/work" \
+                  -w /work \
+                  node:20 \
+                  npm ci && npm run build
+                # ✅ Files written inside container owned by host runner user
+
+  - language: yaml
+    label: "Fixed — cleanup step before checkout to handle pre-existing root-owned files"
+    code: |
+      jobs:
+        build:
+          runs-on: [self-hosted, linux]
+          steps:
+            # ✅ Cleanup root-owned files before checkout
+            - name: Cleanup workspace
+              run: |
+                if [ -d "${{ github.workspace }}" ]; then
+                  sudo chown -R "$USER:$USER" "${{ github.workspace }}" || true
+                  sudo rm -rf "${{ github.workspace }}"
+                fi
+              # Requires: echo "runner ALL=(ALL) NOPASSWD: /bin/chown, /bin/rm" | sudo tee /etc/sudoers.d/runner
+
+            - uses: actions/checkout@v4
+
+  - language: yaml
+    label: "Fixed — register self-hosted runner as ephemeral (--ephemeral flag)"
+    code: |
+      # Register the runner with --ephemeral so each job gets a fresh workspace:
+      # ./config.sh --url https://github.com/org/repo --token TOKEN --ephemeral
+      #
+      # Or for ARC (Actions Runner Controller):
+      # spec:
+      #   ephemeral: true  # Each job pod is destroyed after completion
+
+prevention:
+  - "Always run Docker container steps with `--user $(id -u):$(id -g)` on self-hosted runners to match the host runner's UID/GID."
+  - "Use ephemeral self-hosted runners to eliminate cross-run workspace persistence entirely."
+  - "Add a workspace cleanup step at the start of workflows that use Docker container steps to proactively clear root-owned files."
+  - "After setting up a self-hosted runner, test with a workflow that uses a `container:` job and verify subsequent runs can clean up without errors."
+  - "When using ARC (Actions Runner Controller), enable `ephemeral: true` on the RunnerDeployment spec."
+docs:
+  - url: 'https://github.com/actions/runner/issues/434'
+    label: 'actions/runner#434 — Self-hosted runner with Docker step creates root-owned files (131 reactions)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners'
+    label: 'GitHub Docs: About self-hosted runners'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/running-jobs-in-a-container'
+    label: 'GitHub Docs: Running jobs in a container'
+  - url: 'https://stackoverflow.com/questions/76407664/files-owned-by-rootroot-when-using-actions-checkout-on-self-hosted-runner'
+    label: 'Stack Overflow: Files owned by root:root when using actions/checkout on self-hosted runner'
