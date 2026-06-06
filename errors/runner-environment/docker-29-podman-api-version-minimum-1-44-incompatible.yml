@@ -1,0 +1,155 @@
+id: runner-environment-257
+title: 'Docker 29 minimum API version 1.44 breaks Podman and third-party Docker tools using Docker socket'
+category: runner-environment
+severity: error
+tags:
+  - docker
+  - docker-29
+  - podman
+  - api-version
+  - ubuntu-24.04
+  - runner-image-update
+  - docker-socket
+patterns:
+  - regex: 'client version 1\.4[0123].*too old.*Minimum supported API version is 1\.44'
+    flags: 'i'
+  - regex: 'client version.*too old.*Minimum supported API version is 1\.44'
+    flags: 'i'
+  - regex: 'loading image from docker engine.*client version.*too old'
+    flags: 'i'
+  - regex: 'Error response from daemon: client version \d+\.\d+ is too old'
+    flags: 'i'
+error_messages:
+  - "Error response from daemon: client version 1.41 is too old. Minimum supported API version is 1.44, please upgrade your client to a newer version"
+  - "loading image from docker engine: Error response from daemon: client version 1.41 is too old. Minimum supported API version is 1.44, please upgrade your client to a newer version"
+  - "Error response from daemon: client version 1.40 is too old. Minimum supported API version is 1.44, please upgrade your client to a newer version"
+root_cause: |
+  Docker 29.0 raised the **minimum supported Docker daemon API version from 1.25 to
+  1.44** (equivalent to Docker 25.0+). When a client using an API version older than
+  1.44 connects to a Docker 29 daemon through the Docker socket
+  (`/var/run/docker.sock`), the daemon returns:
+
+  > `Error response from daemon: client version X.YY is too old. Minimum supported
+  > API version is 1.44, please upgrade your client to a newer version`
+
+  **Affected tools on GitHub Actions runners:**
+
+  1. **Podman 4.9.3** (pre-installed on Ubuntu 24.04 runners) — Podman uses Docker
+     API 1.41 when communicating with the Docker socket. After the Docker 29 upgrade
+     on Ubuntu 24.04 runners (tracked in runner-images#14105 for re-rollout), Podman
+     calls to the Docker daemon fail with this error.
+
+  2. **Third-party composite actions or Docker-based actions** that bundle an old
+     Docker client binary or SDK (Docker client ≤ 24.x corresponds to API ≤ 1.43).
+     Examples: some versions of `elastic/elastic-github-actions`,
+     `torizoncore-builder`, older Paketo Buildpack lifecycle runners.
+
+  3. **Custom Docker clients in scripts** that were written against API 1.24–1.43
+     and use the Docker socket to call daemon endpoints.
+
+  The Docker 29 upgrade was deployed on:
+  - **Windows Server 2022** — February 9, 2026 (did NOT roll back)
+  - **Windows Server 2025** — February 9, 2026 (did NOT roll back)
+  - **Ubuntu 22.04** — rolled back, kept on Docker 28 (near EoL)
+  - **Ubuntu 24.04** — rolled back February 20, 2026; scheduled for re-deployment
+    (tracked in runner-images#14105)
+
+  After the Ubuntu 24.04 re-deployment, Podman 4.9.3 workflows WILL be affected
+  unless Podman is upgraded to 5.x (which supports Docker API 1.44+).
+fix: |
+  **Option 1 (recommended): Upgrade Podman to 5.x**
+  Podman 5.x added support for Docker API 1.44+. Install via Podman's official
+  Ubuntu PPA before using Podman with the Docker socket:
+
+  ```yaml
+  - name: Upgrade Podman to 5.x
+    run: |
+      sudo apt-get install -y podman/oracular
+      # or via the Podman PPA:
+      # curl -fsSL https://download.opensuse.org/repositories/devel:kubic:libcontainers:unstable/xUbuntu_24.04/Release.key | sudo gpg --dearmor -o /usr/share/keyrings/devel_kubic_libcontainers_unstable.gpg
+      # echo 'deb [signed-by=...] https://download.opensuse.org/...' | sudo tee /etc/apt/sources.list.d/devel:kubic:libcontainers:unstable.list
+      # sudo apt-get update && sudo apt-get install -y podman
+  ```
+
+  **Option 2: Use `podman-remote` with socket emulation via `podman system service`**
+  Run Podman in socket emulation mode which doesn't route through the Docker daemon:
+
+  ```bash
+  podman system service --time=0 unix:///tmp/podman.sock &
+  export DOCKER_HOST=unix:///tmp/podman.sock
+  ```
+
+  **Option 3: Use Docker CLI directly instead of Podman**
+  Replace `podman` calls with `docker` in your workflow steps. Docker 29 is
+  pre-installed and fully functional on all affected runners.
+
+  **Option 4: Pin to Docker 28.x temporarily**
+  Downgrade Docker to 28.x as a short-term fix while updating affected tooling:
+
+  ```yaml
+  - name: Downgrade Docker to 28.x (Ubuntu 24.04)
+    run: |
+      sudo apt-get install -y --allow-downgrades \
+        docker-ce=5:28.0.4-1~ubuntu.24.04~noble \
+        docker-ce-cli=5:28.0.4-1~ubuntu.24.04~noble
+  ```
+
+  **For third-party actions**: Upgrade the action to a version that bundles a
+  Docker client SDK compatible with API 1.44+ or that uses Docker 25.0+.
+fix_code:
+  - language: yaml
+    label: 'Upgrade Podman to 5.x before using Podman with Docker socket on Ubuntu 24.04'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-24.04
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Upgrade Podman to 5.x (Docker 29 API 1.44 compatible)
+              run: |
+                # Podman 4.9.3 (Ubuntu 24.04 default) uses Docker API 1.41 — incompatible with Docker 29
+                # Install Podman 5.x from Ubuntu oracular backport:
+                sudo apt-get update -q
+                sudo apt-get install -y podman/oracular
+
+            - name: Verify Podman version
+              run: podman version
+
+            - name: Use Podman (now API 1.44 compatible)
+              run: podman build -t myapp:latest .
+  - language: yaml
+    label: 'Use podman system service socket to bypass Docker API version requirement'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-24.04
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Start Podman socket service (bypass Docker API version requirement)
+              run: |
+                podman system service --time=0 unix:///tmp/podman.sock &
+                sleep 1
+                export DOCKER_HOST=unix:///tmp/podman.sock
+                echo "DOCKER_HOST=unix:///tmp/podman.sock" >> $GITHUB_ENV
+
+            - name: Build with Podman via its own socket
+              run: |
+                # Uses Podman's own socket (no Docker daemon API version check)
+                podman build -t myapp:latest .
+                podman push myapp:latest registry.example.com/myapp:latest
+prevention:
+  - 'Check the Docker API version supported by any tool that interacts with the Docker socket — tools using Docker API < 1.44 will fail against Docker 29 daemons.'
+  - 'Prefer the `docker` CLI over `podman` for Docker socket interactions in GitHub Actions — Docker 29 is the native pre-installed daemon and has no API version incompatibility with itself.'
+  - 'When using third-party composite actions that invoke Docker, verify that the action is updated to use a Docker client SDK compatible with Docker 29 before your runner images receive the upgrade.'
+  - 'Subscribe to actions/runner-images announcements and runner-images#14105 to get advance notice when the Docker 29 re-deployment lands on Ubuntu 24.04 runners.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/13474'
+    label: 'runner-images #13474 — Docker 29.1.5 upgrade announcement (42 reactions, 63 comments)'
+  - url: 'https://github.com/actions/runner-images/issues/14105'
+    label: 'runner-images #14105 — Ubuntu 24.04 Docker v29 rollback and re-deployment tracking'
+  - url: 'https://docs.podman.io/en/latest/markdown/podman-system-service.1.html'
+    label: 'Podman docs — podman system service (socket emulation mode)'
+  - url: 'https://docs.docker.com/engine/release-notes/29.0/'
+    label: 'Docker Engine 29.0 release notes — API version minimum raised to 1.44'

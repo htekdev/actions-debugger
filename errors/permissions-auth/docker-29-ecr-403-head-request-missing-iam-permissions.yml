@@ -1,0 +1,150 @@
+id: permissions-auth-080
+title: 'Docker 29 ECR push fails 403 Forbidden — ecr:BatchGetImage and ecr:GetDownloadUrlForLayer required for HEAD requests'
+category: permissions-auth
+severity: error
+tags:
+  - docker
+  - docker-29
+  - aws-ecr
+  - iam
+  - 403
+  - runner-image-update
+  - ecr-push
+patterns:
+  - regex: 'unexpected status from HEAD request to.*\.amazonaws\.com.*403 Forbidden'
+    flags: 'i'
+  - regex: 'HEAD.*ecr.*amazonaws\.com.*v2.*manifests.*403'
+    flags: 'i'
+  - regex: 'failed to push.*ecr.*403 Forbidden'
+    flags: 'i'
+  - regex: 'error.*HEAD.*manifests.*403 Forbidden'
+    flags: 'i'
+error_messages:
+  - "unexpected status from HEAD request to https://ACCOUNT.dkr.ecr.REGION.amazonaws.com/v2/REPO/manifests/TAG: 403 Forbidden"
+  - "failed to push image to ACCOUNT.dkr.ecr.REGION.amazonaws.com/REPO:TAG: unexpected status: 403 Forbidden"
+  - "Error response from daemon: unexpected status from HEAD request to https://ACCOUNT.dkr.ecr.us-east-1.amazonaws.com/v2/myapp/manifests/latest: 403 Forbidden"
+root_cause: |
+  Docker 29 (deployed to GitHub Actions ubuntu-22.04 and all Windows runners on
+  February 9, 2026 via runner-images#13474) switched to a **containerd-backed image
+  store** by default. As part of this change, `docker push` now performs a **HEAD
+  request against the manifest endpoint** before pushing to check whether layers
+  already exist on the remote registry.
+
+  AWS ECR's IAM policy model requires explicit permissions for every API operation.
+  The old Docker 27/28 push path did NOT make these HEAD manifest requests, so ECR
+  push policies only needed:
+  - `ecr:GetAuthorizationToken`
+  - `ecr:BatchCheckLayerAvailability`
+  - `ecr:PutImage`
+  - `ecr:InitiateLayerUpload`
+  - `ecr:UploadLayerPart`
+  - `ecr:CompleteLayerUpload`
+
+  Docker 29's new HEAD request requires **two additional permissions** that were
+  previously not needed:
+  - `ecr:BatchGetImage` — used to look up existing manifest data
+  - `ecr:GetDownloadUrlForLayer` — used to check layer existence via HEAD
+
+  ECR returns **403 Forbidden** (not 404) when the caller lacks these permissions,
+  which Docker 29 treats as a hard push failure rather than a "not found, proceed
+  to push" signal.
+
+  This change does NOT affect:
+  - ECR public galleries (`public.ecr.aws`) — they have different auth
+  - Workflows that already grant `ecr:*` broadly in their IAM policies
+  - GitHub Actions runners on Ubuntu 24.04 (Docker 29 rollback; re-tracked in #14105)
+fix: |
+  **Add the two missing IAM permissions to the ECR push policy attached to your
+  GitHub Actions role/user:**
+
+  ```json
+  {
+    "Effect": "Allow",
+    "Action": [
+      "ecr:BatchGetImage",
+      "ecr:GetDownloadUrlForLayer"
+    ],
+    "Resource": "arn:aws:ecr:REGION:ACCOUNT:repository/REPO"
+  }
+  ```
+
+  This is the minimal fix confirmed by AWS. The HEAD request is purely a
+  pre-push check — adding these two read permissions does not grant the ability
+  to pull or redeploy the image outside this workflow context.
+
+  **Alternative: Use Crane instead of docker push**
+  If you cannot modify the IAM policy immediately, `crane` (google/go-containerregistry)
+  does not perform the pre-push HEAD request and works with the same IAM policy as
+  Docker 27/28.
+
+  **Alternative: Disable containerd image store**
+  Set `DOCKER_DEFAULT_PLATFORM` or configure `daemon.json` with
+  `"containerd-snapshotter": false` to revert to the legacy image store, which
+  skips the HEAD request.
+fix_code:
+  - language: json
+    label: 'Add ecr:BatchGetImage and ecr:GetDownloadUrlForLayer to ECR IAM policy'
+    code: |
+      {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": [
+              "ecr:GetAuthorizationToken",
+              "ecr:BatchCheckLayerAvailability",
+              "ecr:PutImage",
+              "ecr:InitiateLayerUpload",
+              "ecr:UploadLayerPart",
+              "ecr:CompleteLayerUpload",
+              "ecr:BatchGetImage",
+              "ecr:GetDownloadUrlForLayer"
+            ],
+            "Resource": "arn:aws:ecr:us-east-1:123456789012:repository/my-app"
+          }
+        ]
+      }
+  - language: yaml
+    label: 'ECR push workflow with correct IAM permissions (all required actions)'
+    code: |
+      jobs:
+        push:
+          runs-on: ubuntu-latest
+          permissions:
+            id-token: write
+            contents: read
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Configure AWS credentials (OIDC)
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-to-assume: arn:aws:iam::123456789012:role/github-actions-ecr-push
+                aws-region: us-east-1
+                # IAM role must include ecr:BatchGetImage + ecr:GetDownloadUrlForLayer
+                # in addition to the standard ECR push permissions (required for Docker 29)
+
+            - name: Login to Amazon ECR
+              id: login-ecr
+              uses: aws-actions/amazon-ecr-login@v2
+
+            - name: Build and push image
+              uses: docker/build-push-action@v6
+              with:
+                context: .
+                push: true
+                tags: ${{ steps.login-ecr.outputs.registry }}/my-app:${{ github.sha }}
+prevention:
+  - 'After any Docker upgrade on hosted runners, validate ECR push workflows by checking the Docker version in the run log and testing a push to confirm the IAM policy includes `ecr:BatchGetImage` and `ecr:GetDownloadUrlForLayer`.'
+  - 'Use `ecr:*` as a wildcard action in dev/staging ECR policies to avoid missing permissions on future Docker behavior changes; apply least-privilege only in production policies.'
+  - 'Subscribe to actions/runner-images announcements to get advance notice of Docker version upgrades and test ECR push workflows against a staging role before the change lands on production runners.'
+  - 'Consider pinning a known-working Docker version in critical ECR push workflows using a self-hosted runner or explicit Docker installation step until IAM policies can be updated.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/13474'
+    label: 'runner-images #13474 — Docker 29.1.5 + Compose 2.40.3 update announcement (42 reactions)'
+  - url: 'https://github.com/actions/runner-images/issues/13474#issuecomment-3896678850'
+    label: 'runner-images #13474 — AWS confirmation: ecr:BatchGetImage + ecr:GetDownloadUrlForLayer required'
+  - url: 'https://docs.aws.amazon.com/AmazonECR/latest/userguide/image-push-iam.html'
+    label: 'AWS ECR docs — Minimum IAM permissions for docker push'
+  - url: 'https://docs.docker.com/engine/release-notes/29.1/'
+    label: 'Docker Engine 29.1 release notes — containerd image store changes'
