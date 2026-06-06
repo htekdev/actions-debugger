@@ -1,0 +1,108 @@
+id: known-unsolved-064
+title: 'No conditional matrix skip — an empty matrix from `fromJSON([])` always fails the workflow with a validation error'
+category: known-unsolved
+severity: limitation
+tags:
+  - matrix
+  - dynamic-matrix
+  - fromJSON
+  - conditional
+  - strategy
+  - limitation
+patterns:
+  - regex: 'The strategy/matrix must contain at least one'
+    flags: 'i'
+  - regex: 'matrix must define at least one vector'
+    flags: 'i'
+  - regex: 'Error when evaluating .strategy. for job.*matrix.*empty'
+    flags: 'i'
+error_messages:
+  - 'The strategy/matrix must contain at least one vector'
+  - 'matrix must define at least one vector'
+  - 'Error when evaluating ''strategy'' for job'
+root_cause: |
+  GitHub Actions validates that a matrix strategy always produces at least one job.
+  When a prior step outputs an empty JSON array and the matrix job uses
+  `fromJSON(steps.generate.outputs.matrix)`, the workflow fails at plan time with
+  a validation error before any jobs run.
+
+  There is NO supported way to:
+    - Provide an `if:` condition on the matrix strategy to skip it entirely
+    - Use `strategy: if: ${{ condition }}` syntax (does not exist)
+    - Have a job run zero times when its matrix is empty
+
+  This is a fundamental platform limitation: matrix jobs must always expand to at
+  least one job instance. The validation runs before job execution, so even an `if:`
+  on the job itself does not help — the matrix must be non-empty regardless.
+
+  Common scenarios:
+    - CI that builds only changed packages: if no packages changed, the matrix
+      is empty and the entire workflow fails.
+    - Release workflows that conditionally matrix over artifacts: if nothing was
+      built, the matrix is empty.
+    - PR labeler workflows that matrix over affected services: a trivial change
+      affects no services, producing an empty list.
+
+  Note: yaml-syntax-008 covers the technical "fromJSON parse error" message. This
+  entry covers the LIMITATION: there is no native mechanism to conditionally skip
+  matrix jobs or provide a zero-matrix strategy.
+fix: |
+  Workaround 1 — Always include at least one sentinel/dummy entry and guard with if:
+    In the matrix-generating step, append a sentinel entry when the list is empty:
+      matrix=$(echo "$matrix" | jq 'if length == 0 then [{"skip":true}] else map(. + {"skip":false}) end')
+    Then in the job:
+      if: ${{ !matrix.skip }}
+
+  Workaround 2 — Use a separate check job with needs: to gate the matrix job:
+    Add an upstream job that outputs a boolean "has_work". The matrix job then uses
+    `needs: check` and reads `needs.check.outputs.has_work` in an `if:` condition.
+    This still requires the matrix to be non-empty (use sentinel), but the `if:`
+    prevents actual work from running.
+
+  Workaround 3 — Always include a no-op entry in the matrix output:
+    Ensure the matrix-generating script never outputs an empty array by always
+    appending a `{"target":"none"}` entry, then:
+      if: matrix.target != 'none'
+
+  None of these workarounds are elegant. This is a known limitation with no native
+  fix scheduled. Tracked in actions/runner#1502 (96+ reactions, open since 2021).
+fix_code:
+  - language: yaml
+    label: 'Workaround: inject sentinel entry when matrix is empty, skip in job if:'
+    code: |
+      jobs:
+        generate-matrix:
+          runs-on: ubuntu-latest
+          outputs:
+            matrix: ${{ steps.set-matrix.outputs.matrix }}
+          steps:
+            - id: set-matrix
+              run: |
+                # Build your matrix list; inject sentinel when empty
+                matrix='[]'  # Replace with real generation logic
+                if [ "$(echo "$matrix" | jq 'length')" -eq 0 ]; then
+                  matrix='[{"target":"__skip__"}]'
+                fi
+                echo "matrix=$matrix" >> $GITHUB_OUTPUT
+
+        build:
+          needs: generate-matrix
+          if: ${{ fromJSON(needs.generate-matrix.outputs.matrix)[0].target != '__skip__' }}
+          strategy:
+            matrix:
+              include: ${{ fromJSON(needs.generate-matrix.outputs.matrix) }}
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Building ${{ matrix.target }}"
+prevention:
+  - 'Never pass a potentially empty array directly to fromJSON() in a matrix strategy — always guard with a sentinel entry'
+  - 'Add an upstream check job that validates matrix size before the matrix job runs'
+  - 'Document the sentinel pattern in your workflow so future maintainers understand why a dummy entry exists'
+  - 'Vote/watch actions/runner#1502 for native conditional matrix support'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/running-variations-of-jobs-in-a-workflow'
+    label: 'GitHub Docs: Running variations of jobs in a workflow (matrix)'
+  - url: 'https://github.com/actions/runner/issues/1502'
+    label: 'actions/runner#1502: Support for empty matrix (96+ reactions, open)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idstrategymatrix'
+    label: 'GitHub Docs: jobs.<job_id>.strategy.matrix'

@@ -1,0 +1,107 @@
+id: caching-artifacts-068
+title: '`actions/cache` key containing Windows backslash path separators never matches on restore — cache miss every run'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - cache
+  - windows
+  - path-separator
+  - backslash
+  - cache-miss
+  - cross-platform
+patterns:
+  - regex: 'Cache not found for input keys'
+    flags: 'i'
+  - regex: 'cache.*miss.*windows|windows.*cache.*miss'
+    flags: 'i'
+error_messages:
+  - 'Cache not found for input keys:'
+  - 'cache hit for key: false'
+root_cause: |
+  GitHub Actions cache keys are plain strings matched byte-for-byte. On Windows
+  runners, several common patterns produce cache keys containing backslashes (`\`):
+
+    1. Embedding ${{ runner.temp }} or ${{ github.workspace }} directly in the key:
+         key: ${{ runner.os }}-${{ runner.temp }}-${{ hashFiles('**/package-lock.json') }}
+       On Windows, runner.temp resolves to `D:\a\_temp` producing a key with `\`.
+
+    2. Using hashFiles() with backslash glob patterns:
+         key: ${{ hashFiles('**\node_modules\**') }}
+       hashFiles() on Windows sometimes receives backslash-escaped paths in its
+       argument, encoding them into the resulting hash string.
+
+    3. String concatenation with Windows path variables set in earlier steps:
+         TOOL_PATH: C:\hostedtoolcache\node\18\x64
+       When $TOOL_PATH is embedded in the cache key, the `\` chars are literal.
+
+  The cache service stores and retrieves keys as exact string matches. A cache
+  saved with key `npm-D:\a\_temp-abc123` is never found by a lookup for
+  `npm-D:/a/_temp-abc123` or by a lookup on a different run where the runner.temp
+  path differs.
+
+  On Linux/macOS runners, paths always use `/` so this issue is Windows-specific.
+  Cross-platform matrix workflows are especially affected: the Linux cache is found
+  on restore; the Windows cache is always missed.
+fix: |
+  Normalize all path separators to forward slashes before including in cache keys.
+
+  Option 1 — Avoid runner.temp and github.workspace in cache keys entirely.
+  Use runner.os and a fixed path pattern instead:
+    key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+
+  Option 2 — If you must embed a path, normalize in a prior step:
+    - name: Set normalized cache path
+      shell: bash
+      run: echo "CACHE_PATH=$(echo '${{ runner.temp }}' | tr '\\' '/')" >> $GITHUB_ENV
+    Then:
+    key: ${{ runner.os }}-${{ env.CACHE_PATH }}-${{ hashFiles(...) }}
+
+  Option 3 — Always use forward-slash glob patterns in hashFiles():
+    key: ${{ hashFiles('**/package-lock.json') }}    # correct
+    # NOT: ${{ hashFiles('**\package-lock.json') }}  # Windows-style — avoid
+
+  Option 4 — Use a bash shell step to compute the key and store in GITHUB_ENV,
+  ensuring all path manipulation happens in a POSIX shell that normalizes separators.
+fix_code:
+  - language: yaml
+    label: 'Bad: runner.temp in cache key produces backslashes on Windows'
+    code: |
+      # ❌ runner.temp on Windows = "D:\a\_temp" — backslashes in key → never matches
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/cache
+          key: ${{ runner.os }}-${{ runner.temp }}-${{ hashFiles('**/lock.json') }}
+  - language: yaml
+    label: 'Good: use runner.os and a fixed path — no path variables in key'
+    code: |
+      # ✅ No Windows path separators in key
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+  - language: yaml
+    label: 'Good: normalize path separators with bash tr before embedding in key'
+    code: |
+      - name: Normalize cache path
+        shell: bash
+        run: |
+          NORM_PATH=$(echo '${{ runner.tool_cache }}' | tr '\\' '/')
+          echo "NORM_TOOL_CACHE=$NORM_PATH" >> $GITHUB_ENV
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.tool_cache }}
+          key: ${{ runner.os }}-tools-${{ env.NORM_TOOL_CACHE }}-${{ hashFiles('**/tool-versions') }}
+prevention:
+  - 'Never include runner.temp, runner.tool_cache, or github.workspace in cache keys — these resolve to OS-specific paths with backslashes on Windows'
+  - 'Always use runner.os (e.g., "Windows") as the OS discriminator in cross-platform cache keys, not path-based variables'
+  - 'Use forward-slash glob patterns in hashFiles() expressions on all platforms'
+  - 'When path variables must appear in a cache key, normalize separators to forward slashes in a bash step first and use the env variable'
+  - 'Test cache hit rate explicitly in CI by checking the cache-hit output of the restore step on Windows runners'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows'
+    label: 'GitHub Docs: Caching dependencies to speed up workflows'
+  - url: 'https://github.com/actions/cache/issues/671'
+    label: 'actions/cache#671: Cache key with Windows path separators causes cache miss'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/store-information-in-variables#default-environment-variables'
+    label: 'GitHub Docs: Default environment variables (runner.temp, etc.)'
