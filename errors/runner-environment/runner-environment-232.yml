@@ -1,0 +1,131 @@
+id: runner-environment-232
+title: 'Self-hosted runner started as a service (svc.sh/svc.cmd) does not load user PATH from shell profile'
+category: runner-environment
+severity: error
+tags:
+  - self-hosted
+  - PATH
+  - svc.sh
+  - service
+  - environment-variables
+  - bash
+  - profile
+  - command-not-found
+patterns:
+  - regex: '(?:command not found|No such file or directory).+(?:\/home\/.+\/|~\/.+\/|GOPATH|cargo\/bin|\.local\/bin)'
+    flags: 'i'
+  - regex: '(?:bash|sh):.+: (?:command not found|No such file or directory)'
+    flags: 'i'
+error_messages:
+  - '/bin/bash: my-tool: command not found'
+  - 'bash: /home/runner/.local/bin/my-tool: No such file or directory'
+  - 'Error: Unable to locate executable file: my-tool. Please verify either the file path exists or the file can be found within a directory specified by the PATH environment variable.'
+root_cause: |
+  When the self-hosted runner is registered and started as a system service
+  using `svc.sh install && svc.sh start` (Linux/macOS) or
+  `svc.cmd install` (Windows), the service is launched by the OS service
+  manager (systemd, launchd, or Windows SCM) rather than interactively by
+  the user. As a result:
+
+  1. **Shell profile files are NOT sourced.** The service process never runs
+     `~/.bashrc`, `~/.bash_profile`, `~/.profile`, or `~/.zshrc`, so any
+     `export PATH=...` statements in those files have no effect on the runner
+     process or any job steps it spawns.
+
+  2. **Step shells use `--noprofile --norc` by default.** Even when job steps
+     invoke `bash`, the runner uses `bash --noprofile --norc -e -o pipefail`
+     (or equivalent), which explicitly disables sourcing of profile files.
+     This means binaries installed in user-specific directories — such as
+     `~/.local/bin`, `~/.cargo/bin`, `~/go/bin`, `~/.nvm/versions/node/*/bin`,
+     or any path added via `nvm`, `rbenv`, `pyenv`, `asdf`, etc. — are missing
+     from `PATH` in job steps even if they work fine in an interactive terminal.
+
+  3. **The runner's `.env` file is the authoritative PATH source.** The runner
+     process reads environment variables from a `.env` file at startup
+     (typically at `<runner-install-dir>/.env`). This file is NOT automatically
+     populated when the service is installed.
+
+  This is a common trap when developers install tools as their user (e.g.,
+  `cargo install`, `npm install -g`, `go install`, `pip install --user`) and
+  then register a self-hosted runner. Everything works in an interactive
+  terminal but fails when the service-started runner tries to execute the same
+  commands.
+fix: |
+  **Option 1 (recommended): Add paths to the runner's `.env` file**
+  Edit `<runner-install-dir>/.env` and append the needed PATH entries. The
+  runner reads this file at startup and merges it into the environment for all
+  job steps:
+
+  ```bash
+  # Append to <runner-install-dir>/.env
+  PATH=/home/runner/.cargo/bin:/home/runner/.local/bin:/home/runner/go/bin:$PATH
+  ```
+
+  Restart the service after editing: `sudo svc.sh stop && sudo svc.sh start`
+
+  **Option 2: Use `$GITHUB_PATH` in the workflow**
+  Add a step early in the job to append the needed paths using the
+  `$GITHUB_PATH` mechanism — this persists for all subsequent steps in the job:
+
+  ```yaml
+  - name: Add user bins to PATH
+    run: echo "$HOME/.local/bin" >> $GITHUB_PATH
+  ```
+
+  **Option 3: Start the runner interactively (development/testing only)**
+  Use `./run.sh` instead of the service to start the runner in an interactive
+  session that sources your shell profile. This is useful for debugging but
+  not suitable for production.
+
+  **Option 4: Change step shell to a login shell**
+  Override the shell at the step level to source the user profile:
+
+  ```yaml
+  - name: Run with login shell
+    shell: 'bash --login -e {0}'
+    run: my-tool --version
+  ```
+fix_code:
+  - language: yaml
+    label: 'Append user bin paths to runner PATH via .env file (persistent, affects all jobs)'
+    code: |
+      # Run this once on the self-hosted runner host:
+      # echo "PATH=/home/runner/.cargo/bin:/home/runner/.local/bin:$PATH" >> /home/runner/actions-runner/.env
+      # Then restart the runner service: sudo ./svc.sh stop && sudo ./svc.sh start
+      #
+      # In your workflow, the tool will now be found without any PATH workaround:
+      - name: Use cargo-installed tool
+        run: my-tool --version
+  - language: yaml
+    label: 'Append missing path per-job using $GITHUB_PATH'
+    code: |
+      jobs:
+        build:
+          runs-on: [self-hosted, linux]
+          steps:
+            - name: Add cargo bin to PATH
+              run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+            - name: Use cargo-installed tool
+              run: my-tool --version  # Now visible because GITHUB_PATH was updated
+  - language: yaml
+    label: 'Use login shell on a single step to source ~/.profile'
+    code: |
+      - name: Run with login shell (sources ~/.profile and ~/.bash_profile)
+        shell: 'bash --login -e {0}'
+        run: |
+          my-tool --version
+prevention:
+  - 'After registering a self-hosted runner, verify PATH by running a debug step: `run: echo $PATH && which my-tool` to confirm expected binaries are visible.'
+  - 'Document all non-standard tool paths in your `.env` file at runner registration time, before registering as a service, so PATH is correct from the first job.'
+  - 'Prefer system-wide tool installations (e.g., `/usr/local/bin/`) over user-specific paths for tools used on self-hosted runners, so the service environment sees them without profile sourcing.'
+  - 'When using version managers like nvm, rbenv, pyenv, or asdf, their shims are typically installed into shell-profile-sourced directories and will NOT work in service-started runners without explicit PATH entries in `.env`.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/2903'
+    label: 'actions/runner#2903 — Runner service does not update PATH when started via svc.sh'
+  - url: 'https://github.com/actions/runner/issues/2528'
+    label: 'actions/runner#2528 — PATH changes at runtime not applied to runner steps (--noprofile --norc)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners#adding-the-runner-to-your-enterprise'
+    label: 'GitHub Docs — Self-hosted runner environment configuration'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions#adding-a-system-path'
+    label: 'GitHub Docs — Adding a system path (GITHUB_PATH)'

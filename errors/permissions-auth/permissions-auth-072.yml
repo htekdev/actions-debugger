@@ -1,0 +1,112 @@
+id: permissions-auth-072
+title: 'actions/labeler fails with "You do not have permission to create labels" — missing issues: write'
+category: permissions-auth
+severity: error
+tags:
+  - actions/labeler
+  - issues
+  - labels
+  - permissions
+  - issues-write
+  - GITHUB_TOKEN
+  - HttpError
+patterns:
+  - regex: 'You do not have permission to create labels on this repository'
+    flags: 'i'
+  - regex: 'HttpError.+do not have permission to create labels'
+    flags: 'i'
+  - regex: '"resource":"Repository","field":"label","code":"unauthorized"'
+    flags: 'i'
+error_messages:
+  - 'HttpError: You do not have permission to create labels on this repository.: {"resource":"Repository","field":"label","code":"unauthorized"}'
+  - 'Error: You do not have permission to create labels on this repository.'
+root_cause: |
+  `actions/labeler` requires the `issues: write` permission on the
+  `GITHUB_TOKEN` whenever it needs to **create** a label that does not yet
+  exist in the repository. The labeler's `create-labels: true` setting (or
+  its equivalent in older versions that auto-create missing labels) triggers a
+  `POST /repos/{owner}/{repo}/labels` API call.
+
+  In 2023+, GitHub tightened default token permissions. Repositories and
+  organizations that enable "Read repository contents and packages permissions"
+  as the default GITHUB_TOKEN permission, or workflows that explicitly
+  enumerate `permissions:` without including `issues: write`, will cause the
+  label-creation API call to return HTTP 403:
+
+    `HttpError: You do not have permission to create labels on this repository.`
+
+  Note: If all labels already exist in the repository, the action only calls
+  `GET /repos/{owner}/{repo}/labels` (read) and `POST .../issues/{number}/labels`
+  (adding a label to an issue/PR — also requires issues:write). In practice,
+  any labeling operation that modifies issues or creates labels needs this
+  permission. The error is especially confusing because it surfaces as an
+  `HttpError` that looks like a GitHub API error rather than a clear
+  "permission denied" message.
+fix: |
+  Add `issues: write` to the workflow or job permissions block:
+
+  ```yaml
+  permissions:
+    issues: write
+    pull-requests: write  # Also needed if labeling pull requests
+    contents: read
+  ```
+
+  If the repository uses the default broad permissions and the error occurs on
+  a fork PR (where fork PRs receive read-only tokens regardless of the
+  workflow's permissions block), add a guard:
+
+  ```yaml
+  if: github.event.pull_request.head.repo.full_name == github.repository
+  ```
+
+  to skip label creation on fork PRs where the token cannot be elevated.
+fix_code:
+  - language: yaml
+    label: 'Add issues: write permission to the labeler job'
+    code: |
+      name: Label PRs
+
+      on:
+        pull_request_target:
+          types: [opened, synchronize, reopened]
+
+      jobs:
+        label:
+          runs-on: ubuntu-latest
+          permissions:
+            issues: write       # Required to create new labels
+            pull-requests: write # Required to add labels to pull requests
+            contents: read
+          steps:
+            - uses: actions/labeler@v5
+              with:
+                repo-token: ${{ secrets.GITHUB_TOKEN }}
+  - language: yaml
+    label: 'Skip labeler on fork PRs where token is always read-only'
+    code: |
+      jobs:
+        label:
+          runs-on: ubuntu-latest
+          # Skip on forks — their GITHUB_TOKEN is read-only regardless of permissions block
+          if: github.event.pull_request.head.repo.full_name == github.repository
+          permissions:
+            issues: write
+            pull-requests: write
+            contents: read
+          steps:
+            - uses: actions/labeler@v5
+              with:
+                repo-token: ${{ secrets.GITHUB_TOKEN }}
+prevention:
+  - 'Always include `issues: write` and `pull-requests: write` when using actions/labeler, even if the labeler config only applies existing labels — it still needs write to apply labels to PRs/issues.'
+  - 'Pre-create all labels defined in `.github/labeler.yml` in the repository settings so the action never needs to create them, reducing the permission surface needed (though issues:write is still needed for applying labels to issues/PRs).'
+  - 'When using `pull_request` trigger (not `pull_request_target`), fork PRs receive a read-only GITHUB_TOKEN by design; switch to `pull_request_target` or handle fork PRs with a separate read-only path.'
+  - 'Use the permissions checker in your CI review process: verify labeler workflows include explicit `permissions:` blocks before merging.'
+docs:
+  - url: 'https://github.com/actions/labeler/issues/870'
+    label: 'actions/labeler#870 — HttpError: You do not have permission to create labels on this repository'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/controlling-permissions-for-github_token'
+    label: 'GitHub Docs — Controlling permissions for GITHUB_TOKEN'
+  - url: 'https://github.com/actions/labeler#token'
+    label: 'actions/labeler — Token and permissions requirements'
