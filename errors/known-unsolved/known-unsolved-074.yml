@@ -1,0 +1,141 @@
+id: known-unsolved-074
+title: '`hashFiles()` has a hardcoded 120-second timeout — fails silently on large repos with many files'
+category: known-unsolved
+severity: limitation
+tags:
+  - hashFiles
+  - timeout
+  - cache-key
+  - large-repo
+  - actions-cache
+  - 120-seconds
+  - known-limitation
+patterns:
+  - regex: 'hashFiles\(.+\) couldn''t finish within 120 seconds'
+    flags: 'i'
+  - regex: 'hashFiles.*couldn''t finish'
+    flags: 'i'
+  - regex: 'The template is not valid.*hashFiles.*couldn''t finish'
+    flags: 'i'
+error_messages:
+  - "Error: The template is not valid. .github/workflows/ci.yml (Line: N, Col: M): hashFiles('Assets/**', 'Packages/**', 'ProjectSettings/**') couldn't finish within 120 seconds."
+  - "hashFiles('**/pom.xml') couldn't finish within 120 seconds."
+  - "hashFiles('**/Podfile.lock') couldn't finish within 120 seconds."
+root_cause: |
+  The `hashFiles()` expression function has a **hardcoded 120-second timeout** inside the
+  GitHub Actions runner. When hashing many files — large game projects, monorepos with
+  thousands of dependencies, or deeply nested directory trees — the hash process (a separate
+  Node.js subprocess) can exceed this limit.
+
+  The timeout is set in the runner source:
+  `src/Runner.Worker/Expressions/HashFilesFunction.cs` as a fixed constant. There is no
+  workflow-level configuration to extend or remove it. Pull Request actions/runner#1844,
+  opened in April 2022 to make the timeout configurable, has remained unmerged for years.
+
+  **Common triggers:**
+  - Unity game projects hashing `Assets/**`, `Packages/**`, `ProjectSettings/**` (tens of
+    thousands of binary and text assets).
+  - Java monorepos hashing `**/pom.xml` across hundreds of modules.
+  - iOS projects hashing `**/Podfile.lock` where CocoaPods creates large lock files.
+  - `actions/cache` Post step re-computing `hashFiles()` at the **end** of the job (to
+    check whether the cache should be saved), by which point many new files may exist in
+    the hashed path, making the second hash slower than the first.
+  - Self-hosted Windows runners, which tend to have slower file system scan speeds than
+    Linux GitHub-hosted runners for large directory trees.
+
+  The error surfaces as a YAML template evaluation failure before any step runs, so the
+  entire job fails immediately with no useful diagnostic beyond the 120-second error.
+
+  Related: actions/runner#1840 (12 reactions, open since April 2022, last active May 2024).
+fix: |
+  There is **no native fix** — `hashFiles()` timeout is hardcoded and cannot be increased
+  in workflow YAML.
+
+  **Workaround 1 — Pre-compute the hash in a shell step:**
+  Run a shell command to hash the target files and write the result to a single file, then
+  use `hashFiles()` on only that single file. The shell command runs without the 120-second
+  runner constraint, and hashing one file is nearly instant.
+
+  **Workaround 2 — Use the last Git commit hash for the target directory:**
+  `git log` is much faster than file-content hashing. If cache invalidation on the last
+  commit touching the directory is acceptable (rather than on file-content change), use
+  `git log -1 --pretty=format:%H -- <directory>` to generate the key.
+
+  **Workaround 3 — Narrow the glob pattern:**
+  Instead of `Assets/**`, narrow to a specific file type:
+  `Assets/**/*.meta` or `Assets/**/*.asset`. Fewer files = faster hash = less chance of
+  timeout. Acceptable when only certain file types are meaningful for cache invalidation.
+
+  **Workaround 4 — Reduce what goes in the hashed path:**
+  If you control the directory structure, move frequently-updated large binary files out
+  of the hashed path so the glob matches fewer files.
+fix_code:
+  - language: yaml
+    label: 'Broken — hashFiles() times out on large directory tree'
+    code: |
+      - uses: actions/cache@v4
+        with:
+          path: Library
+          # ✗ hashFiles() will time out if Assets/**, Packages/**, ProjectSettings/**
+          # contains thousands of files (e.g. large Unity project)
+          key: Library-${{ hashFiles('Assets/**', 'Packages/**', 'ProjectSettings/**') }}
+
+  - language: yaml
+    label: 'Fixed — pre-compute hash in a shell step, then hashFiles() on single file'
+    code: |
+      - name: Generate cache key from directory contents
+        run: |
+          find Assets Packages ProjectSettings \
+            -type f | sort | xargs sha256sum > /tmp/unity-hash-input.txt
+          # On Windows self-hosted runner, use PowerShell instead:
+          # Get-ChildItem -Recurse Assets,Packages,ProjectSettings |
+          #   Where-Object { !$_.PSIsContainer } |
+          #   Sort-Object FullName |
+          #   ForEach-Object { sha256sum $_.FullName } |
+          #   Out-File /tmp/unity-hash-input.txt -Encoding utf8
+
+      - uses: actions/cache@v4
+        with:
+          path: Library
+          # ✓ hashFiles() on a single pre-computed file is nearly instant
+          key: Library-${{ hashFiles('/tmp/unity-hash-input.txt') }}
+
+  - language: yaml
+    label: 'Alternative — use last Git commit hash touching the cached directory'
+    code: |
+      - name: Get cache key from last commit touching packages
+        run: |
+          echo "PKG_HASH=$(git log -1 --pretty=format:%H -- packages/)" >> $GITHUB_ENV
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          # ✓ git log is instant regardless of how many files are in packages/
+          # Note: invalidates on commit, not on file-content change
+          key: maven-${{ runner.os }}-${{ env.PKG_HASH }}
+
+  - language: yaml
+    label: 'Alternative — narrow glob to only meaningful file types'
+    code: |
+      - uses: actions/cache@v4
+        with:
+          path: Library
+          # ✓ Narrow glob: only hash .meta files instead of all assets
+          # Fewer matched files = faster hash = less risk of timeout
+          key: Library-${{ hashFiles('Assets/**/*.meta', 'Packages/**/package.json') }}
+
+prevention:
+  - 'For any project with more than ~10,000 files in the hashed path, pre-compute the hash in a shell step instead of using `hashFiles()` directly in the cache key expression.'
+  - 'Test `hashFiles()` locally by adding a step that logs the evaluation time: the timeout occurs during expression evaluation, before the step executes.'
+  - 'On Windows self-hosted runners, file system scan is slower — lower the threshold for when to switch to a pre-computed hash (≥5,000 files).'
+  - 'Watch the `actions/cache` Post step — it re-evaluates `hashFiles()` at job end to decide whether to save. If you add files to the hashed path during the job, the Post step can time out even when the Pre step succeeded.'
+  - 'Upvote actions/runner#1844 — the PR to make the timeout configurable. No merge timeline as of June 2026.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/1840'
+    label: 'actions/runner#1840: hashFiles() couldn''t finish within 120 seconds (12 reactions, open since 2022)'
+  - url: 'https://github.com/actions/runner/pull/1844'
+    label: 'actions/runner#1844: PR to make hashFiles() timeout configurable (unmerged)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#hashfiles'
+    label: 'GitHub Docs: hashFiles() expression function'
+  - url: 'https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows'
+    label: 'GitHub Docs: Caching dependencies to speed up workflows'
