@@ -1,0 +1,73 @@
+id: runner-environment-247
+title: '`apt-get install` stalls ~75 seconds on ubuntu-24.04 — "Processing triggers for man-db" post-install hook'
+category: runner-environment
+severity: warning
+tags:
+  - ubuntu-24.04
+  - apt-get
+  - man-db
+  - package-install
+  - performance
+  - slow
+patterns:
+  - regex: 'Processing triggers for man-db \('
+    flags: 'i'
+  - regex: 'man-db.*stall|stall.*man-db'
+    flags: 'i'
+error_messages:
+  - "Processing triggers for man-db (2.12.0-4build2) ..."
+  - "Processing triggers for man-db (2.12.0-4build2) ..."
+root_cause: |
+  On ubuntu-24.04 runners, installing any package that triggers the `man-db` post-install
+  hook causes a ~75-second stall during the `apt-get install` step.
+
+  The `man-db` daemon (which indexes manual pages for `man` lookups) has a post-install
+  trigger that runs `mandb` to rebuild the manual page database after packages are
+  installed. On ubuntu-24.04, this database rebuild operation runs synchronously and
+  takes approximately 60-90 seconds, blocking the apt post-install phase.
+
+  Any package that installs manual pages (cmake, make, build-essential, gcc, etc.)
+  triggers this slow hook. Workflows that install multiple packages in a single
+  `apt-get install` step will still only pay the cost once (one rebuild per transaction),
+  but even a single apt install with man pages will stall for over a minute.
+
+  The `man-db` package is installed by default on ubuntu-24.04 runner images. This
+  issue was reported in September 2025 and remains open as of June 2026 (runner#4030).
+fix: |
+  Option 1 — Remove man-db before running apt-get install commands:
+  ```yaml
+  - name: Remove man-db to prevent slow post-install trigger
+    run: sudo apt-get remove --purge -y man-db
+  ```
+  After removing man-db, all subsequent apt installs skip the man page indexing trigger.
+
+  Option 2 — Disable the man-db auto-update file (lighter weight):
+  ```yaml
+  - name: Disable man-db auto-update
+    run: sudo rm -f /var/lib/man-db/auto-update
+  ```
+  This deletes the sentinel file that triggers auto-update, preventing the stall without
+  uninstalling man-db.
+
+  Option 3 — Set DEBIAN_FRONTEND and skip recommended packages (partial mitigation):
+  Some packages still trigger man-db via direct page installation, but combining
+  `--no-install-recommends` reduces the set of affected packages.
+fix_code:
+  - language: yaml
+    label: "Remove man-db before apt-get installs to eliminate the stall"
+    code: |
+      - name: Remove man-db (prevents ~75s stall on ubuntu-24.04)
+        run: sudo apt-get remove --purge -y man-db
+
+      - name: Install dependencies
+        run: sudo apt-get install -y cmake make build-essential
+prevention:
+  - "Remove or disable man-db at the start of jobs that run apt-get install on ubuntu-24.04"
+  - "Use sudo rm -f /var/lib/man-db/auto-update as a lighter-weight alternative to removing the package"
+  - "Combine all apt-get installs into a single command to pay the man-db trigger cost only once"
+  - "Monitor job timing — if an apt step takes 75+ extra seconds on ubuntu-24.04, man-db is the cause"
+docs:
+  - url: "https://github.com/actions/runner/issues/4030"
+    label: "GitHub runner#4030 — man-db trigger severely stalls package installation on ubuntu-24.04"
+  - url: "https://manpages.ubuntu.com/manpages/noble/man8/mandb.8.html"
+    label: "Ubuntu mandb(8) manual — man page database indexer"
