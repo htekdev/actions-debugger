@@ -1,0 +1,140 @@
+id: silent-failures-121
+title: '`workflow_run: types: [completed]` triggers on ALL conclusions — deploy runs even when CI failed or was cancelled'
+category: silent-failures
+severity: silent-failure
+tags:
+  - workflow-run
+  - conclusion
+  - silent-failure
+  - deploy-on-failure
+  - ci-cd
+  - workflow-trigger
+  - conclusion-check
+patterns:
+  - regex: 'on:\s*\n\s+workflow_run:'
+    flags: 'im'
+  - regex: 'types:\s*[\[\s]*completed[\]\s]*\n'
+    flags: 'i'
+error_messages:
+  - "# No error message — the deploy workflow runs silently even when upstream CI failed or was cancelled"
+root_cause: |
+  The `workflow_run` event with `types: [completed]` fires whenever the referenced workflow
+  finishes — regardless of its conclusion. A completed workflow can have any of these conclusions:
+  `success`, `failure`, `cancelled`, `skipped`, `timed_out`, `action_required`, `neutral`,
+  or `stale`. GitHub fires `workflow_run: completed` for ALL of these states.
+
+  Developers commonly use `workflow_run` to chain a deploy or release workflow after a CI
+  workflow passes. The intuitive reading of "completed" is "finished successfully," but GitHub's
+  semantics are "finished with any outcome":
+
+  ```yaml
+  # ❌ This runs deploy even when CI failed, was cancelled, or was skipped
+  on:
+    workflow_run:
+      workflows: [CI]
+      types: [completed]
+  ```
+
+  Without an explicit `if:` conclusion check, the deploy workflow runs unconditionally after CI —
+  including when CI failed mid-run, was cancelled by a force-push, or was skipped by a path
+  filter. This silently deploys broken code (or publishes, releases, or notifies) whenever CI
+  does not succeed.
+
+  **Why this is a silent failure:**
+  - No error appears — the triggered workflow runs normally and reports "success"
+  - The CI failure and deploy completion appear as separate workflow runs — easy to miss
+  - GitHub does not add a default conclusion filter — the developer must add it manually
+  - The mistake is natural: "trigger when CI is done" sounds equivalent to "trigger when CI passes"
+
+  Sources: GitHub Docs (workflow_run event, conclusion field); SO#62750603 (159 upvotes,
+  152,034 views — top answer recommends adding conclusion check); `ahmadnassri/action-workflow-run-wait`
+  (39 stars — third-party action created specifically to work around this limitation)
+fix: |
+  Add an `if:` condition at the JOB level (not workflow level) to check
+  `github.event.workflow_run.conclusion == 'success'`. Job-level conditions are evaluated at
+  runtime after the event fires, so this reliably gates deployment on CI success.
+
+  Do NOT put the `if:` check at the workflow level — it prevents ALL jobs from running,
+  including any cleanup or notification jobs that should run regardless of conclusion.
+
+  For workflows that need to handle both success and failure (e.g., notify Slack of failures),
+  use separate jobs with different `if:` checks.
+fix_code:
+  - language: yaml
+    label: 'Add conclusion check at the job level — most common fix'
+    code: |
+      name: Deploy
+
+      on:
+        workflow_run:
+          workflows: [CI]
+          types: [completed]
+
+      jobs:
+        deploy:
+          # ✅ Only deploy when CI succeeded
+          if: github.event.workflow_run.conclusion == 'success'
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                # workflow_run always checks out default branch — use ref for PR branches
+                ref: ${{ github.event.workflow_run.head_sha }}
+            - run: ./deploy.sh
+  - language: yaml
+    label: 'Branch by conclusion — deploy on success, notify on failure'
+    code: |
+      name: Post-CI Actions
+
+      on:
+        workflow_run:
+          workflows: [CI]
+          types: [completed]
+
+      jobs:
+        deploy:
+          if: github.event.workflow_run.conclusion == 'success'
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./deploy.sh
+
+        notify-failure:
+          if: >-
+            github.event.workflow_run.conclusion == 'failure' ||
+            github.event.workflow_run.conclusion == 'timed_out'
+          runs-on: ubuntu-latest
+          steps:
+            - name: Notify team of CI failure
+              run: |
+                echo "CI failed on branch ${{ github.event.workflow_run.head_branch }}"
+                # Send Slack/Teams notification here
+  - language: yaml
+    label: 'Anti-pattern: missing conclusion check silently deploys broken code'
+    code: |
+      # ❌ BAD: Runs even when CI failed, was cancelled, or was skipped by path filter
+      on:
+        workflow_run:
+          workflows: [CI]
+          types: [completed]   # "completed" means ANY outcome, not just success
+
+      jobs:
+        deploy:
+          # No if: conclusion check — deploys broken code on CI failure!
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./deploy.sh
+prevention:
+  - "Always add `if: github.event.workflow_run.conclusion == 'success'` to deploy/release jobs triggered by workflow_run"
+  - "Remember: 'completed' means the upstream workflow finished — NOT that it succeeded; always check conclusion explicitly"
+  - "Use separate jobs with different `if: conclusion ==` checks for success vs failure vs cancelled handling"
+  - "Consider adding a linting step or actionlint check that flags workflow_run jobs without a conclusion check"
+  - "Test the failure path by intentionally failing CI and verifying the downstream workflow does NOT deploy"
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run'
+    label: 'GitHub Docs: workflow_run event — conclusion field and types'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context'
+    label: 'GitHub Docs: github.event.workflow_run context properties'
+  - url: 'https://stackoverflow.com/questions/62750603/github-actions-trigger-another-action-after-one-action-is-completed'
+    label: 'SO #62750603: Trigger action after completion — top answer adds conclusion check (159 upvotes, 152k views)'
+  - url: 'https://github.com/ahmadnassri/action-workflow-run-wait'
+    label: 'ahmadnassri/action-workflow-run-wait — third-party action created to wait for successful workflow_run'

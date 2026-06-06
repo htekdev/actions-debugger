@@ -1,0 +1,142 @@
+id: known-unsolved-076
+title: '`env` context unavailable in `strategy.matrix` — workflow env vars cannot be used in matrix definitions'
+category: known-unsolved
+severity: limitation
+tags:
+  - matrix
+  - env-context
+  - strategy
+  - fromJSON
+  - dynamic-matrix
+  - context-availability
+  - known-limitation
+patterns:
+  - regex: 'Error when evaluating .+strategy.+ for job'
+    flags: 'i'
+  - regex: 'strategy.*matrix.*\$\{\{.*env\.'
+    flags: 'i'
+  - regex: 'Unrecognized named-value: .+env.+ \(Line: \d+'
+    flags: 'i'
+error_messages:
+  - "Error when evaluating 'strategy' for job 'build'. .github/workflows/deploy.yaml (Line: 10, Col: 15): Error parsing fromJson"
+  - "Error when evaluating 'strategy' for job 'test'. Input string '3.11' is not a valid number. Path '[0]'"
+  - "Error when evaluating 'strategy' for job 'matrix-job': Object reference not set to an instance of an object"
+root_cause: |
+  The `env` context — workflow-level environment variables defined under the top-level `env:` key
+  — is NOT available during evaluation of `strategy.matrix`. GitHub Actions evaluates the
+  `strategy:` block at workflow QUEUING time, before jobs are dispatched and before environment
+  variable interpolation occurs. Any expression like `${{ env.VERSIONS_JSON }}` or
+  `${{ fromJSON(env.VERSIONS_JSON) }}` inside `strategy.matrix` resolves to an empty string
+  or produces a parse error.
+
+  **GitHub's documented context availability:**
+  Per the official context availability table, `env` is explicitly NOT listed as available in
+  `jobs.<job_id>.strategy`. Available contexts there are only: `github`, `inputs`, `vars`,
+  `needs`, `strategy`, and `matrix`.
+
+  **Common failure patterns:**
+  - Using `${{ fromJSON(env.MY_VERSIONS) }}` to share a JSON array between matrix and other steps
+  - Setting `env: DEPLOY_ENVS: '["staging","production"]'` at workflow level and referencing it
+    in the matrix include/exclude blocks
+  - Using workflow-level env vars to DRY up matrix configs shared with `run:` script logic
+
+  **Why this surprises developers:**
+  - `env` IS available inside `jobs.<job_id>.steps.*` — the limitation is specific to `strategy`
+  - The error message "Error parsing fromJson" doesn't mention that `env` context is unavailable
+  - The empty-string resolution (when no parse error) causes a silent empty matrix, not an error
+
+  Sources: actions/runner#480 (281 👍, open since 2020 — most-upvoted env context limitation);
+  SO#74072206 (10 upvotes, 19,053 views); SO#76039616 (6 upvotes, 10,482 views)
+fix: |
+  Three workarounds exist, in order of preference:
+
+  **Option 1 — Use `vars` context (org/repo-level variables)**
+  Org-level and repo-level variables (`vars.*`) ARE available in `strategy.matrix`.
+  Move shared values to repository Settings → Secrets and variables → Variables instead of
+  workflow-level `env:`.
+
+  **Option 2 — Compute matrix in a previous job's output (most flexible)**
+  Use a dedicated setup job that outputs the matrix JSON, then reference it in dependent
+  jobs via `fromJSON(needs.setup.outputs.matrix)`. This also enables dynamic matrix
+  generation from files, APIs, or scripts.
+
+  **Option 3 — Hardcode values directly in strategy.matrix**
+  Duplicate the values in `strategy.matrix` explicitly. Avoids the DRY violation but
+  is the simplest fix when values rarely change.
+fix_code:
+  - language: yaml
+    label: 'Option 1: Use vars context — repo/org variables ARE available in strategy'
+    code: |
+      # In repo Settings → Secrets and variables → Variables, create:
+      # Name: PYTHON_VERSIONS  Value: ["3.10","3.11","3.12"]
+
+      jobs:
+        test:
+          strategy:
+            matrix:
+              # ✅ vars context IS available in strategy.matrix
+              python-version: ${{ fromJSON(vars.PYTHON_VERSIONS) }}
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/setup-python@v5
+              with:
+                python-version: ${{ matrix.python-version }}
+            - run: python -m pytest
+  - language: yaml
+    label: 'Option 2: Compute matrix in a setup job, pass via needs outputs'
+    code: |
+      jobs:
+        setup:
+          runs-on: ubuntu-latest
+          outputs:
+            matrix: ${{ steps.set-matrix.outputs.matrix }}
+          steps:
+            - id: set-matrix
+              run: |
+                # Build matrix from any source: env var, file, API, conditional logic
+                echo 'matrix={"python-version":["3.10","3.11","3.12"]}' >> "$GITHUB_OUTPUT"
+
+        test:
+          needs: setup
+          strategy:
+            matrix:
+              # ✅ fromJSON(needs.*.outputs.*) IS available in strategy.matrix
+              ${{ fromJSON(needs.setup.outputs.matrix) }}
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/setup-python@v5
+              with:
+                python-version: ${{ matrix.python-version }}
+            - run: python -m pytest
+  - language: yaml
+    label: 'Anti-pattern: env context in strategy.matrix causes parse error'
+    code: |
+      # ❌ Workflow-level env vars are NOT available in strategy.matrix
+
+      env:
+        PYTHON_VERSIONS: '["3.10","3.11","3.12"]'
+
+      jobs:
+        test:
+          strategy:
+            matrix:
+              # This causes: "Error when evaluating 'strategy' for job 'test'"
+              python-version: ${{ fromJSON(env.PYTHON_VERSIONS) }}
+          runs-on: ubuntu-latest
+          steps:
+            - run: python --version
+prevention:
+  - "Use `vars.*` (repo/org variables from Settings) instead of workflow `env:` for values shared between matrix and steps"
+  - "Generate dynamic matrices in a dedicated setup job and pass via `needs.*.outputs.*`"
+  - "Consult the GitHub Actions context availability table before using any context in `strategy` — not all contexts are available there"
+  - "actionlint will flag `env` context usage in strategy blocks — add it to your CI pipeline or pre-commit hooks"
+  - "Remember: `env` IS available in `steps.*.run`, `steps.*.with`, and most other places — the restriction is specific to `strategy` and `concurrency`"
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#context-availability'
+    label: 'GitHub Docs: Context availability table (env not listed for strategy)'
+  - url: 'https://github.com/actions/runner/issues/480'
+    label: 'actions/runner#480: Workflow level env does not work in all fields (281 upvotes, open since 2020)'
+  - url: 'https://stackoverflow.com/questions/74072206/github-actions-use-variables-in-matrix-definition'
+    label: 'SO #74072206: Use variables in matrix definition (10 upvotes, 19,053 views)'
+  - url: 'https://stackoverflow.com/questions/76039616/how-to-read-in-an-array-of-strings-to-matrix-in-github-actions'
+    label: 'SO #76039616: Read array of strings into matrix (6 upvotes, 10,482 views)'

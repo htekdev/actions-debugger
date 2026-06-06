@@ -1,0 +1,142 @@
+id: triggers-074
+title: '`workflow_run: branches:` filter silently never triggers when upstream was started by `schedule` or `workflow_dispatch` — `head_branch` is null'
+category: triggers
+severity: silent-failure
+tags:
+  - workflow-run
+  - branches-filter
+  - head-branch
+  - schedule
+  - workflow-dispatch
+  - null
+  - silent-failure
+  - trigger-missing
+patterns:
+  - regex: 'on:\s*\n\s+workflow_run:\s*\n(.|\n)*?branches:\s*\n'
+    flags: 'im'
+  - regex: 'workflow_run.*branches.*schedule\s*$|schedule.*workflow_run.*branches'
+    flags: 'im'
+error_messages:
+  - "# No error message — the downstream workflow simply never runs when upstream was triggered by schedule or workflow_dispatch"
+root_cause: |
+  The `workflow_run` event exposes a `branches:` filter that is supposed to limit which upstream
+  workflow run conclusions trigger the downstream workflow. The filter compares against
+  `github.event.workflow_run.head_branch`.
+
+  **The problem:** When the upstream workflow is triggered by a `schedule` or `workflow_dispatch`
+  event, GitHub sets `head_branch` to `null` (not a branch name). The `branches:` filter then
+  evaluates `null` against each pattern in the list — and null never matches any branch name
+  pattern, including `[main]`, `['**']`, or any glob. The downstream workflow silently never
+  triggers, even though the upstream ran successfully on main.
+
+  **Event types that produce null head_branch:**
+  - `schedule` — cron-triggered workflows have no associated branch context
+  - `workflow_dispatch` — manually dispatched workflows MAY have null head_branch in some cases
+
+  **Pull request triggers correctly populate head_branch** (the PR head branch name), and
+  `push` triggers also correctly populate it (the pushed branch name). The null behavior is
+  specific to schedule and dispatch events on the upstream.
+
+  **Why this is a silent failure:**
+  - No error is raised — the downstream workflow simply does not appear in the Actions UI for that run
+  - The upstream workflow runs and completes successfully
+  - The `branches:` filter looks correct — `[main]` is the right branch name
+  - The issue only manifests for schedule/dispatch-triggered upstream runs; if CI also triggers
+    on push to main, push-triggered runs DO reach the downstream workflow
+
+  **Example scenario:** A deploy workflow runs after CI. CI has `on: [push, schedule]`.
+  The `branches: [main]` filter in the deploy's workflow_run block works for push events but
+  silently skips all scheduled CI runs.
+
+  Sources: GitHub Docs (workflow_run, head_branch null for schedule); community/discussions
+  related to workflow_run not triggering after schedule; documented in
+  `workflow-run-head-branch-null-schedule-dispatch-concurrency.yml` (concurrency variant)
+fix: |
+  Remove the `branches:` filter from the `workflow_run` trigger entirely and instead use a
+  job-level `if:` condition to check the branch after the event fires. The `if:` condition
+  evaluates at runtime and can handle null gracefully.
+
+  For schedule-triggered upstreams, use `github.event.workflow_run.head_branch == 'main' ||
+  github.event.workflow_run.head_branch == null` (null means it ran from the default branch).
+
+  Alternatively, filter by the workflow run's `head_sha` and check against known branch SHAs.
+fix_code:
+  - language: yaml
+    label: 'Remove branches filter and add job-level if condition — handles schedule and dispatch'
+    code: |
+      name: Deploy After CI
+
+      on:
+        workflow_run:
+          workflows: [CI]
+          types: [completed]
+          # ❌ Do NOT use branches: here if CI runs on schedule or workflow_dispatch
+          # branches: [main]   # This silently skips all schedule-triggered CI runs
+
+      jobs:
+        deploy:
+          # ✅ Use job-level if: instead of trigger-level branches:
+          # null head_branch means schedule/dispatch from default branch — include it
+          if: >-
+            github.event.workflow_run.conclusion == 'success' &&
+            (github.event.workflow_run.head_branch == 'main' ||
+             github.event.workflow_run.head_branch == null)
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./deploy.sh
+  - language: yaml
+    label: 'When upstream is push-only: branches filter works fine (head_branch is always set)'
+    code: |
+      name: Deploy After CI (push-only upstream)
+
+      on:
+        workflow_run:
+          workflows: [CI]
+          types: [completed]
+          # ✅ branches: filter works correctly ONLY when upstream runs on push or pull_request
+          # Because push and pull_request events always set head_branch
+          branches: [main]
+
+      jobs:
+        deploy:
+          if: github.event.workflow_run.conclusion == 'success'
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./deploy.sh
+
+      # ⚠️ If CI also has on: schedule — add null check above or remove branches: filter
+  - language: yaml
+    label: 'Anti-pattern: branches filter with schedule-triggered upstream — downstream never fires'
+    code: |
+      # ❌ BAD: Upstream CI has on: [push, schedule]
+      # But deploy's branches filter silently skips all scheduled CI runs
+
+      name: Deploy After CI
+
+      on:
+        workflow_run:
+          workflows: [CI]
+          types: [completed]
+          branches: [main]   # null (from schedule) never matches 'main' — deploy skipped!
+
+      jobs:
+        deploy:
+          if: github.event.workflow_run.conclusion == 'success'
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./deploy.sh   # Never runs after scheduled CI
+prevention:
+  - "Avoid `branches:` filter in workflow_run if the upstream workflow can be triggered by `schedule` or `workflow_dispatch`"
+  - "Use job-level `if:` conditions with explicit null handling instead of trigger-level branch filters"
+  - "Check the upstream workflow's triggers — if it includes `schedule` or `workflow_dispatch`, `head_branch` will be null for those runs"
+  - "Test by triggering the upstream workflow manually and verifying the downstream workflow appears in the Actions UI"
+  - "When null head_branch is acceptable (schedule from default branch), use `head_branch == 'main' || head_branch == null`"
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run'
+    label: 'GitHub Docs: workflow_run event — branches filter and head_branch field'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context'
+    label: 'GitHub Docs: github.event.workflow_run — head_branch property (null for schedule/dispatch)'
+  - url: 'https://github.com/orgs/community/discussions/26238'
+    label: 'GitHub Community: workflow_run not triggering — head_branch null discussion'
