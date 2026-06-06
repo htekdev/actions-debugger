@@ -1,0 +1,149 @@
+id: known-unsolved-065
+title: 'ubuntu-24.04-arm64 Hosted Runner Kernel Missing binder_linux and ashmem_linux Modules — Android Container Tests Fail'
+category: known-unsolved
+severity: limitation
+tags:
+  - ubuntu-24.04-arm64
+  - arm64
+  - kernel-modules
+  - android
+  - binder
+  - ashmem
+  - container
+  - known-limitation
+patterns:
+  - regex: 'modprobe: FATAL: Module binder_linux not found|modprobe.*binder_linux.*not found'
+    flags: 'i'
+  - regex: 'modprobe: FATAL: Module ashmem_linux not found|modprobe.*ashmem_linux.*not found'
+    flags: 'i'
+  - regex: '/dev/binder: No such file or directory|/dev/ashmem: No such file or directory'
+    flags: 'i'
+  - regex: 'CONFIG_ANDROID_BINDER_IPC.*not set|binder_linux.*absent.*kernel'
+    flags: 'i'
+error_messages:
+  - 'modprobe: FATAL: Module binder_linux not found in directory /lib/modules/<kernel>'
+  - 'modprobe: FATAL: Module ashmem_linux not found in directory /lib/modules/<kernel>'
+  - '/dev/binder: No such file or directory'
+  - '/dev/ashmem: No such file or directory'
+  - 'modprobe binder_linux exited with code 1'
+root_cause: |
+  The ubuntu-24.04-arm64 GitHub Actions hosted runner kernel is compiled WITHOUT
+  `CONFIG_ANDROID_BINDER_IPC=m` and `CONFIG_ANDROID_BINDERFS=m`. This means the
+  `binder_linux` and `ashmem_linux` kernel modules do not exist in
+  `/lib/modules/$(uname -r)/` on ARM64 runners.
+
+  Attempting `modprobe binder_linux` fails silently (exits 1) on ARM64 because
+  the module is simply absent from the kernel tree — it cannot be loaded even
+  as a privileged container.
+
+  **Why x86_64 hosted runners DO have these modules:**
+  The x86_64 ubuntu-24.04 hosted runners expose `binder` and `ashmem` because
+  they support the [GitHub Actions KVM Android hardware acceleration feature](https://github.blog/changelog/2024-04-02-github-actions-hardware-accelerated-android-virtualization-now-available/)
+  (released April 2024). The x86_64 kernel was explicitly built with Android
+  IPC support to enable this feature. The ARM64 kernel image is compiled
+  separately and was not built with these modules.
+
+  **Affected use cases:**
+  - Running [ReDroid](https://github.com/remote-android/redroid-doc) (GPU-enabled
+    Android-in-Docker) on native ARM64 CI for ARM-native app testing
+  - Running [Waydroid](https://waydro.id/) in ARM64 CI containers
+  - Any workflow that requires `/dev/binder` or `/dev/ashmem` devices
+
+  **Confirmed on:**
+  - ubuntu-24.04-arm64 image 20260531.15.1 (kernel aarch64, Azure westus2)
+  - Source: actions/runner-images#14184 (feature request, June 2026, open)
+
+  **No current workaround exists** — the module cannot be compiled from source
+  against the runner's kernel headers without the kernel source tree, and the
+  azure-linux kernel for ARM64 is not shipped with headers for out-of-tree
+  `binder_linux` builds. A request to add the modules to the ubuntu-24.04-arm64
+  image is tracked at runner-images#14184 and is currently open with no ETA.
+fix: |
+  **No complete fix is currently available for native ARM64 hosted runners.**
+
+  **Option 1 (Recommended): Use ubuntu-24.04 x86_64 runners for Android tests**
+
+  The x86_64 ubuntu-24.04 runner has `binder_linux` and `ashmem_linux` and
+  supports Android container tests via KVM acceleration. ARM-native testing can
+  be approximated via the Android native bridge, at the cost of some overhead:
+
+  ```yaml
+  android-test:
+    runs-on: ubuntu-24.04   # x86_64 — has binder_linux/ashmem_linux
+    steps:
+      - uses: actions/checkout@v6
+      - run: |
+          sudo modprobe binder_linux  # succeeds on x86_64
+          sudo modprobe ashmem_linux
+          # ... run ReDroid or Waydroid Android container tests
+  ```
+
+  **Option 2: Use real ARM hardware (Firebase Test Lab, self-hosted)**
+
+  For true ARM64 profiling (power/wakelock, native execution) use Firebase
+  Test Lab with physical Pixel hardware, or a self-hosted ARM64 runner on
+  hardware/VMs that expose binder devices.
+
+  **Option 3: Compile binder_linux from source (complex, unreliable)**
+
+  Without kernel headers matching the runner kernel, this is not practical
+  on GitHub-hosted runners.
+
+  **Track for a platform fix:** Follow actions/runner-images#14184 for progress
+  on adding `binder_linux`/`ashmem_linux` to the ubuntu-24.04-arm64 runner image.
+fix_code:
+  - language: yaml
+    label: 'Route Android container tests to x86_64 runner which has binder_linux/ashmem_linux'
+    code: |
+      jobs:
+        android-container-test:
+          # ubuntu-24.04-arm64 runner kernel is compiled without CONFIG_ANDROID_BINDER_IPC=m
+          # Use x86_64 runner which has binder_linux/ashmem_linux for KVM Android acceleration.
+          # Track runner-images#14184 for ARM64 kernel module support.
+          runs-on: ubuntu-24.04     # x86_64 — binder_linux available
+          container:
+            image: redroid/redroid:15.0.0-latest
+            options: --privileged
+          steps:
+            - uses: actions/checkout@v6
+            - name: Verify binder device
+              run: ls -la /dev/binder /dev/ashmem
+            - name: Run instrumented tests
+              run: ./gradlew connectedAndroidTest
+  - language: yaml
+    label: 'Guard ARM64 jobs against missing kernel modules'
+    code: |
+      jobs:
+        android-test:
+          runs-on: ${{ matrix.runner }}
+          strategy:
+            matrix:
+              runner: [ubuntu-24.04, ubuntu-24.04-arm64]
+          steps:
+            - uses: actions/checkout@v6
+            - name: Check binder_linux availability
+              id: binder-check
+              run: |
+                if modprobe binder_linux 2>/dev/null; then
+                  echo "available=true" >> "$GITHUB_OUTPUT"
+                else
+                  echo "available=false" >> "$GITHUB_OUTPUT"
+                  echo "::warning::binder_linux not available on $(uname -m) runner. Skipping Android container tests."
+                fi
+            - name: Run Android container tests
+              if: steps.binder-check.outputs.available == 'true'
+              run: ./run-android-tests.sh
+prevention:
+  - 'Do not assume binder_linux or ashmem_linux are available on ubuntu-24.04-arm64 hosted runners — the kernel was not built with CONFIG_ANDROID_BINDER_IPC=m.'
+  - 'Route Android container (ReDroid/Waydroid) CI tests to x86_64 ubuntu-24.04 runners until runner-images#14184 is resolved.'
+  - 'Always guard binder_linux/ashmem_linux modprobe calls with an availability check so ARM64 jobs fail gracefully rather than unexpectedly.'
+  - 'Track the ARM64 runner image feature request at actions/runner-images#14184 to know when the modules are added.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14184'
+    label: 'runner-images #14184 — Add binder_linux and ashmem_linux kernel modules to ubuntu-24.04-arm image (open Jun 2026)'
+  - url: 'https://github.com/remote-android/redroid-doc/issues/928'
+    label: 'redroid-doc #928 — GitHub Actions ubuntu-24.04-arm runners lack binder/ashmem kernel modules'
+  - url: 'https://github.blog/changelog/2024-04-02-github-actions-hardware-accelerated-android-virtualization-now-available/'
+    label: 'GitHub Changelog — Hardware-accelerated Android virtualization on x86_64 Actions runners'
+  - url: 'https://github.com/actions/runner-images/releases/tag/ubuntu24-arm64%2F20260531.15'
+    label: 'ubuntu-24.04-arm64 image 20260531.15.1 release notes'

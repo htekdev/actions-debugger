@@ -1,0 +1,134 @@
+id: runner-environment-211
+title: 'ARC Controller Upgrade Leaves Stale AutoscalingListener and EphemeralRunnerSet — Manual Intervention Required'
+category: runner-environment
+severity: error
+tags:
+  - arc
+  - actions-runner-controller
+  - kubernetes
+  - upgrade
+  - autoscaling
+  - helm
+  - stale-controller
+patterns:
+  - regex: 'AutoscalingListener.*spec\.image.*old.*version|spec\.image.*ghcr\.io/actions.*stale'
+    flags: 'i'
+  - regex: 'app\.kubernetes\.io/version.*mismatch|helm\.sh/chart.*stale.*controller'
+    flags: 'i'
+  - regex: 'RunnerScaleSet.*stale.*image|EphemeralRunnerSet.*old.*version'
+    flags: 'i'
+error_messages:
+  - 'AutoscalingListener CRs retain stale controller image after controller upgrade'
+  - 'EphemeralRunnerSet retains stale version labels after controller upgrade'
+  - 'spec.image still points to old controller version after helm upgrade'
+root_cause: |
+  When upgrading the `gha-runner-scale-set-controller` Helm chart, two
+  controller-managed objects are NOT updated to reflect the new version:
+
+  1. **AutoscalingListener CRs** — retain the old controller image in `spec.image`
+  2. **EphemeralRunnerSet objects** — retain old version labels
+     (`app.kubernetes.io/version`, `helm.sh/chart`)
+
+  The root cause is that the controller gates reconciliation on a **spec hash**.
+  A controller-only upgrade does not change any `AutoscalingRunnerSet` spec, so
+  the hash is identical and the controller skips reconciliation of both objects
+  entirely. The `updateStrategy` flag only governs spec-change rollout, not
+  controller version upgrades.
+
+  **Object hierarchy affected:**
+  ```
+  AutoscalingRunnerSet   (Helm-managed)
+  ├── AutoscalingListener   ← stale image after controller upgrade
+  └── EphemeralRunnerSet    ← stale labels/spec after controller upgrade
+          └── EphemeralRunner
+  ```
+
+  For minor version bumps (e.g. 0.14.1 → 0.14.2) the staleness may appear
+  cosmetic. For **major upgrades** where the `EphemeralRunnerSet` or
+  `EphemeralRunner` spec has breaking changes (new required fields, removed
+  fields, changed defaults), stale objects under a new controller can cause
+  runtime failures — jobs queued but never dispatched, runner pods using the old
+  image's entrypoint, or scale-set reporting incorrect capacity.
+
+  **Version confirmed affected:** controller 0.14.2 / scale-set 0.14.2,
+  Kubernetes RKE2 (reproducible on any Kubernetes distribution).
+fix: |
+  Two separate manual steps are required after every controller upgrade where
+  AutoscalingListener or EphemeralRunnerSet spec has changed:
+
+  **Step 1 — Delete all AutoscalingListener CRs** (the controller recreates them
+  immediately with the new image; runner pods are unaffected):
+
+  ```bash
+  kubectl delete autoscalinglisteners -A --all
+  ```
+
+  Verify the new version is used after recreation:
+  ```bash
+  kubectl get autoscalinglisteners -A \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.image}{"\n"}{end}'
+  ```
+
+  **Step 2 — Trigger EphemeralRunnerSet reconciliation** via a dummy annotation
+  change to `spec.template.spec` (a change to `minRunners` alone is NOT
+  sufficient — it only affects the AutoscalingListener hash, not the
+  EphemeralRunnerSet hash):
+
+  ```yaml
+  spec:
+    template:
+      metadata:
+        annotations:
+          upgrade-trigger: "0.14.2"   # bump on each controller upgrade
+  ```
+
+  This triggers a graceful transition: the old EphemeralRunnerSet drains
+  (in-progress jobs complete) while the new one starts accepting jobs
+  immediately. Remove the annotation in a follow-up commit.
+
+  **Verify EphemeralRunnerSet version labels are updated:**
+  ```bash
+  kubectl get ephemeralrunnersets -A \
+    -o custom-columns='NAME:.metadata.name,VERSION:.metadata.labels.app\.kubernetes\.io/version'
+  ```
+fix_code:
+  - language: yaml
+    label: 'Trigger EphemeralRunnerSet reconciliation via dummy annotation (per scale set)'
+    code: |
+      # In your AutoscalingRunnerSet HelmRelease or values.yaml:
+      # Add a dummy annotation to spec.template.spec to force EphemeralRunnerSet
+      # reconciliation after a controller upgrade.
+      # Remove the annotation in a follow-up commit once migration is confirmed.
+      spec:
+        template:
+          metadata:
+            annotations:
+              upgrade-trigger: "0.14.2"   # bump to new controller version
+  - language: yaml
+    label: 'Post-upgrade runbook as a one-off Job'
+    code: |
+      # After upgrading the controller chart, run this in CI or manually:
+      # Step 1: delete stale AutoscalingListener CRs (controller recreates immediately)
+      # kubectl delete autoscalinglisteners -A --all
+      #
+      # Step 2: patch each AutoscalingRunnerSet with a dummy annotation to force
+      # EphemeralRunnerSet reconciliation:
+      # kubectl annotate autoscalingrunnersets -A --all \
+      #   upgrade-trigger=$(date +%s) --overwrite
+      #
+      # Note: kubectl annotate updates metadata.annotations, not spec.template.spec,
+      # so it does NOT trigger EphemeralRunnerSet reconciliation. Use the values
+      # approach above (spec.template.metadata.annotations) instead.
+prevention:
+  - 'After every ARC controller upgrade, check AutoscalingListener images and EphemeralRunnerSet labels before routing production traffic.'
+  - 'Add a post-upgrade step to your CI/CD pipeline that deletes AutoscalingListener CRs and adds a dummy upgrade-trigger annotation.'
+  - 'Pin a dummy annotation like `upgrade-trigger: "<version>"` in your HelmRelease values and bump it with each controller upgrade.'
+  - 'Subscribe to actions/actions-runner-controller releases and review EphemeralRunnerSet spec changes before upgrading.'
+  - 'Track the upstream issue at actions/actions-runner-controller#4513 for a platform-side fix.'
+docs:
+  - url: 'https://github.com/actions/actions-runner-controller/issues/4513'
+    label: 'ARC #4513 — AutoscalingListener and EphemeralRunnerSet retain stale controller image/labels after upgrade (open Jun 2026)'
+  - url: 'https://github.com/actions/actions-runner-controller/blob/master/TROUBLESHOOTING.md'
+    label: 'ARC Troubleshooting Guide'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners-with-actions-runner-controller/about-actions-runner-controller'
+    label: 'About Actions Runner Controller'
