@@ -1,0 +1,140 @@
+id: runner-environment-240
+title: 'ARC v0.14.1 listener pods enter infinite crash-loop after upgrade — scaleset v0.3.0 treats broker EOF as fatal'
+category: runner-environment
+severity: error
+tags:
+  - arc
+  - actions-runner-controller
+  - kubernetes
+  - listener
+  - crash-loop
+  - scaleset
+  - ephemeral-runners
+patterns:
+  - regex: 'Listener pod is terminated.*reason.*Error'
+    flags: 'i'
+  - regex: 'scaleset.*v0\.3\.[0-9].*EOF|EOF.*broker.*fatal|EOF.*scaleset.*crash'
+    flags: 'i'
+  - regex: 'AutoscalingListener.*recreate.*loop|listener.*restart.*loop'
+    flags: 'i'
+error_messages:
+  - 'Listener pod is terminated  {"reason": "Error", "message": ""}'
+  - 'level=FATAL source=github.com/actions/scaleset@v0.3.0/listener/listener.go msg="EOF from broker"'
+  - 'AutoscalingListener: listener terminated unexpectedly, recreating'
+root_cause: |
+  ARC (Actions Runner Controller) v0.14.1 upgraded the internal `scaleset` library from
+  v0.2.0 to v0.3.0. The v0.3.0 library introduced a "Restore job acquisition flow" change
+  (scaleset PR #90) that treats **EOF responses from the GitHub Actions broker service**
+  (`broker.actions.githubusercontent.com`) as a **fatal error** instead of a transient
+  condition to retry.
+
+  **Before v0.3.0 (ARC v0.14.0):** EOF from the broker long-poll endpoint was treated as a
+  reconnect signal — the listener would gracefully retry the connection and continue.
+
+  **After v0.3.0 (ARC v0.14.1):** EOF causes the listener to exit with a non-zero status
+  code. The ARC controller detects the pod termination via `Listener pod is terminated`
+  with `reason: "Error"` and immediately recreates the listener pod. The new pod hits
+  another EOF and crashes again — producing an infinite restart loop.
+
+  **Note:** scaleset v0.4.0 does NOT fix this. It addresses a different (message ordering)
+  issue. The EOF-as-fatal regression is still present in v0.4.0.
+
+  **Impact:** All `AutoscalingRunnerSet` resources in the cluster enter crash-loop behavior.
+  Jobs queue but no runners are dispatched. Production ARC deployments can accumulate dozens
+  of error terminations within a 30-60 minute window.
+
+  **GitHub-hosted runners are unaffected** — this only impacts organizations using ARC
+  (self-hosted Kubernetes runners) via Helm chart `gha-runner-scale-set-controller`.
+
+  Source: actions/actions-runner-controller#4488 (May 6, 2026, 4 reactions)
+fix: |
+  **Option 1 (recommended): Downgrade to ARC v0.14.0**
+
+  Roll back the `gha-runner-scale-set-controller` Helm chart to the previous stable version:
+
+  ```
+  helm upgrade gha-runner-scale-set-controller \
+    --namespace arc-systems \
+    actions-runner-controller/gha-runner-scale-set-controller \
+    --version 0.14.0
+  ```
+
+  **Option 2: Wait for ARC v0.14.2+ with the EOF fix**
+
+  Monitor the ARC changelog and release notes at:
+  https://github.com/actions/actions-runner-controller/blob/master/docs/gha-runner-scale-set-controller/README.md#changelog
+
+  **Option 3 (partial mitigation): Reduce listener restart pressure**
+
+  Set `minRunners: 0` on affected `AutoscalingRunnerSet` resources to reduce the frequency
+  of broker long-poll connections that can EOF. This reduces symptom frequency but does
+  not eliminate the crash-loop.
+
+  **How to confirm the root cause:**
+  Check controller logs in the `arc-systems` namespace:
+  ```
+  kubectl logs -n arc-systems -l app=gha-runner-scale-set-controller --since=1h | grep "terminated"
+  ```
+  If you see repeated `Listener pod is terminated {"reason": "Error"}` entries cycling
+  every 1-5 minutes, this is the scaleset v0.3.0 EOF regression.
+fix_code:
+  - language: yaml
+    label: 'Identify crash-loop in controller logs'
+    code: |
+      # Check controller logs for the crash-loop pattern
+      # kubectl logs -n arc-systems deployment/gha-runner-scale-set-controller
+      # Look for repeated:
+      #   Listener pod is terminated  {"reason": "Error", "message": ""}
+      #   AutoscalingListener: recreating listener pod
+
+      # Also check the listener pod itself before it's deleted:
+      # kubectl logs -n arc-systems <listener-pod-name>
+      # Look for scaleset@v0.3.0 in the source path:
+      #   time=... source=github.com/actions/scaleset@v0.3.0/listener/listener.go:179
+      #            msg="Getting next message"
+  - language: yaml
+    label: 'Downgrade ARC controller Helm chart to v0.14.0'
+    code: |
+      # Downgrade via Helm — replace the controller chart version
+      # helm upgrade gha-runner-scale-set-controller \
+      #   --namespace arc-systems \
+      #   actions-runner-controller/gha-runner-scale-set-controller \
+      #   --version 0.14.0
+
+      # Or in your values/ArgoCD/Flux manifest, pin the chart version:
+      # Chart.yaml / helmrelease / kustomize reference:
+      apiVersion: helm.toolkit.fluxcd.io/v2
+      kind: HelmRelease
+      metadata:
+        name: gha-runner-scale-set-controller
+        namespace: arc-systems
+      spec:
+        chart:
+          spec:
+            chart: gha-runner-scale-set-controller
+            version: '0.14.0'   # Pin until EOF crash-loop is fixed in 0.14.2+
+            sourceRef:
+              kind: HelmRepository
+              name: actions-runner-controller
+  - language: yaml
+    label: 'Partial mitigation — set minRunners to 0 to reduce EOF pressure'
+    code: |
+      # gha-runner-scale-set values.yaml
+      # Reducing minRunners to 0 means the listener doesn't stay
+      # permanently connected to the broker, reducing EOF frequency.
+      # NOT a full fix — crash-loop still occurs but less frequently.
+      githubConfigUrl: 'https://github.com/<org>'
+      minRunners: 0     # Reduce from default to limit constant broker connections
+      maxRunners: 10
+prevention:
+  - "Before upgrading ARC to a new minor version, review the changelog at https://github.com/actions/actions-runner-controller/blob/master/docs/gha-runner-scale-set-controller/README.md#changelog for breaking changes in the scaleset library."
+  - "Deploy ARC upgrades to a staging cluster first. Monitor listener pod restarts for 30-60 minutes before rolling out to production."
+  - "Set up alerting on `Listener pod is terminated` log patterns in your ARC controller namespace — frequent terminations signal a crash-loop before it causes widespread job queuing failures."
+  - "Subscribe to release notifications for `actions/actions-runner-controller` to receive timely notice of regression fixes."
+docs:
+  - url: 'https://github.com/actions/actions-runner-controller/issues/4488'
+    label: 'ARC#4488 — Listener pods crash-loop after upgrading to ARC v0.14.1 (4 reactions)'
+  - url: 'https://github.com/actions/actions-runner-controller/blob/master/docs/gha-runner-scale-set-controller/README.md#changelog'
+    label: 'ARC Changelog — gha-runner-scale-set-controller release notes'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners-with-actions-runner-controller/troubleshooting-actions-runner-controller-errors'
+    label: 'GitHub Docs: Troubleshooting Actions Runner Controller errors'
