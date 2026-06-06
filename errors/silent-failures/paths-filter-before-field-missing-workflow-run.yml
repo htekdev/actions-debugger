@@ -1,0 +1,105 @@
+id: silent-failures-107
+title: "dorny/paths-filter Reports All Files Changed When 'before' Field Missing on workflow_run"
+category: silent-failures
+severity: silent-failure
+tags:
+  - paths-filter
+  - workflow_run
+  - before-field
+  - silent-failure
+  - fork-pr
+  - changed-files
+  - wrong-output
+patterns:
+  - regex: '''before'' field is missing in event payload'
+    flags: 'i'
+  - regex: 'changes will be detected from last commit'
+    flags: 'i'
+  - regex: 'paths-filter.*workflow.run'
+    flags: 'i'
+error_messages:
+  - "Warning: 'before' field is missing in event payload - changes will be detected from last commit"
+root_cause: |
+  `dorny/paths-filter` (v3 and earlier) contains an internal code path that requires a
+  `before` SHA field from the GitHub event payload to compute the diff base. When used in
+  a `workflow_run`-triggered workflow, the event payload does not contain a `before` field
+  (it only has `head_sha`, `head_branch`, etc.) — so the action falls into a fallback path
+  that calls `getChangesInLastCommit()` instead of performing a proper merge-base diff.
+
+  The result: **every file in the repository is reported as "changed"**, defeating any
+  attempt to use paths-filter as a change detection gate in `workflow_run` workflows.
+
+  Root cause in source code (paths-filter v3):
+  The action's `getChangedFilesFromGit()` logic normalizes both `base` and `head` to short
+  branch names. On `workflow_run`, `github.context.ref` resolves to the same ref as the
+  user-supplied `base:` (e.g. both become "main"). The `isBaseSameAsHead` check triggers
+  the fallback: if `base === head` AND `beforeSha` is null, the action emits the warning
+  and returns only the last commit's changes — which in a merge-queue or PR workflow is
+  completely wrong.
+
+  The same bug occurs when:
+  - Using paths-filter in a `workflow_run` workflow without explicitly passing `ref:` as a SHA.
+  - Running from a forked PR where the `before` field is absent from the push payload.
+  - Any workflow_run where `github.context.ref` resolves to the same branch name as the
+    `base:` input after short-name normalization.
+fix: |
+  Pass `ref:` explicitly as the HEAD SHA of the triggering workflow run. Using a full SHA
+  prevents the `isBaseSameAsHead` short-circuit because a SHA never equals a branch name
+  after normalization:
+
+    - uses: dorny/paths-filter@v3
+      with:
+        base: 'main'
+        ref: ${{ github.event.workflow_run.head_sha }}
+        filters: |
+          backend:
+            - 'src/**'
+
+  Also ensure the prior `actions/checkout` step uses `fetch-depth: 0` so the action has
+  both `base` and `ref` locally available for `getChangesSinceMergeBase`.
+
+  For fork PRs: use `ref: ${{ github.event.workflow_run.head_sha }}` and
+  `base: ${{ github.event.workflow_run.base_branch }}`.
+
+  Alternative: upgrade to dorny/paths-filter v4.0.1+ which adds native `merge_group`
+  support and has improved ref handling (check release notes for workflow_run fixes).
+fix_code:
+  - language: yaml
+    label: 'Pass ref as SHA to avoid isBaseSameAsHead false-positive on workflow_run'
+    code: |
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+
+      jobs:
+        check-changes:
+          runs-on: ubuntu-latest
+          outputs:
+            backend: ${{ steps.filter.outputs.backend }}
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.workflow_run.head_sha }}
+                fetch-depth: 0
+
+            - uses: dorny/paths-filter@v3
+              id: filter
+              with:
+                base: ${{ github.event.workflow_run.base_branch }}
+                # REQUIRED: pass ref as SHA, not branch name
+                # Without this, base == head after normalization → all files reported as changed
+                ref: ${{ github.event.workflow_run.head_sha }}
+                filters: |
+                  backend:
+                    - 'src/**'
+prevention:
+  - 'Always pass ref: ${{ github.event.workflow_run.head_sha }} when using paths-filter in workflow_run contexts.'
+  - 'Never rely on implicit ref resolution in workflow_run workflows — the context.ref is the default branch, not the PR head.'
+  - 'After fixing, add a smoke-test PR that changes only an unmonitored path and verify paths-filter returns false for the guarded path.'
+  - 'Consider tj-actions/changed-files as an alternative; check its workflow_run documentation before switching.'
+docs:
+  - url: 'https://github.com/dorny/paths-filter/issues/261'
+    label: "Bug: 'before' field is missing when it should not even be used (11 reactions, open)"
+  - url: 'https://github.com/dorny/paths-filter'
+    label: 'dorny/paths-filter — conditionally run actions based on modified files'

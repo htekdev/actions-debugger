@@ -1,0 +1,129 @@
+id: runner-environment-203
+title: 'ARC EphemeralRunner Stuck in Running State After OOM Kill — Scale Set Blocked'
+category: runner-environment
+severity: error
+tags:
+  - arc
+  - actions-runner-controller
+  - ephemeral-runner
+  - oomkill
+  - kubernetes
+  - scale-set
+  - session-conflict
+  - stuck
+  - self-hosted
+patterns:
+  - regex: 'RunnerScaleSetSessionConflictException'
+    flags: 'i'
+  - regex: 'TaskAgentSessionConflictException'
+    flags: 'i'
+  - regex: 'A session for this runner already exists'
+    flags: 'i'
+  - regex: 'Runner connect error: Error: Conflict\. Retrying until reconnected'
+    flags: 'i'
+error_messages:
+  - 'RunnerScaleSetSessionConflictException: there is already an active session'
+  - 'TaskAgentSessionConflictException: Error: Conflict'
+  - 'A session for this runner already exists.'
+  - '2026-XX-XX HH:MM:SSZ: Runner connect error: Error: Conflict. Retrying until reconnected.'
+root_cause: |
+  When an ARC (Actions Runner Controller) ephemeral runner pod is OOM-killed by the
+  Kubernetes kubelet (memory limit exceeded), the pod terminates abruptly without going
+  through the runner's graceful shutdown path. The runner never sends a "job completed" or
+  "runner offline" signal to the GitHub broker.
+
+  As a result:
+  1. The EphemeralRunner custom resource stays in phase `Running` indefinitely.
+  2. The ARC scale-set controller still counts the dead runner as "in use", so it does not
+     spin up a replacement pod to service the next queued job.
+  3. New jobs remain stuck at "Waiting for a runner to pick up this job..." until the
+     stale EphemeralRunner CR is manually deleted.
+
+  When ARC tries to restart the runner (either via a controller health check or manually),
+  the new runner pod connects to the GitHub broker using the same JIT token/session, and
+  the broker responds HTTP 409 Conflict because the old session is still registered:
+
+    TaskAgentSessionConflictException: Error: Conflict
+    A session for this runner already exists.
+    Runner connect error: Error: Conflict. Retrying until reconnected.
+
+  The runner retries every 30 seconds. After the broker's session lease expires (~2-3 min
+  in most cases), the conflict resolves and the runner connects — but the session timeout
+  window varies and can leave the scale set blocked for longer periods.
+
+  Versions affected:
+  - Reproducible across ARC v0.9.x - v0.12.x; partial mitigation added in ARC v0.12.0
+    (stale EphemeralRunner detection), but OOM kills on active runners can still bypass it.
+  - Frequently triggered by Vitest --coverage, Jest with large test suites, or any
+    memory-intensive build tool running without memory limits in the runner container.
+fix: |
+  Immediate recovery: delete the stuck EphemeralRunner CR to release the scale-set slot:
+
+    kubectl delete ephemeralrunner -n <namespace> <runner-name>
+
+  After deletion, ARC will spin up a new runner pod and pick up the queued job.
+
+  Root fix (prevent recurrence):
+  1. Set memory limits on runner containers that match actual job requirements with headroom.
+  2. Add workflow-level `timeout-minutes:` to ensure jobs terminate and release the runner
+     if they run too long.
+  3. Upgrade ARC to v0.12.0+ for improved stale EphemeralRunner detection.
+  4. Configure `terminationGracePeriodSeconds: 90` (or longer) on runner pods to give the
+     runner process time to deregister gracefully before the kubelet force-kills it.
+fix_code:
+  - language: yaml
+    label: 'Set memory limits and timeout on runner pods to prevent OOM kills'
+    code: |
+      # In your HelmRelease / values.yaml for actions-runner-controller
+      githubConfigUrl: "https://github.com/your-org/your-repo"
+      maxRunners: 4
+      minRunners: 0
+      template:
+        spec:
+          terminationGracePeriodSeconds: 90
+          containers:
+            - name: runner
+              image: ghcr.io/actions/actions-runner:latest
+              resources:
+                requests:
+                  memory: "2Gi"
+                  cpu: "500m"
+                limits:
+                  memory: "4Gi"   # Set appropriate limit; OOM kill occurs when exceeded
+                  cpu: "2"
+  - language: yaml
+    label: 'Add workflow timeout to guarantee runner release even on hang'
+    code: |
+      jobs:
+        test:
+          runs-on: arc-runner-set
+          timeout-minutes: 30   # Runner is released after 30 min even if job hangs
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test -- --coverage
+  - language: yaml
+    label: 'Manual recovery: delete stuck EphemeralRunner CR'
+    code: |
+      # List stuck EphemeralRunners
+      kubectl get ephemeralrunner -n arc-systems
+
+      # Delete the stuck one (ARC will create a new pod automatically)
+      kubectl delete ephemeralrunner -n arc-systems <stuck-runner-name>
+
+      # Alternatively, delete all stuck runners in a namespace
+      kubectl delete ephemeralrunner -n arc-systems --field-selector='status.phase=Running'
+prevention:
+  - 'Always set memory limits on ARC runner containers; without limits, a single job can consume all node memory and OOM-kill other runners.'
+  - 'Set timeout-minutes: at the job level for all ARC-backed workflows to guarantee the runner is eventually released.'
+  - 'Upgrade ARC to v0.12.0+ for automatic stale EphemeralRunner cleanup.'
+  - 'Monitor EphemeralRunner phase distribution; a growing count of Running CRs with no corresponding pods is a leading indicator of this issue.'
+  - 'Add terminationGracePeriodSeconds: 90+ to runner pod templates so gradual shutdown signals have time to deregister the runner.'
+docs:
+  - url: 'https://github.com/actions/actions-runner-controller/issues/4155'
+    label: 'EphemeralRunner and its pods left stuck Running after runner OOMKILL (15 reactions)'
+  - url: 'https://github.com/actions/actions-runner-controller/issues/3922'
+    label: 'Scaleset controllers stuck with RunnerScaleSetSessionConflictException (12 reactions)'
+  - url: 'https://github.com/actions/runner/issues/4312'
+    label: 'Self-hosted runner gets stuck in active state, blocking queued jobs across multiple repositories'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners-with-actions-runner-controller'
+    label: 'Managing self-hosted runners with Actions Runner Controller'
