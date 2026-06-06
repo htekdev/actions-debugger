@@ -1,0 +1,93 @@
+id: runner-environment-215
+title: 'setup-node fails with EBADDEVENGINES when devEngines.packageManager.version does not match initial npm'
+category: runner-environment
+severity: error
+tags:
+  - setup-node
+  - npm
+  - devEngines
+  - EBADDEVENGINES
+  - package-manager
+  - npm-version
+patterns:
+  - regex: 'npm error code EBADDEVENGINES'
+    flags: 'i'
+  - regex: 'npm error EBADDEVENGINES.*Invalid devEngines\.packageManager'
+    flags: 'i'
+  - regex: 'npm error EBADDEVENGINES.*Invalid semver version.*does not match.*for "packageManager"'
+    flags: 'i'
+  - regex: '/npm config get cache\s*npm error code EBADDEVENGINES'
+    flags: 'is'
+error_messages:
+  - 'npm error code EBADDEVENGINES'
+  - 'npm error EBADDEVENGINES The developer of this package has specified the following through devEngines'
+  - 'npm error EBADDEVENGINES Invalid devEngines.packageManager'
+  - 'npm error EBADDEVENGINES Invalid semver version "^11.10.0" does not match "10.9.7" for "packageManager"'
+root_cause: |
+  actions/setup-node@v6 runs `npm config get cache` immediately after installing Node.js to
+  determine the npm cache path before activating the package-manager-cache feature. If
+  package.json declares a `devEngines.packageManager.version` constraint (Node.js 22.6+
+  feature) that the bundled npm does NOT satisfy, npm exits with EBADDEVENGINES before
+  returning the cache path.
+
+  The failure happens before setup-node has a chance to upgrade npm to the required version,
+  creating a catch-22: the action needs the cache path to set up, but npm won't answer
+  because the version constraint is not yet met.
+
+  Common scenario: project requires `npm@^11.10.0` (for `min-release-age` or other features
+  added in npm 11.x), but Node 22 ships with npm 10.x. The first `npm` invocation fails
+  immediately when devEngines enforcement is active.
+fix: |
+  Option 1 (recommended) — add `"onFail": "warn"` to the devEngines.packageManager block.
+  This downgrades version mismatches to warnings so npm commands still complete, letting
+  setup-node finish. Install the required npm version in a subsequent step.
+
+  Option 2 — pin Node.js to a version whose bundled npm satisfies devEngines (often
+  impractical).
+
+  Option 3 — set `package-manager-cache: false` in setup-node to skip the cache-path probe
+  entirely and manage npm caching separately.
+fix_code:
+  - language: yaml
+    label: 'Option 1 — add onFail: warn to package.json (fix the root cause)'
+    code: |
+      # In package.json:
+      # {
+      #   "devEngines": {
+      #     "packageManager": {
+      #       "name": "npm",
+      #       "version": "^11.10.0",
+      #       "onFail": "warn"        <-- add this
+      #     }
+      #   }
+      # }
+
+      # In workflow — install the required npm version after setup-node succeeds:
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+      - run: npm install -g npm@^11.10.0
+  - language: yaml
+    label: 'Option 3 — disable package-manager-cache in setup-node'
+    code: |
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          package-manager-cache: false   # skip npm config get cache probe
+      - run: npm install -g npm@^11.10.0
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+prevention:
+  - 'Always pair devEngines.packageManager.version with "onFail": "warn" unless the project must hard-fail on CI for version mismatches.'
+  - 'Use package-manager-cache: false in setup-node and handle npm caching manually when devEngines constraints are strict.'
+  - 'Track the Node.js release schedule to choose a version that ships with an npm satisfying devEngines requirements from day one.'
+  - 'Pin action version in workflow (e.g., actions/setup-node@v6.4.0) and test upgrades in a branch before rolling out.'
+docs:
+  - url: 'https://github.com/actions/setup-node/issues/1553'
+    label: 'setup-node#1553 — EBADDEVENGINES blocks cache-path probe (May 2026)'
+  - url: 'https://docs.npmjs.com/cli/v11/configuring-npm/package-json#devengines'
+    label: 'npm docs — devEngines field and onFail option'
+  - url: 'https://github.com/nodejs/node/issues/62425'
+    label: 'Node.js#62425 — npm installation behavior on Node v22.22.2 with devEngines'
