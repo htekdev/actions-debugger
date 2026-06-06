@@ -1,0 +1,100 @@
+id: runner-environment-202
+title: 'Runner v2.334.0 "Download action repository" repeats for same action when references use different letter casing'
+category: runner-environment
+severity: warning
+tags:
+  - runner
+  - action-resolution
+  - performance
+  - v2.334
+  - composite-actions
+  - case-sensitivity
+patterns:
+  - regex: 'Download action repository.*already been downloaded'
+    flags: 'i'
+  - regex: 'Download action repository.*\d+\.\d+s.*Download action repository'
+    flags: 'i'
+  - regex: 'Resolving action.*batching.*dedup.*failed|action.*resolution.*duplicate.*case'
+    flags: 'i'
+error_messages:
+  - 'Download action repository ''actions/checkout@v4'' (SHA:abc123...) 18.35s'
+  - 'Download action repository ''Actions/Checkout@v4'' (SHA:abc123...) 19.12s'
+  - 'Download action repository ''ACTIONS/CHECKOUT@v4'' (SHA:abc123...) 17.88s'
+root_cause: |
+  Runner v2.334.0 introduced "batch and deduplicate action resolution across composite
+  depths" to speed up jobs with many actions. The deduplication logic uses a
+  case-sensitive equality check on the action reference string (owner/repo@ref). When
+  the same action is referenced with different capitalizations — for example,
+  actions/checkout@v4 in one workflow step and Actions/Checkout@v4 inside a composite
+  action — the deduplication logic treats them as distinct actions and downloads both.
+
+  This regression is tracked in actions/runner#3731. Each duplicate download takes
+  15-20 seconds, which multiplies across all case-variant references in a job. In
+  workflows with many composite actions or large action dependency trees, this can add
+  several minutes of silent overhead.
+
+  The issue does not cause a build failure — the downloads resolve to the same SHA
+  and the action runs once. The cost is purely in duplicate network traffic, API
+  calls, and elapsed time. Repeated downloads also count against GitHub API rate
+  limits for private runners or GHES installations.
+
+  Most commonly observed when:
+  - Composite actions use uppercase or title-case owners in their uses: fields
+  - Third-party actions internally call actions/core or actions/toolcache with
+    inconsistent casing
+  - Workflows mix community-contributed composite actions with differing conventions
+fix: |
+  Canonicalize all action references to lowercase owner/repo throughout your
+  workflow files and composite action.yml files. GitHub API lookups are
+  case-insensitive, so actions/checkout and Actions/Checkout resolve identically,
+  but the v2.334.0 deduplication cache is case-sensitive.
+
+  After fixing, run the job again to confirm "Download action repository" appears
+  only once per unique action in the logs.
+
+  A fix for the runner-side deduplication (case-insensitive cache key) is tracked
+  in actions/runner#3731 and may be included in a future runner release.
+fix_code:
+  - language: yaml
+    label: 'Bug: mixed-case action references cause repeated downloads'
+    code: |
+      # workflow.yml — uses lowercase
+      steps:
+        - uses: actions/checkout@v4
+
+      # internal/composite/action.yml — uses title-case (different casing)
+      runs:
+        using: composite
+        steps:
+          - uses: Actions/Checkout@v4   # triggers a second download in v2.334.0
+  - language: yaml
+    label: 'Fix: canonicalize to lowercase owner/repo in all workflow and composite action files'
+    code: |
+      # workflow.yml
+      steps:
+        - uses: actions/checkout@v4   # lowercase
+
+      # internal/composite/action.yml
+      runs:
+        using: composite
+        steps:
+          - uses: actions/checkout@v4   # lowercase matches — deduplicated correctly
+  - language: yaml
+    label: 'Diagnostic: detect duplicate downloads by searching job logs'
+    code: |
+      # In the Actions UI, open the job log and search for "Download action repository"
+      # If the same action appears more than once (even with different casing), you
+      # have duplicate downloads.
+      #
+      # CLI equivalent (with gh):
+      # gh run view <run-id> --log | grep "Download action repository" | sort | uniq -c
+prevention:
+  - 'Use consistent lowercase owner/repo for all action references across workflow files and composite actions'
+  - 'Add an actionlint check to CI; it flags inconsistent action reference casing'
+  - 'Audit composite action.yml files for uppercase uses: references, as they are the most common source'
+  - 'Pin runner version to v2.333.0 as a temporary workaround while waiting for runner#3731 fix'
+docs:
+  - url: 'https://github.com/actions/runner/issues/3731'
+    label: 'GitHub runner#3731: Download action repository called repeatedly for same action (case-sensitivity)'
+  - url: 'https://github.com/actions/runner/releases/tag/v2.334.0'
+    label: 'Runner v2.334.0 release notes: batch and deduplicate action resolution'
