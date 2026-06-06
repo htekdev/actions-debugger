@@ -1,0 +1,161 @@
+id: permissions-auth-069
+title: 'OIDC trust policy silently fails for repos missing required custom property claim — repository_property:* absent when property unset'
+category: permissions-auth
+severity: error
+tags:
+  - oidc
+  - custom-properties
+  - trust-policy
+  - aws
+  - azure
+  - gcp
+  - repository-property
+  - april-2026
+patterns:
+  - regex: 'Not authorized to perform sts:AssumeRoleWithWebIdentity'
+    flags: 'i'
+  - regex: 'AccessDenied.*AssumeRoleWithWebIdentity|WebIdentityErr.*AccessDenied'
+    flags: 'i'
+  - regex: 'Couldn''t retrieve OIDC token.*403|OIDC token.*invalid.*claim'
+    flags: 'i'
+  - regex: 'Error: Credentials could not be loaded.*OIDC'
+    flags: 'i'
+error_messages:
+  - 'Error: Not authorized to perform sts:AssumeRoleWithWebIdentity'
+  - 'AccessDenied: User: arn:aws:sts::... is not authorized to perform: sts:AssumeRoleWithWebIdentity'
+  - 'Error: Credentials could not be loaded, please check your action inputs: Could not load credentials from any providers'
+  - 'google.auth.exceptions.DefaultCredentialsError: OIDC token condition not satisfied'
+root_cause: |
+  GitHub Actions OIDC tokens now include `repository_property:{name}` claims for each
+  custom property set on the repository (generally available from April 2026). This
+  feature lets organizations create finer-grained cloud trust policies — for example,
+  only allowing OIDC authentication for repos whose `deploy_tier` custom property is
+  set to `production`.
+
+  However, the claim is **absent from the OIDC token when the property is not set on
+  the repository**. Cloud providers (AWS IAM, Azure AD, Google Cloud) evaluate a
+  missing claim as a condition failure:
+
+  - **AWS IAM** `Condition: { StringEquals: { "...repository_property:deploy_tier": "production" } }`
+    → `AccessDenied` if the repo has no `deploy_tier` property set
+  - **GCP** workload identity attribute conditions on `attribute.repository_property_*`
+    → condition evaluates false, token exchange rejected
+
+  Common scenarios that trigger this:
+  1. **Org-wide trust policy** uses a custom property claim, but individual repos have
+     not been tagged with the required property.
+  2. **Property renamed or deleted** — the trust policy still references the old
+     property name; the token no longer includes the old claim.
+  3. **Fork PRs** — forked repositories do not inherit the parent org's custom
+     properties; OIDC tokens from fork CI lack the expected claims.
+  4. **New repo** — a repository was added to the org after the trust policy was
+     configured; the property has not yet been applied to it.
+
+  The error message (`Not authorized to perform sts:AssumeRoleWithWebIdentity`) is
+  identical to other OIDC failures (wrong `sub`, wrong `aud`, expired token) and gives
+  no indication that a missing custom property claim is the cause.
+fix: |
+  1. **Verify the claim is present in the token**: Use the GitHub OIDC debugger or
+     print the decoded token payload in a workflow step to confirm the
+     `repository_property:{name}` claim exists and has the expected value.
+
+  2. **Ensure the custom property is set on all target repos**: In the org settings,
+     verify that every repository expected to use the trust policy has the required
+     property configured. Newly added repos will not have it by default.
+
+  3. **Make the condition optional (if the property may not always be set)**:
+     In AWS IAM, use `StringLike` with a wildcard or remove the custom-property
+     condition from the trust policy; use a separate, more permissive role for repos
+     without the property.
+
+  4. **For fork PRs**: custom properties on the upstream org do not flow to forks.
+     Avoid trust policies that require custom property claims in workflows triggered
+     by `pull_request` from external forks.
+fix_code:
+  - language: yaml
+    label: 'Debug step — print OIDC token claims to diagnose missing custom property'
+    code: |
+      jobs:
+        debug-oidc:
+          runs-on: ubuntu-latest
+          permissions:
+            id-token: write
+          steps:
+            - name: Fetch OIDC token and decode payload
+              run: |
+                TOKEN=$(curl -sH "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+                  "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r '.value')
+                # Decode payload (second segment of JWT, base64url-encoded)
+                echo "$TOKEN" | cut -d. -f2 | tr '_-' '/+' \
+                  | base64 -d 2>/dev/null | jq .
+              # Look for "repository_property:your_property_name" in the output.
+              # If the claim is missing, the repo does not have that property set.
+
+  - language: yaml
+    label: 'AWS IAM trust policy — correct use of repository_property claim'
+    code: |
+      # AWS IAM role trust policy (JSON, not YAML — shown here for reference)
+      # Only allow OIDC from repos where custom property "deploy_tier" = "production"
+      {
+        "Version": "2012-10-17",
+        "Statement": [{
+          "Effect": "Allow",
+          "Principal": { "Federated": "arn:aws:iam::ACCOUNT:oidc-provider/token.actions.githubusercontent.com" },
+          "Action": "sts:AssumeRoleWithWebIdentity",
+          "Condition": {
+            "StringEquals": {
+              "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+              "token.actions.githubusercontent.com:repository_property:deploy_tier": "production"
+            }
+          }
+        }]
+      }
+      # IMPORTANT: Every repo that runs this workflow MUST have the "deploy_tier"
+      # custom property set to "production" in org settings. If the property is
+      # unset or absent, the token will not include the claim and the assume-role
+      # call will return AccessDenied.
+
+  - language: yaml
+    label: 'Workflow — ensure the custom property claim is available before assuming role'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          permissions:
+            id-token: write
+            contents: read
+          steps:
+            - uses: actions/checkout@v4
+
+            # Verify the custom property claim is present before assuming the role
+            - name: Validate OIDC custom property claim
+              run: |
+                TOKEN=$(curl -sH "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+                  "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r '.value')
+                PAYLOAD=$(echo "$TOKEN" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null)
+                TIER=$(echo "$PAYLOAD" | jq -r '."repository_property:deploy_tier" // "MISSING"')
+                echo "deploy_tier claim: $TIER"
+                if [[ "$TIER" != "production" ]]; then
+                  echo "::error::Repository custom property 'deploy_tier' is not set to 'production'. Set it in org settings before running this workflow."
+                  exit 1
+                fi
+
+            - name: Configure AWS credentials via OIDC
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-to-assume: arn:aws:iam::123456789012:role/my-production-deploy-role
+                aws-region: us-east-1
+
+prevention:
+  - 'Maintain a registry of which repositories have each custom property set — before applying a trust policy that requires a custom property claim, verify all target repos have the property configured.'
+  - 'When adding a new repo to an org that uses OIDC custom property trust policies, immediately apply the required custom properties before running any workflows that assume cloud roles.'
+  - 'Do not use repository custom property claims in OIDC trust policies for workflows triggered by external fork pull requests — forks do not inherit the upstream org''s custom properties.'
+  - 'Add a preflight validation step to workflows that assume cloud roles — verify the expected repository_property:* claim is present in the OIDC token before calling the cloud provider.'
+  - 'If a custom property is renamed or removed, update all OIDC trust policies before the change takes effect to avoid sudden AccessDenied failures.'
+docs:
+  - url: 'https://github.blog/changelog/2026-04-02-github-actions-early-april-2026-updates/#actions-oidc-tokens-now-support-repository-custom-properties'
+    label: 'GitHub Changelog: OIDC tokens now support repository custom properties (April 2026)'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect#customizing-the-token-claims'
+    label: 'GitHub Docs: Customizing OIDC token claims — repository custom properties'
+  - url: 'https://docs.github.com/en/organizations/managing-organization-settings/managing-custom-properties-for-repositories-in-your-organization'
+    label: 'GitHub Docs: Managing custom properties for repositories in your organization'
