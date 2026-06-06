@@ -1,0 +1,110 @@
+id: silent-failures-113
+title: 'Org-level self-hosted runner with correct group access never dispatched — job stays Queued indefinitely with no error'
+category: silent-failures
+severity: silent-failure
+tags:
+  - self-hosted
+  - runner-group
+  - org-runner
+  - dispatch
+  - queued
+  - v2-broker
+  - silent
+patterns:
+  - regex: 'runner_group_id.*null'
+    flags: 'i'
+  - regex: 'Waiting for a runner to pick up this job'
+    flags: 'i'
+error_messages:
+  - 'Waiting for a runner to pick up this job'
+  - '(job stays in Queued state indefinitely — no error message is displayed)'
+root_cause: |
+  When a self-hosted runner is registered at the **organization level** (not the
+  repository level) and added to a runner group with explicit per-repository access,
+  a bug in the V2 broker flow (`useV2Flow: true`,
+  `serverUrl: broker.actions.githubusercontent.com`) can cause the dispatcher to fail
+  to resolve the runner group membership against the target repository.
+
+  The result: the queued job never receives a `runner_group_id` assignment
+  (confirmed via `GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs` API, which
+  returns `runnerId: null`, `runnerName: null`, `runnerGroupId: null` throughout the
+  entire queue duration). The runner is online and idle throughout — it simply is
+  never offered the job.
+
+  From the UI perspective, the job shows the standard "Waiting for a runner to pick
+  up this job" message with no indication that the runner group resolution failed.
+  No error annotation is ever produced — the workflow just hangs until cancelled.
+
+  This failure mode has been observed under these conditions:
+  - Runner registered at organization scope
+  - Runner group has explicit per-repository access (not "All repositories")
+  - Runner version 2.334.0, V2 broker protocol enabled
+  - GitHub Team plan
+  - GitHub Enterprise Cloud is NOT required to reproduce
+
+  Repository-level runners using identical labels and configuration dispatch
+  correctly, confirming the bug is specific to the org-level + runner-group + V2
+  broker path.
+
+  The precise broker-side failure point is unknown; the hypothesis is an inconsistency
+  in how V2 broker resolves org runner group → repository access grant at dispatch time.
+fix: |
+  Immediate workaround: re-register the runner at the repository level instead of
+  the organization level.
+
+  1. Stop and unregister the org-level runner:
+     cd <runner-dir> && ./config.sh remove --token <removal-token>
+
+  2. Re-register at repository level:
+     ./config.sh --url https://github.com/<org>/<repo> --token <repo-token>
+
+  3. Trigger the workflow again — dispatch should proceed immediately.
+
+  If you need the runner to serve multiple repositories, repeat the registration
+  for each repository, or use runner groups with "All repositories" scope as an
+  interim workaround until GitHub resolves the V2 broker dispatch bug.
+
+  Track actions/runner#4429 for an official fix.
+fix_code:
+  - language: bash
+    label: 'Re-register runner at repository level instead of org level'
+    code: |
+      cd /path/to/runner
+
+      # Remove org-level registration
+      ./config.sh remove --token <ORG_REMOVAL_TOKEN>
+
+      # Re-register at repository level
+      ./config.sh \
+        --url https://github.com/<org>/<repo> \
+        --token <REPO_RUNNER_TOKEN> \
+        --name my-runner \
+        --labels my-label \
+        --unattended
+
+      # Start the runner
+      ./run.sh
+
+  - language: yaml
+    label: 'Workflow — no workflow change needed; fix is in runner registration scope'
+    code: |
+      # No changes needed in the workflow YAML itself.
+      # The runs-on label works correctly once the runner is repo-scoped.
+      jobs:
+        build:
+          runs-on: [self-hosted, my-label]
+          steps:
+            - uses: actions/checkout@v4
+            - run: echo "Runner dispatched correctly"
+prevention:
+  - 'Prefer repository-level runner registration for single-repo pipelines; use org-level runners only when the runner must serve many repos and test dispatch before rolling out.'
+  - 'After registering an org-level runner, verify dispatch with a simple echo workflow before building production pipelines on top of it.'
+  - 'Monitor actions/runner#4429 for a fix to the V2 broker org-runner-group dispatch resolution bug.'
+  - 'When investigating stuck jobs, use the REST API (GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs) to check if runnerGroupId is null — this confirms dispatch resolution failure rather than a resource-wait.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4429'
+    label: 'actions/runner#4429 — Org-level self-hosted runner never dispatched despite correct runner group repo access'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/adding-self-hosted-runners'
+    label: 'GitHub Docs — Adding self-hosted runners (org vs repo level)'
+  - url: 'https://docs.github.com/en/rest/actions/self-hosted-runners'
+    label: 'GitHub REST API — Self-hosted runners'
