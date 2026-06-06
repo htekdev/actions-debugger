@@ -1,0 +1,120 @@
+id: runner-environment-246
+title: 'Container `options:` empty string from matrix causes "The template is not valid. Unexpected value''" in runner >= 2.331.0'
+category: runner-environment
+severity: error
+tags:
+  - container
+  - matrix
+  - container-options
+  - runner-regression
+  - template-validation
+  - runner-2331
+patterns:
+  - regex: 'The template is not valid.*Unexpected value'
+    flags: 'i'
+  - regex: 'Unexpected value .{0,5}\.github/workflows'
+    flags: 'i'
+error_messages:
+  - "Error: The template is not valid. .github/workflows/deploy.yml (Line: 42, Col: 15): Unexpected value ''"
+  - "Error: The template is not valid. .github/workflows/ci.yml (Line: 18, Col: 9): Unexpected value ''"
+root_cause: |
+  In runner version 2.331.0, a regression was introduced in template validation for
+  container job `options:` fields. When a workflow uses a matrix to conditionally set
+  container options — so that some matrix combinations have no container options
+  (`options: ''` or `options: ${{ matrix.container_options }}` where the value is
+  unset/empty) — the runner's template evaluator now rejects the empty string with
+  "Unexpected value ''" and marks the job as failed before it even starts.
+
+  Prior to runner 2.331.0, an empty `options:` string was silently accepted and the
+  container job ran without extra Docker options. The 2.331.0 release tightened template
+  validation for the `container.options` field, rejecting any expression that evaluates
+  to an empty string at runtime.
+
+  **Common trigger pattern:**
+  ```yaml
+  strategy:
+    matrix:
+      include:
+        - os: ubuntu
+          container_options: "--memory=2g"
+        - os: alpine
+          # No container_options key — evaluates to empty string
+  jobs:
+    build:
+      container:
+        image: myapp:latest
+        options: ${{ matrix.container_options }}  # empty for alpine row
+  ```
+
+  This pattern worked on runner 2.330.0 but fails on 2.331.0+ with "Unexpected value ''".
+  The issue is tracked in actions/runner#4204 (open, labeled bug, Jan 2026).
+fix: |
+  Add a fallback non-empty value to the options expression using the `||` operator.
+  A single space `' '` is enough to satisfy the validator while having no effect on
+  the container invocation, since Docker ignores empty/whitespace-only option strings.
+
+  Replace:
+    options: ${{ matrix.container_options }}
+
+  With:
+    options: ${{ matrix.container_options || ' ' }}
+
+  Alternatively, restructure the matrix to always provide a defined (non-empty)
+  `container_options` value, using a neutral default like `'--label=placeholder'`
+  for rows that don't need real options. This is more explicit and survives future
+  validator changes.
+fix_code:
+  - language: yaml
+    label: 'Fallback to single space so template validator accepts an empty matrix value'
+    code: |
+      strategy:
+        matrix:
+          include:
+            - name: with-limits
+              container_options: "--memory=2g --cpus=1"
+            - name: no-limits
+              # container_options intentionally absent
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          container:
+            image: myapp:latest
+            # ✅ Use || ' ' to avoid empty-string rejection in runner >= 2.331.0
+            options: ${{ matrix.container_options || ' ' }}
+          steps:
+            - uses: actions/checkout@v4
+            - run: make build
+  - language: yaml
+    label: 'Explicit neutral default in the matrix row avoids the ambiguity entirely'
+    code: |
+      strategy:
+        matrix:
+          include:
+            - name: with-limits
+              container_options: "--memory=2g --cpus=1"
+            - name: no-limits
+              # ✅ Always set a value — Docker ignores a dummy label at no cost
+              container_options: "--label=no-extra-opts"
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          container:
+            image: myapp:latest
+            options: ${{ matrix.container_options }}
+          steps:
+            - uses: actions/checkout@v4
+            - run: make build
+prevention:
+  - 'Never let `container.options` evaluate to an empty string — always provide a neutral fallback with `|| '' ''` or a dummy label'
+  - 'Test matrix workflows with every combination, including rows that skip optional matrix keys like `container_options`'
+  - 'Pin runner version in self-hosted setups to detect regressions before rolling out to all jobs'
+  - 'Track actions/runner#4204 for a permanent fix; apply the `|| '' ''` workaround in the interim'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4204'
+    label: 'actions/runner#4204: "The template is not valid" when container.options is not set in matrix (open, regression in 2.331.0)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/running-jobs-in-a-container'
+    label: 'GitHub Docs: Running jobs in a container — options field'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idcontaineroptions'
+    label: 'GitHub Docs: jobs.<job_id>.container.options'
