@@ -1,0 +1,125 @@
+id: yaml-syntax-078
+title: '`vars.*` context returns empty string for undefined configuration variables, causing "unexpected value ''" in reusable workflow with: inputs'
+category: yaml-syntax
+severity: error
+tags:
+  - vars-context
+  - reusable-workflow
+  - workflow-call
+  - configuration-variables
+  - empty-string
+  - unexpected-value
+patterns:
+  - regex: 'evaluate reusable workflow inputs.*unexpected value'
+    flags: 'i'
+  - regex: 'vars\.\w+.*unexpected value|unexpected value.*vars\.\w+'
+    flags: 'i'
+  - regex: 'unexpected value ''''.*reusable.*input|reusable.*input.*unexpected value '''''
+    flags: 'i'
+error_messages:
+  - "evaluate reusable workflow inputs: key 'my-input': unexpected value ''"
+  - "evaluate reusable workflow inputs: unexpected value '' for boolean input"
+  - "Error: evaluate reusable workflow inputs: ... unexpected value ''"
+root_cause: |
+  When a caller workflow passes a `vars.*` context expression to a reusable workflow's
+  `with:` input, and that configuration variable is not defined in the repository or
+  organization settings, `${{ vars.SOME_VAR }}` evaluates to an empty string `""`.
+
+  Reusable workflow inputs that are typed as `boolean` or `number` (or have strict
+  validation) reject the empty string `""` with the error:
+    evaluate reusable workflow inputs: ... unexpected value ''
+
+  For `type: boolean` inputs, the only valid values are `"true"` or `"false"`.
+  An empty string `""` is not a valid boolean and triggers this error.
+  For `type: number` inputs, `""` is not parseable as a number.
+
+  Even for `type: string` inputs with `required: true`, some versions of the runner
+  treat `""` as "not provided" and reject it with this error.
+
+  Root causes of the empty string:
+  1. The developer never created the configuration variable in the repository/organization
+     Settings → Variables UI. `vars.*` is the context for configuration variables (set
+     in the UI), NOT for environment variables set with `env:` in the workflow YAML.
+  2. The variable was created at the wrong scope — e.g., created as an environment-level
+     variable but the workflow doesn't reference a matching environment.
+  3. The variable name was mistyped — `vars.MY_VAR` but the setting is named `MY_VAr`
+     (case-sensitive match is required).
+
+  This is a common confusion: developers sometimes set `env:` workflow-level variables
+  expecting them to be accessible via `vars.*`, but `vars.*` only resolves variables
+  set in the GitHub repository/organization/environment Settings UI.
+fix: |
+  Option 1 — Create the configuration variable in GitHub Settings:
+  Go to your repository (or organization/environment) Settings → Secrets and variables
+  → Actions → Variables tab, and create the variable `SOME_VAR` with the desired value.
+  The `vars.SOME_VAR` expression will then resolve correctly.
+
+  Option 2 — Provide a fallback default using the `||` operator in the caller workflow:
+  Pass `${{ vars.SOME_VAR || 'default-value' }}` to avoid passing an empty string when
+  the variable is unset. The reusable workflow input then receives `'default-value'`
+  instead of `''`.
+
+  Option 3 — Use the `inputs.` default in the reusable workflow definition:
+  In the reusable workflow's `on.workflow_call.inputs`, set a `default:` value so the
+  input has a sensible fallback even when the caller passes an empty string.
+
+  For boolean inputs specifically — always coerce `vars.*` to boolean in the caller:
+  Use `${{ vars.ENABLE_FEATURE == 'true' }}` to convert the string variable value to
+  a proper boolean rather than passing the raw string.
+fix_code:
+  - language: yaml
+    label: 'Caller workflow — provide default fallback for undefined vars.*'
+    code: |
+      jobs:
+        call-reusable:
+          uses: org/repo/.github/workflows/reusable.yml@main
+          with:
+            # ❌ Fails with "unexpected value ''" if SOME_ARG_A is not set:
+            # some-arg-a: ${{ vars.SOME_ARG_A }}
+
+            # ✅ Provide a fallback when the variable is unset:
+            some-arg-a: ${{ vars.SOME_ARG_A || 'default-value' }}
+
+            # ✅ For boolean inputs — convert the string to actual boolean:
+            # enable-feature: ${{ vars.ENABLE_FEATURE == 'true' }}
+
+  - language: yaml
+    label: 'Reusable workflow — define a default for the input'
+    code: |
+      # In the reusable workflow definition:
+      on:
+        workflow_call:
+          inputs:
+            some-arg-a:
+              type: string
+              required: false   # Make it optional if a default makes sense
+              default: 'default-value'
+              description: 'Argument A (can be overridden by vars.SOME_ARG_A in caller)'
+
+      # ✅ Now even if caller passes '' or omits the input, the default is used
+
+  - language: yaml
+    label: 'Caller workflow — coerce vars.* string to boolean for boolean inputs'
+    code: |
+      jobs:
+        call-reusable:
+          uses: org/repo/.github/workflows/reusable.yml@main
+          with:
+            # ❌ Passing vars.ENABLE_FEATURE ('true'/'false' string or '') to bool input:
+            # enable-feature: ${{ vars.ENABLE_FEATURE }}
+
+            # ✅ Coerce the string value to an actual boolean:
+            enable-feature: ${{ vars.ENABLE_FEATURE == 'true' }}
+prevention:
+  - "Use `vars.*` only for configuration variables set in the GitHub repository/organization/environment Settings UI — not for `env:` YAML workflow variables"
+  - "Always provide a `||` fallback when passing `vars.*` to a reusable workflow input: `${{ vars.MY_VAR || 'default' }}`"
+  - "For boolean reusable workflow inputs, coerce `vars.*` strings with `${{ vars.FLAG == 'true' }}` instead of passing the raw string"
+  - "Verify the variable name and scope in Settings → Secrets and variables → Actions → Variables before using it in a workflow"
+  - "Set `required: false` with a `default:` in the reusable workflow definition to make inputs resilient to empty string values"
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/variables#using-the-vars-context-to-access-configuration-variable-values'
+    label: 'GitHub Docs — vars context for configuration variables (distinct from env: YAML variables)'
+  - url: 'https://docs.github.com/en/actions/sharing-automations/reusing-workflows#using-inputs-and-secrets-in-a-reusable-workflow'
+    label: 'GitHub Docs — Using inputs in a reusable workflow (types, required, defaults)'
+  - url: 'https://stackoverflow.com/questions/79949037/consumers-callers-vars-value-passed-and-blank-strings-for-reusable-inputs'
+    label: "Stack Overflow — Consumer's/caller's vars value passed and blank strings for reusable inputs (May 2026)"

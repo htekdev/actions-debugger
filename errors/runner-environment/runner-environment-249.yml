@@ -1,0 +1,144 @@
+id: runner-environment-249
+title: '`actions/github-script@v9` breaking changes — `const getOctokit` SyntaxError + `require(''@actions/github'')` ERR_REQUIRE_ESM'
+category: runner-environment
+severity: error
+tags:
+  - github-script
+  - v9
+  - breaking-change
+  - getOctokit
+  - esm
+  - require
+  - SyntaxError
+  - octokit
+patterns:
+  - regex: 'SyntaxError.*Identifier.*getOctokit.*already been declared'
+    flags: 'i'
+  - regex: "require.*@actions/github.*ERR_REQUIRE_ESM|ERR_REQUIRE_ESM.*@actions/github"
+    flags: 'i'
+  - regex: 'github-script.*v9.*const getOctokit|const getOctokit.*github-script.*v9'
+    flags: 'i'
+  - regex: "require.*@actions/github.*ES Module.*not supported"
+    flags: 'i'
+error_messages:
+  - "SyntaxError: Identifier 'getOctokit' has already been declared"
+  - "Error [ERR_REQUIRE_ESM]: require() of ES Module /node_modules/@actions/github/lib/github.js is not supported."
+  - "Instead change the require of index.js to a dynamic import() which is available in all CommonJS modules."
+root_cause: |
+  `actions/github-script@v9.0.0` (released April 9, 2026) introduced two breaking changes
+  compared to v8 and earlier:
+
+  BREAKING CHANGE 1: `getOctokit` is now an injected function parameter
+  In v9, the `getOctokit` factory function is injected directly into the script's
+  execution context as a named function parameter (alongside `github`, `context`, `core`,
+  etc.). This means `getOctokit` is now a declared parameter name in the script scope.
+
+  If a script re-declares `getOctokit` using `const` or `let`, JavaScript throws a
+  SyntaxError at parse time because re-declaring a `const`/`let` binding that already
+  exists in scope is illegal:
+
+    const getOctokit = require('@octokit/rest').Octokit  // ❌ SyntaxError in v9
+    let getOctokit = ...                                  // ❌ SyntaxError in v9
+
+  Using `var` avoids this issue because `var` allows redeclaration in the same scope
+  (though the injected value will be shadowed).
+
+  BREAKING CHANGE 2: `require('@actions/github')` no longer works
+  `@actions/github` v9 is an ESM-only package. The `github-script` execution context
+  is CommonJS (CJS). Calling `require('@actions/github')` from within a script will
+  fail at runtime:
+
+    const { getOctokit } = require('@actions/github')   // ❌ ERR_REQUIRE_ESM in v9
+
+  This pattern was previously used in v7/v8 scripts to create secondary Octokit
+  clients with custom tokens. In v9, this is replaced by the injected `getOctokit`
+  function parameter, which eliminates the need to require `@actions/github` at all.
+
+  Impact: Scripts that used `require('@actions/github')` to create custom clients
+  (e.g., for cross-organization access or GitHub App tokens) will fail when the
+  action is upgraded or when `@latest` resolves to v9.
+fix: |
+  FIX FOR BREAKING CHANGE 1 (SyntaxError: 'getOctokit' already declared):
+  Remove or rename the local `getOctokit` variable declaration. The injected
+  `getOctokit` is available directly in the script scope without any import.
+  If you need to keep the variable name, use `var` instead of `const`/`let` — or
+  simply rename the local variable to something else.
+
+  FIX FOR BREAKING CHANGE 2 (ERR_REQUIRE_ESM from require('@actions/github')):
+  Replace the `require('@actions/github')` pattern with the injected `getOctokit`
+  function. In v9, `getOctokit(token)` is available directly in the script context
+  and accepts a PAT or GitHub App token to create a secondary authenticated client.
+
+  General recommendation: pin to `actions/github-script@v9` explicitly and
+  migrate your scripts using the patterns below.
+fix_code:
+  - language: yaml
+    label: 'Fix SyntaxError — use injected getOctokit directly, remove const/let redeclaration'
+    code: |
+      - uses: actions/github-script@v9
+        with:
+          script: |
+            # ❌ v8 and earlier — required declaration to get getOctokit:
+            # const { getOctokit } = require('@actions/github')
+            # const myOctokit = getOctokit(process.env.MY_TOKEN)
+
+            # ❌ v9 SyntaxError — can't redeclare the injected getOctokit parameter:
+            # const getOctokit = require('@actions/github').getOctokit   // SyntaxError!
+
+            # ✅ v9 — getOctokit is injected directly; use it without any import:
+            const myOctokit = getOctokit(process.env.MY_TOKEN)
+            const result = await myOctokit.rest.repos.get({
+              owner: 'my-org',
+              repo: 'my-private-repo',
+            })
+            core.info(`Repo: ${result.data.full_name}`)
+        env:
+          MY_TOKEN: ${{ secrets.MY_CROSS_REPO_TOKEN }}
+
+  - language: yaml
+    label: 'Fix ERR_REQUIRE_ESM — replace require(''@actions/github'') with injected getOctokit'
+    code: |
+      - uses: actions/github-script@v9
+        with:
+          script: |
+            # ❌ v8 pattern — fails with ERR_REQUIRE_ESM in v9:
+            # const { getOctokit } = require('@actions/github')
+            # const crossOrgClient = getOctokit(process.env.CROSS_ORG_TOKEN)
+
+            # ✅ v9 pattern — use injected getOctokit directly:
+            const crossOrgClient = getOctokit(process.env.CROSS_ORG_TOKEN)
+            await crossOrgClient.rest.issues.create({
+              owner: 'other-org',
+              repo: 'other-repo',
+              title: 'Cross-org issue from Actions',
+              body: 'Created via github-script v9 getOctokit factory'
+            })
+        env:
+          CROSS_ORG_TOKEN: ${{ secrets.CROSS_ORG_PAT }}
+
+  - language: yaml
+    label: 'Use dynamic import() as alternative for @actions/github internals'
+    code: |
+      - uses: actions/github-script@v9
+        with:
+          script: |
+            # If you need @actions/github internals beyond getOctokit/github,
+            # use dynamic import() — ESM packages can be imported this way in github-script:
+            const actionsGithub = await import('@actions/github')
+            const customClient = actionsGithub.getOctokit(process.env.MY_TOKEN)
+            core.info('Loaded via dynamic import')
+        env:
+          MY_TOKEN: ${{ secrets.MY_TOKEN }}
+prevention:
+  - "Pin `uses: actions/github-script@v9` (not `@latest`) to control when you upgrade and avoid surprise breaking changes"
+  - "Remove all `require('@actions/github')` calls from github-script scripts — use the injected `getOctokit` function parameter instead"
+  - "Never re-declare `getOctokit`, `github`, `context`, `core`, `exec`, `glob`, `io`, `fetch`, or `require` with `const`/`let` — these are all injected parameters in v9"
+  - "When creating secondary Octokit clients, use `getOctokit(token)` directly without any imports — this pattern works in all versions of github-script that inject the factory"
+  - "Review the v9.0.0 release notes when upgrading from v8: https://github.com/actions/github-script/releases/tag/v9.0.0"
+docs:
+  - url: 'https://github.com/actions/github-script/releases/tag/v9.0.0'
+    label: 'actions/github-script v9.0.0 release notes — breaking changes (April 9, 2026)'
+  - url: 'https://github.com/actions/github-script#creating-additional-clients-with-getoctokit'
+    label: 'actions/github-script README — Creating additional clients with getOctokit (v9 pattern)'
+  - url: 'https://github.com/actions/github-script/pull/700'
+    label: 'actions/github-script PR#700 — add getOctokit to script context, upgrade @actions/github v9'
