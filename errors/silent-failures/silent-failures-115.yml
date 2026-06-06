@@ -1,0 +1,130 @@
+id: silent-failures-115
+title: 'actions/cache save exits 0 and logs "Cache saved" despite 503 backend upload failures'
+category: silent-failures
+severity: silent-failure
+tags:
+  - actions/cache
+  - cache-save
+  - 503
+  - backend-error
+  - silent-success
+  - false-positive
+  - upload
+patterns:
+  - regex: 'Cache service responded with 503'
+    flags: 'i'
+  - regex: 'uploadChunk .+ failed: Cache service responded with'
+    flags: 'i'
+  - regex: 'Warning: Failed to save: uploadChunk .+ failed'
+    flags: 'i'
+error_messages:
+  - 'Warning: Failed to save: uploadChunk (start: 67108864, end: 100663295) failed: Cache service responded with 503'
+  - 'Cache saved with key: Linux-<run_id>-build'
+root_cause: |
+  When `actions/cache` (or `actions/cache/save@v4`) uploads a cache, it
+  splits the archive into chunks and uploads them in parallel using the Azure
+  SDK `BlobClient`. If the backend returns HTTP 503 errors for individual
+  chunks, the action retries once but ultimately logs the failure as a
+  `Warning:` line and continues.
+
+  The critical flaw is that the action then calls `commitCache()` to finalize
+  the cache entry regardless of whether all chunks uploaded successfully.
+  The cache entry is committed to the Actions service database even though
+  the underlying blob storage is corrupt or incomplete.
+
+  This results in a silently false "cache saved" state:
+  - The action logs `Cache saved with key: <key>` (green success)
+  - The job exits with code 0 (no failure)
+  - BUT the stored cache entry is corrupt or truncated
+
+  On the next run, `actions/cache/restore` (or the inline `actions/cache`
+  restore phase) either fails with a decompression/extraction error or
+  silently falls back to "Cache not found" — depending on the extent of
+  corruption. The developer sees a cache miss on the restore side and
+  investigates there, never realizing the root cause was a silent save failure
+  several runs earlier.
+
+  This pattern is especially harmful when:
+  - The cache backend is temporarily degraded (503 storms during peak usage)
+  - The cache key includes the run_id, making the corrupt entry unique and
+    never overwritten by a subsequent run with the same key
+  - The project has long build times that the cache was supposed to skip
+fix: |
+  1. **Add a post-save validation step** that calls the GitHub Actions cache
+     REST API to confirm the cache entry was actually committed:
+
+     ```bash
+     gh api "/repos/${{ github.repository }}/actions/caches?key=${{ steps.cache.outputs.cache-primary-key }}" \
+       | jq -e '.actions_caches | length > 0' || { echo "Cache save failed — no entry in API"; exit 1; }
+     ```
+
+  2. **Use `save-always: false` (the default)** — only invoke `actions/cache`
+     for save when you know the prior job succeeded. If you use the `save`
+     sub-action with `save-always: true`, be aware that backend failures are
+     swallowed.
+
+  3. **Separate save from restore** using the `actions/cache/save` and
+     `actions/cache/restore` sub-actions so you can add explicit error
+     handling around the save step via `continue-on-error: false`.
+
+  4. **Monitor for the upstream fix** in actions/cache#1416. Once the action
+     propagates chunk upload failures to the overall exit code, the job will
+     correctly fail on corrupt saves.
+fix_code:
+  - language: yaml
+    label: 'Validate cache was committed after save using the REST API'
+    code: |
+      - name: Cache node modules
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
+
+      - name: Verify cache entry was committed
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          KEY="${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}"
+          COUNT=$(gh api \
+            "/repos/${{ github.repository }}/actions/caches?key=${KEY}" \
+            --jq '.actions_caches | length')
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::Cache save reported success but no entry found in API. Backend may have returned 503."
+            exit 1
+          fi
+  - language: yaml
+    label: 'Separate save from restore to add explicit error handling'
+    code: |
+      # In your build job:
+      - name: Restore cache
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
+
+      - run: npm ci
+
+      - name: Save cache
+        if: steps.cache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
+        # NOTE: If this step shows "Warning: Failed to save: uploadChunk..."
+        # but still exits 0, the cache is corrupt. Add the REST API validation
+        # step above to catch this scenario.
+prevention:
+  - 'Watch for "Warning: Failed to save: uploadChunk ... failed: Cache service responded with 503" in your workflow logs — this indicates a silent corrupt save even though the step shows green.'
+  - 'If you see intermittent cache misses that cannot be explained by key changes, check whether the previous save step logged any 503 chunk-upload warnings.'
+  - 'Use time-bounded cache keys (e.g. including the week number) so a corrupt entry from a bad save is overwritten on the next successful run rather than being cached indefinitely.'
+  - 'For critical caches that must succeed, add a post-save REST API validation step to fail fast when the backend silently corrupted the save.'
+docs:
+  - url: 'https://github.com/actions/cache/issues/1416'
+    label: 'actions/cache#1416 — actions/cache and actions/cache/save consider cache uploaded successfully even with backend errors'
+  - url: 'https://docs.github.com/en/rest/actions/cache?apiVersion=2022-11-28#list-github-actions-caches-for-a-repository'
+    label: 'GitHub REST API — List GitHub Actions caches for a repository'
+  - url: 'https://github.com/actions/cache/blob/main/tips-and-workarounds.md'
+    label: 'actions/cache — Tips and Workarounds'
