@@ -1,0 +1,131 @@
+id: runner-environment-255
+title: 'Ubuntu 22.04+/24.04 missing libssl.so.1.1 and libcrypto.so.1.1 — OpenSSL 1.1.x removed'
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-22.04
+  - ubuntu-24.04
+  - openssl
+  - libssl
+  - libcrypto
+  - shared-library
+  - mongodb
+  - ubuntu-latest
+patterns:
+  - regex: 'libssl\.so\.1\.1.*cannot open shared object file'
+    flags: 'i'
+  - regex: 'libcrypto\.so\.1\.1.*cannot open shared object file'
+    flags: 'i'
+  - regex: 'error while loading shared libraries: libssl\.so\.1\.1'
+    flags: 'i'
+  - regex: 'error while loading shared libraries: libcrypto\.so\.1\.1'
+    flags: 'i'
+  - regex: 'library is missing or cannot be opened: "libcrypto\.so\.1\.1"'
+    flags: 'i'
+error_messages:
+  - "error while loading shared libraries: libssl.so.1.1: cannot open shared object file: No such file or directory"
+  - "error while loading shared libraries: libcrypto.so.1.1: cannot open shared object file: No such file or directory"
+  - "StdoutInstanceError: Instance failed to start because a library is missing or cannot be opened: \"libcrypto.so.1.1\""
+  - "libssl.so.1.1: cannot open shared object file: No such file or directory"
+  - "MongoMemoryServer failed: libcrypto.so.1.1"
+  - "Could not find libssl.so.1.1"
+root_cause: |
+  Ubuntu 22.04 (Jammy) and Ubuntu 24.04 (Noble) ship **OpenSSL 3.x** as the default SSL
+  library. The OpenSSL 1.1.x packages (`libssl1.1`, `libcrypto.so.1.1`) are NOT installed
+  by default on these releases and are not available in the standard Ubuntu 22.04+
+  repositories.
+
+  This affects **ubuntu-latest** (which has been Ubuntu 24.04 since April 2025) and
+  **ubuntu-22.04** runners. Ubuntu 20.04 runners (which ship OpenSSL 1.1.1) are not
+  affected, but they are approaching end-of-life.
+
+  **Commonly affected tools and packages:**
+  1. **mongodb-memory-server / mongoms**: Downloads MongoDB 4.x or 5.x binaries which
+     are compiled against OpenSSL 1.1. These binaries link against `libcrypto.so.1.1`
+     which does not exist on Ubuntu 22.04+.
+  2. **Old Node.js builds**: Node.js ≤16.x built with OpenSSL 1.1 bindings may fail.
+  3. **Rust crates using openssl-sys**: If the crate is compiled against OpenSSL 1.1.x
+     the resulting binary cannot load on Ubuntu 22.04+ without the old shared library.
+  4. **Custom Docker images based on ubuntu:22.04**: Applications built on older Ubuntu
+     or Debian bases that installed libssl1.1 from backports/manual packages.
+  5. **Prisma ORM**: Older versions auto-detect the SSL version and may download binaries
+     compiled against OpenSSL 1.1 when running on Ubuntu 22.04+.
+
+  **Root cause**: OpenSSL maintained two separate ABI-incompatible library versions
+  (1.1.x via `libssl.so.1.1` and 3.x via `libssl.so.3`). Ubuntu 22.04+ only ships
+  OpenSSL 3.x by default. Binaries linked against `libssl.so.1.1` cannot find the
+  shared library at runtime, causing an immediate startup crash.
+fix: |
+  **Option 1 (recommended): Upgrade to MongoDB 6.0+ / update mongodb-memory-server.**
+  MongoDB 6.0+ was compiled against OpenSSL 3.x. Update mongodb-memory-server to use a
+  MongoDB version ≥6.0 and set MONGOMS_VERSION or MONGOMS_DOWNLOAD_PREFER in env.
+
+  **Option 2: Install libssl1.1 from an older Ubuntu/Debian repository.**
+  For tools that require the exact libssl1.1 library and can't be updated, manually
+  install the package from Ubuntu 20.04 (Focal) repositories. This is a temporary
+  workaround — the long-term fix is to update your dependencies.
+
+  **Option 3: Use ubuntu-20.04 runner temporarily.**
+  Downgrade your `runs-on:` to `ubuntu-20.04` while you update your dependencies to
+  OpenSSL 3.x compatible versions. Note: ubuntu-20.04 runners reach end-of-life.
+
+  **Option 4: Use a Docker container with OpenSSL 1.1 pre-installed.**
+  Pin a container image that ships libssl1.1 (e.g., ubuntu:20.04-based images).
+fix_code:
+  - language: yaml
+    label: 'mongodb-memory-server: use MongoDB 7.0+ (OpenSSL 3.x compatible)'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest  # ubuntu-24.04
+          env:
+            # Tell mongodb-memory-server to use MongoDB 7.0+ (OpenSSL 3.x)
+            MONGOMS_VERSION: '7.0.14'
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                node-version: '20'
+            - run: npm ci
+            - run: npm test
+  - language: yaml
+    label: 'Install libssl1.1 from Ubuntu 20.04 Focal archives (temporary workaround)'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-22.04
+          steps:
+            - name: Install libssl1.1 (OpenSSL 1.1.x compat shim)
+              run: |
+                # WARNING: libssl1.1 is EOL — update your deps to OpenSSL 3.x instead
+                wget -qO /tmp/libssl1.1.deb http://security.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1f-1ubuntu2_amd64.deb
+                sudo dpkg -i /tmp/libssl1.1.deb
+            - uses: actions/checkout@v4
+            - run: npm ci
+            - run: npm test
+  - language: yaml
+    label: 'Temporary: use ubuntu-20.04 runner (EOL workaround)'
+    code: |
+      jobs:
+        test:
+          # ubuntu-20.04 ships OpenSSL 1.1.1 — use only as short-term workaround
+          # ubuntu-20.04 reaches end-of-life; update deps to OpenSSL 3.x long-term
+          runs-on: ubuntu-20.04
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm ci
+            - run: npm test
+prevention:
+  - 'When upgrading from `ubuntu-20.04` to `ubuntu-22.04` or `ubuntu-latest` (now ubuntu-24.04), audit all dependencies for OpenSSL 1.1 linkage before switching.'
+  - 'For mongodb-memory-server, always set `MONGOMS_VERSION` to MongoDB 6.0+ (which uses OpenSSL 3.x) in the workflow env block.'
+  - 'Check your Node.js addon dependencies and native modules for `libssl.so.1.1` linkage using `ldd <binary> | grep ssl` before migrating runners.'
+  - 'Pin to Docker base images that are OpenSSL 3.x compatible (ubuntu:22.04+, debian:bookworm+, node:18+) to avoid the mismatch.'
+docs:
+  - url: 'https://stackoverflow.com/questions/72133316/libssl-so-1-1-cannot-open-shared-object-file-no-such-file-or-directory'
+    label: 'Stack Overflow #72133316 — libssl.so.1.1 on Ubuntu 22.04 (146 votes, 362,748 views)'
+  - url: 'https://github.com/actions/runner-images/issues/10636'
+    label: 'actions/runner-images#10636 — Ubuntu-latest workflows will use Ubuntu-24.04 image'
+  - url: 'https://github.com/actions/runner-images/issues/6697'
+    label: 'actions/runner-images#6697 — Missing OpenSSL 1.1.1 Dependency on ubuntu-22.04'
+  - url: 'https://github.com/nodkz/mongodb-memory-server/issues?q=libcrypto'
+    label: 'mongodb-memory-server — libcrypto.so.1.1 issues tracker'
