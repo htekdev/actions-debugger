@@ -1,0 +1,117 @@
+id: caching-artifacts-074
+title: 'actions/cache restore silently treats 429 rate limit as cache miss — no retry, full rebuild forced'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - cache
+  - rate-limit
+  - 429
+  - restore
+  - cache-miss
+  - rebuild
+  - no-retry
+  - matrix
+patterns:
+  - regex: "You've hit a rate limit"
+    flags: 'i'
+  - regex: 'Failed to restore.*Rate limited.*429'
+    flags: 'i'
+  - regex: 'Failed to GetCacheEntryDownloadURL.*rate limit exceeded'
+    flags: 'i'
+  - regex: 'Too Many Requests.*rate limit exceeded'
+    flags: 'i'
+error_messages:
+  - "Warning: You've hit a rate limit, your rate limit will reset in 18 seconds"
+  - "Warning: Failed to restore: Failed to GetCacheEntryDownloadURL: Rate limited: Failed request: (429) Too Many Requests: rate limit exceeded"
+  - "Cache not found for input keys: ..."
+root_cause: |
+  When the GitHub Actions Cache Service rate-limits a restore request with HTTP 429, the cache
+  action (v4/v5) emits a warning and immediately falls back to "Cache not found" — treating the
+  rate limit as a permanent cache miss rather than a transient error worth retrying.
+
+  The cache action does not:
+  - Retry the restore after the rate-limit reset period (reported in the warning, typically 10-60s).
+  - Fail the step with a hard error so the developer is alerted to an infrastructure issue.
+  - Implement any exponential backoff on the restore path.
+
+  Downstream steps see only "Cache not found for input keys: ..." and proceed to rebuild
+  dependencies from scratch, as if the cache had never been saved. The real cause — a transient
+  429 from the cache service — is easily missed because it appears only as a "Warning:" line
+  mid-step, several lines before the final "Cache not found" output.
+
+  This is most disruptive in large parallel matrix workflows where many concurrent jobs all hit
+  the cache service simultaneously. The cache service rate-limits the burst, every affected job
+  sees a cache miss, and the entire matrix rebuilds from scratch. CI time can multiply by 5-10x
+  with no clear indication in the job summary that the rebuilds were avoidable.
+fix: |
+  While the cache action does not yet implement automatic retry on 429, you can reduce the impact:
+
+  1. Limit max-parallel on matrix strategies to reduce simultaneous cache restore bursts.
+
+  2. Use restore-keys as a fallback: even if the exact-key restore is rate-limited, a prefix
+     match restore-keys request may succeed (different cache entry, different cache service shard).
+
+  3. Stagger cache-heavy workflows using concurrency groups or needs: dependencies so they don't
+     all restore caches at the same second.
+
+  4. Upgrade to the latest cache action — retry logic for 429 is a tracked improvement in
+     actions/cache#1758.
+fix_code:
+  - language: yaml
+    label: 'Use restore-keys as a fallback to reduce full rebuilds on 429 rate limit'
+    code: |
+      - uses: actions/cache@v4
+        id: cache
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+          # Fallback: match any npm cache for this OS — may succeed even when exact key is rate-limited
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
+  - language: yaml
+    label: 'Limit matrix parallelism to reduce simultaneous cache restore bursts'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              target: [linux-x64, linux-arm64, windows-x64, macos-x64, macos-arm64]
+            # Limit concurrent cache restores — burst of 2 is much less likely to
+            # trigger 429 than a burst of 5 hitting the cache service simultaneously.
+            max-parallel: 2
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/cache@v4
+              with:
+                path: ~/.cache
+                key: ${{ matrix.target }}-deps-${{ hashFiles('**/Cargo.lock') }}
+                restore-keys: |
+                  ${{ matrix.target }}-deps-
+
+  - language: yaml
+    label: 'Stagger cache-restore-heavy jobs using concurrency groups'
+    code: |
+      jobs:
+        restore-cache:
+          concurrency:
+            group: cache-restore-${{ github.ref }}
+            cancel-in-progress: false   # queue, not cancel
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/cache@v4
+              with:
+                path: ~/.gradle/caches
+                key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*') }}
+prevention:
+  - 'Never run more than ~8 simultaneous cache restore operations in the same repository — the cache service rate limit is per repository.'
+  - 'Always include restore-keys as a fallback so partial cache hits reduce rebuild cost when the exact key is rate-limited.'
+  - 'Watch for the "Warning: You'\''ve hit a rate limit" log line when investigating unexpectedly slow CI builds.'
+  - 'Treat "Cache not found" as potentially a transient 429, not necessarily a first-run or key-miss, especially in high-parallelism workflows.'
+docs:
+  - url: 'https://github.com/actions/cache/issues/1758'
+    label: 'actions/cache#1758 — Handle rate limit with retry instead of silent cache miss (open)'
+  - url: 'https://github.com/actions/cache#inputs'
+    label: 'actions/cache — restore-keys documentation'
+  - url: 'https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows'
+    label: 'GitHub Docs — Caching dependencies to speed up workflows'

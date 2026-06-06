@@ -1,0 +1,97 @@
+id: silent-failures-112
+title: 'Non-ephemeral self-hosted runner REST API busy flag desync causes auto-scaler to kill active job'
+category: silent-failures
+severity: silent-failure
+tags:
+  - self-hosted
+  - non-ephemeral
+  - rest-api
+  - autoscaling
+  - broker
+  - busy-flag
+  - desync
+  - aws
+patterns:
+  - regex: 'The runner has received a shutdown signal'
+    flags: 'i'
+  - regex: '"busy":\s*false'
+    flags: 'i'
+  - regex: 'broker\.actions\.githubusercontent\.com.*busy.*JobState'
+    flags: 'i'
+error_messages:
+  - '##[error]The runner has received a shutdown signal.'
+  - '"busy": false  ← REST API shows idle while broker actively renewing job lease'
+  - 'Successfully renew job, valid till ...'
+root_cause: |
+  On non-ephemeral self-hosted runners (runners that execute multiple sequential jobs on the same
+  instance), there is a state desynchronization between the broker layer
+  (broker.actions.githubusercontent.com) and the REST API endpoint
+  GET /repos/{owner}/{repo}/actions/runners/{runner_id}.
+
+  The failure sequence:
+  1. Runner completes Job A and briefly enters the Online/idle state.
+  2. Runner picks up Job B, transitions to Busy, and reports JobState: Busy to the broker.
+  3. The broker acknowledges the job and successfully renews the lease every 60 seconds
+     (logged as "Successfully renew job, valid till ...").
+  4. Despite (3), the REST API returns "busy": false — sometimes immediately when Job B starts,
+     sometimes after tracking correctly for several minutes before spontaneously flipping.
+  5. Auto-scaling infrastructure (AWS Lambda scaler, GKE controllers, terraform-aws-github-runner,
+     or custom polling services) queries the REST API, sees the runner as idle, and terminates the
+     EC2/VM instance mid-job.
+  6. Job B fails with "The runner has received a shutdown signal." No error is surfaced by GitHub's
+     UI indicating the runner was inappropriately killed.
+
+  The desync appears to occur at the Busy→Online transition boundary between jobs. The broker and
+  the REST API maintain separate state stores; in certain timing windows the REST API does not pick
+  up the Job B start event, leaving its state stale from the inter-job idle period.
+fix: |
+  Option 1 — Use ephemeral runners (recommended). Each runner instance handles exactly one job
+  and then terminates. There is no second job pick-up, so the busy-flag desync window never exists.
+
+  Option 2 — Do not rely solely on "busy": false from the REST API as the termination signal.
+  Cross-reference with a job-completion event (CloudWatch, Pub/Sub, broker callback) or add a
+  grace period of 60-120 seconds after the REST API first reports idle before terminating.
+
+  Option 3 — Use the Webhook-based ARC (Actions Runner Controller) instead of REST-poll-based
+  autoscaling. ARC receives direct runner lifecycle events and does not depend on the REST API
+  busy state for scale-down decisions.
+fix_code:
+  - language: hcl
+    label: 'Enable ephemeral runners in terraform-aws-github-runner to prevent multi-job desync'
+    code: |
+      module "runners" {
+        source  = "philips-labs/github-runner/aws"
+        version = "~> 6.6.0"
+
+        # Each instance executes exactly one job then terminates.
+        # Eliminates the busy-flag desync window between sequential jobs.
+        enable_ephemeral_runners = true
+
+        # ... other config
+      }
+
+  - language: yaml
+    label: 'Declare ephemeral runner label in the workflow'
+    code: |
+      jobs:
+        build:
+          # Request a fresh ephemeral runner — one job per instance.
+          # Requires your runner pool to be configured for ephemeral mode.
+          runs-on: [self-hosted, ephemeral, linux, x64]
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./build.sh
+prevention:
+  - 'Prefer ephemeral runners over reuse runners in autoscaling environments — one job per instance eliminates the busy-flag desync window entirely.'
+  - 'Never use "busy": false from the REST API as the sole signal for terminating a non-ephemeral runner instance.'
+  - 'Add a minimum 90-second grace period after the REST API first reports busy=false before terminating any non-ephemeral runner.'
+  - 'Monitor broker lease-renewal logs ("Successfully renew job") to track active job state independently of the REST API.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4422'
+    label: 'actions/runner#4422 — /runners REST API reports busy: false while broker says busy (open)'
+  - url: 'https://github.com/github-aws-runners/terraform-aws-github-runner'
+    label: 'terraform-aws-github-runner — ephemeral runner module'
+  - url: 'https://docs.github.com/en/rest/actions/self-hosted-runners#list-self-hosted-runners-for-a-repository'
+    label: 'GitHub Docs — REST API for self-hosted runners'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners'
+    label: 'GitHub Docs — About self-hosted runners'
