@@ -1,0 +1,103 @@
+id: runner-environment-204
+title: 'setup-node fails with EBADDEVENGINES when devEngines.packageManager requires a newer npm than Node ships'
+category: runner-environment
+severity: error
+tags:
+  - setup-node
+  - npm
+  - devEngines
+  - EBADDEVENGINES
+  - package-manager
+  - node-22
+  - package-json
+patterns:
+  - regex: 'npm error code EBADDEVENGINES'
+    flags: 'i'
+  - regex: 'EBADDEVENGINES.*Invalid devEngines\.packageManager'
+    flags: 'i'
+  - regex: 'Invalid semver version.*does not match.*for "packageManager"'
+    flags: 'i'
+  - regex: 'npm config get cache.*EBADDEVENGINES'
+    flags: 'si'
+error_messages:
+  - 'npm error code EBADDEVENGINES'
+  - 'npm error EBADDEVENGINES The developer of this package has specified the following through devEngines'
+  - 'npm error EBADDEVENGINES Invalid devEngines.packageManager'
+  - 'npm error EBADDEVENGINES Invalid semver version "^11.10.0" does not match "10.9.7" for "packageManager"'
+  - '/opt/hostedtoolcache/node/22.22.2/x64/bin/npm config get cache'
+root_cause: |
+  actions/setup-node detects the package manager by running `npm config get cache`
+  early in its initialization — before any user-specified npm upgrade step can run.
+  When package.json contains a `devEngines.packageManager` field specifying a minimum
+  npm version higher than the version bundled with the selected Node.js release, npm
+  enforces the devEngines constraint and exits with EBADDEVENGINES during that preflight
+  `npm config get cache` call, causing setup-node to fail immediately.
+
+  Example: Node.js v22 ships with npm v10. If package.json requires:
+    "devEngines": { "packageManager": { "name": "npm", "version": "^11.10.0" } }
+  then npm v10 raises EBADDEVENGINES, aborting setup-node before the user can run
+  `npm install --global npm@latest` in a subsequent step.
+
+  The `devEngines` field (npm RFC) was introduced in Node.js 22's era and allows
+  packages to declare their required toolchain. npm 10.x enforces it strictly by
+  default. Source: actions/setup-node#1553.
+fix: |
+  Option 1 — Use the npm-version input on setup-node (recommended):
+  If setup-node applies the npm-version upgrade before its package manager detection,
+  the correct npm version will already be present when devEngines is checked.
+  Test this first; behaviour may depend on setup-node version.
+
+  Option 2 — Set devEngines.packageManager.onFail to "warn" in package.json:
+  npm 10.9+ supports an `onFail` sub-field that downgrades the constraint violation
+  from fatal error to warning. This allows CI to proceed and install the required
+  npm in a subsequent step.
+
+  Option 3 — Use explicit node-version instead of node-version-file:
+  When node-version-file is used, setup-node reads package.json to determine the
+  Node version, which may trigger the devEngines check. Using an explicit
+  node-version string avoids reading package.json entirely for version resolution.
+
+  Option 4 — Remove or relax devEngines.packageManager for CI use:
+  Consider whether the devEngines constraint is necessary for CI vs local dev.
+  A `.npmrc` with `engine-strict=false` in the repo will disable enforcement
+  for all npm operations in that directory, but this also affects local installs.
+fix_code:
+  - language: yaml
+    label: 'Option 1 — use npm-version input to pre-install required npm'
+    code: |
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json   # Reads engines.node
+          npm-version: '11'                 # Pre-installs npm 11 before devEngines check
+  - language: yaml
+    label: 'Option 3 — use explicit node-version to skip package.json parsing'
+    code: |
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'                # Explicit version; does not read package.json
+      # Install required npm explicitly in a later step
+      - run: npm install --global npm@^11.10.0
+  - language: json
+    label: 'Option 2 — set onFail: warn in package.json to prevent fatal error'
+    code: |
+      {
+        "devEngines": {
+          "packageManager": {
+            "name": "npm",
+            "version": "^11.10.0",
+            "onFail": "warn"
+          }
+        }
+      }
+prevention:
+  - 'When adopting devEngines.packageManager in package.json, test the CI setup-node step immediately — it may fail before your npm upgrade step can run'
+  - 'Set devEngines.packageManager.onFail: "warn" in any repo where CI installs the required npm version dynamically rather than having it pre-installed'
+  - 'Use the npm-version input on setup-node when your package.json requires a specific npm version via devEngines'
+  - 'Avoid relying on node-version-file if your package.json contains strict devEngines constraints and you need to upgrade the package manager in CI'
+docs:
+  - url: 'https://github.com/actions/setup-node/issues/1553'
+    label: 'actions/setup-node#1553: npm config get cache fails with EBADDEVENGINES'
+  - url: 'https://docs.npmjs.com/cli/v11/configuring-npm/package-json#devengines'
+    label: 'npm docs: devEngines field in package.json'
+  - url: 'https://github.com/nodejs/package-maintenance/issues/539'
+    label: 'Node.js RFC: devEngines field specification'

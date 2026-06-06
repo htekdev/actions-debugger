@@ -1,0 +1,126 @@
+id: runner-environment-205
+title: 'macOS self-hosted Runner.Listener silently stalls after AAD credential-refresh — ghost-busy state blocks queue'
+category: runner-environment
+severity: silent-failure
+tags:
+  - self-hosted
+  - macos
+  - apple-silicon
+  - listener
+  - aad
+  - ghost-busy
+  - broker-reconnect
+  - credential-refresh
+patterns:
+  - regex: 'AAD Correlation ID for this token request:\s*Unknown'
+    flags: 'i'
+  - regex: 'RSAFileKeyManager.*Loading RSA key parameters from file.*credentials_rsaparams'
+    flags: 'i'
+  - regex: 'GitHubActionsService.*AAD Correlation ID.*Unknown'
+    flags: 'i'
+error_messages:
+  - '[INFO RSAFileKeyManager] Loading RSA key parameters from file .../.credentials_rsaparams'
+  - '[INFO GitHubActionsService] AAD Correlation ID for this token request: Unknown'
+root_cause: |
+  On long-lived self-hosted macOS runners (v2.334.0+, Apple Silicon), the
+  Runner.Listener process can permanently stall after an AAD (Azure Active Directory)
+  credential-refresh event coincides with a broker session disconnect.
+
+  Normal broker long-poll timeouts produce "SocketException (89): Operation canceled"
+  entries and the listener successfully reconnects. However, when a broker disconnect
+  occurs at the same time as an AAD credential refresh, the listener logs its final
+  diagnostic sequence and then goes permanently silent:
+    [INFO RSAFileKeyManager] Loading RSA key parameters from file .../.credentials_rsaparams
+    [INFO GitHubActionsService] AAD Correlation ID for this token request: Unknown
+
+  After these lines, the main thread parks in pthread_cond_wait with no further diag
+  log output and no TCP ESTABLISHED connection to the broker. The OS process stays alive
+  (visible in ps/Activity Monitor/launchctl list), so launchd does not restart it. The
+  broker-side agent state continues to show the runner as "busy" from its last completed
+  job, stalling all subsequent queued jobs behind the phantom runner until an external
+  restart clears the state.
+
+  The trigger requires: runner lifetime longer than several hours (so a credential
+  refresh occurs), plus a broker disconnect at or immediately after the refresh boundary.
+  Observed simultaneously affecting all 4 of 4 macOS ARM64 runners on a single host
+  within a 32-minute window, causing a 4-hour queue stall. Source: actions/runner#4446.
+fix: |
+  No platform-side fix available as of June 2026 (open issue).
+
+  Workaround — implement an out-of-band watchdog script/cron that:
+  1. Confirms the Runner.Listener PID has an ESTABLISHED TCP socket to the broker
+     (check with `lsof -p <pid> -i TCP | grep ESTABLISHED`)
+  2. Confirms the most recent entry in _diag/Runner_*.log is less than N minutes old
+     (e.g., 10 minutes)
+  3. If both checks fail, restarts the runner service:
+     - macOS (launchd):
+         launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/actions.runner.<owner-repo>.<name>.plist
+         sleep 5
+         launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/actions.runner.<owner-repo>.<name>.plist
+     - Linux (systemd):
+         systemctl --user restart actions.runner.<owner-repo>.<name>.service
+  4. Optionally clear the broker-side ghost-busy state via REST API:
+         curl -X DELETE \
+           -H "Authorization: Bearer $GH_TOKEN" \
+           "https://api.github.com/repos/<owner>/<repo>/actions/runners/<runner_id>"
+     This forces re-registration and clears the stale busy state immediately.
+
+  Long-term: run macOS runners as ephemeral (--once) with a process supervisor
+  that restarts after each completed job, eliminating the multi-hour lifetime
+  that triggers the credential-refresh race.
+fix_code:
+  - language: yaml
+    label: 'Watchdog workflow on separate runner — detect and restart stalled listeners'
+    code: |
+      # Separate monitoring workflow on a non-affected runner
+      # Runs every 15 minutes via cron
+      on:
+        schedule:
+          - cron: '*/15 * * * *'
+      jobs:
+        watchdog:
+          runs-on: ubuntu-latest   # Use a separate hosted runner for the watchdog
+          steps:
+            - name: Check and restart stalled macOS listeners
+              env:
+                GH_TOKEN: ${{ secrets.RUNNER_MGMT_PAT }}
+              run: |
+                # List all self-hosted runners and check for stuck-busy ones
+                gh api /repos/${{ github.repository }}/actions/runners \
+                  --jq '.runners[] | select(.status=="online" and .busy==true) | .id' \
+                  | while read runner_id; do
+                    echo "Runner $runner_id showing busy — may need investigation"
+                    # Add custom liveness check here (SSH to host, check log freshness)
+                  done
+  - language: bash
+    label: 'Shell watchdog — check listener log freshness and restart via launchctl'
+    code: |
+      #!/bin/bash
+      # Run on the macOS runner host via cron every 10 minutes
+      RUNNER_LABEL="owner-repo-runner-name"
+      PLIST="$HOME/Library/LaunchAgents/actions.runner.${RUNNER_LABEL}.plist"
+      DIAG_DIR="$HOME/actions-runner/_diag"
+      STALE_MINUTES=10
+
+      latest_log=$(ls -t "${DIAG_DIR}/Runner_"*.log 2>/dev/null | head -1)
+      if [[ -z "$latest_log" ]]; then exit 0; fi
+
+      age_minutes=$(( ($(date +%s) - $(stat -f %m "$latest_log")) / 60 ))
+      if (( age_minutes > STALE_MINUTES )); then
+        echo "Runner diag log stale for ${age_minutes}min — restarting..."
+        launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null
+        sleep 5
+        launchctl bootstrap "gui/$(id -u)" "$PLIST"
+      fi
+prevention:
+  - 'Run macOS self-hosted runners as ephemeral (--once) with a process supervisor — this eliminates the multi-hour lifetime needed to trigger the credential-refresh race condition'
+  - 'Implement a log-freshness watchdog that monitors _diag/Runner_*.log modification time and restarts the launchd service if no new entries appear for > 10 minutes'
+  - 'Monitor GET /repos/{owner}/{repo}/actions/runners and alert on runners with busy=true for longer than your longest expected job duration'
+  - 'Limit runner lifetime with a cron-triggered scheduled restart between jobs (e.g., nightly) to reduce the window where credential refresh coincides with a broker disconnect'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4446'
+    label: 'actions/runner#4446: Listener silently exits broker-reconnect loop after AAD credential-refresh (ghost-busy)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/monitoring-and-troubleshooting-self-hosted-runners'
+    label: 'GitHub Docs: Monitoring and troubleshooting self-hosted runners'
+  - url: 'https://docs.github.com/en/rest/actions/self-hosted-runners'
+    label: 'GitHub REST API: Self-hosted runners'
