@@ -1,0 +1,140 @@
+id: known-unsolved-077
+title: '`fromJSON()` array nested inside a matrix object does not expand — resolves as literal "Array" or raw JSON string'
+category: known-unsolved
+severity: silent-failure
+tags:
+  - matrix
+  - fromJSON
+  - dynamic-matrix
+  - object
+  - array-expansion
+  - known-limitation
+  - silent-failure
+patterns:
+  - regex: 'fromJSON\(needs\.\w+\.outputs\.'
+    flags: 'i'
+  - regex: 'matrix\.\w+\.\w+.*\bArray\b|\bArray\b.*matrix\.'
+    flags: 'i'
+error_messages:
+  - "echo x86_64 Array"
+  - 'matrix.component.distro = Array'
+  - 'matrix.component.distro = ["el8","el9"]'
+root_cause: |
+  GitHub Actions supports expanding a JSON array into matrix rows when `fromJSON()` is
+  used **at the top level** of a matrix dimension:
+  ```yaml
+  strategy:
+    matrix:
+      version: ${{ fromJSON(needs.setup.outputs.versions) }}  # ✅ expands to N rows
+  ```
+
+  However, when the array is nested inside a matrix **object** (i.e., as a value within
+  one of the items of a matrix dimension), `fromJSON()` does NOT expand it into rows.
+  Instead, the expression resolves to:
+  - The literal string `"Array"` when `fromJSON()` is used (type-1 pattern)
+  - The raw JSON string (e.g., `["el8","el9"]`) when the output is used directly (type-2 pattern)
+
+  **Failing patterns:**
+  ```yaml
+  # Type 1 — fromJSON inside a matrix object value
+  matrix:
+    component:
+      - name: rhel
+        distro: ${{ fromJSON(needs.setup.outputs.rpms) }}   # ❌ becomes "Array"
+
+  # Type 2 — raw JSON string inside a matrix object value
+  matrix:
+    component:
+      - name: rhel
+        distro: ${{ needs.setup.outputs.rpms }}              # ❌ becomes the raw JSON string
+  ```
+
+  The expansion mechanism only applies when the entire matrix dimension value is a
+  `fromJSON()` call returning an array. Nesting breaks the expansion because the runner
+  evaluates the object first and cannot retroactively fan out a single object item into
+  multiple rows.
+
+  This is a documented limitation. GitHub's matrix engine does not support nested array
+  expansion within object-typed matrix dimensions. The issue is tracked in
+  actions/runner#3794 (open since Apr 2025, no planned fix).
+
+  **Why this is confusing:**
+  The `fromJSON()` approach works perfectly when the array IS the entire dimension:
+  `matrix: version: ${{ fromJSON(needs.setup.outputs.versions) }}`. Developers naturally
+  try to reuse the same pattern inside object dimensions and get silently wrong values —
+  the job runs to completion but with a single row containing "Array" instead of N rows.
+fix: |
+  Restructure the matrix so that the dynamic array is the TOP-LEVEL matrix dimension,
+  not nested inside an object. Move any additional object properties into the
+  `matrix.include` block to pair them with each array element.
+
+  If you need multiple outputs to compose a matrix, pre-process them into a combined
+  JSON array in an upstream job step and pass the combined output as a single
+  `fromJSON()` expression.
+fix_code:
+  - language: yaml
+    label: 'Move the dynamic array to the top-level dimension — this expands correctly'
+    code: |
+      jobs:
+        setup:
+          runs-on: ubuntu-latest
+          outputs:
+            rpms: ${{ steps.distros.outputs.rpms }}
+            debs: ${{ steps.distros.outputs.debs }}
+          steps:
+            - id: distros
+              run: |
+                echo 'rpms=["el8","el9"]' >> "$GITHUB_OUTPUT"
+                echo 'debs=["focal","jammy","noble"]' >> "$GITHUB_OUTPUT"
+
+        build:
+          needs: setup
+          runs-on: ubuntu-latest
+          strategy:
+            matrix:
+              # ✅ distro is the top-level dimension — fromJSON expands to N rows
+              distro: ${{ fromJSON(needs.setup.outputs.rpms) }}
+          steps:
+            - run: echo "Building for ${{ matrix.distro }}"
+  - language: yaml
+    label: 'Pre-combine multiple arrays into a single include list in the upstream job'
+    code: |
+      jobs:
+        setup:
+          runs-on: ubuntu-latest
+          outputs:
+            matrix: ${{ steps.build-matrix.outputs.matrix }}
+          steps:
+            - id: build-matrix
+              run: |
+                # Build a combined include list from multiple arrays
+                matrix=$(python3 -c "
+                import json, sys
+                rpms = ['el8', 'el9']
+                debs = ['focal', 'jammy', 'noble']
+                include = [{'family': 'rhel', 'distro': d} for d in rpms] + \
+                          [{'family': 'debian', 'distro': d} for d in debs]
+                print(json.dumps({'include': include}))
+                ")
+                echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+        build:
+          needs: setup
+          runs-on: ubuntu-latest
+          strategy:
+            # ✅ fromJSON on a single combined matrix object with include list
+            matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+          steps:
+            - run: echo "Building ${{ matrix.family }} for ${{ matrix.distro }}"
+prevention:
+  - 'Never use `fromJSON()` as the value of a property inside a matrix object — it will not expand to multiple rows'
+  - 'Only use `fromJSON()` when the array IS the entire dimension value (e.g., `matrix.version: ${{ fromJSON(...) }}`)'
+  - 'When combining multi-dimensional dynamic matrices, pre-compute a combined `include` list in an upstream job'
+  - 'Verify matrix expansion by adding a `- run: echo ${{ toJSON(matrix) }}` debug step; "Array" in the output confirms the bug'
+docs:
+  - url: 'https://github.com/actions/runner/issues/3794'
+    label: 'actions/runner#3794: Array outputs not understood by matrix when nested inside object (open, Apr 2025)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/running-variations-of-jobs-in-a-workflow#using-a-matrix-strategy'
+    label: 'GitHub Docs: Using a matrix strategy'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#fromjson'
+    label: 'GitHub Docs: fromJSON expression function'

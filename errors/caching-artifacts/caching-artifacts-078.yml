@@ -1,0 +1,100 @@
+id: caching-artifacts-078
+title: '`upload-artifact/merge` aborts with "Failed to DeleteArtifact: (404) Not Found" when a delete is retried after a transient server error'
+category: caching-artifacts
+severity: error
+tags:
+  - upload-artifact
+  - merge
+  - delete-merged
+  - 404
+  - idempotent-delete
+  - artifact-merge
+patterns:
+  - regex: 'Failed to DeleteArtifact.*non-retryable error.*404|DeleteArtifact.*404.*Not Found'
+    flags: 'i'
+  - regex: 'Received non-retryable error.*Failed request.*404.*artifact not found'
+    flags: 'i'
+error_messages:
+  - "Error: Failed to DeleteArtifact: Received non-retryable error: Failed request: (404) Not Found: artifact not found"
+  - "Attempt 1 of 5 failed with error: Unexpected token '<', \"<!DOCTYPE \"... is not valid JSON. Retrying request in 3000 ms..."
+root_cause: |
+  When using `actions/upload-artifact/merge@v6` (or later) with `delete-merged: true`,
+  the action deletes each source artifact after merging them into the combined artifact.
+  If a delete request encounters a transient server error (e.g., a malformed HTML response
+  instead of JSON — indicated by "Unexpected token '<'"), the action retries the delete.
+
+  If the first delete request was actually processed by the server before the error was
+  returned to the client, the artifact is already gone. The retry then receives a 404
+  Not Found, which `DeleteArtifact` treats as a **non-retryable fatal error** and
+  immediately aborts the job.
+
+  Because `delete-merged: true` is destructive — source artifacts have already been
+  deleted by this point — retrying the entire job from scratch is impossible, as the
+  source artifacts no longer exist.
+
+  Root bug: `DeleteArtifact` should treat 404 as a success (idempotent delete — the
+  artifact not existing IS the desired state). This is tracked in upload-artifact#751
+  (open, Jan 2026). No server-side fix has been released as of June 2026.
+fix: |
+  Option 1 — Add `continue-on-error: true` to the merge step so that the 404 error
+  does not fail the overall job. Verify that the merge artifact was created successfully
+  before relying on this workaround, since `continue-on-error` also swallows real
+  failures.
+
+  Option 2 — Set `delete-merged: false` and handle deletion of source artifacts in a
+  separate step with explicit error handling (e.g., `gh api` with `--fail-with-body` and
+  a conditional step that ignores 404 exit codes).
+
+  Option 3 — Wrap the merge step in a retry loop using `nick-invision/retry` or a
+  shell retry, but note that re-running the merge after partial deletion will fail because
+  source artifacts are gone. Prevention is better than recovery here.
+
+  Monitor upload-artifact#751 for an upstream fix that makes 404 on DeleteArtifact
+  idempotent/non-fatal.
+fix_code:
+  - language: yaml
+    label: 'continue-on-error workaround — prevents 404 from failing the job'
+    code: |
+      - name: Merge artifacts
+        uses: actions/upload-artifact/merge@v6
+        # ⚠️ Workaround: continue-on-error so a DeleteArtifact 404 does not fail the job.
+        # Also swallows real upload failures — add a downstream step to verify the
+        # merged artifact exists if reliability matters.
+        continue-on-error: true
+        with:
+          name: merged-results
+          pattern: partial-results-*
+          delete-merged: true
+  - language: yaml
+    label: 'delete-merged: false with manual deletion that ignores 404'
+    code: |
+      - name: Merge artifacts (no auto-delete)
+        uses: actions/upload-artifact/merge@v6
+        with:
+          name: merged-results
+          pattern: partial-results-*
+          delete-merged: false   # ✅ Suppress automatic deletion
+
+      # Manually delete source artifacts, ignoring 404 responses (already deleted)
+      - name: Delete source artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for artifact_id in $(gh api repos/${{ github.repository }}/actions/artifacts \
+            --jq '.artifacts[] | select(.name | startswith("partial-results-")) | .id'); do
+            gh api --method DELETE \
+              repos/${{ github.repository }}/actions/artifacts/$artifact_id \
+              --silent || echo "Artifact $artifact_id already deleted (404) — ignoring"
+          done
+prevention:
+  - 'Avoid `delete-merged: true` in critical CI pipelines until upload-artifact#751 is fixed — use manual deletion with 404 tolerance instead'
+  - 'Add `continue-on-error: true` to merge steps as a temporary workaround for the 404 abort'
+  - 'Keep source artifacts available by using `delete-merged: false` until the upstream fix lands'
+  - 'Monitor actions/upload-artifact#751 for a release that treats DeleteArtifact 404 as success'
+docs:
+  - url: 'https://github.com/actions/upload-artifact/issues/751'
+    label: 'upload-artifact#751: DeleteArtifact should not consider a 404 response an error (open, Jan 2026)'
+  - url: 'https://github.com/actions/upload-artifact/blob/main/merge/README.md'
+    label: 'actions/upload-artifact merge action README — delete-merged option'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-workflow-data-as-artifacts'
+    label: 'GitHub Docs: Storing workflow data as artifacts'

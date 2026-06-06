@@ -1,0 +1,95 @@
+id: caching-artifacts-079
+title: '`setup-node@v5` auto-enables caching when `packageManager` is set in `package.json` — post-run fails with "Path Validation Error" if dependencies are not installed'
+category: caching-artifacts
+severity: error
+tags:
+  - setup-node
+  - caching
+  - packageManager
+  - path-validation
+  - post-run
+  - setup-node-v5
+  - automatic-caching
+patterns:
+  - regex: 'Path Validation Error.*Path.*specified.*action.*caching.*do.*not exist'
+    flags: 'i'
+  - regex: 'Path.*specified.*action.*caching.*do.{0,5}not exist.*no cache'
+    flags: 'i'
+error_messages:
+  - "Error: Path Validation Error: Path(s) specified in the action for caching do(es) not exist, hence no cache is being saved."
+root_cause: |
+  Starting with `actions/setup-node@v5`, automatic caching is enabled **by default**
+  whenever a `packageManager` field is present in the project's `package.json` file —
+  even if the workflow does not explicitly configure caching via the `cache:` input.
+
+  This means jobs that merely run linting, type-checking, or any step that does not
+  execute `npm install` / `yarn install` / `pnpm install` will still attempt to cache
+  the package manager's dependency directory in the post-run cleanup step. Because no
+  `install` was run, the expected cache paths (e.g., `~/.npm`, `~/.yarn/cache`,
+  `~/.pnpm-store`) do not exist. The toolkit's path validation then emits:
+  "Path Validation Error: Path(s) specified in the action for caching do(es) not exist"
+  and **fails the job step**, turning a previously green run red.
+
+  **Why this surprises developers:**
+  - The workflow never explicitly enables caching — the presence of `packageManager`
+    in `package.json` is the invisible trigger.
+  - The error appears in the **post-run** cleanup step, not in the setup step where
+    caching is configured, making it harder to trace.
+  - Workflows that have always worked (no `cache:` input) start failing after upgrading
+    from `setup-node@v4` to `setup-node@v5`.
+
+  **Resolution:** `setup-node@v6` (released Oct 2025) changed the default so automatic
+  caching only applies to npm; yarn/pnpm caching is now opt-in. Upgrading to v6 or
+  explicitly disabling the cache in v5 resolves the issue.
+  Source: setup-node#1363 (5 reactions, closed Oct 2025 via v6 release).
+fix: |
+  Option 1 (recommended) — Upgrade to `actions/setup-node@v6`. The v6 release limits
+  automatic caching to npm only; yarn and pnpm caching require explicit `cache: yarn`
+  or `cache: pnpm` input.
+
+  Option 2 — Disable automatic caching in v5 by setting `package-manager-cache: false`.
+  Use this if you cannot upgrade to v6 immediately.
+
+  Option 3 — Ensure dependencies are installed in every job that uses `setup-node@v5`.
+  If the job only needs Node for tooling (lint, type-check, etc.), run a minimal
+  `npm ci --ignore-scripts` or equivalent before the setup post-run fires.
+fix_code:
+  - language: yaml
+    label: 'Upgrade to setup-node@v6 — fixes automatic caching defaults'
+    code: |
+      # ✅ Recommended: v6 only auto-caches npm, not yarn/pnpm
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          # No cache: input needed — auto-caching is npm-only in v6
+  - language: yaml
+    label: 'Disable automatic caching in v5 with package-manager-cache: false'
+    code: |
+      # ✅ Workaround for setup-node@v5: suppress auto-caching
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          package-manager-cache: false   # Disables packageManager-triggered auto-cache
+      - run: npx eslint src/
+  - language: yaml
+    label: 'Opt in to caching explicitly for jobs that do install dependencies'
+    code: |
+      # ✅ Jobs that do install: use explicit cache input instead of relying on auto-detect
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'            # Explicit opt-in — cache only when deps are installed
+      - run: npm ci
+      - run: npm test
+prevention:
+  - 'Upgrade to `setup-node@v6` which fixes the over-eager auto-caching of yarn/pnpm in v5'
+  - 'In v5, always set `package-manager-cache: false` for jobs that do not run `install`'
+  - 'Check `package.json` for a `packageManager` field — its presence triggers auto-caching in v5 even without an explicit `cache:` input'
+  - 'Run lint, type-check, and audit jobs without setup-node caching to keep them fast and avoid phantom cache failures'
+docs:
+  - url: 'https://github.com/actions/setup-node/issues/1363'
+    label: 'setup-node#1363: v5 fails with Path Validation Error in Post Run steps (5 reactions, resolved in v6)'
+  - url: 'https://github.com/actions/setup-node/releases/tag/v6.0.0'
+    label: 'setup-node v6.0.0 release notes — auto-caching limited to npm'
+  - url: 'https://github.com/actions/setup-node/blob/main/docs/advanced-usage.md#caching-packages-data'
+    label: 'setup-node docs: Caching packages data'
