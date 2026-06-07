@@ -1,0 +1,101 @@
+id: caching-artifacts-100
+title: 'upload-artifact@v7 archive:false + overwrite:true triggers 409 Conflict — name mismatch between upload and delete phases'
+category: caching-artifacts
+severity: error
+tags:
+  - upload-artifact
+  - archive-false
+  - overwrite
+  - conflict
+  - v7
+  - 409
+patterns:
+  - regex: 'Failed to CreateArtifact: Received non-retryable error: Failed request: \(409\) Conflict: an artifact with this name already exists'
+    flags: 'i'
+  - regex: 'artifact with this name already exists on the workflow run'
+    flags: 'i'
+error_messages:
+  - 'Error: Failed to CreateArtifact: Received non-retryable error: Failed request: (409) Conflict: an artifact with this name already exists on the workflow run'
+root_cause: |
+  When `archive: false` is set on `actions/upload-artifact@v7`, the artifact is
+  registered under the uploaded file's filename (e.g., `report.txt`) — NOT under
+  the `name:` input parameter. However, when `overwrite: true` is also set, the
+  action's deletion phase uses the `name:` input to locate and delete the existing
+  artifact before the new upload.
+
+  The sequence of events in a matrix/multi-job scenario:
+  1. Job 1 uploads `report.txt` with `name: my-report`, `archive: false`
+     → artifact registered as `report.txt` (filename)
+  2. Job 2 (same re-run) tries to upload `report.txt` with `overwrite: true`
+  3. Action deletes artifact named `my-report` (the `name:` parameter)
+     → deletion targets wrong artifact name; `report.txt` artifact still exists
+  4. Upload attempt hits 409 Conflict because `report.txt` already exists
+
+  The root cause is an inconsistency in the action's `archive: false` implementation:
+  upload uses the filename as the artifact identifier, but overwrite deletion uses
+  the `name:` input. The `name:` parameter is completely ignored during upload when
+  `archive: false` is active.
+
+  This manifests on workflow re-runs and in any setup where the same filename is
+  uploaded more than once on the same workflow run.
+fix: |
+  Option 1 (recommended): Do not combine `archive: false` with `overwrite: true`.
+  Remove `overwrite: true` and instead use unique artifact names per job/matrix by
+  incorporating the matrix variable or run ID.
+
+  Option 2: Rename the file to match what `name:` would expect, so the artifact
+  registered and the artifact deleted share the same name. Note: when `archive: false`
+  and `name:` is not set, the filename IS the artifact name.
+
+  Option 3: Delete the existing artifact manually before the upload step using the
+  GitHub CLI or REST API, then upload without `overwrite: true`.
+
+  Track actions/upload-artifact#769 for an upstream fix.
+fix_code:
+  - language: yaml
+    label: 'Use matrix variable in artifact name to avoid collisions (no overwrite needed)'
+    code: |
+      - name: Upload test results
+        uses: actions/upload-artifact@v7
+        with:
+          name: report-${{ matrix.os }}  # unique name per matrix leg
+          path: report.txt
+          archive: false
+          # overwrite: true  <-- not needed; each leg has a unique name
+  - language: yaml
+    label: 'Remove archive:false to use default zip-based upload with overwrite'
+    code: |
+      - name: Upload report
+        uses: actions/upload-artifact@v7
+        with:
+          name: my-report
+          path: report.txt
+          # archive: false  <-- remove; zip upload supports overwrite:true correctly
+          overwrite: true
+  - language: yaml
+    label: 'Delete existing artifact manually then upload fresh (no overwrite flag needed)'
+    code: |
+      - name: Delete old artifact if exists
+        run: |
+          gh api repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts \
+            --jq '.artifacts[] | select(.name == "report.txt") | .id' | \
+            xargs -I{} gh api --method DELETE repos/${{ github.repository }}/actions/artifacts/{}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: report.txt
+          archive: false
+prevention:
+  - 'Do not combine archive:false with overwrite:true — the two features use different artifact identifiers (filename vs. name: parameter) and the combination is currently broken.'
+  - 'When using archive:false in matrix jobs, use unique artifact names (e.g., name: report-${{ matrix.os }}) instead of relying on overwrite.'
+  - 'Test re-run behavior for workflows that use archive:false — failures may only appear on the second run.'
+docs:
+  - url: 'https://github.com/actions/upload-artifact/issues/769'
+    label: 'GitHub Issue: Fails to overwrite existing artifact when archive is false (upload-artifact#769)'
+  - url: 'https://github.com/actions/upload-artifact/issues/765'
+    label: 'GitHub Issue: Related archive:false MIME type validation failure (upload-artifact#765)'
+  - url: 'https://github.com/actions/upload-artifact/blob/main/README.md'
+    label: 'upload-artifact README — archive and overwrite input documentation'

@@ -1,0 +1,110 @@
+id: silent-failures-150
+title: 'checkout sparse-checkout silently ignored when gitCommandManager init fails on old git versions'
+category: silent-failures
+severity: silent-failure
+tags:
+  - checkout
+  - sparse-checkout
+  - git-version
+  - rest-api-fallback
+  - silent-failure
+  - self-hosted
+patterns:
+  - regex: 'sparse.checkout.*not applied|sparse.*checkout.*falls?\s+back|gitCommandManager.*fail'
+    flags: 'i'
+  - regex: 'Minimum Git version required for sparse checkout is 2\.28'
+    flags: 'i'
+error_messages:
+  - 'Failed to initialize CommandManager: Minimum Git version required for sparse checkout is 2.28. Your git is 2.23'
+  - 'Minimum Git version required for sparse checkout is 2.28'
+root_cause: |
+  When `actions/checkout` initializes its git command manager, it runs version checks
+  against the local git binary. If initialization fails for any reason (git version too
+  old, git not found at expected path, etc.), the checkout action catches the error in
+  a try/catch block in `getGitCommandManager`.
+
+  Critically, this error is only re-thrown if `settings.lfs` is true. For all other
+  settings — including `sparse-checkout` — the error is silently swallowed. The action
+  falls back to downloading the repository as a zip via the GitHub REST API.
+
+  The REST API fallback provides a full repository snapshot and does NOT support:
+  - Sparse checkout (all files are downloaded regardless of patterns)
+  - LFS pointers (not dereferenced)
+  - Custom fetch depth
+  - Submodule initialization
+  - Filter options (partial clone)
+
+  The developer sees the checkout step complete successfully (exit 0) with all files
+  present — because the REST API fallback downloads everything. Their sparse-checkout
+  patterns are silently ignored and never applied. No warning or info log line is
+  emitted about the fallback or the reason for it.
+
+  Most commonly affects self-hosted runners running git 2.23 or older (common on
+  Ubuntu 20.04 with default packages). Sparse checkout requires git >= 2.28
+  (cone mode requires git >= 2.36).
+fix: |
+  Upgrade git on the self-hosted runner to at least 2.28:
+    sudo add-apt-repository ppa:git-core/ppa
+    sudo apt-get update && sudo apt-get install git
+
+  Or explicitly install a specific git version:
+    sudo apt-get install git=1:2.43.*
+
+  Alternatively, add a pre-checkout step to assert git version meets the minimum:
+    - name: Check git version
+      run: |
+        GIT_VERSION=$(git --version | grep -oP '\d+\.\d+\.\d+')
+        echo "Git version: $GIT_VERSION"
+        if [ "$(echo "$GIT_VERSION 2.28.0" | tr ' ' '\n' | sort -V | head -1)" != "2.28.0" ]; then
+          echo "::error::git >= 2.28 required for sparse checkout; found $GIT_VERSION"
+          exit 1
+        fi
+fix_code:
+  - language: yaml
+    label: 'Pre-flight git version assertion before sparse checkout'
+    code: |
+      - name: Assert git version for sparse checkout
+        run: |
+          GIT_VER=$(git --version | grep -oP '\d+\.\d+\.\d+')
+          echo "Detected git $GIT_VER"
+          python3 -c "
+          import sys
+          v = tuple(int(x) for x in '$GIT_VER'.split('.'))
+          if v < (2, 28):
+              print(f'::error::sparse-checkout requires git >= 2.28; found $GIT_VER')
+              sys.exit(1)
+          "
+
+      - name: Checkout with sparse-checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            src/
+            tests/
+  - language: yaml
+    label: 'Install latest git on Ubuntu self-hosted runner before checkout'
+    code: |
+      - name: Install latest git
+        run: |
+          sudo add-apt-repository ppa:git-core/ppa -y
+          sudo apt-get update -qq
+          sudo apt-get install -y git
+          git --version
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            src/
+prevention:
+  - 'Self-hosted runner documentation should specify minimum git 2.28 when sparse-checkout workflows are used.'
+  - 'Add the git version assertion step before any checkout with sparse-checkout to surface silent failures as explicit errors.'
+  - 'When switching from GitHub-hosted to self-hosted runners, verify git version meets the 2.28 minimum for sparse checkout and 2.36 for cone mode.'
+  - 'Monitor checkout step output for absence of sparse-checkout-related log lines (e.g., "Applying sparse checkout") as an indicator that fallback occurred.'
+docs:
+  - url: 'https://github.com/actions/checkout/issues/2435'
+    label: 'GitHub Issue: Errors from initializing the gitCommandManager are ignored and never displayed (checkout#2435)'
+  - url: 'https://github.com/actions/checkout/blob/main/src/git-source-provider.ts'
+    label: 'checkout source: getGitCommandManager catch block (git-source-provider.ts)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-github-actions-with-git-sparse-checkout'
+    label: 'GitHub Docs: Using GitHub Actions with Git sparse checkout'
