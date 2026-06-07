@@ -1,0 +1,114 @@
+id: triggers-087
+title: "github.event.schedule Contains Stale Cron Expression After Workflow Edit"
+category: triggers
+severity: error
+tags:
+  - schedule
+  - cron
+  - github-event
+  - routing
+  - stale-state
+patterns:
+  - regex: 'Unknown schedule: \d'
+    flags: "i"
+  - regex: 'github\.event\.schedule.*not.*match'
+    flags: "i"
+  - regex: 'Unexpected schedule value'
+    flags: "i"
+error_messages:
+  - "Error: Unknown schedule: 0 5 * * *"
+  - "Unrecognized cron expression in github.event.schedule"
+root_cause: |
+  GitHub's schedule service caches registered cron expressions independently of
+  the workflow YAML. When you update `on.schedule[*].cron` in your workflow file
+  and push to the default branch, there is a propagation lag — sometimes hours or
+  days — before the scheduler adopts the new expression. During this window,
+  `github.event.schedule` in the event payload still carries the **old** cron
+  string, not the new one.
+
+  Any workflow logic that routes based on `github.event.schedule` (the documented
+  pattern for distinguishing between multiple schedules) will break during this
+  lag. The workflow YAML being executed is the up-to-date version, so `case`
+  statements or `if:` conditions referencing the new schedule expression will
+  never match.
+
+  Root confirmed in actions/runner#4241 (open Feb 2026, ava-labs/firewood
+  reproduction): after changing `'0 5 * * *'` to `'0 5 * * 1-5'`, the scheduler
+  continued firing with `github.event.schedule` = `'0 5 * * *'`, causing the
+  routing case to fail with "Unknown schedule".
+fix: |
+  1. **Do not route on `github.event.schedule` value.** Use separate workflow
+     files instead — one per schedule cadence — so routing is implicit.
+  2. If you must keep one workflow file for multiple schedules, poll until the
+     new schedule fires successfully and verify `github.event.schedule` has
+     updated before relying on it.
+  3. As a workaround, temporarily add both old and new expressions to your
+     routing logic until the scheduler propagates the change:
+     ```yaml
+     if: github.event.schedule == '0 5 * * 1-5' || github.event.schedule == '0 5 * * *'
+     ```
+  4. Delete and recreate the workflow file (or rename it) — this forces the
+     schedule service to register a fresh schedule. Renaming resets the
+     scheduler's cached state.
+fix_code:
+  - language: yaml
+    label: "FRAGILE — routing on github.event.schedule (breaks after cron edit)"
+    code: |
+      on:
+        schedule:
+          - cron: '0 5 * * 1-5'   # weekdays
+          - cron: '0 5 * * 6'     # Saturday
+
+      jobs:
+        run:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Route by schedule
+              run: |
+                case "${{ github.event.schedule }}" in
+                  '0 5 * * 1-5') echo "Weekday run" ;;
+                  '0 5 * * 6')   echo "Saturday run" ;;
+                  *) echo "ERROR: Unknown schedule: ${{ github.event.schedule }}" && exit 1 ;;
+                esac
+  - language: yaml
+    label: "ROBUST — separate workflow files per schedule (no routing needed)"
+    code: |
+      # .github/workflows/weekday-job.yml
+      on:
+        schedule:
+          - cron: '0 5 * * 1-5'
+      jobs:
+        run:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Weekday run"
+
+      # .github/workflows/saturday-job.yml
+      on:
+        schedule:
+          - cron: '0 5 * * 6'
+      jobs:
+        run:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Saturday run"
+  - language: yaml
+    label: "WORKAROUND — dual-expression routing during cron propagation lag"
+    code: |
+      - name: Detect weekday schedule (handles propagation lag)
+        if: |
+          github.event.schedule == '0 5 * * 1-5' ||
+          github.event.schedule == '0 5 * * *'
+        run: echo "Weekday or legacy schedule matched"
+prevention:
+  - "Prefer separate workflow files per schedule rather than one file with multi-schedule routing."
+  - "After editing a cron expression, allow 24–48 hours before relying on github.event.schedule."
+  - "Use a deployment variable (`vars.CURRENT_SCHEDULE`) as the routing signal instead of github.event.schedule."
+  - "When renaming or deleting a workflow, the schedule is fully reset; recreating the file registers a fresh schedule."
+docs:
+  - url: "https://docs.github.com/en/actions/reference/context-and-expression-syntax-for-github-actions#github-context"
+    label: "github context — github.event.schedule"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#schedule"
+    label: "Schedule trigger — workflow syntax"
+  - url: "https://github.com/actions/runner/issues/4241"
+    label: "actions/runner#4241 — Cron scheduled returns stale cron expression after updating"

@@ -1,0 +1,101 @@
+id: runner-environment-283
+title: "Runner v2.334.0 Windows Broker Listener Stops Polling After First Job"
+category: runner-environment
+severity: error
+tags:
+  - self-hosted
+  - windows
+  - runner-version
+  - broker-v2
+  - listener
+  - stuck-queued
+patterns:
+  - regex: 'Get messages has been cancelled using local token source\. Continue to get messages with new status\.'
+    flags: "i"
+  - regex: 'BrokerMessageListener.*cancelled.*local token source'
+    flags: "i"
+  - regex: 'Listener stops polling.*2\.334'
+    flags: "i"
+error_messages:
+  - "Get messages has been cancelled using local token source. Continue to get messages with new status."
+  - "[BrokerMessageListener] Get messages has been cancelled using local token source."
+root_cause: |
+  Runner v2.334.0 introduced a regression in the V2 broker flow
+  (`useV2Flow: true`, broker host `broker.actions.githubusercontent.com`) that
+  affects Windows self-hosted runners installed as a service.
+
+  After the first job completes — specifically at the Busy→Online state transition
+  — `BrokerMessageListener` cancels its local `CancellationTokenSource` and logs
+  "Get messages has been cancelled using local token source. Continue to get
+  messages with new status." However, the follow-up loop that restarts polling
+  with the new status does not execute correctly. The listener silently stops
+  issuing `GET /message` requests to the broker.
+
+  The runner process stays alive, the runner shows as "Idle" in the GitHub UI,
+  and OAuth token refreshes continue on schedule — but no new jobs are ever
+  dispatched. Queued jobs wait indefinitely with "Waiting for a runner to pick up
+  this job..." until the runner service is restarted manually.
+
+  Source: actions/runner#4444 (open May 2026, Windows Server 2022, runner v2.334.0,
+  V2 broker flow, confirmed reproduced 3+ times in 22 hours on the same host).
+fix: |
+  1. **Pin to runner v2.333.x** — downgrade the runner service until a patched
+     release is published:
+     ```powershell
+     # Stop service, replace binary with v2.333.x, restart
+     Stop-Service actions.runner.*
+     # Download v2.333.x from github.com/actions/runner/releases
+     ```
+  2. **Restart the service after each job** — add a post-job script that restarts
+     the runner service. For an autoscaler, use ephemeral runners (`--ephemeral`
+     flag) so a fresh runner process is spawned per job.
+  3. **Monitor and auto-restart** — add a watchdog that checks whether the runner
+     has been Idle for more than N minutes without picking up queued jobs and
+     restarts the service automatically.
+  4. **Watch for v2.334.1+** — GitHub will ship a patch. Once the fix ships,
+     upgrade from v2.333.x.
+fix_code:
+  - language: yaml
+    label: "Runner service watchdog — PowerShell scheduled task (restart if idle too long)"
+    code: |
+      # Add as a Windows Scheduled Task running every 10 minutes
+      # Restarts runner service if idle but jobs are queued
+
+      $svc = Get-Service -Name 'actions.runner.*' -ErrorAction SilentlyContinue
+      if ($svc -and $svc.Status -eq 'Running') {
+        $runnerLogDir = 'C:\actions-runner\_diag'
+        $latestLog = Get-ChildItem $runnerLogDir -Filter 'Listener_*.log' |
+                     Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($latestLog) {
+          $ageMinutes = (Get-Date) - $latestLog.LastWriteTime | Select-Object -ExpandProperty TotalMinutes
+          $lastLine = Get-Content $latestLog.FullName -Tail 5 -ErrorAction SilentlyContinue
+          if ($ageMinutes -gt 15 -and $lastLine -match 'Continue to get messages with new status') {
+            Write-Host "Broker listener appears stalled — restarting runner service"
+            Restart-Service -Name $svc.Name
+          }
+        }
+      }
+  - language: yaml
+    label: "Use ephemeral runners to avoid the stall entirely"
+    code: |
+      # Register the runner with --ephemeral so a fresh process is used per job
+      # In your runner setup script:
+      ./config.cmd --url https://github.com/ORG/REPO \
+                   --token TOKEN \
+                   --ephemeral \
+                   --name "windows-runner-$(hostname)"
+
+      # With actions-runner-controller (ARC), set spec.ephemeral: true
+      # With autoscalers (e.g. GitHub's hosted runners), ephemeral is the default
+prevention:
+  - "Use ephemeral runners (--ephemeral flag) so each job gets a fresh runner process."
+  - "Pin runner version explicitly in your autoscaler or runner image to avoid automatic upgrades to broken versions."
+  - "Monitor runner idle time with a watchdog; if a runner is Idle for >15 min and jobs are queued, restart the service."
+  - "Subscribe to github.com/actions/runner/releases to be notified of patch releases fixing regressions."
+docs:
+  - url: "https://github.com/actions/runner/issues/4444"
+    label: "actions/runner#4444 — Listener stops polling broker after first job's Busy→Online transition (2.334.0, Windows, V2 flow)"
+  - url: "https://github.com/actions/runner/releases"
+    label: "GitHub Actions Runner releases"
+  - url: "https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/running-scripts-before-or-after-a-job"
+    label: "Running scripts before or after a job"
