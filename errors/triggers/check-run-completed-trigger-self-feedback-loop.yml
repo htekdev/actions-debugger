@@ -1,0 +1,141 @@
+id: triggers-091
+title: 'check_run: [completed] Trigger Creates Infinite Feedback Loop — Workflow Re-Fires on Its Own Check Run'
+category: triggers
+severity: error
+tags:
+  - check_run
+  - check_suite
+  - feedback-loop
+  - infinite-loop
+  - workflow-trigger
+  - self-trigger
+patterns:
+  - regex: 'check_run.*types.*\[.*completed'
+    flags: 'i'
+  - regex: 'check_suite.*types.*\[.*completed'
+    flags: 'i'
+  - regex: 'on:\s*check_run'
+    flags: 'i'
+error_messages:
+  - "Workflow triggered by check_run completed event"
+  - "check_run event fired for own workflow run"
+  - "Run limit reached"
+  - "Workflow run limit exceeded"
+root_cause: |
+  Every GitHub Actions workflow run produces a check run record upon completion.
+  A workflow configured with the check_run: [completed] trigger will therefore
+  be re-triggered by its own completion check run, creating an infinite loop:
+
+    1. Push code → workflow "Automation" starts
+    2. "Automation" run creates a check run (standard GitHub Actions behavior)
+    3. check_run: [completed] event fires when "Automation" check run finishes
+    4. "Automation" triggers again because it listens on check_run: [completed]
+    5. New "Automation" run creates another check run → goto step 3
+
+  The loop continues until the workflow is manually disabled or GitHub's per-workflow
+  run limit (500 queued or in-progress runs) is hit, causing new runs to be rejected.
+  Organizations on metered plans accumulate significant Actions minutes before
+  the loop is detected. The Actions history tab fills with hundreds of queued runs.
+
+  The same feedback loop occurs with check_suite: [completed] when the workflow
+  creates a check suite as part of its execution.
+
+  Note: GitHub Actions workflows triggered by GITHUB_TOKEN do NOT re-trigger
+  push, pull_request, or workflow_run events — this "no re-trigger" protection
+  intentionally does NOT apply to check_run and check_suite events, making
+  them uniquely susceptible to this pattern.
+
+  The loop is especially hard to detect because:
+  - The first few runs look normal in the Actions UI
+  - Each run completes successfully (it just happens to trigger another run)
+  - No error message indicates that the run is being self-triggered
+  - The problem only becomes visible when the queue depth grows
+fix: |
+  Option 1 (recommended): Switch to workflow_run: [completed] instead of check_run:
+  [completed]. The workflow_run event fires once per workflow run (not per check run),
+  and GitHub's GITHUB_TOKEN re-trigger protection prevents self-loops.
+
+  Option 2: Add an if: condition that filters on the specific check run app or name
+  to exclude the workflow's own check runs. GitHub Actions workflows create check runs
+  with app name "GitHub Actions" — filter to a different app:
+
+    if: github.event.check_run.app.slug != 'github-actions'
+
+  Option 3: For check_suite events, filter to a specific app's check suite:
+
+    if: github.event.check_suite.app.slug != 'github-actions'
+
+  Option 4: Move the logic that responds to check run completion into a dedicated
+  workflow that uses workflow_run: [completed] instead, passing the relevant context
+  via github.event.workflow_run.
+fix_code:
+  - language: yaml
+    label: 'Broken: check_run: [completed] re-fires on the workflow''s own check run'
+    code: |
+      # INFINITE LOOP — every run creates a check run which re-triggers this workflow
+      name: Automation
+      on:
+        check_run:
+          types: [completed]
+        pull_request:
+          types: [opened, synchronize]
+
+      jobs:
+        process:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Handle check completion
+              run: echo "Check ${{ github.event.check_run.name }} completed"
+  - language: yaml
+    label: 'Fixed: filter out GitHub Actions check runs to break the loop'
+    code: |
+      name: Automation
+      on:
+        check_run:
+          types: [completed]
+        pull_request:
+          types: [opened, synchronize]
+
+      jobs:
+        process:
+          # Skip check runs created by GitHub Actions (this workflow's own runs)
+          if: |
+            github.event_name == 'pull_request' ||
+            (github.event_name == 'check_run' &&
+             github.event.check_run.app.slug != 'github-actions')
+          runs-on: ubuntu-latest
+          steps:
+            - name: Handle check completion
+              run: echo "Check ${{ github.event.check_run.name }} completed"
+  - language: yaml
+    label: 'Best practice: use workflow_run instead of check_run to avoid self-trigger risk'
+    code: |
+      # workflow_run fires once per workflow, and GITHUB_TOKEN prevents self-loops
+      name: Post-CI Automation
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+
+      jobs:
+        process:
+          if: ${{ github.event.workflow_run.conclusion == 'success' }}
+          runs-on: ubuntu-latest
+          steps:
+            - name: Handle CI completion
+              run: echo "CI passed for ${{ github.event.workflow_run.head_branch }}"
+prevention:
+  - 'Avoid check_run: [completed] and check_suite: [completed] triggers for general automation workflows — prefer workflow_run: [completed] which has built-in self-loop protection.'
+  - 'When check_run: [completed] is required, always add an if: condition that excludes the github-actions app slug to prevent self-triggering.'
+  - 'After adding a check_run trigger, monitor the Actions history tab for 10–15 minutes to confirm runs are not accumulating.'
+  - 'Set up a workflow run limit alert or budget alert to detect unexpected run accumulation early.'
+  - 'Understand that GitHub Actions'' GITHUB_TOKEN re-trigger protection applies to push/pull_request/workflow_run but NOT to check_run/check_suite.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#check_run'
+    label: 'GitHub Docs: check_run event trigger'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run'
+    label: 'GitHub Docs: workflow_run event — safer alternative for post-CI automation'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#using-the-github_token-in-a-workflow'
+    label: 'GitHub Docs: GITHUB_TOKEN re-trigger protection scope'
+  - url: 'https://github.com/flipt-io/flipt/pull/4819'
+    label: 'flipt/flipt#4819 — switch check_run to check_suite to reduce noisy self-triggers'

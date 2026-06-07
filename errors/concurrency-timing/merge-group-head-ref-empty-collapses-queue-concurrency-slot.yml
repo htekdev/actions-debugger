@@ -1,0 +1,124 @@
+id: concurrency-timing-080
+title: 'github.head_ref Is Empty for merge_group Events — All Merge Queue Runs Share the Same Concurrency Slot'
+category: concurrency-timing
+severity: error
+tags:
+  - concurrency
+  - merge-queue
+  - merge_group
+  - head_ref
+  - cancel-in-progress
+  - null-key
+patterns:
+  - regex: 'merge_group'
+    flags: 'i'
+  - regex: 'github\.head_ref'
+    flags: 'i'
+  - regex: 'Canceling since a higher priority waiting run was found'
+    flags: 'i'
+error_messages:
+  - 'This run was automatically cancelled'
+  - 'Canceling since a higher priority waiting run was found'
+  - 'Required status checks did not pass'
+  - 'Your PR was removed from the merge queue due to failed status checks'
+root_cause: |
+  github.head_ref is populated only for pull_request and pull_request_target events.
+  For merge_group events it evaluates to an empty string — it is never set in the
+  merge_group event payload.
+
+  When a workflow uses github.head_ref as the discriminator in a concurrency group key
+  (a pattern widely recommended in GitHub documentation and community examples for
+  scoping CI to individual PRs), all merge queue validation runs share an identical
+  concurrency key. For a workflow named "CI" and concurrency group
+  "${{ github.workflow }}-${{ github.head_ref }}", every merge_group run resolves to
+  "CI-" — the same slot for every queued PR.
+
+  With cancel-in-progress: true: each new merge queue entry immediately cancels all
+  previously running validations for other entries. Required status checks fail with
+  "cancelled" conclusion. GitHub removes the affected PRs from the queue.
+
+  With cancel-in-progress: false (or omitted): only one run can be pending at a time.
+  Runs queue and execute serially instead of concurrently. Merge queue throughput drops
+  to one PR at a time regardless of how many runners are available.
+
+  This is a different failure mode from ct-051 (github.event.pull_request.number null
+  in merge_group context) — github.head_ref is specifically the variable documented as
+  the per-PR identifier and is explicitly recommended in GitHub's own concurrency
+  examples. It is also different from ct-014 (github.head_ref empty on push events),
+  which affects push-triggered workflows rather than merge-queue-triggered ones.
+
+  The issue typically appears when a developer adds merge_group to an existing
+  pull_request workflow without auditing concurrency group expressions.
+fix: |
+  Add a || github.ref fallback to the concurrency group expression. For merge_group
+  events, github.ref resolves to a unique value per queue entry in the format
+  refs/heads/gh-readonly-queue/main/pr-NNN-SHA, guaranteeing an independent
+  concurrency slot for each PR in the merge queue.
+
+  concurrency:
+    group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+    cancel-in-progress: true
+
+  For the most explicit handling, use github.event.merge_group.head_sha as the
+  merge queue identifier (unique per batch):
+
+  concurrency:
+    group: ${{ github.workflow }}-${{ github.head_ref || github.event.merge_group.head_sha || github.ref }}
+    cancel-in-progress: ${{ github.event_name != 'merge_group' }}
+fix_code:
+  - language: yaml
+    label: 'Broken: github.head_ref empty for merge_group — all queue runs share "CI-" slot'
+    code: |
+      on:
+        pull_request:
+          branches: [main]
+        merge_group:
+          branches: [main]
+
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.head_ref }}  # "" for merge_group!
+        cancel-in-progress: true  # kills every queued merge validation
+  - language: yaml
+    label: 'Fixed: || github.ref fallback gives each merge queue entry a unique slot'
+    code: |
+      on:
+        pull_request:
+          branches: [main]
+        merge_group:
+          branches: [main]
+
+      concurrency:
+        # pull_request:  "CI-feature-branch-name" (unique per PR branch)
+        # merge_group:   "CI-refs/heads/gh-readonly-queue/main/pr-42-SHA" (unique per queue entry)
+        group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+        cancel-in-progress: true
+  - language: yaml
+    label: 'Best practice: conditional cancel-in-progress (cancel for PRs, never for merge queue)'
+    code: |
+      on:
+        pull_request:
+          branches: [main]
+        merge_group:
+          branches: [main]
+
+      concurrency:
+        group: >-
+          ${{ github.workflow }}-
+          ${{ github.head_ref || github.event.merge_group.head_sha || github.ref }}
+        # Cancel for updated PR drafts; NEVER cancel merge queue validations
+        cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+prevention:
+  - 'Whenever adding merge_group to an existing pull_request workflow, audit every concurrency group expression for github.head_ref usage — add || github.ref as a fallback.'
+  - 'Prefer github.event.merge_group.head_sha as the explicit merge queue key rather than relying on github.ref format.'
+  - 'Use cancel-in-progress: ${{ github.event_name == ''pull_request'' }} to keep PR-update cancellation while protecting merge queue runs.'
+  - 'Test merge queue behavior by simultaneously queuing 2+ PRs and confirming all checks complete without cancellations.'
+  - 'Run a debug step that echoes github.head_ref and github.ref when first adding merge_group to a workflow.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#merge_group'
+    label: 'GitHub Docs: merge_group event — context and payload'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/controlling-concurrency'
+    label: 'GitHub Docs: Controlling concurrency'
+  - url: 'https://github.com/epinowcast/epinowcast/issues/713'
+    label: 'epinowcast/epinowcast#713 — github.head_ref empty for merge_group breaks concurrency'
+  - url: 'https://github.com/scratchfoundation/understand-gha-triggers'
+    label: 'scratchfoundation: Understanding GitHub Actions triggers and merge queue concurrency'
