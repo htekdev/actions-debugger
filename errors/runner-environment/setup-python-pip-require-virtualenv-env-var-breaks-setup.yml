@@ -1,0 +1,121 @@
+id: runner-environment-319
+title: 'actions/setup-python Fails With "Could Not Find an Activated Virtualenv" When PIP_REQUIRE_VIRTUALENV=true Is Set'
+category: runner-environment
+severity: error
+tags:
+  - setup-python
+  - pip
+  - virtualenv
+  - PIP_REQUIRE_VIRTUALENV
+  - self-hosted
+  - environment-variable
+  - strict-pip
+patterns:
+  - regex: 'Could not find an activated virtualenv \(required\)'
+    flags: 'i'
+  - regex: 'ERROR: Could not find an activated virtualenv'
+    flags: 'i'
+  - regex: 'process.*failed with exit code 3'
+    flags: 'i'
+error_messages:
+  - 'Error: ERROR: Could not find an activated virtualenv (required).'
+  - 'Error: The process ''/usr/bin/bash'' failed with exit code 3'
+root_cause: |
+  When a self-hosted runner has `PIP_REQUIRE_VIRTUALENV=true` (or `=1`) set in its
+  shell environment, pip refuses to install packages outside of a virtual environment.
+  This is a pip-level security/isolation setting that prevents accidental global
+  installs.
+
+  `actions/setup-python` calls pip internally during the setup process (to install or
+  upgrade pip itself, to locate existing Python installations, and to populate the
+  tool cache). These internal pip invocations run without an active virtual environment,
+  which causes pip to exit with code 3 and the error "Could not find an activated
+  virtualenv (required)."
+
+  The error surfaces during the setup-python step itself — before any user code runs.
+  The action fails with exit code 3 wrapped in the generic "The process failed with
+  exit code 3" message.
+
+  This is specific to self-hosted runners where the runner's system environment or
+  shell profile sets `PIP_REQUIRE_VIRTUALENV=true`. GitHub-hosted runners do not set
+  this variable. The fix proposed upstream is for setup-python to pass `--isolated`
+  to its internal pip calls to bypass environment variable overrides.
+
+  Source: actions/setup-python#1285 (open Mar 2026).
+fix: |
+  Option 1 — Unset PIP_REQUIRE_VIRTUALENV before the setup-python step:
+  Add a workflow step to unset the variable in the runner's process environment
+  before calling setup-python. Use the GITHUB_ENV mechanism so it persists
+  across steps.
+
+  Option 2 — Set PIP_REQUIRE_VIRTUALENV per-step only:
+  Move `PIP_REQUIRE_VIRTUALENV=true` to only the specific steps that need it
+  instead of setting it globally on the runner system.
+
+  Option 3 — Patch the runner environment:
+  If you control the self-hosted runner image or configuration, remove
+  `PIP_REQUIRE_VIRTUALENV=true` from the global runner environment and
+  set it only in workflow steps that require virtualenv enforcement.
+
+  Note: The upstream fix (adding `--isolated` to setup-python's internal pip calls)
+  was proposed in setup-python#1285 but as of June 2026 has not been merged.
+fix_code:
+  - language: yaml
+    label: 'Unset PIP_REQUIRE_VIRTUALENV before setup-python (workflow-level fix)'
+    code: |
+      jobs:
+        build:
+          runs-on: [self-hosted, ubuntu]
+          steps:
+            # ✅ Unset the env var so setup-python's internal pip calls can run
+            - name: Clear PIP_REQUIRE_VIRTUALENV
+              run: echo "PIP_REQUIRE_VIRTUALENV=" >> "$GITHUB_ENV"
+
+            - name: Set up Python
+              uses: actions/setup-python@v5
+              with:
+                python-version: '3.11'
+
+            # Now set it back for steps that actually need virtualenv enforcement
+            - name: Restore PIP_REQUIRE_VIRTUALENV
+              run: echo "PIP_REQUIRE_VIRTUALENV=true" >> "$GITHUB_ENV"
+
+            - name: Install dependencies (inside venv as required)
+              run: |
+                python -m venv .venv
+                source .venv/bin/activate
+                pip install -r requirements.txt
+  - language: yaml
+    label: 'Use step-level env override to isolate pip enforcement (alternative)'
+    code: |
+      jobs:
+        build:
+          runs-on: [self-hosted, ubuntu]
+          steps:
+            - name: Set up Python
+              uses: actions/setup-python@v5
+              with:
+                python-version: '3.11'
+              env:
+                # Override PIP_REQUIRE_VIRTUALENV for this step only
+                PIP_REQUIRE_VIRTUALENV: ''
+
+            - name: Install dependencies in venv
+              run: |
+                python -m venv .venv
+                source .venv/bin/activate
+                pip install -r requirements.txt
+              env:
+                PIP_REQUIRE_VIRTUALENV: 'true'
+prevention:
+  - 'Do not set PIP_REQUIRE_VIRTUALENV globally in the runner system environment if you use actions/setup-python — set it only in workflow steps where virtualenv enforcement is required.'
+  - 'If your self-hosted runner image sets PIP_REQUIRE_VIRTUALENV=true via shell profile, override or unset it in the workflow before any setup-python step.'
+  - 'Test self-hosted runner image changes against a workflow that uses setup-python to catch pip environment variable conflicts before rolling out the image.'
+  - 'Watch for actions/setup-python#1285 to be resolved upstream — a fix adding --isolated to internal pip calls will eliminate the need for this workaround.'
+docs:
+  - url: 'https://github.com/actions/setup-python/issues/1285'
+    label: 'actions/setup-python#1285: PIP_REQUIRE_VIRTUALENV breaks setup-python (open Mar 2026)'
+  - url: 'https://pip.pypa.io/en/stable/cli/pip/#cmdoption-isolated'
+    label: 'pip --isolated flag — bypass environment variable overrides'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/using-self-hosted-runners-in-a-workflow'
+    label: 'GitHub Docs: Using self-hosted runners in a workflow'
