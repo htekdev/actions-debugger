@@ -1,0 +1,99 @@
+id: runner-environment-300
+title: 'ARC Kubernetes Container Job Workspace Created with Wrong UID — Permission Denied'
+category: runner-environment
+severity: error
+tags:
+  - arc
+  - actions-runner-controller
+  - kubernetes
+  - container-job
+  - uid
+  - permissions
+  - fsgroup
+patterns:
+  - regex: 'Permission denied.*__w|__w.*Permission denied'
+    flags: 'i'
+  - regex: 'tar.*__w.*Cannot mkdir.*Permission denied'
+    flags: 'i'
+  - regex: 'UnauthorizedAccessException.*_work.*_tool'
+    flags: 'i'
+  - regex: 'Access to the path.*_work.*is denied'
+    flags: 'i'
+  - regex: '_runner_hook_responses.*Permission denied'
+    flags: 'i'
+error_messages:
+  - "fatal: could not create work tree dir '/__w/org/repo': Permission denied"
+  - "tar: __w/org/repo: Cannot mkdir: Permission denied"
+  - "System.UnauthorizedAccessException: Access to the path '/home/runner/_work/_tool' is denied."
+  - "System.IO.IOException: Permission denied"
+  - "ERR StepsRunner ---> System.UnauthorizedAccessException: Access to the path '/home/runner/_work/_temp/_runner_hook_responses' is denied."
+root_cause: |
+  In ARC Kubernetes mode, when the workspace directory `/__w/<org>/<repo>` does not exist
+  on the persistent volume at job start, it is created by the Kubernetes kubelet or an
+  init container with root ownership (uid 0) and group-sticky permissions such as
+  `drwxr-sr-x` (gid 1001, no group write bit). Container job steps run as a non-root
+  user (typically uid 1000 or the container's default user) and cannot write to
+  a directory they do not own.
+
+  This causes `actions/checkout` (git init) and any tool-cache writes
+  (`actions/setup-node`, `actions/setup-python`, etc.) to fail immediately with
+  "Permission denied" or `UnauthorizedAccessException`.
+
+  The failure surfaces on first run for a new repository, after a PersistentVolume
+  is reprovisioned, or when `runner-container-hooks` creates `_runner_hook_responses`
+  before the workspace is owned by the runner user.
+
+  Root source of the ownership mismatch: the runner pod itself runs as uid 1001 but
+  when it invokes container hooks the file operations happen in the workflow pod which
+  uses a different user identity. Without an explicit `fsGroup`, Kubernetes does not
+  change volume ownership to match the pod's user.
+
+  Source: actions/runner-container-hooks#282, #257; actions-runner-controller#4011.
+fix: |
+  Set `fsGroup: 1001` in the runner pod's security context. Kubernetes will
+  automatically `chown` all mounted volume directories to this GID on pod start,
+  giving the runner user (uid 1001) write access to the workspace.
+
+  If `fsGroup` is insufficient (e.g., the PVC uses a storage class that ignores fsGroup),
+  add an init container that explicitly `chown`s the workspace directory.
+fix_code:
+  - language: yaml
+    label: 'Set fsGroup in RunnerScaleSet pod spec (recommended)'
+    code: |
+      # In your ARC RunnerScaleSet values.yaml:
+      template:
+        spec:
+          securityContext:
+            fsGroup: 1001        # Runner GID — Kubernetes chowns all volume mounts to this group
+          containers:
+            - name: runner
+              image: ghcr.io/actions/actions-runner:latest
+  - language: yaml
+    label: 'Init container fallback: explicitly chown workspace'
+    code: |
+      template:
+        spec:
+          initContainers:
+            - name: fix-workspace-permissions
+              image: busybox:latest
+              command: ['sh', '-c', 'mkdir -p /__w && chown -R 1001:1001 /__w']
+              volumeMounts:
+                - name: work
+                  mountPath: /__w
+          containers:
+            - name: runner
+              image: ghcr.io/actions/actions-runner:latest
+prevention:
+  - "Always set `securityContext.fsGroup: 1001` in your RunnerScaleSet pod spec when using container jobs."
+  - "Use `runAsUser: 1001` together with `fsGroup: 1001` for consistent UID/GID alignment."
+  - "Verify workspace directory ownership after provisioning a new PersistentVolume before running production jobs."
+  - "Test permission setup with a `ls -la /__w` step in a diagnostic workflow after any ARC upgrade."
+docs:
+  - url: 'https://docs.github.com/en/actions/tutorials/use-actions-runner-controller/deploy-runner-scale-sets'
+    label: 'GitHub Docs: ARC — Deploy runner scale sets'
+  - url: 'https://github.com/actions/runner-container-hooks/issues/282'
+    label: 'runner-container-hooks#282: Permission denied on workingDir (__w/repo) — wrong UID on directory'
+  - url: 'https://github.com/actions/runner-container-hooks/issues/257'
+    label: 'runner-container-hooks#257: Container job workspace permission denied with non-root user'
+  - url: 'https://github.com/actions/actions-runner-controller/issues/4011'
+    label: 'actions-runner-controller#4011: fsGroup required for _work/_tool access denied'

@@ -1,0 +1,116 @@
+id: permissions-auth-088
+title: 'checkout@v6 Git Credentials Not Available Inside Manually-Run Docker Containers'
+category: permissions-auth
+severity: error
+tags:
+  - checkout
+  - v6
+  - docker
+  - credentials
+  - runner-temp
+  - persist-credentials
+  - includeif
+patterns:
+  - regex: 'fatal.*could not read Username.*https://github\.com.*No such device or address'
+    flags: 'i'
+  - regex: 'fatal.*Authentication failed.*https://.*@github\.com'
+    flags: 'i'
+  - regex: 'remote: Repository not found.*fatal.*repository.*https://github\.com.*not found'
+    flags: 'i'
+  - regex: 'git.*credential.*helper.*no credential.*found'
+    flags: 'i'
+error_messages:
+  - "fatal: could not read Username for 'https://github.com': No such device or address"
+  - "fatal: Authentication failed for 'https://github.com/org/repo/'"
+  - "fatal: could not read Password for 'https://x-access-token@github.com': No such device or address"
+  - "Error: The process '/usr/bin/git' failed with exit code 128"
+root_cause: |
+  `actions/checkout@v6` switched from storing credentials as HTTP Authorization headers
+  directly in `.git/config` (the v5 approach) to using conditional git config includes
+  (`includeIf.gitdir`) that reference a credential helper file stored in `RUNNER_TEMP`.
+
+  The credential file lives at:
+    $RUNNER_TEMP/git-credentials-<UUID>.config   (host path)
+    /github/runner_temp/git-credentials-<UUID>.config  (inside GitHub-managed containers)
+
+  For Docker container actions managed by the runner (`using: docker` in action.yml),
+  the runner automatically mounts `$RUNNER_TEMP` as `/github/runner_temp/` and sets
+  up the `includeIf` path match — credentials work transparently.
+
+  However, for steps that run their own `docker run` commands (e.g., Docker-based
+  third-party actions that invoke `docker run` internally), the runner does NOT
+  automatically mount `RUNNER_TEMP` into the user-managed container. The `includeIf`
+  directive in `.git/config` also requires the checkout to be mounted at the SAME path
+  inside the container for the condition to trigger.
+
+  Because neither `$RUNNER_TEMP` is mounted nor the workspace path necessarily matches,
+  git operations inside the user-managed container fail to find credentials and
+  error with "could not read Username" or authentication failures.
+
+  This is a breaking change from v5 which placed credentials directly in `.git/config`
+  as `http.extraheader`, making them available to any `git` invocation in any container
+  that mounted the `.git` directory.
+
+  Source: actions/checkout#2359 (open Jan 2026, 12 👍, 30+ downstream mentions).
+  Upstream maintainer (ericsciple) acknowledged the issue and is evaluating switching
+  from `includeIf.gitdir` to unconditional `include.path` as a fix.
+fix: |
+  Mount `$RUNNER_TEMP` into the docker container at `/github/runner_temp` so the
+  credentials file is accessible at the path `includeIf.gitdir` expects.
+
+  If the container mounts the workspace at a non-standard path, pass git credentials
+  explicitly via environment variable as a fallback.
+
+  Alternatively, pin to `actions/checkout@v5` until the upstream fix ships in v6.
+fix_code:
+  - language: yaml
+    label: 'Mount RUNNER_TEMP into the docker container (recommended v6 workaround)'
+    code: |
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: true   # default — credential file written to $RUNNER_TEMP
+
+      - name: Run git operation inside container
+        run: |
+          docker run \
+            -v "${{ github.workspace }}:/github/workspace" \
+            -v "$RUNNER_TEMP:/github/runner_temp" \
+            -w /github/workspace \
+            my-image:latest \
+            git push origin HEAD
+  - language: yaml
+    label: 'Pass token explicitly via env (simpler fallback)'
+    code: |
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Run git inside container with explicit token
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          docker run \
+            -e GH_TOKEN \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            my-image:latest \
+            sh -c 'git push https://x-access-token:${GH_TOKEN}@github.com/org/repo.git HEAD'
+  - language: yaml
+    label: 'Pin to checkout@v5 until v6 upstream fix ships'
+    code: |
+      - name: Checkout
+        uses: actions/checkout@v5   # v5 uses HTTP Authorization headers — works in any container
+        with:
+          token: ${{ secrets.PROJECT_GITHUB_TOKEN }}
+prevention:
+  - "When using `docker run` in workflow steps, always mount `$RUNNER_TEMP:/github/runner_temp` so checkout@v6 credentials are accessible."
+  - "Pass `$RUNNER_TEMP` as a volume mount and ensure the workspace is mounted at the same path the host uses (`/github/workspace`) for `includeIf` to match."
+  - "If upgrading from checkout@v5 to v6, audit all workflow steps that invoke `docker run` directly — they require the volume mount workaround."
+  - "For Docker-based third-party actions that run `docker run` internally, check if they accept a `RUNNER_TEMP` mount or use explicit token injection."
+docs:
+  - url: 'https://github.com/actions/checkout/issues/2359'
+    label: 'actions/checkout#2359: checkout@v6 credentials not available inside manually-run Docker containers (open)'
+  - url: 'https://github.com/actions/checkout/blob/main/README.md'
+    label: 'actions/checkout README: persist-credentials and token inputs'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/store-information-in-variables#default-environment-variables'
+    label: 'GitHub Docs: Default environment variables (RUNNER_TEMP)'

@@ -1,0 +1,81 @@
+id: runner-environment-298
+title: 'hashFiles() Rejects github.action_path in Composite Actions — Relative ''.'' Segment Not Allowed'
+category: runner-environment
+severity: error
+tags:
+  - hashfiles
+  - composite-action
+  - github-action-path
+  - path-resolution
+  - caching
+patterns:
+  - regex: 'Invalid pattern.*\./\..*Relative pathing.*not allowed'
+    flags: 'i'
+  - regex: 'ERR_ASSERTION.*Invalid pattern.*\./'
+    flags: 'i'
+  - regex: 'Relative pathing.*and.*\.\. is not allowed'
+    flags: 'i'
+error_messages:
+  - "AssertionError [ERR_ASSERTION]: Invalid pattern '/home/runner/work/repo/./.github/actions/foo/bar.txt'. Relative pathing '.' and '..' is not allowed."
+  - "Invalid pattern '/home/runner/work/repo/./.github/actions/my-action/lock.json'. Relative pathing '.' and '..' is not allowed."
+root_cause: |
+  `hashFiles()` validates that path patterns do not contain relative segments (`.` or `..`).
+  When a composite action is referenced via a local path (e.g., `uses: ./.github/actions/foo`),
+  the GitHub Actions runner populates `github.action_path` with a trailing `/.` suffix:
+
+    /home/runner/work/repo/./.github/actions/foo
+
+  When the composite action uses `hashFiles(format('{0}/lockfile', github.action_path))`,
+  the resulting pattern contains the `./` segment that hashFiles rejects outright
+  with an `AssertionError`. The action fails with a cryptic error rather than a useful
+  message about the path issue.
+
+  The restriction lives in the hashFiles binary bundled with the runner
+  (`bin/hashFiles/index.js`) and has been present since at least runner v2.322.0.
+  The upstream issue (actions/runner#3765, opened March 2025) was marked Stale in
+  March 2026 with no fix shipped.
+
+  This affects composite actions that include dependency lock files and want to build
+  cache keys from them — a very common pattern for pinned tool versions.
+fix: |
+  Trim the trailing `/.` from `github.action_path` before passing it to `hashFiles()`.
+  Use a preceding shell step to resolve the clean absolute path and store it in an
+  environment variable or step output, then reference that in the cache key expression.
+fix_code:
+  - language: yaml
+    label: 'Workaround: strip trailing /. with shell and store in GITHUB_ENV'
+    code: |
+      - name: Resolve composite action path
+        shell: bash
+        run: |
+          ACTION_PATH="${{ github.action_path }}"
+          echo "CLEAN_ACTION_PATH=${ACTION_PATH%/.}" >> "$GITHUB_ENV"
+
+      - name: Cache tool
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/my-tool
+          key: ${{ runner.os }}-${{ hashFiles(format('{0}/lock.json', env.CLEAN_ACTION_PATH)) }}
+  - language: yaml
+    label: 'Alternative: resolve via cd && pwd into step output'
+    code: |
+      - name: Resolve real action path
+        id: paths
+        shell: bash
+        run: |
+          echo "dir=$(cd '${{ github.action_path }}' && pwd)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache tool
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/my-tool
+          key: ${{ runner.os }}-${{ hashFiles(format('{0}/lock.json', steps.paths.outputs.dir)) }}
+prevention:
+  - "Never interpolate `github.action_path` directly into `hashFiles()` — always resolve the path through a shell step first."
+  - "Use `$(cd '${{ github.action_path }}' && pwd)` in a `run:` step to get a clean absolute path without trailing `/.`."
+  - "Track actions/runner#3765 for an upstream fix; pin your composite action's runner version once a fix is released."
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#hashfiles'
+    label: 'GitHub Docs: hashFiles() function reference'
+  - url: 'https://github.com/actions/runner/issues/3765'
+    label: 'actions/runner#3765: hashFiles() cannot be used with github.action_path in composite actions (bug, open)'
