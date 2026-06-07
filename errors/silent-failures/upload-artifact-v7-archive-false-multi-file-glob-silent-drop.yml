@@ -1,0 +1,85 @@
+id: silent-failures-149
+title: 'upload-artifact@v7 archive:false silently drops all but first file when path matches multiple files'
+category: silent-failures
+severity: silent-failure
+tags:
+  - upload-artifact
+  - v7
+  - archive
+  - non-zipped
+  - multi-file
+  - silent-failure
+patterns:
+  - regex: 'only one.*file.*uploaded.*archive.*false|archive.*false.*single.*file'
+    flags: 'i'
+  - regex: 'With the provided path.*only one file'
+    flags: 'i'
+error_messages:
+  - "With the provided path, only one file will be uploaded when archive is set to false"
+root_cause: |
+  actions/upload-artifact@v7 with archive: false (non-zipped mode, introduced February 2026 via
+  GitHub Changelog) only supports uploading a single file. When the path: input resolves to
+  multiple files via a glob pattern (e.g., dist/*.js) or a directory, the action uploads only
+  the first matched file and silently discards all others.
+
+  The step exits with code 0. No error is thrown. The artifact appears in the GitHub Actions UI
+  as a single raw file. Downstream jobs that expect all matched files to be available receive
+  only one file — causing builds, tests, or deployment steps to fail in unexpected ways, often
+  far from the actual problem source.
+
+  The action may emit a warning log line ("With the provided path, only one file will be uploaded
+  when archive is set to false") but the step result is still success, and the CI green badge gives
+  no signal that data was lost.
+
+  This is a fundamental design constraint of archive: false — non-zipped uploads are single-file
+  only by design. The constraint is mentioned in the February 2026 changelog but is easy to miss
+  when migrating existing multi-file upload steps to use the new archive: false input.
+fix: |
+  Use archive: true (the default) when uploading multiple files. The archive: true path creates
+  a zip bundle containing all matched files and correctly honors the name: input.
+
+  If you specifically need non-zipped uploads, ensure path: resolves to exactly one file.
+  Move or rename files to a staging directory and use an explicit single-file path. Add an
+  assertion before the upload step to fail loudly if multiple files are present.
+fix_code:
+  - language: yaml
+    label: 'Broken — archive:false with multi-file glob silently drops extra files'
+    code: |
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-bundles
+          path: dist/*.js          # Matches 5 files — only first is uploaded ❌
+          archive: false           # Silent drop of files 2-5; step exits 0
+  - language: yaml
+    label: 'Fixed — use archive:true (default) for multi-file upload'
+    code: |
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-bundles
+          path: dist/*.js          # All files included in zip ✅
+          # Remove archive: false — archive:true is the default
+  - language: yaml
+    label: 'Fixed — single-file archive:false with assertion guard'
+    code: |
+      - name: Assert exactly one output file exists
+        run: |
+          count=$(find ./dist -name "app.min.js" | wc -l)
+          [[ "$count" -eq 1 ]] || { echo "Expected 1 file, found $count"; exit 1; }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: app.min.js
+          path: dist/app.min.js    # Exact single-file path — safe with archive: false ✅
+          archive: false
+prevention:
+  - 'Never use archive: false with glob patterns or directory paths — only use it with an explicit single-file path.'
+  - 'Wrap archive: false uploads with a pre-upload assertion step that validates exactly one file matches the path.'
+  - 'Default to archive: true for all multi-file or directory uploads; reserve archive: false only for deliberate single-file non-zipped uploads.'
+  - 'Monitor CI logs for "only one file will be uploaded" warning lines which signal this misconfiguration.'
+docs:
+  - url: 'https://github.blog/changelog/2026-02-26-github-actions-now-supports-uploading-and-downloading-non-zipped-artifacts'
+    label: 'GitHub Changelog 2026-02-26: Non-zipped artifact support — single-file-only constraint'
+  - url: 'https://github.com/actions/upload-artifact'
+    label: 'actions/upload-artifact — archive input documentation'
+  - url: 'https://github.com/actions/upload-artifact/issues/785'
+    label: 'actions/upload-artifact#785: archive:false behavior discussion (March 2026)'

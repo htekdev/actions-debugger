@@ -1,0 +1,121 @@
+id: caching-artifacts-097
+title: 'Artifact names containing non-ASCII characters (Kanji, emoji, accented chars) cause download failure'
+category: caching-artifacts
+severity: error
+tags:
+  - download-artifact
+  - artifact-name
+  - encoding
+  - unicode
+  - non-ascii
+  - internationalization
+patterns:
+  - regex: 'Unable to find.*artifact|no artifact.*found'
+    flags: 'i'
+  - regex: 'artifact.*download.*failed.*name|Could not find.*artifact'
+    flags: 'i'
+error_messages:
+  - "Unable to find any artifacts for the associated workflow"
+  - "Unable to download artifact. No artifacts found for the associated workflow."
+root_cause: |
+  Artifact names containing non-ASCII characters — Japanese Kanji, Chinese characters, emoji,
+  accented Latin characters (é, ñ, ü), Arabic, Cyrillic, etc. — are accepted by
+  actions/upload-artifact and stored in the artifact service. They appear in the GitHub Actions
+  UI and can be downloaded manually from the web interface. However, programmatic download via
+  actions/download-artifact or the GitHub REST API fails because of character-encoding
+  mismatches between the upload path, artifact service URL encoding, and the download client's
+  name lookup query.
+
+  The artifact service stores names using one encoding representation; the download action
+  (or API consumer) sends a percent-encoded or byte-sequence form of the name that does not
+  match the stored form. The lookup returns no results, and download-artifact reports that no
+  artifact was found.
+
+  Behavior also varies by runner OS: Linux runners use UTF-8 encoding while Windows runners
+  may apply different code-page handling. A matrix build that uploads an artifact on Linux and
+  downloads it on Windows (or vice versa) can fail due to the cross-platform encoding mismatch
+  even when the name looks identical in the workflow YAML.
+
+  This was reported in GitHub Community Discussion #187941 (2026) where users uploading
+  artifacts named with Japanese characters (e.g., test suite names) observed consistent
+  download failures in downstream jobs despite successful uploads.
+fix: |
+  Use only ASCII-safe artifact names. Normalize or slugify names before both the upload and
+  download steps so they use the same identifier:
+  - Replace non-ASCII characters with ASCII equivalents or remove them
+  - Replace spaces with hyphens
+  - Use only a-z, 0-9, hyphens, underscores, and periods
+
+  For matrix builds that generate artifact names from localized values (e.g., test suite names,
+  branch names, or user-supplied strings), add a normalization step that produces a deterministic
+  ASCII-safe identifier used in both the upload and download steps.
+fix_code:
+  - language: yaml
+    label: 'Broken — non-ASCII artifact name causes download failure'
+    code: |
+      # Upload job
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        with:
+          name: テスト結果-${{ matrix.suite }}   # ❌ Non-ASCII causes download failure
+          path: results/
+
+      # Downstream job
+      - name: Download test results
+        uses: actions/download-artifact@v4
+        with:
+          name: テスト結果-unit                  # ❌ Encoding mismatch — download fails
+  - language: yaml
+    label: 'Fixed — normalize artifact name to ASCII before upload and download'
+    code: |
+      # Upload job
+      - name: Set ASCII-safe artifact name
+        id: artifact-name
+        run: |
+          # Transliterate and strip non-ASCII characters
+          SAFE_NAME=$(echo "${{ matrix.suite }}" | iconv -c -t ascii//TRANSLIT | tr -dc 'a-zA-Z0-9._-' | tr ' ' '-')
+          echo "name=test-results-${SAFE_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact-name.outputs.name }}   # ✅ ASCII-safe
+          path: results/
+
+      # Downstream job — use same normalization logic or a known ASCII name
+      - name: Download test results
+        uses: actions/download-artifact@v4
+        with:
+          name: test-results-unit                         # ✅ Matches normalized upload name
+  - language: yaml
+    label: 'Fixed — matrix build using sanitized artifact names from a shared expression'
+    code: |
+      jobs:
+        test:
+          strategy:
+            matrix:
+              suite: [unit, integration, e2e]
+          steps:
+            - uses: actions/upload-artifact@v4
+              with:
+                name: results-${{ matrix.suite }}   # ✅ ASCII-only matrix values
+                path: results/
+
+        aggregate:
+          needs: test
+          steps:
+            - uses: actions/download-artifact@v4
+              with:
+                name: results-unit                  # ✅ Known ASCII name
+prevention:
+  - 'Enforce ASCII-only artifact names in team CI conventions; add a linting step or PR check that rejects non-ASCII artifact names.'
+  - 'Never derive artifact names directly from user-supplied or locale-sensitive strings without first normalizing to ASCII.'
+  - 'When running matrix builds across Linux and Windows, use a shared normalization function to ensure identical artifact names across platforms.'
+  - 'Audit existing workflows that use locale-specific test suite names, branch names with accented characters, or emoji labels as artifact names.'
+docs:
+  - url: 'https://github.com/orgs/community/discussions/187941'
+    label: 'GitHub Community Discussion #187941: Non-ASCII artifact names causing download failures (2026)'
+  - url: 'https://github.com/actions/upload-artifact'
+    label: 'actions/upload-artifact — artifact naming documentation'
+  - url: 'https://github.com/actions/download-artifact'
+    label: 'actions/download-artifact — name input documentation'
