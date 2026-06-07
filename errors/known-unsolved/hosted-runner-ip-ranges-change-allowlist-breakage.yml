@@ -1,0 +1,111 @@
+id: known-unsolved-082
+title: "GitHub-hosted runner IP ranges change without advance notice, breaking allowlist-based network policies"
+category: known-unsolved
+severity: limitation
+tags:
+  - runner
+  - ip-allowlist
+  - network
+  - firewall
+  - security
+patterns:
+  - regex: 'connect ECONNREFUSED|connect ETIMEDOUT|connect ECONNRESET'
+    flags: ''
+  - regex: 'Connection refused|Connection timed out|Network is unreachable|No route to host'
+    flags: i
+  - regex: 'Unable to connect to|Failed to connect to|could not connect to server'
+    flags: i
+error_messages:
+  - "connect ECONNREFUSED"
+  - "connect ETIMEDOUT"
+  - "Connection refused"
+  - "Network is unreachable"
+  - "No route to host"
+root_cause: |
+  GitHub publishes the current IP address ranges for GitHub-hosted runners via the
+  Meta API at https://api.github.com/meta (fields `actions` and `actions_macos`).
+  However, these CIDR ranges are updated frequently — sometimes multiple times per
+  week — and changes are announced only through the GitHub Changelog blog. There is
+  no push notification mechanism, no webhook, and no machine-readable subscription
+  feed for IP range changes.
+
+  Organizations that allowlist runner egress IPs in cloud security groups (AWS, Azure,
+  GCP), on-premise firewalls, or SaaS platform IP restrictions will experience
+  intermittent network failures when runner IPs rotate into CIDR blocks outside the
+  previously allowlisted ranges. The failure manifests as a standard network-level
+  timeout or connection refusal from the target service — no GitHub-specific error
+  message is emitted, making root cause diagnosis difficult.
+
+  Standard GitHub-hosted runners (ubuntu-latest, windows-latest, macos-latest) do NOT
+  support static IP assignment. The IP a job receives is drawn from a large shared
+  pool and is unpredictable per-run.
+fix: |
+  There is no complete solution on standard GitHub-hosted runners. Partial mitigations
+  ordered by effectiveness:
+
+  1. **Larger runners with static IPs** (most reliable): GitHub-hosted "larger runners"
+     support static IP assignment when configured in a runner group. Available on
+     GitHub Team and GitHub Enterprise Cloud plans. The runner group's IP range is
+     stable and documented, suitable for firewall rules.
+
+  2. **Self-hosted runners**: Deploy runners inside your own network. The runner's IP
+     is controlled by your infrastructure and never changes unexpectedly.
+
+  3. **VPN/tunnel from runner to private network**: Use a WireGuard or OpenVPN step at
+     workflow start to connect the runner to your private network, eliminating the need
+     to expose the target service to GitHub's shared IP pool at all.
+
+  4. **Poll `/meta` and auto-update firewall rules**: A scheduled workflow compares the
+     current `api.github.com/meta` `actions` ranges against your current firewall rules
+     and updates them automatically. Requires cloud provider API access from CI.
+
+  5. **Token-based auth instead of IP allowlisting**: Architect internal services to
+     authenticate via bearer token, mTLS, or OIDC federation rather than relying on
+     source IP as a security control.
+fix_code:
+  - language: yaml
+    label: "Poll GitHub meta API and sync to AWS security group (illustrative)"
+    code: |
+      name: Sync GitHub Actions IPs to AWS security group
+      on:
+        schedule:
+          - cron: '0 */6 * * *'   # every 6 hours
+        workflow_dispatch:
+
+      jobs:
+        sync-ips:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Fetch current GitHub Actions IP ranges
+              id: meta
+              run: |
+                RANGES=$(curl -s https://api.github.com/meta | jq -r '.actions[]')
+                echo "ranges<<EOF" >> "$GITHUB_OUTPUT"
+                echo "$RANGES" >> "$GITHUB_OUTPUT"
+                echo "EOF" >> "$GITHUB_OUTPUT"
+
+            - name: Update AWS security group
+              env:
+                AWS_REGION: us-east-1
+                SG_ID: sg-0123456789abcdef0
+                AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+                AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+              run: |
+                # Revoke all existing egress rules for port 443 first
+                # Then re-authorize with current GitHub Actions IP ranges
+                # Implementation varies — adapt to your cloud provider's CLI
+                echo "New ranges to allowlist:"
+                echo "${{ steps.meta.outputs.ranges }}"
+prevention:
+  - "Use GitHub Larger runners with dedicated static IP ranges if your org requires consistent IP allowlisting."
+  - "Self-hosted runners eliminate IP unpredictability entirely for network-restricted targets."
+  - "Subscribe to the GitHub Changelog RSS feed and set up alerts for 'IP range' or 'Meta API' posts."
+  - "Prefer token/OIDC-based authentication over IP-based access controls for internal services accessed from CI."
+  - "Cache the /meta API response and run a diff job to detect changes before they break production workflows."
+docs:
+  - url: https://api.github.com/meta
+    label: "GitHub Meta API — current runner IP ranges (live)"
+  - url: https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners/about-github-hosted-runners#ip-addresses
+    label: "GitHub Docs — GitHub-hosted runner IP addresses"
+  - url: https://docs.github.com/en/actions/using-github-hosted-runners/managing-larger-runners/about-larger-runners#static-ip-addresses-for-larger-runners
+    label: "GitHub Docs — Static IP addresses for larger runners"

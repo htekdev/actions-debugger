@@ -1,0 +1,93 @@
+id: yaml-syntax-083
+title: "YAML folded scalar > in run: collapses multiline commands into a single line"
+category: yaml-syntax
+severity: silent-failure
+tags:
+  - yaml-scalars
+  - run
+  - multiline
+  - folded-scalar
+  - block-literal
+patterns:
+  - regex: 'command not found|No such file or directory|unexpected token|syntax error near unexpected'
+    flags: i
+error_messages: []
+root_cause: |
+  YAML has two multi-line string types for block scalars: the block literal (`|`) and the
+  folded scalar (`>`). They behave very differently inside a `run:` step:
+
+  - `run: |` (block literal) preserves newlines — each line becomes a separate shell
+    statement, exactly as the developer intended for multi-command scripts.
+
+  - `run: >` (folded scalar) replaces newlines with a single space, collapsing the
+    entire block into one long line. The resulting command is often syntactically valid
+    but semantically wrong — arguments from the second line are silently appended to the
+    first command rather than running as a new statement.
+
+  Because the collapsed script is frequently still valid shell syntax, no error is
+  emitted. The runner executes the first command with the second command's text as
+  unexpected arguments, or runs all words as a single compound expression. Output is
+  wrong but the step passes with exit code 0.
+
+  This is a very common mistake for developers who write YAML outside of CI contexts
+  and reach for `>` as a generic "multiline string" operator, unaware that `|` is
+  required to preserve the newlines that shell scripts depend on.
+
+  Example of the silent failure:
+    run: >
+      echo "Building..."
+      npm ci
+      npm run build
+  This executes as: `echo "Building..." npm ci npm run build`
+  — a single echo statement with extra arguments, not three separate commands.
+fix: |
+  Replace `>` with `|` (pipe character) for all multi-command `run:` blocks. The `|`
+  block literal preserves newlines faithfully, giving the shell one command per line.
+
+  The only correct use of `>` in a `run:` step is for a deliberately single-line
+  command that is broken across lines purely for readability and where the space
+  substitution is intentional (rare in CI scripts).
+fix_code:
+  - language: yaml
+    label: "Incorrect — folded scalar > collapses three commands into one line"
+    code: |
+      # WRONG: run: > collapses all lines into:
+      #   echo "Building..." npm ci npm run build
+      - name: Build
+        run: >
+          echo "Building..."
+          npm ci
+          npm run build
+
+  - language: yaml
+    label: "Correct — block literal | preserves newlines and runs three commands"
+    code: |
+      # CORRECT: run: | runs each line as a separate shell statement
+      - name: Build
+        run: |
+          echo "Building..."
+          npm ci
+          npm run build
+
+  - language: yaml
+    label: "Legitimate use of > — intentional single-line command split for readability"
+    code: |
+      # ACCEPTABLE: > to wrap a long single command (newline → space is intentional)
+      - name: Long curl command
+        shell: bash
+        run: >
+          curl -fsSL
+          -H "Authorization: Bearer $TOKEN"
+          -H "Content-Type: application/json"
+          https://api.example.com/endpoint
+prevention:
+  - "Always use `run: |` for any `run:` step that contains more than one shell command."
+  - "Reserve `run: >` only for deliberately single-statement commands that are wrapped for line-length readability."
+  - "Enable `set -euo pipefail` at the top of `run: |` blocks so collapsed-command failures are not silently swallowed."
+  - "Use `actionlint` or the VS Code GitHub Actions extension, which can surface unexpected single-line collapsing in some cases."
+  - "When copying shell scripts into workflow YAML, always verify the scalar type is `|` before committing."
+docs:
+  - url: https://yaml.org/spec/1.2-old/spec.html#id2794534
+    label: "YAML 1.2 Spec — Block Scalars (literal | and folded >)"
+  - url: https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idstepsrun
+    label: "GitHub Docs — jobs.<id>.steps[*].run"
