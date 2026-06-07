@@ -1,0 +1,113 @@
+id: silent-failures-124
+title: 'Composite action steps do not receive INPUT_* environment variables — inputs are only available via ${{ inputs.name }}'
+category: silent-failures
+severity: silent-failure
+tags:
+  - composite-action
+  - INPUT_
+  - environment-variables
+  - inputs
+  - migration
+patterns:
+  - regex: 'INPUT_[A-Z_]+=\s*$'
+    flags: 'm'
+  - regex: 'using:\s*composite'
+    flags: 'i'
+error_messages:
+  - 'INPUT_FOO='
+  - 'INPUT_TOKEN='
+  - 'INPUT_VERSION='
+root_cause: |
+  In GitHub Actions, there are three action types: JavaScript (node20/node16), Docker
+  container, and composite. JavaScript and Docker container actions automatically receive
+  every action input as an `INPUT_*` environment variable (e.g., input `my-token`
+  becomes `INPUT_MY-TOKEN`). Composite actions do NOT set these variables.
+
+  In composite actions, inputs are ONLY available via the `${{ inputs.name }}`
+  expression context. There is no `INPUT_*` environment variable equivalent.
+
+  This is a documented behavioral difference between action types (actions/runner#665,
+  66 reactions), but it causes silent failures when:
+
+  1. A developer migrates a Docker or JS action to a composite action and keeps shell
+     scripts that reference `${INPUT_FOO}`.
+  2. A composite action wraps a third-party script or binary that reads `INPUT_*` vars.
+  3. Documentation examples using Docker action syntax are copy-pasted into a composite
+     action without adaptation.
+
+  The failure is silent because `${INPUT_FOO}` evaluates to an empty string in bash —
+  no error is thrown, the script runs with the wrong (empty) value.
+fix: |
+  Replace all `${INPUT_FOO}` references in composite action steps with
+  `${{ inputs.foo }}` expressions, OR pass inputs explicitly via `env:` on each step.
+
+  Option 1 (preferred): Use `${{ inputs.name }}` directly in `run:` scripts.
+  Option 2: Set explicit `env:` on the step to bridge the gap.
+fix_code:
+  - language: yaml
+    label: 'Wrong — composite action using INPUT_* variable (silently empty)'
+    code: |
+      # action.yml (composite)
+      inputs:
+        token:
+          description: 'GitHub token'
+          required: true
+        version:
+          description: 'Version to deploy'
+          required: true
+      runs:
+        using: composite
+        steps:
+          - name: Deploy
+            shell: bash
+            run: |
+              # WRONG: INPUT_TOKEN and INPUT_VERSION are EMPTY in composite actions
+              echo "Deploying version ${INPUT_VERSION} with token ${INPUT_TOKEN}"
+              curl -H "Authorization: Bearer ${INPUT_TOKEN}" https://api.example.com/deploy/${INPUT_VERSION}
+  - language: yaml
+    label: 'Correct — use ${{ inputs.name }} expressions directly'
+    code: |
+      # action.yml (composite)
+      inputs:
+        token:
+          description: 'GitHub token'
+          required: true
+        version:
+          description: 'Version to deploy'
+          required: true
+      runs:
+        using: composite
+        steps:
+          - name: Deploy
+            shell: bash
+            run: |
+              # CORRECT: use inputs context
+              echo "Deploying version ${{ inputs.version }}"
+              curl -H "Authorization: Bearer ${{ inputs.token }}" https://api.example.com/deploy/${{ inputs.version }}
+  - language: yaml
+    label: 'Alternative — pass inputs via env: for cleaner shell scripts'
+    code: |
+      runs:
+        using: composite
+        steps:
+          - name: Deploy
+            shell: bash
+            env:
+              TOKEN: ${{ inputs.token }}
+              VERSION: ${{ inputs.version }}
+            run: |
+              # env vars are now set explicitly — safe to use ${TOKEN} etc.
+              echo "Deploying version ${VERSION}"
+              curl -H "Authorization: Bearer ${TOKEN}" https://api.example.com/deploy/${VERSION}
+prevention:
+  - 'Never use ${INPUT_*} in composite action steps — use ${{ inputs.name }} or explicit env: instead'
+  - 'When migrating a Docker or JS action to composite, search for INPUT_ references in all scripts and replace them'
+  - 'Add integration tests that assert expected input values are non-empty to catch this silently-empty-variable pattern'
+  - 'Use shellcheck on action scripts — it may flag undefined variable usage that hints at missing input bindings'
+docs:
+  - url: 'https://docs.github.com/en/actions/sharing-automations/creating-actions/metadata-syntax-for-github-actions#inputs'
+    label: 'GitHub Docs — Action inputs (INPUT_* behavior per action type)'
+  - url: 'https://github.com/actions/runner/issues/665'
+    label: 'actions/runner#665 — INPUT_* environment variables are missing in composite actions (66 reactions)'
+  - url: 'https://docs.github.com/en/actions/sharing-automations/creating-actions/creating-a-composite-action'
+    label: 'GitHub Docs — Creating a composite action'

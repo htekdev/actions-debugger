@@ -1,0 +1,99 @@
+id: silent-failures-125
+title: '${{ }} expression in ::add-mask:: run command leaks the secret value in the workflow log before masking takes effect'
+category: silent-failures
+severity: silent-failure
+tags:
+  - add-mask
+  - masking
+  - secret-leak
+  - expression
+  - security
+  - log-redaction
+patterns:
+  - regex: 'echo\s+["\x27]::add-mask::\$\{\{'
+    flags: 'i'
+  - regex: '::add-mask::\$\{\{.*\}\}'
+    flags: 'i'
+error_messages:
+  - 'echo "::add-mask::ghp_actualTokenValue"'
+  - 'echo "::add-mask::actualPasswordValue"'
+root_cause: |
+  When a workflow step runs `echo "::add-mask::${{ expression }}"`, GitHub Actions
+  evaluates ALL `${{ }}` expressions before logging or executing the run command.
+  The runner logs the fully-expanded command BEFORE executing it. This means:
+
+  1. `${{ steps.generate-token.outputs.value }}` resolves to the actual secret value
+  2. The log prints: `echo "::add-mask::actualSecretValue123"` — the secret is now
+     visible in the workflow log in plain text
+  3. The `::add-mask::` command is processed AFTER the log line is written
+  4. Future log output is correctly masked, but the leaked line already exists
+
+  This is a silent security failure — the workflow completes successfully, the secret
+  appears masked in all subsequent log lines, but the initial `echo` command line
+  permanently exposes the secret value. Anyone with read access to the repository
+  (including contributors and Actions log viewers) can see the value.
+
+  Affected patterns:
+  - `echo "::add-mask::${{ secrets.MY_SECRET }}"` — leaks the secret
+  - `echo "::add-mask::${{ steps.get-token.outputs.token }}"` — leaks the token
+  - `run: echo ::add-mask::${{ env.COMPUTED_SECRET }}` — leaks the computed value
+
+  Note: this is DIFFERENT from `add-mask-no-retroactive-masking` (sf-006), which covers
+  masking applied after a value has already been printed. This entry covers the case
+  where the `echo` command itself leaks the value due to pre-execution expression
+  expansion and command logging.
+fix: |
+  Never use `${{ }}` expressions directly inside an `::add-mask::` command. Instead,
+  pass the secret/value via an environment variable so the `echo` command logged by
+  the runner shows the variable name (e.g., `$MY_SECRET`) — not the expanded value.
+
+  The runner does not expand `$ENV_VAR` syntax when logging the run command, so the
+  log will show `echo "::add-mask::$MY_SECRET"` without revealing the actual value.
+fix_code:
+  - language: yaml
+    label: 'Wrong — ${{ }} expression in add-mask leaks value in log'
+    code: |
+      steps:
+        - name: Generate token
+          id: generate-token
+          run: echo "token=ghp_$(openssl rand -hex 20)" >> $GITHUB_OUTPUT
+
+        - name: Mask token (WRONG — leaks value in log)
+          run: echo "::add-mask::${{ steps.generate-token.outputs.token }}"
+          # Log shows: echo "::add-mask::ghp_actualTokenValueHere" ← SECRET LEAKED
+  - language: yaml
+    label: 'Correct — pass value via env var to prevent expansion in log'
+    code: |
+      steps:
+        - name: Generate token
+          id: generate-token
+          run: echo "token=ghp_$(openssl rand -hex 20)" >> $GITHUB_OUTPUT
+
+        - name: Mask token (CORRECT — env var not expanded in log)
+          env:
+            TOKEN_TO_MASK: ${{ steps.generate-token.outputs.token }}
+          run: echo "::add-mask::$TOKEN_TO_MASK"
+          # Log shows: echo "::add-mask::$TOKEN_TO_MASK" ← safe, value not revealed
+  - language: yaml
+    label: 'Correct — combine mask and use in one step with env:'
+    code: |
+      steps:
+        - name: Generate and use token safely
+          env:
+            TOKEN: ${{ steps.generate-token.outputs.token }}
+          run: |
+            echo "::add-mask::$TOKEN"
+            # Now use $TOKEN safely — all future log output masks the value
+            curl -H "Authorization: Bearer $TOKEN" https://api.example.com/endpoint
+prevention:
+  - 'Never write echo "::add-mask::${{ expression }}" — always use env: to pass the value'
+  - 'Audit existing workflows for the pattern: grep -rn "add-mask.*\${{" .github/'
+  - 'Use $ENV_VAR syntax (not ${{ }}) in any run: step that handles secrets to prevent log expansion'
+  - 'Set ACTIONS_STEP_DEBUG=true in a test run and review logs for unexpectedly unmasked values'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions#masking-a-value-in-a-log'
+    label: 'GitHub Docs — Masking a value in a log (add-mask command)'
+  - url: 'https://github.com/actions/runner/issues/475'
+    label: 'actions/runner#475 — usage of add-mask still echoes the value to the log (68 reactions)'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions#using-an-intermediate-environment-variable'
+    label: 'GitHub Docs — Security hardening: using intermediate environment variables'
