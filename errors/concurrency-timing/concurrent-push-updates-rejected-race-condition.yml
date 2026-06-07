@@ -1,0 +1,114 @@
+id: concurrency-timing-070
+title: 'Concurrent workflow runs both push to same branch — "Updates were rejected because the remote contains work"'
+category: concurrency-timing
+severity: error
+tags:
+  - git-push
+  - concurrent-runs
+  - race-condition
+  - auto-commit
+  - push-rejected
+  - non-fast-forward
+patterns:
+  - regex: 'Updates were rejected because the remote contains work that you do not have locally'
+    flags: 'i'
+  - regex: 'Updates were rejected because the tip of your current branch is behind'
+    flags: 'i'
+  - regex: 'error: failed to push some refs'
+    flags: 'i'
+error_messages:
+  - "hint: Updates were rejected because the remote contains work that you do not"
+  - "hint: have locally. This is usually caused by another repository pushing to"
+  - "hint: the same ref. If you want to integrate the remote changes, use"
+  - "error: failed to push some refs to 'https://github.com/owner/repo.git'"
+  - "Updates were rejected because the tip of your current branch is behind its remote counterpart."
+root_cause: |
+  When multiple workflow runs execute in parallel and all attempt to `git push` to
+  the same branch, a race condition occurs: whichever run pushes first advances the
+  remote HEAD. Every subsequent run that checked out the branch BEFORE that push
+  now has a stale local copy and cannot fast-forward push — resulting in:
+
+    error: failed to push some refs to 'https://github.com/owner/repo.git'
+    hint: Updates were rejected because the remote contains work that you do not
+    hint: have locally.
+
+  Common triggers:
+  - Auto-format/lint workflows (e.g., prettier, black, isort) that commit and push
+    formatting fixes — if multiple PRs are opened in quick succession, two parallel
+    runs both try to push to their respective branches (or the same branch if using
+    a shared fix branch)
+  - Auto-update workflows that push changelog, version, or generated file updates
+  - Matrix jobs that each commit a per-matrix artifact to a release branch
+  - `stefanzweifel/git-auto-commit-action` used without concurrency: groups,
+    triggering multiple pushes to the same branch
+
+  The git push failure exits with code 1, failing the step. If the step uses
+  `continue-on-error: true`, the failure is silently ignored and some commits
+  are lost.
+fix: |
+  Use `concurrency:` groups to serialize workflow runs that push to the same branch.
+  This ensures only one run pushes at a time; others wait or are cancelled.
+
+  For auto-format/auto-commit patterns, add a `concurrency:` block scoped to the
+  branch ref. For workflows that must not be cancelled, use `cancel-in-progress: false`.
+fix_code:
+  - language: yaml
+    label: 'Serialize auto-commit runs per branch with concurrency group'
+    code: |
+      name: Auto Format
+
+      on:
+        pull_request:
+          branches: [main]
+
+      # Serialize runs per PR branch — only one auto-format push at a time
+      concurrency:
+        group: auto-format-${{ github.head_ref }}
+        cancel-in-progress: true   # cancel older run; latest commit wins
+
+      jobs:
+        format:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.head_ref }}
+                token: ${{ secrets.GITHUB_TOKEN }}
+            - name: Run formatter
+              run: npx prettier --write .
+            - name: Commit changes
+              run: |
+                git config user.name "github-actions[bot]"
+                git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+                git add -A
+                git diff --staged --quiet || git commit -m "style: auto-format"
+                git push
+  - language: yaml
+    label: 'Alternative — retry push with pull --rebase on conflict'
+    code: |
+      - name: Commit and push with retry
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --staged --quiet && exit 0
+          git commit -m "chore: auto-update"
+          # Retry up to 3 times on push rejection
+          for i in 1 2 3; do
+            git push && break
+            echo "Push failed (attempt $i), pulling and retrying..."
+            git pull --rebase origin HEAD
+          done
+prevention:
+  - 'Always add a concurrency: group to workflows that auto-commit and push'
+  - 'Scope the concurrency group to the branch ref (${{ github.head_ref || github.ref }}) to avoid serializing across unrelated branches'
+  - 'For workflows where losing a run is acceptable, use cancel-in-progress: true; for audit-critical workflows use cancel-in-progress: false'
+  - 'Avoid matrix jobs that all push to the same branch — use upload-artifact instead and merge in a final job'
+  - 'stefanzweifel/git-auto-commit-action docs recommend adding a concurrency group for all push-to-branch workflows'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/using-concurrency'
+    label: 'GitHub Docs — Using concurrency'
+  - url: 'https://github.com/stefanzweifel/git-auto-commit-action/issues/383'
+    label: 'git-auto-commit-action#383 — Updates were rejected in parallel runs'
+  - url: 'https://github.com/stefanzweifel/git-auto-commit-action/issues/170'
+    label: 'git-auto-commit-action#170 — Concurrent auto-commit push rejection'
