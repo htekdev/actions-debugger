@@ -1,0 +1,140 @@
+id: yaml-syntax-091
+title: "YAML Merge Keys (<<: *alias) Unsupported — Basic Anchors Work But Inheritance Fails"
+category: yaml-syntax
+severity: error
+tags:
+  - yaml
+  - anchors
+  - merge-keys
+  - dry
+  - inheritance
+  - syntax
+patterns:
+  - regex: 'mapping values are not allowed in this context'
+    flags: "i"
+  - regex: 'The workflow is not valid.*<<'
+    flags: "i"
+  - regex: 'unexpected mapping key'
+    flags: "i"
+  - regex: 'could not parse the yaml file.*<<'
+    flags: "i"
+error_messages:
+  - "The workflow is not valid. .github/workflows/ci.yml (Line: N, Col: N): mapping values are not allowed in this context"
+  - "could not parse the yaml file '.github/workflows/ci.yml'"
+  - "unexpected mapping key '<<'"
+root_cause: |
+  GitHub Actions added support for basic YAML anchors (`&`) and aliases (`*`) on
+  September 18, 2025 (after 4+ years of community requests). However, this
+  implementation deliberately excludes **YAML merge keys** (`<<: *alias`), which
+  are a YAML 1.1 extension not included in the YAML 1.2.2 specification GitHub
+  chose to implement.
+
+  Merge keys allow inheriting and overriding a mapped anchor — the feature that
+  makes anchors genuinely useful for DRY job configurations on GitLab CI/CD and
+  Bitbucket Pipelines. When developers see that `env: *prod_env` works (plain
+  alias), they naturally attempt `<<: *job_defaults` for job-level inheritance.
+  This fails with a YAML parse or schema error because GitHub's custom parser
+  does not implement merge key semantics.
+
+  Concretely: `<<: *defaults` adds a literal key `<<` to the mapping. GitHub
+  Actions' strict schema validation rejects unknown keys such as `<<` in a job
+  definition, producing "mapping values are not allowed in this context" or a
+  schema validation error.
+
+  Source: GitHub Actions September 2025 changelog, frenck.dev analysis
+  (Oct 2025), github/docs#40209 (closed as documented).
+fix: |
+  1. **Use plain aliases (`*`) for scalar or full-block repetition** — anchors and
+     aliases work for `env:` blocks, `services:`, and `paths:` filters where you
+     need exact (not overridden) repetition.
+  2. **Use composite actions for shared step sequences** — define shared steps
+     in `.github/actions/setup/action.yml` and call them with `uses:`.
+  3. **Use reusable workflows for shared job structures** — `workflow_call`
+     lets you parameterize entire jobs via `with:` inputs.
+  4. **Duplicate deliberately** — for job-level settings that differ slightly
+     (e.g. `timeout-minutes`), explicit duplication is the only option until
+     GitHub adds merge key support.
+fix_code:
+  - language: yaml
+    label: "BROKEN — merge key to inherit job defaults (not supported)"
+    code: |
+      .job_defaults: &job_defaults
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+
+      jobs:
+        build:
+          <<: *job_defaults     # ❌ parse error — merge keys unsupported
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm run build
+
+        test:
+          <<: *job_defaults     # ❌ parse error
+          timeout-minutes: 60   # would override if merge keys worked
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+  - language: yaml
+    label: "WORKS — plain alias for exact block repetition (no override needed)"
+    code: |
+      env:
+        jobs:
+          build:
+            runs-on: ubuntu-latest
+            env: &prod_env
+              NODE_ENV: production
+              API_URL: https://api.example.com
+            steps:
+              - run: ./deploy.sh
+
+          smoke-test:
+            runs-on: ubuntu-latest
+            env: *prod_env       # ✅ exact copy — no override needed
+            steps:
+              - run: ./smoke-test.sh
+  - language: yaml
+    label: "CORRECT — composite action for shared step sequences with variation"
+    code: |
+      # .github/actions/setup-node/action.yml
+      name: Setup Node
+      runs:
+        using: composite
+        steps:
+          - uses: actions/checkout@v4
+          - uses: actions/setup-node@v4
+            with:
+              node-version: 20
+              cache: npm
+          - run: npm ci
+            shell: bash
+
+      # .github/workflows/ci.yml
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          timeout-minutes: 30
+          steps:
+            - uses: ./.github/actions/setup-node
+            - run: npm run build
+
+        test:
+          runs-on: ubuntu-latest
+          timeout-minutes: 60    # different timeout — no merge key needed
+          steps:
+            - uses: ./.github/actions/setup-node
+            - run: npm test
+prevention:
+  - "Use YAML aliases (`*`) only for exact block repetition where no override is needed."
+  - "For shared step logic, use composite actions in .github/actions/."
+  - "For shared job graphs, use reusable workflows with workflow_call and with: inputs."
+  - "actionlint flags merge key syntax as an error — run it locally before pushing."
+docs:
+  - url: "https://github.blog/changelog/2025-09-18-github-actions-now-supports-yaml-anchors/"
+    label: "GitHub Actions now supports YAML anchors (Sept 18, 2025 changelog)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#yaml-anchors"
+    label: "Workflow syntax — YAML anchors"
+  - url: "https://frenck.dev/github-actions-yaml-anchors-aliases-merge-keys/"
+    label: "GitHub Actions finally supports YAML anchors (but not really) — Frenck"
+  - url: "https://docs.github.com/en/actions/sharing-automations/creating-actions/creating-a-composite-action"
+    label: "Creating a composite action"

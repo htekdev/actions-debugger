@@ -1,0 +1,133 @@
+id: silent-failures-140
+title: "github.sha in pull_request Workflows Is Merge-Preview SHA, Not PR Head Commit"
+category: silent-failures
+severity: silent-failure
+tags:
+  - pull-request
+  - github-sha
+  - merge-preview
+  - docker
+  - deployment
+  - sha-mismatch
+patterns:
+  - regex: 'manifest unknown.*refs/pull/\d+/merge'
+    flags: "i"
+  - regex: 'no such image.*\bpull\b.*\bmerge\b'
+    flags: "i"
+  - regex: 'sha.*not found.*pull.*merge'
+    flags: "i"
+error_messages:
+  - "manifest unknown: manifest unknown"
+  - "Error: No image found for SHA: abc1234 (expected from git log, but was tagged with merge-preview SHA)"
+  - "deployment not found for sha: <head-commit-sha>"
+root_cause: |
+  In workflows triggered by the `pull_request` event, `github.sha` is **not** the
+  SHA of the last commit pushed to the PR branch. It is the SHA of a synthetic
+  **merge-preview commit** — the hypothetical merge of the PR head into the base
+  branch that GitHub computes internally (equivalent to `refs/pull/N/merge`).
+
+  This merge-preview SHA:
+  - Does not appear in `git log` on the PR branch
+  - Cannot be reproduced locally with a standard `git merge`
+  - May differ from the PR's actual commit history by including base branch changes
+  - Is regenerated whenever the base branch advances (so it changes without a new
+    PR commit)
+
+  Three distinct SHAs exist for a pull_request event:
+  1. `github.sha` — merge-preview SHA (refs/pull/N/merge)
+  2. `github.event.pull_request.head.sha` — actual last commit on the PR branch ✅
+  3. `github.event.pull_request.base.sha` — current HEAD of the target branch
+
+  Developers commonly use `github.sha` expecting value (2), and are surprised when:
+  - Docker images tagged with `${{ github.sha }}` can't be pulled by other tools
+    that look up the image by the PR branch's commit SHA
+  - Sentry/Datadog release tags use the merge-preview SHA, which never appears in
+    the repository's commit history
+  - GitHub Deployments created with `${{ github.sha }}` aren't findable via git
+  - `actions/checkout@v4` with no `ref:` checks out the merge-preview commit, so
+    the code being tested is NOT exactly what was pushed — it includes base branch
+    changes since the last `git merge main`
+fix: |
+  Use `github.event.pull_request.head.sha` when you need the actual commit SHA
+  of the last push to the PR branch. Reserve `github.sha` only when you want to
+  test the merged state (which is the default checkout behavior).
+
+  For tagging Docker images, deployments, and release tracking, ALWAYS prefer
+  the head SHA:
+  ```yaml
+  ${{ github.event.pull_request.head.sha }}
+  ```
+
+  If you need consistent SHA handling across both `push` and `pull_request`
+  events, use a conditional:
+  ```yaml
+  env:
+    COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+  ```
+  For `push` events, `github.event.pull_request.head.sha` is empty (empty string),
+  so the `||` fallback picks up `github.sha` — which for push events IS the actual
+  commit SHA.
+fix_code:
+  - language: yaml
+    label: "WRONG — tags Docker image with merge-preview SHA (not in git history)"
+    code: |
+      on: pull_request
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build and push Docker image
+              run: |
+                docker build -t myapp:${{ github.sha }} .
+                # ❌ github.sha = merge-preview SHA, not the PR commit
+                # Other tools looking up image by actual commit SHA will fail
+  - language: yaml
+    label: "CORRECT — tags with actual PR head commit SHA"
+    code: |
+      on: pull_request
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build and push Docker image
+              env:
+                IMAGE_SHA: ${{ github.event.pull_request.head.sha }}
+              run: |
+                docker build -t myapp:${IMAGE_SHA} .
+                # ✅ uses the actual last commit SHA on the PR branch
+  - language: yaml
+    label: "PORTABLE — works for both pull_request and push events"
+    code: |
+      on:
+        push:
+          branches: [main]
+        pull_request:
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build image with consistent SHA
+              env:
+                # For pull_request: head.sha is the actual PR commit
+                # For push: head.sha is empty, falls back to github.sha (actual commit)
+                IMAGE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+              run: |
+                docker build -t myapp:${IMAGE_SHA} .
+prevention:
+  - "Never use github.sha to tag artifacts or deployments in pull_request workflows — it is a synthetic merge-preview SHA."
+  - "Use github.event.pull_request.head.sha for the actual PR branch commit; use github.sha only for push events."
+  - "When creating GitHub Deployments from a PR workflow, use the head SHA so the deployment is traceable via git."
+  - "Document in your team workflow conventions which SHA variable to use in which event context."
+docs:
+  - url: "https://docs.github.com/en/actions/reference/context-and-expression-syntax-for-github-actions#github-context"
+    label: "github context — github.sha and github.event"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request"
+    label: "pull_request event — payload context"
+  - url: "https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request"
+    label: "Pull request API — head.sha field"
