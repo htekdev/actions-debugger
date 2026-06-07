@@ -1,0 +1,118 @@
+id: permissions-auth-081
+title: 'GITHUB_TOKEN cannot create GitHub Releases in a different repository — Resource not accessible by integration'
+category: permissions-auth
+severity: error
+tags:
+  - github-token
+  - releases
+  - cross-repo
+  - contents-write
+  - action-gh-release
+  - 403
+patterns:
+  - regex: 'Resource not accessible by integration'
+    flags: 'i'
+  - regex: 'GitHub release failed with status: 403'
+    flags: 'i'
+  - regex: 'HttpError: Resource not accessible by integration.*releases'
+    flags: 'i'
+  - regex: 'releases#create-a-release.*403'
+    flags: 'i'
+error_messages:
+  - "GitHub release failed with status: 403"
+  - '{"message":"Resource not accessible by integration","documentation_url":"https://docs.github.com/rest/releases/releases#create-a-release","status":"403"}'
+  - "Error: Resource not accessible by integration - https://docs.github.com/rest/releases/releases#create-a-release"
+  - "HttpError: Resource not accessible by integration"
+  - "Skip retry — your GitHub token/PAT does not have the required permission to create a release"
+root_cause: |
+  `GITHUB_TOKEN` is automatically scoped to the repository where the workflow runs.
+  It cannot authenticate against GitHub's API for a DIFFERENT repository, even
+  within the same organization.
+
+  When a workflow in `org/repo-A` tries to create a GitHub Release on `org/repo-B`
+  using `GITHUB_TOKEN` (either directly or via `softprops/action-gh-release`,
+  `ncipollo/release-action`, or any action that reads the `GITHUB_TOKEN` env var),
+  the GitHub Releases API returns **403 Resource not accessible by integration**.
+
+  This is by design — `GITHUB_TOKEN` provides repository-scoped access only:
+  - Can create/edit releases in the SAME repository ✅
+  - Cannot create/edit releases in ANY other repository ❌ (even same org)
+
+  A secondary cause involves `softprops/action-gh-release` before v2.3.4: the
+  action read the `GITHUB_TOKEN` environment variable BEFORE checking the `token:`
+  input field. So even when a PAT was passed explicitly via `with.token`, the
+  action would fall back to the ambient `GITHUB_TOKEN`, causing the 403. This was
+  fixed in PR #751 (merged March 2026).
+
+  Note: this is distinct from the `contents: write` permission issue when creating
+  releases in the SAME repository — that error is "403: GitHub Actions is not
+  permitted to create or update release assets" with a different message.
+fix: |
+  Use a Personal Access Token (PAT) or GitHub App token that has `contents: write`
+  permission on the TARGET repository, and pass it explicitly to the release action.
+
+  **Option 1 — Fine-grained PAT (recommended):**
+  Create a fine-grained PAT with "Contents: Read and write" on the target repo,
+  store it as a secret (e.g. `RELEASE_PAT`), and pass it to the action:
+
+  **Option 2 — GitHub App token:**
+  Create a GitHub App with "Contents: write" permission, install it on the target
+  repo, generate a token using `actions/create-github-app-token`, and pass that.
+
+  **Option 3 — Classic PAT:**
+  Create a classic PAT with `repo` scope, store as `RELEASE_PAT`, and pass it.
+fix_code:
+  - language: yaml
+    label: 'Fix: pass fine-grained PAT explicitly to softprops/action-gh-release'
+    code: |
+      - name: Create Release on other repo
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: org/target-repo          # different repo
+          tag_name: ${{ github.ref_name }}
+          token: ${{ secrets.RELEASE_PAT }}    # fine-grained PAT, NOT github.token
+          files: |
+            dist/release.zip
+  - language: yaml
+    label: 'Fix: use GitHub App token for cross-repo release'
+    code: |
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: org
+          repositories: target-repo
+
+      - name: Create Release on other repo
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: org/target-repo
+          tag_name: ${{ github.ref_name }}
+          token: ${{ steps.app-token.outputs.token }}
+  - language: yaml
+    label: 'Workaround: create release using gh CLI with explicit token'
+    code: |
+      - name: Create Release via gh CLI
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PAT }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --repo org/target-repo \
+            --title "Release ${{ github.ref_name }}" \
+            dist/release.zip
+prevention:
+  - 'Never use `github.token` or `GITHUB_TOKEN` directly when creating releases in a repository other than the one running the workflow.'
+  - 'Verify the `token:` input is explicitly set when using cross-repo release actions — do not rely on the ambient GITHUB_TOKEN env var being picked up.'
+  - 'Upgrade softprops/action-gh-release to v2.3.4+ (merged March 2026, PR #751) which correctly prefers the explicit `token:` input over the ambient GITHUB_TOKEN env var.'
+  - 'For same-repo releases, ensure `permissions: contents: write` is declared on the job or workflow level.'
+docs:
+  - url: 'https://github.com/softprops/action-gh-release/issues/572'
+    label: 'action-gh-release#572 — Resource not accessible by integration on release publish'
+  - url: 'https://github.com/softprops/action-gh-release/issues/639'
+    label: 'action-gh-release#639 — Creating release on another repo just broke (fixed in v2.3.4)'
+  - url: 'https://github.com/softprops/action-gh-release/pull/751'
+    label: 'action-gh-release PR#751 — fix: prefer token input over GITHUB_TOKEN env var'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#permissions-for-the-github_token'
+    label: 'GitHub docs — GITHUB_TOKEN permissions and repository scope'

@@ -1,0 +1,110 @@
+id: concurrency-timing-064
+title: 'concurrency.group expression using github.event.pull_request.number evaluates to empty string on push events — all push runs collide into same group'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - pull-request
+  - push
+  - github-event
+  - cancel-in-progress
+  - expression-evaluation
+patterns:
+  - regex: 'Canceling since a higher priority waiting request for.*exists'
+    flags: 'i'
+  - regex: 'This run has been cancelled'
+    flags: 'i'
+error_messages:
+  - "Canceling since a higher priority waiting request for <workflow>- exists"
+  - "This run has been cancelled"
+root_cause: |
+  When a `concurrency.group` expression references
+  `github.event.pull_request.number`, the property is `null` (evaluates to empty
+  string `''`) on non-PR events such as `push`, `workflow_dispatch`, or `schedule`.
+
+  A common pattern developers use to deduplicate PR runs is:
+  ```yaml
+  concurrency:
+    group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+    cancel-in-progress: true
+  ```
+
+  This works correctly for `pull_request` events (group = "CI-42", "CI-43", etc.)
+  but on `push` events, `github.event.pull_request.number` evaluates to `''`,
+  making the group `"<workflow-name>-"` for EVERY push run. With
+  `cancel-in-progress: true`, each push to any branch cancels ALL other push runs
+  in the entire repository — not just runs for the same branch.
+
+  This produces confusing behavior:
+  - A push to `feat/a` cancels a running push on `feat/b` unexpectedly
+  - Direct pushes to `main` cancel each other even for unrelated branches
+  - The concurrency group becomes a global mutex rather than a PR-scoped one
+
+  The silent nature of this bug is that the workflow DOES run (it isn't broken
+  in an obvious way) but prior push runs are silently cancelled.
+fix: |
+  Use the `||` fallback operator to provide a unique per-branch identifier when
+  `github.event.pull_request.number` is empty. The recommended pattern is:
+
+  ```yaml
+  concurrency:
+    group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+    cancel-in-progress: true
+  ```
+
+  This evaluates to:
+  - On `pull_request` events: `"CI-42"` (PR number, cancels older runs of same PR)
+  - On `push` events: `"CI-refs/heads/main"` (branch ref, cancels older push runs
+    for the SAME branch only)
+
+  For `workflow_dispatch` where you want each run to complete independently:
+  ```yaml
+  concurrency:
+    group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+    cancel-in-progress: false
+  ```
+fix_code:
+  - language: yaml
+    label: 'Fix: use || github.ref as fallback for non-PR events'
+    code: |
+      # BROKEN — all push runs share the same empty concurrency group
+      # concurrency:
+      #   group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+      #   cancel-in-progress: true
+
+      # CORRECT — PR runs grouped by PR number, push runs grouped by branch ref
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+        cancel-in-progress: true
+  - language: yaml
+    label: 'Fix: full workflow example with correct concurrency'
+    code: |
+      name: CI
+      on:
+        push:
+          branches: [main, 'feat/**']
+        pull_request:
+          branches: [main]
+
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+        cancel-in-progress: true
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm ci && npm test
+prevention:
+  - 'Always use the `||` fallback in concurrency group expressions that reference PR-specific event properties.'
+  - 'Test concurrency behavior for ALL trigger types in the workflow, not just the primary event.'
+  - 'Use `github.ref` as a fallback for push events; use `github.run_id` as fallback when each run should be independent.'
+  - 'Audit concurrency groups with actionlint — it warns about expressions that can evaluate to empty strings.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs'
+    label: 'GitHub docs — Controlling concurrency of workflows and jobs'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context'
+    label: 'GitHub docs — github context reference (event.pull_request.number)'
+  - url: 'https://github.com/actions/runner/issues/2324'
+    label: 'actions/runner#2324 — paths-ignore and related concurrency discussions'
