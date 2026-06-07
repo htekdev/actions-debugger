@@ -1,0 +1,109 @@
+id: runner-environment-280
+title: 'windows-latest VS2026 Migration — `vswhere.exe -version "[17.0,18.0)"` Returns Empty, Breaking CMake and Custom Build Scripts'
+category: runner-environment
+severity: error
+tags:
+  - windows-latest
+  - visual-studio
+  - vs2026
+  - vswhere
+  - cmake
+  - msbuild
+  - migration
+  - breaking-change
+patterns:
+  - regex: 'Could not find any instance of Visual Studio'
+    flags: 'i'
+  - regex: 'CMake Error.*No CMAKE_CXX_COMPILER could be found'
+    flags: 'i'
+  - regex: 'nmake.*not found|Could not find the build system.*NMake'
+    flags: 'i'
+  - regex: 'cmake.*-G.*Visual Studio 17.*failed|generator.*Visual Studio 17.*not found'
+    flags: 'i'
+error_messages:
+  - 'CMake Error: No CMAKE_CXX_COMPILER could be found.'
+  - 'The C++ compiler "cl.exe" is not able to compile a simple test program.'
+  - 'Could not find any instance of Visual Studio.'
+  - 'Error: Process completed with exit code 1.'
+  - 'nmake : fatal error U1064: MAKEFILE not found and no target specified'
+root_cause: |
+  Visual Studio 2026 is version 18.x. The `windows-latest` and `windows-2025` runner
+  labels began migrating to Visual Studio 2026 on June 8, 2026 (completing June 15,
+  2026, per runner-images#14017).
+
+  Many CMake scripts, PowerShell build helpers, and CI configurations use
+  `vswhere.exe` with `-version "[17.0,18.0)"` to locate a VS 2022 installation
+  (version 17.x). With VS 2026 installed (version 18.x), this half-open interval
+  query returns an EMPTY result — 18.x is outside `[17.0, 18.0)`.
+
+  Downstream breakage patterns:
+  - CMake cannot auto-detect a Visual Studio generator and falls back to NMake
+    (which is not on PATH), causing "No CMAKE_CXX_COMPILER could be found."
+  - Build scripts that run `vswhere.exe` to discover the `vcvarsall.bat` path and
+    set up the MSVC environment get an empty path and fail silently or with a
+    non-zero exit.
+  - cmake 4.2.x had additional issues detecting VS2026 outside the VS Developer
+    Command Prompt (cmake discourse#15478).
+
+  This is distinct from the general VS2026 migration entry (runner-environment-020),
+  which covers removed VS components. This entry specifically covers the vswhere
+  version range query pattern used by CMake and custom scripts.
+fix: |
+  Option 1 — Update the vswhere version range:
+  Change `-version "[17.0,18.0)"` to `-version "[17.0,19.0)"` to include both
+  VS 2022 (17.x) and VS 2026 (18.x). Or use `-latest` to always pick the newest.
+
+  Option 2 — Specify the CMake generator explicitly:
+  Use `-G "Visual Studio 18 2026"` for VS2026 or `-G "Visual Studio 17 2022"` and
+  pin `runs-on: windows-2022` to avoid the migration.
+
+  Option 3 — Pin to windows-2022:
+  Use `runs-on: windows-2022` as an interim fix until custom vswhere scripts are
+  updated to handle VS2026.
+fix_code:
+  - language: yaml
+    label: 'Update vswhere range from [17,18) to [17,19) to include VS2026'
+    code: |
+      - name: Locate Visual Studio
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+
+          # OLD — fails when VS2026 (18.x) is installed:
+          # $vsPath = & $vswhere -version "[17.0,18.0)" -property installationPath
+
+          # NEW — works with VS2022 (17.x) and VS2026 (18.x):
+          $vsPath = & $vswhere -version "[17.0,19.0)" -latest -property installationPath
+
+          if (-not $vsPath) {
+            Write-Error "No Visual Studio installation found in range [17.0,19.0)"
+            exit 1
+          }
+          Write-Output "VS found at: $vsPath"
+          & "$vsPath\Common7\Tools\VsDevCmd.bat"
+  - language: yaml
+    label: 'Pin to windows-2022 as interim fix'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-2022  # Pin to VS2022 until vswhere scripts are updated
+          steps:
+            - uses: actions/checkout@v4
+            - name: Configure
+              run: cmake .. -G "Visual Studio 17 2022"
+            - name: Build
+              run: cmake --build . --config Release
+prevention:
+  - 'Never hardcode the upper bound as `18.0` in vswhere version ranges — VS 2026 is 18.x, so use `19.0` as the upper exclusive bound.'
+  - 'Use `-latest` flag with vswhere to always pick the newest installed VS version when no specific version pinning is needed.'
+  - 'Specify CMake generators explicitly (`-G "Visual Studio 18 2026"`) rather than relying on auto-detection.'
+  - 'Subscribe to runner-images announcements (GitHub `actions/runner-images` issues with `Announcement` label) to catch VS version migrations before they roll out.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14017'
+    label: 'runner-images#14017 — windows-latest migration to VS2026 announcement (June 8–15, 2026)'
+  - url: 'https://github.com/microsoft/WSL/pull/14160'
+    label: 'microsoft/WSL#14160 — CMake vswhere range updated from [17.0,18.0) to [17.0,19.0) for VS2026'
+  - url: 'https://github.com/microsoft/vswhere'
+    label: 'microsoft/vswhere — Visual Studio Locator documentation and version range syntax'
+  - url: 'https://cmake.org/cmake/help/latest/generator/Visual%20Studio%2018%202026.html'
+    label: 'CMake — Visual Studio 18 2026 generator documentation'

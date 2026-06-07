@@ -1,0 +1,95 @@
+id: runner-environment-279
+title: 'ubuntu-24.04 Runner `unattended-upgrades` Holds dpkg Lock at Startup — `apt-get` Fails with Exit Code 100'
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-24.04
+  - apt-get
+  - dpkg
+  - unattended-upgrades
+  - package-installation
+  - runner-startup
+patterns:
+  - regex: 'E: Could not get lock /var/lib/dpkg/lock-frontend'
+    flags: 'i'
+  - regex: 'It is held by process \d+ \(unattended-upgr\)'
+    flags: 'i'
+  - regex: 'E: Unable to acquire the dpkg frontend lock.*another process'
+    flags: 'i'
+  - regex: 'dpkg frontend lock was locked by another process with pid'
+    flags: 'i'
+error_messages:
+  - 'E: Could not get lock /var/lib/dpkg/lock-frontend. It is held by process 2448 (unattended-upgr)'
+  - 'E: Unable to acquire the dpkg frontend lock (/var/lib/dpkg/lock-frontend), is another process using it?'
+  - 'Error: Process completed with exit code 100.'
+  - 'dpkg: error: dpkg frontend lock was locked by another process with pid 19603'
+root_cause: |
+  On ubuntu-24.04 GitHub-hosted runners, the `unattended-upgrades` systemd service
+  can still be running when a CI job begins. This service holds the
+  `/var/lib/dpkg/lock-frontend` exclusive lock while performing background package
+  maintenance. Any `apt-get install`, `apt-get update`, or `dpkg` command issued
+  while the lock is held fails immediately with exit code 100.
+
+  This is a race condition: the runner VM boots, cloud-init and systemd services
+  continue their startup sequence, and the CI job begins before systemd fully
+  settles. The race is most likely to trigger in the first step of a job that runs
+  `apt-get`, typically within the first 30-120 seconds of runner startup.
+
+  On ubuntu-22.04 images, `unattended-upgrades` was reliably disabled during
+  provisioning. The ubuntu-24.04 images introduced a regression where the service
+  is not reliably stopped before the runner accepts jobs, leading to intermittent
+  failures (actions/runner-images#13271).
+
+  Note: This is distinct from the `man-db` dpkg trigger stall (runner-environment-207),
+  which causes a multi-minute delay but does NOT cause apt-get to exit non-zero.
+fix: |
+  Option 1 — Disable unattended-upgrades explicitly at job start:
+  Add `sudo systemctl stop unattended-upgrades` as the first step in any job that
+  runs apt-get on ubuntu-24.04.
+
+  Option 2 — Use DPkg lock timeout:
+  Pass `-o DPkg::Lock::Timeout=120` to apt-get to block up to 120 seconds waiting
+  for the lock to clear rather than failing immediately.
+
+  Option 3 — Migrate to a container job:
+  Use a Docker container as the job environment to avoid competing with host
+  systemd services entirely.
+fix_code:
+  - language: yaml
+    label: 'Disable unattended-upgrades before any apt-get step'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-24.04
+          steps:
+            - name: Stop unattended-upgrades (prevent dpkg lock race)
+              run: sudo systemctl stop unattended-upgrades
+
+            - name: Install dependencies
+              run: |
+                sudo apt-get update
+                sudo apt-get install -y build-essential cmake
+  - language: yaml
+    label: 'Use DPkg lock timeout to wait for lock to clear'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-24.04
+          steps:
+            - name: Install dependencies
+              run: |
+                # Wait up to 120 seconds for any dpkg lock to clear
+                sudo apt-get -o DPkg::Lock::Timeout=120 update
+                sudo apt-get -o DPkg::Lock::Timeout=120 install -y build-essential
+prevention:
+  - 'Add `sudo systemctl stop unattended-upgrades` as the first step in any job that uses `apt-get` on ubuntu-24.04.'
+  - 'Use `-o DPkg::Lock::Timeout=120` in apt-get calls to allow graceful waiting instead of immediate failure.'
+  - 'Consider using a Docker container job to eliminate race conditions with systemd services running on the host.'
+  - 'If the failure is intermittent, it is almost certainly the dpkg lock race — add the stop step rather than adding `continue-on-error`.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/13271'
+    label: 'runner-images#13271 — unattended-upgrades not properly disabled on ubuntu-24.04'
+  - url: 'https://github.com/servo/ci-runners/issues/57'
+    label: 'servo/ci-runners#57 — exact error: Could not get lock /var/lib/dpkg/lock-frontend (unattended-upgr)'
+  - url: 'https://manpages.ubuntu.com/manpages/noble/man8/unattended-upgrade.8.html'
+    label: 'Ubuntu Noble — unattended-upgrade man page'
