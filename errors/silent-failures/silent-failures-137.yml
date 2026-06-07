@@ -1,0 +1,119 @@
+id: silent-failures-137
+title: "jobs.<job-id>.outputs referencing non-existent step ID resolves to empty string silently"
+category: silent-failures
+severity: silent-failure
+tags:
+  - job-outputs
+  - step-id
+  - needs-context
+  - outputs
+  - empty-string
+  - silent
+  - typo
+  - copy-paste
+patterns:
+  - regex: 'jobs\.\S+\.outputs\.\S+:\s*\$\{\{.*steps\.'
+    flags: 'i'
+  - regex: 'needs\.\S+\.outputs\.\S+.*empty|needs.*outputs.*empty.*string'
+    flags: 'i'
+error_messages:
+  - "# No error message — job output silently resolves to empty string"
+  - "# Downstream steps receive empty string when expected value is missing"
+root_cause: |
+  When `jobs.<job-id>.outputs` references a step ID that does not exist in that job,
+  GitHub Actions silently resolves the expression to an empty string with no error or
+  warning. The workflow continues running and subsequent jobs read `needs.<job-id>.outputs.<key>`
+  as an empty string, causing silent downstream failures.
+
+  Common causes:
+  1. **Copy-paste across jobs**: An `outputs:` block from one job is copied to another job
+     but the step IDs in the expressions are not updated. The step referenced belongs to
+     the source job, not the destination job.
+  2. **Step rename without outputs update**: A step's `id:` is renamed (e.g., from `build`
+     to `build-app`) but the `jobs.X.outputs` block still references the old ID.
+  3. **Conditional step with wrong ID**: A step only runs on certain branches, and the
+     outputs block references it unconditionally.
+
+  Example of a silently broken configuration:
+    Job A defines:
+      steps:
+        - id: compute-version
+          run: echo "version=1.2.3" >> $GITHUB_OUTPUT
+    Job B (accidentally receives A's outputs block):
+      steps:
+        - id: build-image
+          run: docker build .
+      outputs:
+        version: ${{ steps.compute-version.outputs.version }}  # compute-version not in job B!
+
+  When job B runs, `steps.compute-version` does not exist in its context, so
+  `steps.compute-version.outputs.version` silently evaluates to `''`. Any downstream
+  job reading `needs.job-b.outputs.version` receives an empty string.
+
+  GitHub Actions does NOT emit a warning or schema validation error when a step ID
+  referenced in `jobs.X.outputs` does not exist in that job.
+fix: |
+  1. Verify every step ID in `jobs.<job-id>.outputs` expressions matches an `id:` field
+     declared in a step of the SAME job.
+  2. Add a debug step to dump available step outputs when diagnosing empty values:
+       run: echo '${{ toJSON(steps) }}'
+     This prints all step IDs and their outputs for the current job.
+  3. If the step is conditional (has an `if:` guard), add a complementary output
+     default or guard the downstream consumer.
+fix_code:
+  - language: yaml
+    label: 'Correct: step ID in outputs block matches a step in the same job'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          outputs:
+            image-tag: ${{ steps.set-tag.outputs.tag }}   # 'set-tag' exists in this job
+          steps:
+            - id: set-tag
+              run: echo "tag=v1.2.3-${{ github.sha }}" >> $GITHUB_OUTPUT
+
+            - name: Build image
+              run: docker build -t myapp:${{ steps.set-tag.outputs.tag }} .
+
+        deploy:
+          needs: build
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying ${{ needs.build.outputs.image-tag }}"
+
+  - language: yaml
+    label: 'BROKEN: step ID in outputs block references a step from a different job'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - id: set-tag
+              run: echo "tag=v1.2.3" >> $GITHUB_OUTPUT
+
+        deploy:
+          needs: build
+          runs-on: ubuntu-latest
+          outputs:
+            # BUG: 'set-tag' is in the 'build' job, not 'deploy'.
+            # This silently resolves to empty string with no error.
+            image-tag: ${{ steps.set-tag.outputs.tag }}
+          steps:
+            - run: echo "deploying ${{ steps.set-tag.outputs.tag }}"  # also empty
+
+  - language: yaml
+    label: 'Debug: dump all step IDs and outputs to diagnose empty values'
+    code: |
+      - name: Debug step outputs
+        run: echo '${{ toJSON(steps) }}'
+prevention:
+  - "After copying a job's outputs: block to another job, verify all step IDs exist in the destination job."
+  - "Run a debug step with toJSON(steps) to see all available step IDs and their outputs when diagnosing empty values."
+  - "Use unique, descriptive step IDs to make cross-job copy-paste mistakes immediately obvious."
+  - "Consider adding a post-build validation step that checks critical outputs are non-empty before allowing downstream jobs to proceed."
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/passing-information-between-jobs'
+    label: 'GitHub Docs: Passing information between jobs — job outputs and needs context'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#steps-context'
+    label: 'GitHub Docs: steps context — only contains steps from the current job'
