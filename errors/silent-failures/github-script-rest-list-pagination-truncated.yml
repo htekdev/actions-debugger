@@ -1,0 +1,90 @@
+id: silent-failures-130
+title: "actions/github-script REST list calls silently return at most 100 items without pagination"
+category: silent-failures
+severity: silent-failure
+tags:
+  - github-script
+  - pagination
+  - octokit
+  - rest-api
+  - list
+  - truncation
+patterns:
+  - regex: 'await github\.rest\.\w+\.list'
+    flags: 'i'
+  - regex: 'github\.rest\.\w+\.list[A-Za-z]+\s*\({'
+    flags: 'i'
+error_messages:
+  - "Expected N results but only got 30"
+  - "Expected N results but only got 100"
+  - "Missing results — REST list returned fewer items than expected"
+root_cause: |
+  GitHub REST API list endpoints return a maximum of 100 items per page (default 30).
+  Calling github.rest.X.list*() directly in actions/github-script returns only the first
+  page of results with no error, warning, or indication of truncation. In repositories
+  with many items (issues, PRs, workflow runs, releases, packages, branches) the result
+  set is silently truncated. Automation that processes all items — closing stale issues,
+  tagging all releases, aggregating metrics — silently misses all items beyond page 1.
+  The actions/github-script README explicitly documents github.paginate() for this reason,
+  but developers migrating from curl/REST examples or copying quick snippets miss it.
+fix: |
+  Replace direct github.rest.*.list*() calls with github.paginate() to automatically
+  fetch all pages. For very large datasets (thousands of items), use
+  github.paginate.iterator() to process pages lazily and avoid holding all results in
+  memory simultaneously.
+fix_code:
+  - language: yaml
+    label: "Use github.paginate for complete results"
+    code: |
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            // ❌ Silently returns at most 30-100 items
+            // const { data: issues } = await github.rest.issues.listForRepo({
+            //   owner: context.repo.owner,
+            //   repo: context.repo.repo,
+            //   state: 'open',
+            //   per_page: 100
+            // });
+
+            // ✅ Fetches ALL pages automatically
+            const issues = await github.paginate(
+              github.rest.issues.listForRepo,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                per_page: 100
+              }
+            );
+            console.log(`Total open issues: ${issues.length}`);
+  - language: yaml
+    label: "Use paginate.iterator for memory-efficient large datasets"
+    code: |
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            for await (const { data: runs } of github.paginate.iterator(
+              github.rest.actions.listWorkflowRunsForRepo,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100
+              }
+            )) {
+              for (const run of runs) {
+                // process each run without loading all into memory
+              }
+            }
+prevention:
+  - "Audit all github.rest.*.list* calls in github-script steps and replace with github.paginate()"
+  - "Add per_page: 100 even with paginate to minimize API rate-limit round trips"
+  - "Log the total count of fetched items during development to catch unexpected truncation"
+  - "Use github.paginate.iterator for datasets likely to exceed a few hundred items"
+docs:
+  - url: "https://octokit.github.io/rest.js/#pagination"
+    label: "Octokit REST.js — Pagination documentation"
+  - url: "https://github.com/actions/github-script#pagination"
+    label: "actions/github-script — Pagination examples"
+  - url: "https://github.com/actions/github-script/issues/330"
+    label: "actions/github-script#330 — API has a limit of 100 items per page"

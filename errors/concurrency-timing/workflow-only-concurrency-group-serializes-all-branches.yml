@@ -1,0 +1,71 @@
+id: concurrency-timing-069
+title: "Concurrency group keyed only on github.workflow serializes runs across ALL branches and PRs"
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - group
+  - github-workflow
+  - github-ref
+  - branch
+  - serialization
+patterns:
+  - regex: 'group:\s*[''"]?\$\{\{\s*github\.workflow\s*\}\}[''"]?\s*$'
+    flags: 'im'
+  - regex: 'group:\s*\$\{\{\s*github\.workflow\s*\}\}\s*\n'
+    flags: 'im'
+error_messages:
+  - "Waiting for a pending job to finish..."
+  - "This run is waiting for a pending job run to complete"
+root_cause: |
+  A concurrency group expression of `group: ${{ github.workflow }}` uses only the
+  workflow name as the group key. Because github.workflow is identical for every run
+  of a given workflow file — regardless of branch, PR number, or tag — this group
+  serializes ALL concurrent runs of that workflow across the entire repository.
+
+  A push to feature-A, a push to feature-B, and a PR merge to main all compete for
+  the same single concurrency slot. With cancel-in-progress: true this silently
+  cancels in-progress runs on other branches; without it, runs queue up indefinitely.
+
+  This mistake often comes from copying documentation examples that show
+  ${{ github.workflow }} without the accompanying ${{ github.ref }} or
+  ${{ github.head_ref || github.ref }} suffix. The serialization is invisible in
+  single-branch repos but surfaces immediately in multi-developer workflows.
+fix: |
+  Include a branch or ref discriminator in the concurrency group key to scope the
+  group per-branch. For most workflows, append github.ref. For pull request workflows,
+  use github.head_ref (the source branch name) with a github.ref fallback so that both
+  pull_request and push triggers are handled correctly.
+fix_code:
+  - language: yaml
+    label: "Per-branch concurrency — scope group to workflow + ref"
+    code: |
+      concurrency:
+        # One slot per workflow per branch/tag — does NOT serialize across branches
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: true
+  - language: yaml
+    label: "Per-PR concurrency — handles both push and pull_request triggers"
+    code: |
+      concurrency:
+        # github.head_ref is set on pull_request events (source branch name)
+        # Falls back to github.ref for push events (refs/heads/main etc.)
+        group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+        cancel-in-progress: true
+  - language: yaml
+    label: "Per-PR-number concurrency — strict isolation per PR"
+    code: |
+      concurrency:
+        # Uses PR number for pull_request events, falls back to ref for push
+        group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+        cancel-in-progress: true
+prevention:
+  - "Never use group: ${{ github.workflow }} alone — always append a branch or ref discriminator"
+  - "For push-only workflows, use github.ref; for PR workflows, use github.head_ref || github.ref"
+  - "Review concurrency group expressions whenever copying from docs — examples vary in scope"
+  - "Audit unexpectedly slow queuing runs: if feature-A waits on feature-B, the concurrency key is too coarse"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs"
+    label: "GitHub docs — Control the concurrency of workflows and jobs"
+  - url: "https://github.com/orgs/community/discussions/41054"
+    label: "Community discussion — concurrency group examples and best practices"
