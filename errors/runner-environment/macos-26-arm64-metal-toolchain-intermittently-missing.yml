@@ -1,0 +1,123 @@
+id: runner-environment-290
+title: 'macOS 26 MetalToolchain component intermittently missing — xcrun metal fails with "cannot execute tool metal due to missing Metal Toolchain"'
+category: runner-environment
+severity: error
+tags:
+  - macos
+  - macos-26
+  - xcode
+  - metal
+  - xcrun
+  - intermittent
+  - metal-toolchain
+  - gpu-shader
+patterns:
+  - regex: 'cannot execute tool .metal. due to missing Metal Toolchain'
+    flags: 'i'
+  - regex: 'use: xcodebuild -downloadComponent MetalToolchain'
+    flags: 'i'
+  - regex: 'xcrun.*-sdk macosx metal.*error.*Metal Toolchain'
+    flags: 'i'
+  - regex: 'error: error: cannot execute tool .metal.'
+    flags: 'i'
+error_messages:
+  - "error: error: cannot execute tool 'metal' due to missing Metal Toolchain; use: xcodebuild -downloadComponent MetalToolchain"
+  - "failed to run; exit code: Some(1)"
+root_cause: |
+  On macOS 26 Arm64 runner images, the MetalToolchain Xcode component (which provides `xcrun metal`,
+  `xcrun metallib`, `xcrun air-lld`, and related Metal shader compilation tools) is intermittently
+  absent from approximately 1 in 50 runner allocations. The root cause appears to be a race
+  condition or image generation inconsistency where some runner instances are provisioned without
+  the MetalToolchain component installed correctly, or the component is partially installed but
+  fails to register with `xcrun`.
+
+  This affects any workflow step that invokes Metal shader compilation:
+  - `xcrun -sdk macosx metal ...` (MSL shader validation)
+  - `xcrun -sdk iphoneos metal ...` (iOS Metal shader compilation)
+  - Metal shader validation tools in game engine CI (wgpu, gfx-rs, Unity, Godot tests)
+  - Any toolchain that wraps `metal` compiler for GPU compute shader validation
+
+  The failure is non-deterministic — the same workflow configuration succeeds most runs and
+  fails sporadically. Retrying the job usually succeeds by landing on a different runner instance.
+
+  Note: This is distinct from the Xcode default version changes (26.2 → 26.4.1 → 26.5) which
+  affect all instances consistently. This is a random per-runner provisioning issue.
+fix: |
+  **Option 1 — Pin to latest-stable Xcode (most reliable, recommended):**
+  The intermittent missing component is reported to be absent primarily in older Xcode 26.x
+  default versions. Pinning to the latest stable Xcode resolves it:
+  ```yaml
+  - uses: maxim-lobanov/setup-xcode@v1
+    with:
+      xcode-version: latest-stable
+  ```
+
+  **Option 2 — Explicitly select a Xcode version before Metal compilation:**
+  ```yaml
+  - name: Select Xcode
+    run: sudo xcode-select -s "/Applications/Xcode_26.5.app"
+  - name: Validate Metal shaders
+    run: xcrun -sdk macosx metal ...
+  ```
+
+  **Option 3 — Add retry logic around the xcrun metal step:**
+  Since the issue is runner-allocation-based, a retry often lands on a healthy instance:
+  ```yaml
+  - name: Validate Metal shaders
+    uses: nick-fields/retry@v3
+    with:
+      timeout_minutes: 5
+      max_attempts: 3
+      command: xcrun -sdk macosx metal '-mmacosx-version-min=10.11' -x metal shader.metal -o /dev/null
+  ```
+
+  **Option 4 — Attempt runtime download (slow, not recommended for CI):**
+  This only works if the runner has network access to Apple's CDN and takes significant time:
+  ```bash
+  xcodebuild -downloadComponent MetalToolchain
+  ```
+fix_code:
+  - language: yaml
+    label: 'Pin to latest-stable Xcode before Metal shader validation steps'
+    code: |
+      jobs:
+        validate-shaders:
+          runs-on: macos-26-arm64
+          steps:
+            - uses: actions/checkout@v4
+            # Pin Xcode to latest-stable — avoids intermittent MetalToolchain absence
+            - uses: maxim-lobanov/setup-xcode@v1
+              with:
+                xcode-version: latest-stable
+            - name: Validate MSL shaders
+              run: |
+                xcrun -sdk macosx metal \
+                  '-mmacosx-version-min=10.11' \
+                  '-std=macos-metal1.0' \
+                  -Werror=constant-conversion \
+                  -x metal tests/out/msl/shader.metal \
+                  -o /dev/null
+  - language: yaml
+    label: 'Use explicit xcode-select before Metal toolchain invocation'
+    code: |
+      steps:
+        - name: Select stable Xcode
+          run: sudo xcode-select -s "/Applications/Xcode_26.5.app"
+        - name: Confirm metal compiler available
+          run: xcrun --find metal
+        - name: Compile Metal shaders
+          run: xcrun -sdk macosx metal -x metal shader.metal -o shader.air
+prevention:
+  - 'Always pin Xcode to a specific version or "latest-stable" when running Metal shader compilation to avoid intermittent missing MetalToolchain.'
+  - 'Add a pre-flight check step — `xcrun --find metal` — that fails fast and retriggers if MetalToolchain is absent, rather than discovering it mid-compile.'
+  - 'Use `macos-26` (Intel) as a fallback if `macos-26-arm64` consistently fails your Metal pipeline, as the issue is confirmed on the Arm64 image.'
+  - 'Monitor runner-images#14013 for the upstream fix from the Apple/GitHub runner images team.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14013'
+    label: 'runner-images#14013 — MetalToolchain component occasionally missing on macos-26 runners (May 2026)'
+  - url: 'https://github.com/gfx-rs/wgpu/issues/9514'
+    label: 'wgpu#9514 — MSL shader validation job does not always succeed on macos-26-arm64'
+  - url: 'https://github.com/marketplace/actions/setup-xcode-version'
+    label: 'maxim-lobanov/setup-xcode — GitHub Action for pinning Xcode version'
+  - url: 'https://github.com/actions/runner-images/blob/main/images/macos/macos-26-arm64-Readme.md'
+    label: 'macOS 26 Arm64 runner image installed software listing (Xcode versions available)'

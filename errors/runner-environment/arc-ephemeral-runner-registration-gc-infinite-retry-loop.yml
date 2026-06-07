@@ -1,0 +1,131 @@
+id: runner-environment-289
+title: 'ARC ephemeral runner registration garbage-collected after idle period causes infinite retry loop — ARC controller stuck, jobs queue indefinitely'
+category: runner-environment
+severity: error
+tags:
+  - arc
+  - kubernetes
+  - ephemeral-runner
+  - gha-runner-scale-set
+  - registration
+  - infinite-retry
+  - stuck-runner
+  - self-hosted
+patterns:
+  - regex: 'Registration .+ was not found\. Retrying until reconnected'
+    flags: 'i'
+  - regex: 'VssOAuthTokenRequestException: Registration .+ was not found'
+    flags: 'i'
+  - regex: '(\d+) attempt left.*\n.*\d+ attempt left'
+    flags: 'i'
+  - regex: 'Runner connect error: Registration .+ was not found\.'
+    flags: 'i'
+error_messages:
+  - "Registration de0841aa-9c5f-4f4a-a131-9e314fc4e979 was not found. Retrying until reconnected."
+  - "VssOAuthTokenRequestException: Registration 470d6c87-f8c4-411f-87d0-6b069233ccc7 was not found."
+  - "Runner connect error: Registration de0841aa-9c5f-4f4a-a131-9e314fc4e979 was not found.. Retrying until reconnected."
+  - "Back off 9.418 seconds before next retry. 4 attempt left."
+root_cause: |
+  When an ARC ephemeral runner pod starts successfully and registers with GitHub but then sits idle
+  for an extended period without picking up a job (e.g. the intended job was routed to another
+  runner, or the scale-set received a burst of requests that resolved before this runner was fully
+  ready), GitHub's broker garbage-collects the registration after a timeout (~51 minutes observed).
+
+  Once the registration is deleted server-side, the runner's BrokerServer begins receiving
+  `VssOAuthTokenRequestException: Registration <uuid> was not found` on every poll. The runner's
+  `RetryRequest` helper treats this as retryable, so it decrements a retry counter (typically 4)
+  and tries again. However, after exhausting retries the counter **resets back to 4** instead of
+  terminating, creating an infinite loop: 4 → 3 → 2 → 1 → 4 → 3 → 2 → 1 → ...
+
+  The pod stays in `Running` status with a live runner process. From the ARC controller's
+  perspective, `running=1, desired=1` — so it does nothing. GitHub reports
+  `totalRegisteredRunners: 0` for the scale set. Any jobs assigned to this scale set are queued
+  waiting for a runner that will never appear, and ARC does not scale up to replace the stuck pod.
+
+  The stuck pod eventually self-terminates only if it hits the separate
+  "The runner registration has been deleted from the server, please re-configure" code path on a
+  cycle restart — but this is not guaranteed and can take many minutes or hours.
+
+  This issue is distinct from runner-environment-245 (which covers job cancellation causing pods to
+  hang). That scenario involves the runner pod waiting for a job message after a cancellation.
+  This scenario involves a healthy, idle runner whose server-side registration has expired.
+fix: |
+  **Immediate remediation:**
+  Delete the stuck ARC runner pod manually:
+  ```
+  kubectl delete pod <stuck-runner-pod> -n <namespace>
+  ```
+  The ARC controller will create a replacement pod. Jobs that were queued will be dispatched to
+  the new runner.
+
+  **Long-term fix — reduce runner idle lifetime:**
+  Configure `idleRunnerRetentionTime` in your Helm values to a short window so ARC tears down
+  idle runners before GitHub's broker GC window expires (~50 minutes):
+  ```yaml
+  githubConfigUrl: "https://github.com/org/repo"
+  maxRunners: 10
+  minRunners: 0
+  idleRunnerRetentionTime: "40m"  # Below GitHub broker GC window
+  ```
+
+  **ARC v0.14.0+ fix — use minRunners: 0 with short retention:**
+  Do not keep idle runners alive with `minRunners > 0` if your workload is bursty. ARC
+  creates runners on-demand, so idle runners just sit waiting for GC. Set `minRunners: 0`
+  and let ARC scale from zero on demand.
+
+  **External watchdog (until upstream fix ships):**
+  Run a sidecar or Kubernetes CronJob that detects runner processes matching:
+  - Elapsed time > 15 minutes AND no running worker process
+  - Log contains "was not found" more than N times
+  Kill the pod on detection.
+fix_code:
+  - language: yaml
+    label: 'Helm values — configure short idleRunnerRetentionTime to stay below GC window'
+    code: |
+      # values.yaml for actions-runner-controller scale set
+      githubConfigUrl: "https://github.com/your-org/your-repo"
+      githubConfigSecret: "pre-defined-secret"
+      maxRunners: 10
+      minRunners: 0
+      idleRunnerRetentionTime: "40m"  # Tear down idle runners before GitHub's ~50 min GC window
+      runnerScaleSetName: "my-scale-set"
+  - language: yaml
+    label: 'Kubernetes CronJob watchdog to delete stuck runner pods'
+    code: |
+      apiVersion: batch/v1
+      kind: CronJob
+      metadata:
+        name: arc-stuck-runner-cleanup
+        namespace: arc-runners
+      spec:
+        schedule: "*/15 * * * *"
+        jobTemplate:
+          spec:
+            template:
+              spec:
+                serviceAccountName: arc-watchdog-sa
+                containers:
+                  - name: cleanup
+                    image: bitnami/kubectl:latest
+                    command:
+                      - /bin/sh
+                      - -c
+                      - |
+                        kubectl get pods -n arc-runners -l app=runner \
+                          --field-selector=status.phase=Running \
+                          -o json | jq -r '.items[] | select(.status.containerStatuses[0].started == true) |
+                            select(now - (.status.startTime | fromdateiso8601) > 3600) | .metadata.name' | \
+                          xargs -r kubectl delete pod -n arc-runners
+                restartPolicy: OnFailure
+prevention:
+  - 'Set idleRunnerRetentionTime below the GitHub broker GC window (~50 minutes) so ARC kills idle runners before their registrations expire.'
+  - 'Use minRunners: 0 unless you have sustained load that justifies pre-provisioned runners.'
+  - 'Monitor ARC metrics for totalRegisteredRunners: 0 while pendingJobs > 0 — this combination indicates stuck pods.'
+  - 'Upgrade to ARC v0.14.0+ when available; the upstream fix (actions/runner#4330) ensures the runner exits cleanly on "Registration was not found" after exhausting retries.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4191'
+    label: 'actions/runner#4191 — Runner gets stuck in infinite loop of retries when registration is not found'
+  - url: 'https://github.com/actions/runner/pull/4330'
+    label: 'actions/runner#4330 — Fix infinite retry loop when runner registration is not found'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners-with-actions-runner-controller/deploying-runner-scale-sets-with-actions-runner-controller'
+    label: 'ARC deployment docs — scale set configuration including idleRunnerRetentionTime'

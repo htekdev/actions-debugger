@@ -1,0 +1,113 @@
+id: runner-environment-288
+title: 'Docker v29 + containerd v2.2 cgroupv2 JMX NullPointerException crashes Elasticsearch/Kafka/Zookeeper containers'
+category: runner-environment
+severity: error
+tags:
+  - docker
+  - containerd
+  - cgroupv2
+  - elasticsearch
+  - kafka
+  - jmx
+  - java
+  - runner-image-update
+  - windows-2025
+patterns:
+  - regex: 'Cannot invoke "jdk\.internal\.platform\.CgroupInfo\.getMountPoint\(\)" because "anyController" is null'
+    flags: 'i'
+  - regex: 'CgroupV2Subsystem\.getInstance.*CgroupSubsystemFactory\.create'
+    flags: 'i'
+  - regex: 'NullPointerException.*jdk\.internal\.platform\.cgroup'
+    flags: 'i'
+  - regex: 'jdk\.internal\.platform\.cgroupv2\.CgroupV2Subsystem'
+    flags: 'i'
+error_messages:
+  - "NullPointerException: Cannot invoke \"jdk.internal.platform.CgroupInfo.getMountPoint()\" because \"anyController\" is null"
+  - "at java.base/jdk.internal.platform.cgroupv2.CgroupV2Subsystem.getInstance(CgroupV2Subsystem.java:80)"
+  - "at java.base/jdk.internal.platform.CgroupSubsystemFactory.create(CgroupSubsystemFactory.java:114)"
+root_cause: |
+  Docker v29 upgraded its bundled containerd to v2.2.x, which was compiled with Go 1.24. Go 1.24
+  introduced stricter cgroupv2 subsystem parsing logic. When a container's cgroup hierarchy
+  exposes controller paths that don't satisfy the new validation, containerd's cgroupv2 subsystem
+  factory returns null for the controller instead of a fallback, setting `anyController = null`.
+
+  Java's `jdk.internal.platform.CgroupV2Subsystem.getInstance()` then calls
+  `anyController.getMountPoint()` on the null reference, throwing NullPointerException before the
+  JVM's cgroup metrics layer is initialised. This crashes the JVM at startup for services that
+  call JMX initialisation early: Elasticsearch (all 7.x, pre-8.10), Apache Kafka, Zookeeper,
+  and any service using `jdk.management.OperatingSystemMXBean` with cgroupv2 path discovery.
+
+  The issue was introduced by the Docker v29 + containerd v2.2 update to ubuntu-22.04 and
+  ubuntu-24.04 runner images on 2026-02-09 (image 20260209.23), and forced a rollback to Docker
+  v28 on 2026-02-20. Docker v29 remains active on windows-2025 runners and the Ubuntu Docker
+  v29 migration is still pending (runner-images#14105, May 2026). When Ubuntu runners eventually
+  receive Docker v29, services using affected JDK/JMX paths will fail again unless upgraded.
+fix: |
+  **Option 1 — Upgrade the service to a newer release (preferred):**
+  Elasticsearch 8.10+, Kafka 3.4+, and Zookeeper 3.9+ include fixed JDK distributions or
+  cgroupv2-aware JVM startup flags. Upgrading the service image version is the safest long-term fix.
+
+  **Option 2 — Pass JVM startup flags to disable cgroupv2 metrics:**
+  For services you cannot upgrade, add the JVM flag to bypass cgroupv2 container detection:
+  ```
+  JAVA_TOOL_OPTIONS: "-XX:-UseCGroupMemoryLimitForHeap -Djdk.internal.platform.cgroupv2.enabled=false"
+  ```
+  Or for older JDKs:
+  ```
+  JAVA_TOOL_OPTIONS: "-XX:+UnlockDiagnosticVMOptions -XX:NativeMemoryTracking=off"
+  ```
+
+  **Option 3 — Pin the runner image to pre-Docker-v29 version:**
+  While the rollback is in place on Ubuntu, no action is needed. On windows-2025, pin to the
+  last known-good windows-2025 image version before the Docker v29 update.
+
+  **Option 4 — Use ubuntu-22.04 until Docker v29 Ubuntu migration is resolved:**
+  The pending Docker v29 Ubuntu update (runner-images#14105) has not been released. Monitor
+  the issue for the new release date and test against ubuntu-24.04 with Docker v29 before
+  the rollout starts.
+fix_code:
+  - language: yaml
+    label: 'Upgrade Elasticsearch service container to 8.10+ (no JMX cgroupv2 issue)'
+    code: |
+      services:
+        elasticsearch:
+          image: docker.elastic.co/elasticsearch/elasticsearch:8.19.11  # 8.10+ unaffected
+          ports:
+            - 9200:9200
+          env:
+            discovery.type: single-node
+            xpack.security.enabled: 'false'
+  - language: yaml
+    label: 'Pass JVM flags to disable cgroupv2 container detection when upgrade is not possible'
+    code: |
+      services:
+        kafka:
+          image: apache/kafka:2.13-4.0.0
+          env:
+            # Bypass cgroupv2 path discovery that causes NPE on containerd v2.2+
+            KAFKA_OPTS: '-Djdk.internal.platform.cgroupv2.enabled=false'
+  - language: yaml
+    label: 'Use environment variable for Elasticsearch before upgrading'
+    code: |
+      steps:
+        - name: Start Elasticsearch
+          run: |
+            docker run -d \
+              -e discovery.type=single-node \
+              -e JAVA_TOOL_OPTIONS="-Djdk.internal.platform.cgroupv2.enabled=false" \
+              -p 9200:9200 \
+              docker.elastic.co/elasticsearch/elasticsearch:7.17.4
+prevention:
+  - 'Upgrade Elasticsearch, Kafka, and Zookeeper to versions that ship with cgroupv2-aware JVM (ES 8.10+, Kafka 3.4+, Zookeeper 3.9+).'
+  - 'Monitor runner-images#14105 for the Docker v29 Ubuntu rollout timeline; test on ubuntu-24.04 in advance.'
+  - 'Add a `JAVA_TOOL_OPTIONS` env variable in your docker-compose or service container block as a defensive fallback.'
+  - 'Avoid relying on the default JVM container metrics if you are running on cgroupv2-only hosts (all GitHub-hosted Ubuntu 24.04 runners use cgroupv2).'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/13684'
+    label: 'runner-images#13684 — New Ubuntu runner image breaks Elasticsearch (Feb 2026 rollback trigger)'
+  - url: 'https://github.com/actions/runner-images/issues/13682'
+    label: 'runner-images#13682 — Container healthchecks failing with path escapes from parent (co-reported Feb 2026)'
+  - url: 'https://github.com/actions/runner-images/issues/14105'
+    label: 'runner-images#14105 — [Ubuntu] Docker on Ubuntu 24.04 requires update to v29 (pending, May 2026)'
+  - url: 'https://github.com/containerd/containerd/issues/12683'
+    label: 'containerd#12683 — Go 1.24 os.DirFS stricter path validation in containerd v2.2'
