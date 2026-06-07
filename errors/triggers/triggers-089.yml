@@ -1,0 +1,130 @@
+id: triggers-089
+title: 'workflow_dispatch-Only Workflow Triggered by Push Event — Phantom Failure in Actions Tab'
+category: triggers
+severity: warning
+tags:
+  - workflow_dispatch
+  - push
+  - phantom-failure
+  - trigger
+  - race-condition
+  - ghost-run
+  - required-inputs
+patterns:
+  - regex: 'workflow_dispatch.*push.*fail|push.*event.*dispatch.*only'
+    flags: 'i'
+  - regex: '"event":\s*"push".*workflow_dispatch|dispatch.only.*push.*trigger'
+    flags: 'i'
+error_messages:
+  - "conclusion: failure, event: push (on a workflow_dispatch-only workflow)"
+  - "Workflow run failed before any jobs executed (0 jobs in workflow_dispatch-only file triggered by push)"
+root_cause: |
+  A workflow file that contains ONLY a `workflow_dispatch` trigger can appear in the
+  GitHub Actions tab as triggered by a `push` event, with conclusion `failure` and an
+  empty jobs array. No jobs actually execute; the run fails at workflow evaluation time.
+
+  The root mechanism: GitHub's workflow evaluation engine has a timing race condition
+  where, when a push event is received, the platform briefly evaluates ALL workflow
+  files in `.github/workflows/` before filtering by their declared trigger types. A
+  `workflow_dispatch`-only workflow can slip through this evaluation window and be
+  queued as a push-triggered run. Because the push event context does not provide the
+  `inputs` that `workflow_dispatch` requires, the workflow fails immediately with an
+  empty jobs array.
+
+  Key behavioral indicators:
+  - The phantom run appears ~1 second BEFORE the correct push-triggered workflow runs
+  - The phantom run shows `"event": "push"` and `"conclusion": "failure"` in API responses
+  - `gh run list --workflow=<file>` shows push-triggered failure runs for dispatch-only files
+  - No job logs exist — the run has 0 jobs
+  - The workflow file itself has no YAML errors
+
+  This affects repositories where `workflow_dispatch`-only workflows are used as
+  required status checks or when teams rely on the Actions tab being noise-free.
+  The phantom runs generate noise, spurious failure notifications, and confusion
+  about whether the workflow file is correct.
+
+  Reported in actions/runner#4001 (Aug 2025, closed as "file a support ticket").
+  Still reproduced by multiple teams as of May 2026 (ippoan/ci-workflows#23,
+  ippoan/ci-workflows#14).
+fix: |
+  **Workaround 1 — Separate the workflow_dispatch trigger into its own companion file.**
+  Remove the `workflow_dispatch` trigger from any workflow that shares the filename
+  pattern that causes the phantom. Move dispatch-only logic to a new, dedicated file:
+
+  **Workaround 2 — Add an explicit `push` filter that never matches.**
+  Adding a `push:` trigger with a `branches-ignore: ['**']` filter tells the evaluator
+  explicitly that this workflow should not run on push, suppressing the phantom:
+
+  This workaround is counter-intuitive but works because the explicit push trigger with
+  an impossible filter gives the evaluator a definitive non-match decision, eliminating
+  the phantom evaluation path.
+
+  **Workaround 3 — Add a guard step** that exits cleanly when `github.event_name` is
+  not `workflow_dispatch` (if you cannot change the trigger block):
+fix_code:
+  - language: yaml
+    label: 'Affected pattern — workflow_dispatch-only workflow that produces phantom push failures'
+    code: |
+      # .github/workflows/manual-deploy.yml
+      # PROBLEM: This file produces phantom "push" failure runs
+      name: Manual Deploy
+      on:
+        workflow_dispatch:
+          inputs:
+            environment:
+              description: 'Target environment'
+              required: true
+              type: choice
+              options: [staging, production]
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying to ${{ inputs.environment }}"
+  - language: yaml
+    label: 'WORKAROUND — add explicit push branches-ignore to suppress phantom evaluation'
+    code: |
+      # .github/workflows/manual-deploy.yml
+      # FIX: explicit non-matching push trigger suppresses the phantom run
+      name: Manual Deploy
+      on:
+        push:
+          branches-ignore:
+            - '**'   # never matches — tells evaluator this file is not a push workflow
+        workflow_dispatch:
+          inputs:
+            environment:
+              description: 'Target environment'
+              required: true
+              type: choice
+              options: [staging, production]
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying to ${{ inputs.environment }}"
+  - language: yaml
+    label: 'WORKAROUND — guard step that exits cleanly on non-dispatch event'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Guard — only run on workflow_dispatch
+              if: github.event_name != 'workflow_dispatch'
+              run: |
+                echo "::error::This workflow requires workflow_dispatch trigger. Event was: ${{ github.event_name }}"
+                exit 1
+            - run: echo "Deploying to ${{ inputs.environment }}"
+prevention:
+  - 'If a workflow_dispatch-only workflow produces phantom push failures, add a `push: branches-ignore: ["**"]` block to give the evaluator an explicit non-match signal.'
+  - 'Monitor dispatch-only workflow run history for unexpected push-triggered entries using `gh run list --workflow=<file>` periodically.'
+  - 'Keep dispatch-only workflows in clearly named files (e.g., `manual-*.yml`, `dispatch-*.yml`) to make phantom runs easier to spot.'
+  - 'File a GitHub Support ticket if phantom runs affect required status checks — this is a known platform-level bug.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4001'
+    label: 'actions/runner#4001 — GitHub Actions incorrectly triggers workflow_dispatch-only workflows on push'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_dispatch'
+    label: 'workflow_dispatch trigger documentation'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#push'
+    label: 'push trigger — branches-ignore filter'

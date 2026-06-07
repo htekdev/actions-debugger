@@ -1,0 +1,116 @@
+id: permissions-auth-093
+title: 'Environment-Scoped Secrets Resolve Empty in Reusable Workflow Without secrets: inherit'
+category: permissions-auth
+severity: silent-failure
+tags:
+  - reusable-workflow
+  - environment-secrets
+  - secrets-inherit
+  - silent-failure
+  - empty-secret
+  - environment
+  - workflow-call
+patterns:
+  - regex: 'secret.*empty.*reusable|reusable.*secret.*empty|environment.*secret.*not.*available'
+    flags: 'i'
+  - regex: 'MY_SECRET length: 0|secret.*length.*0'
+    flags: 'i'
+error_messages:
+  - "MY_SECRET length: 0"
+  - "EMPTY (environment-scoped secret resolved to empty string in reusable workflow)"
+root_cause: |
+  When a reusable workflow declares `environment: ${{ inputs.target_environment }}` on its
+  job and reads environment-scoped secrets via `${{ secrets.MY_SECRET }}`, those secrets
+  silently resolve to an empty string ("") unless the caller adds `secrets: inherit`.
+
+  GitHub's documentation states: "If a called workflow needs to access environment secrets,
+  the environment must be defined in the called workflow." In practice this is insufficient.
+  The `environment:` binding does take effect for protection rules and `vars` resolution,
+  but environment-scoped secrets are NOT injected into the called workflow's secret context
+  from the environment declaration alone.
+
+  The mechanism behind `secrets: inherit` is broader than its name suggests: it passes the
+  calling workflow's entire secret scope — including organization, repository, AND environment
+  secrets for any environment the caller is bound to — to the called workflow. Without it,
+  the called workflow's `${{ secrets.* }}` context contains only secrets explicitly mapped
+  via the caller's `secrets:` block.
+
+  This silent failure is especially dangerous in matrix-fan-out patterns where a reusable
+  workflow is called with different `environment_name` values per matrix cell. Each cell
+  receives empty strings for its environment secrets with no error, no annotation, and no
+  exit-code signal unless the consuming step explicitly validates the secret is non-empty.
+
+  Source: actions/runner#4453 (open May 2026) — production CI/CD pipeline silently
+  shipped blank deploy secrets for ~12 tenants for over a week before discovery.
+fix: |
+  Add `secrets: inherit` to the caller workflow's job that calls the reusable workflow.
+  This flows all secrets the caller can access (including env-scoped secrets) to the
+  called workflow:
+
+  If `secrets: inherit` is too permissive, explicitly map only the required secrets
+  in the caller's `secrets:` block instead of relying on the reusable workflow's
+  `environment:` declaration to auto-populate them.
+fix_code:
+  - language: yaml
+    label: 'BROKEN — environment declaration alone does not flow env-scoped secrets'
+    code: |
+      # caller.yml — BROKEN: missing secrets: inherit
+      jobs:
+        deploy:
+          uses: ./.github/workflows/deploy.yml
+          with:
+            target_environment: production
+          # secrets: inherit is missing
+          # Result: secrets.DEPLOY_KEY resolves to "" in the reusable workflow
+          #         even though production environment has DEPLOY_KEY set
+
+      # deploy.yml (reusable)
+      on:
+        workflow_call:
+          inputs:
+            target_environment:
+              required: true
+              type: string
+      jobs:
+        run:
+          runs-on: ubuntu-latest
+          environment: ${{ inputs.target_environment }}
+          steps:
+            - env:
+                DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+              run: |
+                echo "Key length: ${#DEPLOY_KEY}"   # prints: Key length: 0
+                [ -z "$DEPLOY_KEY" ] && echo "EMPTY — deploy will fail silently"
+  - language: yaml
+    label: 'FIXED — add secrets: inherit to the caller job'
+    code: |
+      # caller.yml — FIXED
+      jobs:
+        deploy:
+          uses: ./.github/workflows/deploy.yml
+          with:
+            target_environment: production
+          secrets: inherit   # flows org/repo/environment secrets to the called workflow
+  - language: yaml
+    label: 'FIXED — explicit least-privilege secrets mapping'
+    code: |
+      # caller.yml — explicit mapping (alternative to inherit)
+      jobs:
+        deploy:
+          uses: ./.github/workflows/deploy.yml
+          with:
+            target_environment: production
+          secrets:
+            DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}   # pass only what the reusable workflow needs
+prevention:
+  - 'Always add `secrets: inherit` or an explicit `secrets:` mapping when calling a reusable workflow that reads environment-scoped secrets.'
+  - 'Do not rely solely on `environment:` in the called workflow to auto-populate secrets — the caller must pass them.'
+  - 'Add an explicit secret-presence check at the start of reusable workflows that need secrets: `if [ -z "$MY_SECRET" ]; then echo "::error::MY_SECRET is empty"; exit 1; fi`.'
+  - 'Document which secrets are required in the reusable workflow''s `on.workflow_call` block, even if you plan to pass them via `secrets: inherit`.'
+docs:
+  - url: 'https://docs.github.com/en/actions/sharing-automations/reusing-workflows#using-inputs-and-secrets-in-a-reusable-workflow'
+    label: 'Reusing workflows — using inputs and secrets'
+  - url: 'https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idsecretsinherit'
+    label: 'Workflow syntax — jobs.job_id.secrets.inherit'
+  - url: 'https://github.com/actions/runner/issues/4453'
+    label: 'actions/runner#4453 — Environment-scoped secrets unreachable from reusable workflow'
