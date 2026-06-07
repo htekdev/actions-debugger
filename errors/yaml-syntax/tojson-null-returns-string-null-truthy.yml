@@ -1,0 +1,98 @@
+id: yaml-syntax-084
+title: "toJSON(null) returns the string \"null\" which is truthy — || fallback never fires"
+category: yaml-syntax
+severity: silent-failure
+tags:
+  - toJSON
+  - expressions
+  - null
+  - truthy
+  - fallback
+  - dynamic-matrix
+patterns:
+  - regex: 'toJSON\s*\([^)]+\)\s*\|\|'
+    flags: 'i'
+  - regex: 'toJson\s*\([^)]+\)\s*\|\|'
+    flags: 'i'
+error_messages:
+  - "Unexpected value ''"
+  - "Error when evaluating 'strategy' for job: Unexpected value ''"
+  - "fromJSON returned null — cannot use as strategy matrix"
+root_cause: |
+  The GitHub Actions toJSON() expression function converts null (and undefined) values to
+  the string "null" — a 5-character non-empty string — rather than to an empty string,
+  a JSON null, or a falsy value. Because GitHub Actions expression evaluation treats
+  any non-empty string as truthy, the || fallback operator never fires after toJSON():
+
+    ${{ toJSON(someNullField) || '{}' }}   # evaluates to "null", not '{}'
+
+  This creates two common silent failure modes:
+
+  1. Fallback never fires: toJSON(github.event.pull_request.body) || '"no description"'
+     evaluates to "null" when the PR has no body — the fallback is unreachable. Slack and
+     notification integrations post the literal word "null" to users.
+
+  2. Dynamic matrix breaks: when a job stores toJSON(null) in GITHUB_OUTPUT and a
+     downstream job uses fromJSON(needs.X.outputs.matrix), fromJSON("null") returns
+     JSON null — not an array. GitHub Actions then fails with "Unexpected value ''"
+     because it cannot construct a matrix from null.
+
+  Source: actions/runner#2198 (request for toJSON null tolerance); documented in GitHub
+  Community discussions and commit histories of broken release automation scripts.
+fix: |
+  Apply the null guard BEFORE calling toJSON, not after. Use the || operator on the
+  raw value before it enters toJSON so that toJSON always receives a non-null input.
+  For dynamic matrix jobs, also add an if: condition to skip the matrix job when the
+  output is the string "null" or empty.
+fix_code:
+  - language: yaml
+    label: "Null-safe toJSON — guard the value BEFORE wrapping"
+    code: |
+      # ❌ "null" is truthy — fallback never fires when body is null
+      # ${{ toJSON(github.event.pull_request.body) || '"(no description)"' }}
+
+      # ✅ Null check INSIDE toJSON — fallback fires for null/empty body
+      # ${{ toJSON(github.event.pull_request.body || '(no description)') }}
+
+      - name: Post notification
+        run: |
+          BODY='${{ toJSON(github.event.pull_request.body || "(no description)") }}'
+          echo "PR body: $BODY"
+  - language: yaml
+    label: "Safe dynamic matrix — guard null before storing and consuming"
+    code: |
+      jobs:
+        build-matrix:
+          runs-on: ubuntu-latest
+          outputs:
+            matrix: ${{ steps.set.outputs.matrix }}
+          steps:
+            - id: set
+              run: |
+                # Default to empty include array if no matrix computed
+                MATRIX='{"include":[{"os":"ubuntu-latest"}]}'
+                echo "matrix=${MATRIX:-{\"include\":[]}}" >> $GITHUB_OUTPUT
+
+        run-matrix:
+          needs: build-matrix
+          # Skip if output is the string "null" or empty
+          if: |
+            needs.build-matrix.outputs.matrix != 'null' &&
+            needs.build-matrix.outputs.matrix != ''
+          strategy:
+            matrix: ${{ fromJSON(needs.build-matrix.outputs.matrix) }}
+          runs-on: ${{ matrix.os }}
+          steps:
+            - run: echo "Running on ${{ matrix.os }}"
+prevention:
+  - "Never use toJSON(value) || 'fallback' — always guard before toJSON: toJSON(value || 'fallback')"
+  - "When consuming job outputs as dynamic matrices, add an if: condition guarding against the string 'null'"
+  - "Add a debug step early in development: run: echo '${{ toJSON(github.event.pull_request.body) }}' to inspect raw output"
+  - "For nullable event fields (PR body, issue labels, release notes), always provide a || default inside toJSON"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#tojson"
+    label: "GitHub docs — toJSON expression function"
+  - url: "https://github.com/actions/runner/issues/2198"
+    label: "actions/runner#2198 — toJSON should tolerate sometimes-null properties"
+  - url: "https://stackoverflow.com/questions/73517968/github-actions-how-to-return-empty-string-if-tojson-returns-null"
+    label: "Stack Overflow — how to return empty string if toJSON returns null"

@@ -1,0 +1,89 @@
+id: runner-environment-267
+title: "npm publish fails E401 when NODE_AUTH_TOKEN env var is missing from the publish step"
+category: runner-environment
+severity: error
+tags:
+  - npm
+  - publish
+  - setup-node
+  - registry-url
+  - node-auth-token
+  - 401
+patterns:
+  - regex: 'npm ERR! 401 Unauthorized'
+    flags: 'i'
+  - regex: 'E401.*You must be logged in to publish'
+    flags: 'i'
+  - regex: 'E401.*Unauthorized.*registry\.npmjs\.org'
+    flags: 'i'
+  - regex: 'E401.*Unauthorized.*npm\.pkg\.github\.com'
+    flags: 'i'
+error_messages:
+  - "npm ERR! 401 Unauthorized - PUT https://registry.npmjs.org/..."
+  - "npm ERR! E401 You must be logged in to publish packages."
+  - "error E401 Unauthorized - PUT https://npm.pkg.github.com/..."
+root_cause: |
+  When actions/setup-node is configured with registry-url:, it generates an .npmrc file
+  in the workspace that references NODE_AUTH_TOKEN as a shell variable:
+
+    //registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}
+
+  This variable must be expanded at the time npm publish runs. If NODE_AUTH_TOKEN is not
+  explicitly set as an env: variable on the npm publish step, it expands to an empty
+  string and npm sends no auth token, resulting in a 401 Unauthorized error.
+
+  The setup-node step always exits 0. The .npmrc file is created without error. The
+  failure only appears at publish time with "You must be logged in" — a message that
+  does not mention the missing environment variable or .npmrc expansion, making the root
+  cause difficult to diagnose.
+fix: |
+  Add NODE_AUTH_TOKEN as an env: variable on the step that runs npm publish (or yarn
+  publish, pnpm publish). For publishing to npmjs.org, set NODE_AUTH_TOKEN to an npm
+  automation token stored as a repository secret. For GitHub Packages, use GITHUB_TOKEN.
+  The registry-url: in setup-node must match the registry the .npmrc entry targets.
+fix_code:
+  - language: yaml
+    label: "Publish to npmjs.org — set NODE_AUTH_TOKEN on the publish step"
+    code: |
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish to npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+  - language: yaml
+    label: "Publish to GitHub Packages — use GITHUB_TOKEN"
+    code: |
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@your-org'
+
+      - name: Publish to GitHub Packages
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  - language: yaml
+    label: "Debug — inspect the generated .npmrc to verify token reference"
+    code: |
+      - name: Debug .npmrc (never print real tokens in prod)
+        run: |
+          echo "NPM config file: $NPM_CONFIG_USERCONFIG"
+          cat "$NPM_CONFIG_USERCONFIG"
+          # Should show: //registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}
+prevention:
+  - "Always set NODE_AUTH_TOKEN on the step that runs npm/yarn/pnpm publish — not on the setup-node step"
+  - "Verify registry-url in setup-node matches the exact registry URL in your package.json 'publishConfig'"
+  - "For scoped packages on GitHub Packages, set scope: '@your-org' in setup-node"
+  - "Confirm the secret name (NPM_TOKEN) matches the secret stored in repository Settings > Secrets"
+docs:
+  - url: "https://docs.github.com/en/actions/use-cases-and-examples/publishing-packages/publishing-nodejs-packages"
+    label: "GitHub docs — Publishing Node.js packages"
+  - url: "https://github.com/actions/setup-node#publishing-to-npmjs-and-github-packages"
+    label: "actions/setup-node — Publishing to npmjs and GitHub Packages"
+  - url: "https://github.com/actions/setup-node/issues/73"
+    label: "actions/setup-node#73 — NODE_AUTH_TOKEN not set causes 401 (common pattern)"
