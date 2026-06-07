@@ -1,0 +1,122 @@
+id: runner-environment-265
+title: 'Python 3.12 removes `imp` module — ModuleNotFoundError on ubuntu-24.04 runner migration'
+category: runner-environment
+severity: error
+tags:
+  - python312
+  - ubuntu-24
+  - imp-module
+  - runner-upgrade
+  - module-removed
+  - setuptools
+patterns:
+  - regex: "ModuleNotFoundError: No module named 'imp'"
+    flags: 'i'
+  - regex: "ImportError: No module named 'imp'"
+    flags: 'i'
+  - regex: 'cannot import name .imp. from .importlib'
+    flags: 'i'
+  - regex: 'ModuleNotFoundError.*imp.*python3\.12'
+    flags: 'i'
+error_messages:
+  - "ModuleNotFoundError: No module named 'imp'"
+  - "ImportError: No module named 'imp'"
+  - "ModuleNotFoundError: No module named imp"
+root_cause: |
+  Python's `imp` module was deprecated in Python 3.4 (in favor of `importlib`) and
+  finally **removed** in Python 3.12. Ubuntu 24.04 ships with Python 3.12 as the
+  system default. When `ubuntu-latest` migrated to Ubuntu 24.04 in late 2024,
+  workflows that did not pin their Python version via `actions/setup-python` began
+  using Python 3.12, exposing this removal.
+
+  Common packages and tools that internally import `imp` and break on Python 3.12:
+  - `setuptools` < 65.x (uses `imp` in `pkg_resources`)
+  - `ansible` < 9.0 (imports `imp` in collection loaders)
+  - `nose` test runner (unmaintained, imports `imp`; migrate to `pytest`)
+  - `distlib` < 0.3.7
+  - `paramiko` < 3.0 (imports `imp` for plugin discovery in some code paths)
+  - Old `coverage.py` versions (< 6.0 in some code paths)
+  - Any package using `imp.find_module()`, `imp.load_source()`, or `imp.load_dynamic()`
+
+  This error is distinct from:
+  - `ast.Str` / `ast.Num` removal (Python 3.12, different modules — covered separately)
+  - `distutils` removal (Python 3.12+, different module — covered separately)
+
+  The failure surfaces as:
+    "ModuleNotFoundError: No module named 'imp'"
+  during import of the affected package, typically early in the test runner or
+  application startup phase.
+
+  Source: Python 3.12 What's New (Removed modules), PEP 594 (Removing dead batteries),
+  widespread reports on Stack Overflow and PyPI issue trackers during ubuntu-latest
+  migration.
+fix: |
+  **Option 1 (recommended): Upgrade affected packages to Python 3.12-compatible versions**
+  - setuptools >= 65.x
+  - ansible >= 9.0 (for Python 3.12 support)
+  - Replace `nose` with `pytest` (nose is unmaintained since 2016)
+  - distlib >= 0.3.7
+  - paramiko >= 3.0
+
+  **Option 2: Pin Python version with actions/setup-python**
+  Use `python-version: '3.11'` to stay on a version that still has `imp` available
+  (Python 3.11 has `imp` with a DeprecationWarning). This buys time to upgrade
+  dependencies but is not a long-term solution as Python 3.11 reached EOL Oct 2024.
+
+  **Option 3: Pin runner to ubuntu-22.04 temporarily**
+  Ubuntu 22.04 ships with Python 3.10 which still has `imp`. This is a temporary
+  workaround until dependencies are upgraded.
+fix_code:
+  - language: yaml
+    label: 'Wrong — ubuntu-latest uses Python 3.12 which removed the imp module'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest   # Python 3.12 default — imp module removed
+          steps:
+            - uses: actions/checkout@v4
+            - run: pip install ansible==8.7.0 nose coverage==5.5
+            # ModuleNotFoundError: No module named 'imp'
+            - run: nosetests tests/
+  - language: yaml
+    label: 'Fixed — upgrade to Python 3.12-compatible package versions'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-python@v5
+              with:
+                python-version: '3.12'
+            - run: |
+                pip install --upgrade pip setuptools>=65
+                pip install ansible>=9.0 pytest coverage>=6
+                # nose → pytest: replace nosetests with pytest
+            - run: pytest tests/
+  - language: yaml
+    label: 'Fixed — pin to Python 3.11 as a temporary bridge while upgrading deps'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-python@v5
+              with:
+                python-version: '3.11'   # still has imp with DeprecationWarning
+            - run: pip install -r requirements.txt
+            - run: pytest tests/
+prevention:
+  - 'Always use actions/setup-python to pin the Python version explicitly — never rely on the runner system default'
+  - 'Run your test suite in a Python matrix (3.10, 3.11, 3.12, 3.13) to catch module removal before ubuntu-latest upgrades'
+  - 'Migrate away from the nose test runner to pytest — nose is unmaintained and heavily uses imp'
+  - 'Audit your dependency tree for imp usage: python3.12 -W error::DeprecationWarning -c "import yourpackage"'
+  - 'Pin setuptools >= 65 which replaces all imp usage with importlib'
+docs:
+  - url: 'https://docs.python.org/3.12/whatsnew/3.12.html#removed'
+    label: 'Python 3.12 — Removed modules (including imp)'
+  - url: 'https://peps.python.org/pep-0594/'
+    label: 'PEP 594 — Removing dead batteries from the standard library'
+  - url: 'https://github.com/actions/setup-python'
+    label: 'actions/setup-python — pin Python version in workflows'
