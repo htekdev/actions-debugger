@@ -1,0 +1,144 @@
+id: concurrency-timing-073
+title: "Reusable Workflow (workflow_call) Internal Jobs Do Not Inherit the Caller's Concurrency Group"
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - reusable-workflow
+  - workflow_call
+  - concurrency
+  - race-condition
+  - deployment
+  - concurrent-callers
+patterns:
+  - regex: 'workflow_call'
+    flags: 'i'
+  - regex: 'uses:\s+\./.github/workflows/'
+    flags: 'i'
+  - regex: 'concurrency:.*group:.*workflow_call|workflow_call.*concurrency'
+    flags: 'i'
+error_messages:
+  - "Error: An earlier run of this deployment is in progress."
+  - "error: cannot lock ref 'refs/heads/main': is at ... but expected ..."
+  - "fatal: failed to push some refs to 'https://github.com/...'"
+  - "HttpError: Resource not accessible by integration"
+root_cause: |
+  GitHub Actions `concurrency:` groups are evaluated within the workflow run where they
+  are defined. When a workflow calls a reusable workflow via `uses:`, the caller's
+  `concurrency:` block controls whether the **calling job** is queued or cancelled —
+  but this does NOT propagate into the reusable (called) workflow's internal jobs.
+
+  The called workflow's jobs execute in their own independent context. If two concurrent
+  caller runs both invoke the same reusable workflow at the same time, the called
+  workflow's internal jobs from both callers run in parallel, even if the outer caller
+  workflow has `concurrency: cancel-in-progress: true`.
+
+  Practical failure scenarios:
+  - **Deployment race**: Two PRs merge within seconds of each other. Both trigger a caller
+    workflow with a concurrency group. The concurrency group may cancel one caller run,
+    but if both calls to the deployment reusable workflow started before cancellation,
+    both deploy simultaneously → conflicting deployments, corrupted environment state
+  - **Repository write race**: Reusable workflow that commits generated files or updates
+    a repository variable — concurrent executions from two callers overwrite each other
+  - **Environment approval bypass**: First caller's deployment job is waiting for
+    environment protection approval; second caller's identical deployment starts because
+    the reusable workflow has no own concurrency, and both complete the approval and run
+
+  This is documented GitHub Actions behavior: the `concurrency:` key is not inherited
+  across `workflow_call` boundaries. The fix must be applied inside the called workflow.
+fix: |
+  Add an explicit `concurrency:` block inside the reusable workflow file itself. Use
+  caller-provided inputs to construct a meaningful group key when the group must be
+  caller-aware (e.g., scoped per environment or per feature branch).
+
+  For deployment reusable workflows, scope the concurrency key to the target environment
+  name so parallel deploys to different environments are allowed but parallel deploys
+  to the same environment are serialized.
+fix_code:
+  - language: yaml
+    label: "Add concurrency to the reusable workflow itself (deploy.yml)"
+    code: |
+      # In the called workflow: .github/workflows/deploy.yml
+      on:
+        workflow_call:
+          inputs:
+            environment:
+              required: true
+              type: string
+
+      # Concurrency defined HERE controls the called workflow's own execution.
+      # Scoped per-environment so parallel deploys to different envs are allowed.
+      concurrency:
+        group: deploy-${{ inputs.environment }}
+        cancel-in-progress: false  # Queue — don't cancel in-flight deployments
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          environment: ${{ inputs.environment }}
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./scripts/deploy.sh ${{ inputs.environment }}
+  - language: yaml
+    label: "Caller workflow — passes environment input, relies on called workflow's concurrency"
+    code: |
+      # In the caller workflow: .github/workflows/ci.yml
+      on:
+        push:
+          branches: [main]
+
+      # Caller concurrency controls whether THIS calling job queues or cancels,
+      # but does NOT prevent the called workflow from racing — rely on deploy.yml's
+      # own concurrency block for that.
+      concurrency:
+        group: ci-${{ github.ref }}
+        cancel-in-progress: true
+
+      jobs:
+        deploy-staging:
+          uses: ./.github/workflows/deploy.yml
+          with:
+            environment: staging
+
+        deploy-production:
+          needs: deploy-staging
+          uses: ./.github/workflows/deploy.yml
+          with:
+            environment: production
+  - language: yaml
+    label: "Pass a concurrency key as input for fully caller-controlled grouping"
+    code: |
+      # Called workflow accepts a concurrency_group input for fine-grained control.
+      on:
+        workflow_call:
+          inputs:
+            concurrency_group:
+              required: false
+              type: string
+              default: ""
+
+      concurrency:
+        group: ${{ inputs.concurrency_group != '' && inputs.concurrency_group || github.run_id }}
+        cancel-in-progress: false
+
+      jobs:
+        work:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Running under concurrency group ${{ inputs.concurrency_group }}"
+prevention:
+  - "Never assume the caller's `concurrency:` group prevents simultaneous execution inside a reusable workflow — it does not propagate."
+  - "Add explicit `concurrency:` blocks to every reusable workflow that touches shared resources: environments, repository variables, release assets, or external APIs."
+  - "For deployment reusable workflows, always scope the concurrency key to the target environment name."
+  - "Test concurrent caller scenarios explicitly: trigger the caller workflow twice in rapid succession and verify the second call is queued, not racing."
+  - "When a reusable workflow is called from multiple different caller workflows, the reusable workflow's own concurrency group is the only reliable serialization point."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs"
+    label: "GitHub Docs — Control the concurrency of workflows and jobs"
+  - url: "https://docs.github.com/en/actions/sharing-automations/reusing-workflows"
+    label: "GitHub Docs — Reusing workflows"
+  - url: "https://stackoverflow.com/questions/77021903/how-can-i-stop-reusable-workflows-called-from-a-caller-workflow-in-github-action"
+    label: "Stack Overflow #77021903 — Stop reusable workflows from racing with caller concurrency"
+  - url: "https://github.com/orgs/community/discussions/30708"
+    label: "GitHub Community Discussion #30708 — Reusable workflow concurrency group inheritance"
+  - url: "https://github.com/orgs/community/discussions/88761"
+    label: "GitHub Community Discussion #88761 — Concurrent callers and reusable workflow race conditions"

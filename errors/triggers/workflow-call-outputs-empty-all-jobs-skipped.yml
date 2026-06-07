@@ -1,0 +1,167 @@
+id: triggers-086
+title: "workflow_call Outputs Are Empty String When All Jobs in the Called Workflow Are Skipped"
+category: triggers
+severity: silent-failure
+tags:
+  - workflow_call
+  - reusable-workflow
+  - outputs
+  - skipped-jobs
+  - conditional-jobs
+  - empty-string
+patterns:
+  - regex: 'needs\.\w+\.outputs\.\w+'
+    flags: 'i'
+  - regex: 'workflow_call'
+    flags: 'i'
+  - regex: 'if:\s*\$\{\{.*\}\}\s*$'
+    flags: 'im'
+error_messages:
+  - "Error: Input required and not supplied: <output-name>"
+  - "Error: The template is not valid. Unexpected value ''"
+root_cause: |
+  When a reusable workflow (`on: workflow_call`) defines `outputs:` at the workflow
+  level, those outputs are populated from the `outputs:` of individual jobs that run
+  inside the called workflow. If ALL jobs inside the called workflow are skipped because
+  their `if:` conditions evaluated to false, no job outputs are ever set — and ALL of
+  the called workflow's outputs resolve to **empty string** (`""`).
+
+  GitHub documents this behavior: "If no jobs in a called workflow run, the called
+  workflow's outputs will be empty." No error is emitted. The caller workflow receives
+  empty strings silently, which then propagates to downstream steps that consume those
+  outputs.
+
+  This silent failure manifests in several ways:
+  - Downstream steps receive empty strings and proceed with broken state (e.g., an image
+    tag output is empty → docker pull fails with "invalid reference format")
+  - `if:` conditions on downstream jobs that check `needs.X.outputs.Y != ''` skip
+    unexpectedly, bypassing required work
+  - Steps using outputs as required inputs to other actions produce misleading "Input
+    required and not supplied" errors that point to the consumer, not the skipped producer
+  - Conditional reusable workflows used for "run-if-changed" patterns silently produce
+    empty artifact paths when the condition is false
+
+  Common pattern that triggers this:
+  ```yaml
+  # called-workflow.yml
+  jobs:
+    build:
+      if: ${{ inputs.should_build == 'true' }}  # This job may be skipped
+      outputs:
+        image_tag: ${{ steps.build.outputs.tag }}
+      steps:
+        - id: build
+          run: echo "tag=v1.0.${{ github.run_number }}" >> $GITHUB_OUTPUT
+  ```
+  When `inputs.should_build` is `'false'`, the `build` job is skipped, and the workflow
+  output `image_tag` is empty — but the caller receives `""` with no indication the job
+  was skipped.
+fix: |
+  Always include a fallback job (or step) that unconditionally sets outputs when the
+  primary job may be skipped. Use a "passthrough" job pattern: a lightweight job that
+  always runs, receives the conditional job's output via `needs:`, and passes it through
+  (including any default/fallback value).
+
+  Alternatively, validate outputs in the caller immediately after the `uses:` step before
+  proceeding.
+fix_code:
+  - language: yaml
+    label: "Passthrough job pattern — always runs and provides a fallback output"
+    code: |
+      # called-workflow.yml
+      on:
+        workflow_call:
+          inputs:
+            should_build:
+              type: boolean
+              default: false
+          outputs:
+            image_tag:
+              description: "Built image tag, or empty string if build was skipped"
+              value: ${{ jobs.output-passthrough.outputs.image_tag }}
+
+      jobs:
+        build:
+          if: ${{ inputs.should_build }}
+          runs-on: ubuntu-latest
+          outputs:
+            image_tag: ${{ steps.tag.outputs.tag }}
+          steps:
+            - id: tag
+              run: echo "tag=v1.0.${{ github.run_number }}" >> $GITHUB_OUTPUT
+
+        # This job ALWAYS runs and resolves to the build output or a safe default.
+        output-passthrough:
+          runs-on: ubuntu-latest
+          needs: [build]
+          if: always()
+          outputs:
+            image_tag: ${{ needs.build.outputs.image_tag || '' }}
+          steps:
+            - run: |
+                echo "image_tag=${{ needs.build.outputs.image_tag }}" | tee -a $GITHUB_OUTPUT
+  - language: yaml
+    label: "Caller validates outputs before consuming them"
+    code: |
+      # caller-workflow.yml
+      jobs:
+        maybe-build:
+          uses: ./.github/workflows/build.yml
+          with:
+            should_build: ${{ github.event_name == 'push' }}
+
+        deploy:
+          needs: maybe-build
+          runs-on: ubuntu-latest
+          # Guard against empty outputs from skipped called workflow jobs
+          if: ${{ needs.maybe-build.outputs.image_tag != '' }}
+          steps:
+            - name: Deploy image
+              run: |
+                echo "Deploying ${{ needs.maybe-build.outputs.image_tag }}"
+                # ... actual deploy steps
+
+        notify-skip:
+          needs: maybe-build
+          runs-on: ubuntu-latest
+          if: ${{ needs.maybe-build.outputs.image_tag == '' }}
+          steps:
+            - run: echo "Build was skipped — no deployment needed"
+  - language: yaml
+    label: "Use workflow outputs with explicit default values using || operator"
+    code: |
+      # called-workflow.yml
+      on:
+        workflow_call:
+          outputs:
+            image_tag:
+              value: ${{ jobs.build.outputs.image_tag || 'skip' }}
+              # Returns 'skip' (not empty) when build job is skipped,
+              # allowing callers to detect skip vs actual empty output.
+
+      jobs:
+        build:
+          if: ${{ inputs.should_build }}
+          runs-on: ubuntu-latest
+          outputs:
+            image_tag: ${{ steps.tag.outputs.tag }}
+          steps:
+            - id: tag
+              run: echo "tag=v${{ github.run_number }}" >> $GITHUB_OUTPUT
+prevention:
+  - "Never rely on `workflow_call` outputs without handling the case where all jobs in the called workflow may be skipped."
+  - "Use a passthrough job with `if: always()` and `needs:` to guarantee an output is always set, even when the producing job is skipped."
+  - "In the caller, guard downstream jobs with `if: needs.X.outputs.Y != ''` to skip dependent work when the called workflow produced no outputs."
+  - "Design reusable workflows to return a sentinel value (e.g., `'skip'` or `'false'`) from a fallback step rather than leaving outputs empty — distinguishes skip from failure."
+  - "Test your reusable workflow with the skip condition enabled to verify all callers handle empty outputs gracefully."
+docs:
+  - url: "https://docs.github.com/en/actions/sharing-automations/reusing-workflows#using-outputs-from-a-reusable-workflow"
+    label: "GitHub Docs — Using outputs from a reusable workflow"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#on-workflow_calloutputs"
+    label: "GitHub Docs — on.workflow_call.outputs syntax"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#about-expressions"
+    label: "GitHub Docs — Expressions and || operator for default values"
+  - url: "https://github.com/orgs/community/discussions/46850"
+    label: "GitHub Community Discussion #46850 — workflow_call outputs empty when jobs skipped"
+  - url: "https://stackoverflow.com/questions/76354985/github-actions-reusable-workflow-outputs-are-empty-when-job-is-skipped"
+    label: "Stack Overflow #76354985 — Reusable workflow outputs empty when job is skipped"
