@@ -1,0 +1,87 @@
+id: silent-failures-135
+title: 'github.run_number resets to 1 when workflow file is renamed or moved'
+category: silent-failures
+severity: warning
+tags:
+  - run-number
+  - versioning
+  - workflow-rename
+  - build-number
+  - semver
+  - artifact-naming
+patterns:
+  - regex: 'github\.run_number'
+    flags: 'i'
+error_messages:
+  - "version 1.2.1 already exists in registry"
+  - "409 Conflict: package version already exists"
+  - "tag 'v0.1.1' already exists"
+  - "Error: The specified version already exists"
+root_cause: |
+  github.run_number is a per-workflow-file counter — it counts runs scoped to the
+  specific workflow file path (e.g., .github/workflows/ci.yml). When a workflow file
+  is renamed, moved to a different path, or has its name: field changed, GitHub treats
+  it as a brand-new workflow and the counter resets silently to 1.
+
+  No error or warning is emitted when the reset happens. The next run after a rename
+  simply starts at run_number: 1 again, producing version strings that collide with
+  versions published by the first few runs under the old workflow name.
+
+  Common impact: a workflow that publishes packages to npm, PyPI, or GitHub Packages
+  using a version derived from run_number (e.g., 1.0.${{ github.run_number }}) will
+  attempt to publish 1.0.1, 1.0.2, etc. again after renaming — which are already taken
+  in the registry, causing a 409 Conflict or "version already exists" error.
+
+  github.run_id is different: it is a globally unique 64-bit integer assigned to every
+  run across all repositories and never resets regardless of workflow changes.
+fix: |
+  Do not rely on github.run_number as a globally unique or monotonically increasing
+  identifier across workflow lifecycle (renames, moves, recreations). Use one of these
+  alternatives:
+
+  1. github.run_id — globally unique, 64-bit, never resets. Suitable for unique tagging.
+  2. github.sha (short) — ties the artifact to a specific commit. Reproducible.
+  3. Explicit VERSION file in the repository — increment manually on release.
+  4. Semantic versioning with a separate counter (e.g., git tag count) that is
+     independent of which workflow file produced the build.
+
+  If you must use run_number, document the current value before renaming a workflow
+  and reset your base version number to avoid collisions.
+fix_code:
+  - language: yaml
+    label: "Use github.run_id instead of run_number for globally unique tags"
+    code: |
+      - name: Tag and push Docker image
+        run: |
+          # run_id is globally unique and never resets on workflow rename
+          IMAGE_TAG=ghcr.io/${{ github.repository }}:run-${{ github.run_id }}
+          docker tag myapp "$IMAGE_TAG"
+          docker push "$IMAGE_TAG"
+  - language: yaml
+    label: "Embed git SHA for reproducible artifact versioning"
+    code: |
+      - name: Set version from git SHA
+        run: |
+          SHORT_SHA="${{ github.sha }}"
+          SHORT_SHA="${SHORT_SHA:0:7}"
+          # SHA-based version never collides regardless of workflow name changes
+          echo "VERSION=0.1.0-${SHORT_SHA}" >> $GITHUB_ENV
+  - language: yaml
+    label: "Combine workflow hash with run_number as stable composite key"
+    code: |
+      - name: Build composite build number
+        run: |
+          # Include a hash of the workflow name so renames produce a distinct namespace
+          WFLOW_HASH=$(echo "${{ github.workflow }}" | sha256sum | cut -c1-8)
+          echo "BUILD_NUM=${WFLOW_HASH}-${{ github.run_number }}" >> $GITHUB_ENV
+prevention:
+  - "Never use github.run_number alone as the unique identifier in package or image version strings"
+  - "Document that github.run_number resets to 1 whenever the workflow file path or name changes"
+  - "Prefer github.run_id (globally unique, never resets) for guaranteed artifact uniqueness"
+  - "Pin explicit version numbers in a VERSION file or git tag rather than deriving them from CI context"
+  - "Before renaming a workflow that publishes to a registry, bump the base semantic version to avoid collisions"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context"
+    label: "github context — run_number (unique number for each run of a particular workflow)"
+  - url: "https://github.com/orgs/community/discussions/26709"
+    label: "GitHub Community #26709 — Manually modify GITHUB_RUN_NUMBER for workflow (45 reactions)"

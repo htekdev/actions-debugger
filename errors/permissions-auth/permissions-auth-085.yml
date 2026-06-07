@@ -1,0 +1,125 @@
+id: permissions-auth-085
+title: 'Environment-scoped secrets and variables only available in jobs targeting that environment — silently empty elsewhere'
+category: permissions-auth
+severity: silent-failure
+tags:
+  - environment
+  - secrets
+  - variables
+  - scope
+  - undefined
+  - deployment
+patterns:
+  - regex: 'environment:\s*\n.*secrets\.[A-Z_]+'
+    flags: 'is'
+  - regex: 'secrets\.[A-Z_]+.*empty.*environment|environment.*secret.*not.*found'
+    flags: 'i'
+error_messages:
+  - "Error: Input required and not supplied: password"
+  - "Error: getaddrinfo ENOTFOUND  "
+  - "authentication failed for 'https://'"
+  - "Error: ECONNREFUSED (empty host)"
+  - "Login failed: username or password empty"
+root_cause: |
+  GitHub Environments have their own scoped namespace for secrets and variables,
+  separate from Repository and Organization secrets. An environment-scoped secret
+  (configured at Settings → Environments → <name> → Secrets) is ONLY injected into
+  workflow jobs that explicitly declare:
+    environment: <environment-name>
+
+  In any other job — jobs without an environment: key, or jobs targeting a different
+  environment — the secret resolves to an empty string (""). No warning or error is
+  emitted by the runner; the secret simply appears unset.
+
+  Common scenario:
+  - A "DB_PASSWORD" secret is defined in the "production" environment.
+  - A build job precedes the deploy job and tries to reference secrets.DB_PASSWORD
+    (perhaps to run integration tests against the production DB).
+  - The build job has no environment: key → secrets.DB_PASSWORD is empty string → 
+    authentication fails with a confusing error about empty host or empty credentials.
+
+  This is a scoping decision by GitHub to enforce that sensitive deployment secrets
+  are only available to the deployment job that has passed environment protection rules
+  (required reviewers, wait timers, etc.).
+fix: |
+  Only reference an environment-scoped secret from a job that has the matching
+  environment: key. If a secret is needed by multiple jobs with different environment
+  targets, promote it to Repository-level secrets (Settings → Secrets and variables →
+  Actions → Repository secrets) so it is available to all jobs in the repository.
+
+  To share a derived value (not the raw secret) with downstream jobs, compute it in
+  the environment job and pass it via job outputs.
+fix_code:
+  - language: yaml
+    label: "Correct: reference environment secret only from the environment job"
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          environment: production     # ← environment secret injected ONLY here
+          steps:
+            - name: Deploy to production
+              env:
+                DB_PASS: ${{ secrets.DB_PASSWORD }}   # defined in "production" env
+              run: ./deploy.sh
+  - language: yaml
+    label: "Wrong: referencing environment secret from a non-environment build job"
+    code: |
+      jobs:
+        integration-test:
+          runs-on: ubuntu-latest
+          # No environment: key → secrets.DB_PASSWORD resolves to empty string
+          steps:
+            - run: ./test-integration.sh
+              env:
+                DB_PASS: ${{ secrets.DB_PASSWORD }}   # always empty — silent failure
+  - language: yaml
+    label: "Workaround: pass environment-derived value to downstream jobs via outputs"
+    code: |
+      jobs:
+        prepare:
+          runs-on: ubuntu-latest
+          environment: production
+          outputs:
+            api_host: ${{ steps.config.outputs.api_host }}
+          steps:
+            - id: config
+              run: echo "api_host=${{ vars.API_HOST }}" >> $GITHUB_OUTPUT
+        integration-test:
+          needs: prepare
+          runs-on: ubuntu-latest
+          steps:
+            # Receives computed value (not the raw secret) from environment job
+            - run: curl "https://${{ needs.prepare.outputs.api_host }}/health"
+  - language: yaml
+    label: "Promote to repository secret when multiple jobs need it"
+    code: |
+      # In Settings → Secrets and variables → Actions → Repository secrets:
+      # Add DB_PASSWORD as a Repository secret (not Environment secret)
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./test.sh
+              env:
+                DB_PASS: ${{ secrets.DB_PASSWORD }}   # now available everywhere
+        deploy:
+          runs-on: ubuntu-latest
+          environment: production
+          steps:
+            - run: ./deploy.sh
+              env:
+                DB_PASS: ${{ secrets.DB_PASSWORD }}   # also available here
+prevention:
+  - "Audit all secrets to determine whether they are Environment-scoped vs Repository-scoped in Settings"
+  - "Only reference an environment-scoped secret from a job with a matching environment: key"
+  - "If a secret is needed by multiple jobs with different or no environment targets, move it to Repository level"
+  - "Add a validation step that fails fast if a critical secret is empty: run: test -n \"$SECRET\" || (echo 'SECRET is empty'; exit 1)"
+  - "Use required-reviewers on the environment to ensure the human-approval gate is in place before the secret is exposed"
+docs:
+  - url: "https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment#environment-secrets"
+    label: "Environment secrets — scoped to jobs with a matching environment: key"
+  - url: "https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#secrets-context"
+    label: "secrets context — availability table by event and position"
+  - url: "https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment"
+    label: "Managing environments for deployment — GitHub Actions"

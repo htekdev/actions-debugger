@@ -1,0 +1,109 @@
+id: silent-failures-136
+title: 'github.event.pull_request absent in push event context — .merged always empty in post-merge push run'
+category: silent-failures
+severity: warning
+tags:
+  - push
+  - pull_request
+  - merged
+  - event-context
+  - expression
+  - post-merge
+patterns:
+  - regex: 'github\.event\.pull_request\.merged\s*==\s*(true|''true''|"true")'
+    flags: 'i'
+  - regex: 'github\.event\.pull_request\.(number|title|body|user)\s*\}\}'
+    flags: 'i'
+error_messages:
+  - "merge detection step never triggers"
+  - "github.event.pull_request.merged evaluated to empty string"
+  - "post-merge logic silently skipped on push event"
+root_cause: |
+  When a pull request is merged into the base branch, GitHub fires two independent
+  events that produce two separate workflow runs:
+
+  1. pull_request event — action: closed, merged: true — targets the PR head branch
+     context. github.event.pull_request contains the full PR payload.
+  2. push event — targets the base branch (main/master) for the new merge commit.
+     github.event is the push payload: it contains ref, before, after, commits,
+     and pusher. It does NOT include a pull_request key.
+
+  In the push event run, github.event.pull_request evaluates to an empty object ({}).
+  Accessing any property — github.event.pull_request.merged, .number, .title, .body —
+  returns an empty string (""), never true or the expected value.
+
+  Workflows configured with on: [push, pull_request] and a condition such as:
+    if: github.event.pull_request.merged == true
+  will NEVER satisfy this condition in the push-triggered run, silently skipping any
+  step or job gated on it. The developer expects post-merge behavior but gets nothing.
+fix: |
+  Gate all access to the pull_request payload on the event type first:
+    if: github.event_name == 'pull_request' && github.event.pull_request.merged == true
+
+  To detect a merge-to-main push without relying on the PR payload, filter by base
+  branch instead — every push to a protected main branch is a merge:
+    on:
+      push:
+        branches: [main]
+  With branch protection enabled, no direct pushes reach main, so on.push.branches:
+  [main] reliably fires only on merges.
+
+  For workflows that need both PR validation and post-merge behavior, separate them
+  into two distinct jobs or two distinct workflow files with dedicated triggers.
+fix_code:
+  - language: yaml
+    label: "Correct: guard PR payload access with event_name check"
+    code: |
+      on:
+        push:
+          branches: [main]
+        pull_request:
+          types: [closed]
+
+      jobs:
+        on-merge:
+          # Works correctly: pull_request run has merged=true; push run satisfies push check
+          if: |
+            (github.event_name == 'pull_request' && github.event.pull_request.merged == true) ||
+            github.event_name == 'push'
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Post-merge step"
+  - language: yaml
+    label: "Simpler: only trigger on push to main (merges always create a push to main)"
+    code: |
+      on:
+        push:
+          branches: [main]
+      # With branch protection, all pushes to main are merges — no PR payload needed
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./deploy.sh
+  - language: yaml
+    label: "Wrong: accessing PR payload from push event (always empty)"
+    code: |
+      on:
+        push:
+          branches: [main]
+        pull_request:
+          types: [closed]
+
+      jobs:
+        on-merge:
+          # BUG: in the push event run, merged is "", so this never fires from push
+          if: github.event.pull_request.merged == true
+          runs-on: ubuntu-latest
+prevention:
+  - "Never access github.event.pull_request.* in a push-triggered run — the key is absent"
+  - "Always prefix pull_request payload access with if: github.event_name == 'pull_request'"
+  - "To detect post-merge state from a push event, rely on the base branch filter instead of the PR payload"
+  - "Use github.event_name to branch logic by event type before accessing event-specific context fields"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#push"
+    label: "push event payload — GitHub Actions documentation (no pull_request key)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request"
+    label: "pull_request event — closed type with merged: true"
+  - url: "https://stackoverflow.com/questions/76443801/github-actions-getting-push-event-when-pull-request-merged"
+    label: "Stack Overflow #76443801 — Getting push event when pull request merged (score: 3, 2530 views)"

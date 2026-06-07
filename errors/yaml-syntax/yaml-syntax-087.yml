@@ -1,0 +1,119 @@
+id: yaml-syntax-087
+title: 'github.ref is refs/pull/N/merge for pull_request events — not the source branch — github.ref == refs/heads/X never matches'
+category: yaml-syntax
+severity: warning
+tags:
+  - github.ref
+  - pull_request
+  - head_ref
+  - expression
+  - branch-filter
+  - merge-ref
+patterns:
+  - regex: 'github\.ref\s*==\s*[''"]refs/heads/[^''"]*[''"]'
+    flags: 'i'
+  - regex: 'startsWith\(\s*github\.ref\s*,\s*[''"]refs/heads/[''"]'
+    flags: 'i'
+error_messages:
+  - "if condition evaluating to false on pull_request trigger when github.ref branch matches expected value"
+  - "branch filter condition never fires for pull_request event"
+  - "job skipped unexpectedly — github.ref does not match refs/heads/<branch> in PR context"
+root_cause: |
+  In pull_request and pull_request_target events, github.ref does NOT contain the
+  source (head) branch ref. GitHub creates an ephemeral test-merge commit for every
+  PR and sets github.ref to:
+    refs/pull/<PR_NUMBER>/merge
+
+  This is a synthetic ref that points to what the result of merging the PR would look
+  like — it is not the source branch. github.sha is the SHA of this merge commit, not
+  the head commit of the source branch.
+
+  The commonly expected context properties for pull_request events are:
+    github.head_ref — source branch name WITHOUT prefix (e.g., "feature/my-branch")
+    github.base_ref — target branch name WITHOUT prefix (e.g., "main")
+    github.ref      — refs/pull/<N>/merge  (NOT the source branch)
+
+  Common mistake: writing a step or job condition such as:
+    if: github.ref == 'refs/heads/release'
+  in a workflow triggered by on: pull_request. Because github.ref is
+  refs/pull/123/merge — never refs/heads/release — this condition is NEVER true
+  and the job or step silently skips.
+
+  A similar mistake: startsWith(github.ref, 'refs/heads/') returns false for all
+  pull_request events because github.ref starts with 'refs/pull/', not 'refs/heads/'.
+fix: |
+  Replace github.ref comparisons with github.head_ref (source branch name) or
+  github.base_ref (target branch name) in pull_request event conditions.
+
+  For cross-event conditions (applying to both push and pull_request):
+    github.ref_name  — short name without prefix; works for push (branch name)
+                       but is "<N>/merge" for pull_request, so avoid comparisons.
+    github.head_ref  — source branch name; only populated for pull_request events
+                       (empty for push events).
+
+  Best practice: use github.head_ref for PR source branch and combine with an
+  event_name guard when the workflow handles multiple event types.
+fix_code:
+  - language: yaml
+    label: "Wrong: github.ref branch comparison in pull_request context (never matches)"
+    code: |
+      on:
+        pull_request:
+          branches: [main]
+
+      jobs:
+        release-check:
+          # NEVER fires — github.ref is refs/pull/N/merge, not refs/heads/release
+          if: github.ref == 'refs/heads/release'
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Release PR"
+  - language: yaml
+    label: "Correct: use github.head_ref for the source branch in pull_request events"
+    code: |
+      on:
+        pull_request:
+          branches: [main]
+
+      jobs:
+        release-check:
+          # head_ref is the PR source branch name (e.g., "release") — no refs/ prefix
+          if: github.head_ref == 'release'
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Release PR"
+  - language: yaml
+    label: "Cross-event: different ref checks for push vs pull_request"
+    code: |
+      on:
+        push:
+          branches: [main, release]
+        pull_request:
+          branches: [main]
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Detect release context
+              run: |
+                # Works for both push (github.ref_name = branch) and
+                # pull_request (github.head_ref = source branch)
+                BRANCH="${{ github.head_ref || github.ref_name }}"
+                echo "Branch: $BRANCH"
+                if [[ "$BRANCH" == "release" ]]; then
+                  echo "IS_RELEASE=true" >> $GITHUB_ENV
+                fi
+prevention:
+  - "Never compare github.ref to refs/heads/* inside a pull_request or pull_request_target event workflow"
+  - "Use github.head_ref for the PR source branch name and github.base_ref for the target branch name"
+  - "Use github.ref_name (short ref without prefix) for push events; avoid it for pull_request events where it returns '<N>/merge'"
+  - "Add a debug step that prints all github context values to verify the ref format for each trigger event type"
+  - "Remember: startsWith(github.ref, 'refs/heads/') is false for all pull_request triggers"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context"
+    label: "github context — head_ref, base_ref, and ref for pull_request events"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request"
+    label: "pull_request event — ref field set to refs/pull/N/merge"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-conditions-to-control-job-execution"
+    label: "Using conditions to control job execution — GitHub Actions"
