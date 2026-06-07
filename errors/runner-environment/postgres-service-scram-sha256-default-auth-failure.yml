@@ -1,0 +1,123 @@
+id: runner-environment-263
+title: 'PostgreSQL 16+ service container changes default auth to scram-sha-256 — password authentication failed'
+category: runner-environment
+severity: error
+tags:
+  - postgres
+  - service-container
+  - scram-sha-256
+  - authentication
+  - pg16
+  - runner-upgrade
+patterns:
+  - regex: 'FATAL:\s+password authentication failed for user'
+    flags: 'i'
+  - regex: 'SCRAM authentication requires libpq version 10 or above'
+    flags: 'i'
+  - regex: 'pg_hba\.conf.*rejects connection for host.*user.*database'
+    flags: 'i'
+error_messages:
+  - 'FATAL:  password authentication failed for user "postgres"'
+  - 'error: SCRAM authentication requires libpq version 10 or above'
+  - 'pg_hba.conf rejects connection for host "127.0.0.1", user "postgres", database "testdb", no encryption'
+root_cause: |
+  PostgreSQL 16 changed the default `password_encryption` setting from `md5` to
+  `scram-sha-256`. When `ubuntu-latest` migrated from Ubuntu 22.04 to Ubuntu 24.04
+  in late 2024, workflows that use `image: postgres:latest` in service containers
+  began pulling PostgreSQL 16+ instead of 15.
+
+  Service container configurations that:
+  - Connect via older ORMs or psycopg2 compiled against libpq < 10
+  - Use `POSTGRES_HOST_AUTH_METHOD: trust` but then connect with a password
+  - Rely on md5 auth fallback that no longer exists in pg16 default config
+
+  fail with:
+    "FATAL:  password authentication failed for user "postgres""
+
+  The password value is correct; the failure is that pg16 stored the password hash
+  using scram-sha-256 while the client is sending an md5 hash (libpq < 10) or does
+  not support SCRAM at all.
+
+  Additionally, any tool/library that relied on the `pg_hba.conf` default of `md5`
+  for host connections (pre-pg16 behavior) will fail after the postgres image upgrade
+  because pg16 generates pg_hba.conf entries defaulting to `scram-sha-256`.
+
+  Source: PostgreSQL 16 release notes (default password_encryption changed),
+  github-actions community reports around ubuntu-latest migration, widely documented
+  on Stack Overflow under [postgres] + [github-actions] tags.
+fix: |
+  **Option 1 (recommended): Pin service container to a specific postgres version**
+  Use `postgres:15` (or your production version) instead of `postgres:latest` to
+  prevent surprise major-version upgrades breaking auth protocol.
+
+  **Option 2: Force md5 auth in service container environment**
+  Set `POSTGRES_HOST_AUTH_METHOD: md5` and
+  `POSTGRES_INITDB_ARGS: "--auth-host=md5 --auth-local=md5"` in the container env
+  to revert to md5 auth. Note: md5 is considered less secure than scram-sha-256.
+
+  **Option 3: Upgrade client libraries to support SCRAM-SHA-256**
+  psycopg2 >= 2.8, asyncpg >= 0.27, SQLAlchemy >= 1.4, Rails >= 6 with
+  pg gem >= 1.4 all support scram-sha-256 natively.
+fix_code:
+  - language: yaml
+    label: 'Wrong — postgres:latest now resolves to pg16+ with scram-sha-256 default'
+    code: |
+      services:
+        postgres:
+          image: postgres:latest   # pg16+ uses scram-sha-256 by default
+          env:
+            POSTGRES_PASSWORD: postgres
+            POSTGRES_DB: testdb
+          options: >-
+            --health-cmd pg_isready
+            --health-interval 10s
+            --health-timeout 5s
+            --health-retries 5
+      # Error: FATAL:  password authentication failed for user "postgres"
+  - language: yaml
+    label: 'Fixed — pin postgres version and configure md5 auth for broad compatibility'
+    code: |
+      services:
+        postgres:
+          image: postgres:16   # pin major version; add POSTGRES_HOST_AUTH_METHOD for md5
+          env:
+            POSTGRES_PASSWORD: postgres
+            POSTGRES_DB: testdb
+            POSTGRES_HOST_AUTH_METHOD: md5
+            POSTGRES_INITDB_ARGS: '--auth-host=md5 --auth-local=md5'
+          options: >-
+            --health-cmd pg_isready
+            --health-interval 10s
+            --health-timeout 5s
+            --health-retries 5
+  - language: yaml
+    label: 'Fixed — upgrade to scram-sha-256 with modern client (recommended long-term)'
+    code: |
+      services:
+        postgres:
+          image: postgres:16
+          env:
+            POSTGRES_PASSWORD: postgres
+            POSTGRES_DB: testdb
+            # scram-sha-256 is default in pg16 — no override needed
+          options: >-
+            --health-cmd pg_isready
+            --health-interval 10s
+            --health-timeout 5s
+            --health-retries 5
+      steps:
+        - name: Install Python deps
+          run: |
+            pip install psycopg2-binary>=2.9   # 2.8+ supports SCRAM-SHA-256
+prevention:
+  - 'Pin service container image versions (postgres:16 not postgres:latest) to avoid surprise major-version upgrades'
+  - 'Add postgres version to your dependency tracking alongside application dependencies'
+  - 'Upgrade psycopg2 to >= 2.9, asyncpg to >= 0.27, and pg gem to >= 1.4 which all support SCRAM-SHA-256'
+  - 'Test CI service containers on a matrix of postgres versions matching your supported production range'
+docs:
+  - url: 'https://www.postgresql.org/docs/16/auth-password.html'
+    label: 'PostgreSQL 16 — Password Authentication (scram-sha-256 default)'
+  - url: 'https://hub.docker.com/_/postgres'
+    label: 'postgres Docker Hub image — environment variable documentation'
+  - url: 'https://docs.github.com/en/actions/use-cases-and-examples/using-containerized-services/creating-postgresql-service-containers'
+    label: 'GitHub Docs — Creating PostgreSQL service containers'
