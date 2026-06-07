@@ -1,0 +1,103 @@
+id: runner-environment-285
+title: "setup-python \"candidates is not iterable\" — Manifest Fetch Fails on Rate-Limit or Network Error"
+category: runner-environment
+severity: error
+tags:
+  - setup-python
+  - manifest
+  - rate-limit
+  - self-hosted
+  - ghes
+  - intermittent
+  - python-versions
+patterns:
+  - regex: 'Error: candidates is not iterable'
+    flags: 'i'
+  - regex: 'candidates is not iterable'
+    flags: 'i'
+  - regex: 'was not found in the local cache.*candidates is not iterable'
+    flags: 'i'
+error_messages:
+  - "Error: candidates is not iterable"
+  - "Version 3.12.3 was not found in the local cache"
+  - "Version 3.12.3 was not found in the local cache\n  Error: candidates is not iterable"
+root_cause: |
+  The `actions/setup-python` action fetches a manifest of available Python versions
+  from the GitHub raw content endpoint (python-versions/versions-manifest.json) to
+  determine which version to install. If the manifest fetch fails — due to a GitHub
+  API rate limit, a transient network error, or a GHES proxy / connectivity issue —
+  the action receives a non-array response (null, an error object, or an HTTP error
+  string) instead of the expected JSON array.
+
+  When the action then attempts to find matching candidates with:
+    const candidates = manifest.filter(...)
+  it calls .filter() on a non-iterable value, producing:
+    TypeError: candidates is not iterable
+
+  This error surfaces as "Error: candidates is not iterable" in the step log, often
+  preceded by "Version X.Y.Z was not found in the local cache", which is the line
+  logged just before the manifest lookup attempt.
+
+  Common triggers:
+  - Self-hosted runners on GHES where the manifest endpoint is rate-limited or
+    blocked by a corporate proxy
+  - High concurrency workflows where many parallel jobs hit the manifest endpoint
+    simultaneously and some requests are throttled
+  - Transient network flaps on hosted runners (intermittent; re-running succeeds)
+  - GHES environments where the actions/runner cannot reach raw.githubusercontent.com
+
+  The issue was reported in actions/setup-python#903 (July 2024) and confirmed in
+  multiple GHES + self-hosted environments. Re-running the workflow typically succeeds
+  on the next attempt.
+fix: |
+  This is an intermittent error — a simple re-run usually resolves it. For persistent
+  failures, apply one of these mitigations:
+
+  1. **Use the local cache only** on self-hosted runners: pre-install Python via the
+     runner image (apt, pyenv, or official Python installer) and set
+     `update-environment: false` or use `check-latest: false` to skip the manifest.
+  2. **Pin an exact patch version** that's already in the runner's tool cache:
+     `python-version: '3.12.3'` — if the exact version is cached locally,
+     setup-python skips the manifest fetch entirely.
+  3. **Mirror the manifest on GHES**: configure the pyenv manifest mirror or use
+     `python-version-file: .python-version` with a pre-installed version.
+  4. **Add retry logic**: wrap the setup-python step in a retry action
+     (e.g., `nick-fields/retry`) to automatically re-run on failure.
+fix_code:
+  - language: yaml
+    label: "Mitigation 1: use pre-installed Python to skip manifest fetch"
+    code: |
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          check-latest: false   # ✅ Skips manifest fetch if version already cached
+          update-environment: true
+  - language: yaml
+    label: "Mitigation 2: pin exact version already in tool cache"
+    code: |
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.3'   # ✅ Exact match skips manifest lookup when cached
+  - language: yaml
+    label: "Mitigation 3: retry wrapper for intermittent manifest errors"
+    code: |
+      - uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 5
+          max_attempts: 3
+          command: |
+            # setup-python must run in its own step; this pattern uses a wrapper script
+            echo "Retrying setup-python via composite or reusable workflow step"
+      # Note: for step-level retries, use a reusable workflow with retry logic
+prevention:
+  - "On self-hosted or GHES runners, pre-install Python in the runner image rather than relying on runtime manifest downloads to avoid network-dependent failures"
+  - "Use `check-latest: false` (the default) to prefer the locally cached version and skip the manifest fetch when the exact version is already available"
+  - "If many parallel matrix jobs use setup-python simultaneously, consider caching the manifest or staggering job startup to reduce concurrent manifest requests"
+  - "Monitor for this error pattern in CI dashboards — a cluster of simultaneous failures usually indicates a transient rate-limit or network issue, not a workflow bug"
+docs:
+  - url: "https://github.com/actions/setup-python/issues/903"
+    label: "actions/setup-python#903: Occasionally getting 'candidates is not iterable' error"
+  - url: "https://github.com/actions/setup-python#caching-packages-dependencies"
+    label: "actions/setup-python README: caching and version selection"
+  - url: "https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners"
+    label: "GitHub Docs: About self-hosted runners"

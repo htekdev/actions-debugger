@@ -1,0 +1,98 @@
+id: caching-artifacts-092
+title: "setup-go Cache Restore Fails With tar \"Cannot open: File exists\" — Go 1.23 Telemetry Module"
+category: caching-artifacts
+severity: warning
+tags:
+  - setup-go
+  - cache
+  - tar
+  - go-1-23
+  - telemetry
+  - file-exists
+  - go-mod-cache
+patterns:
+  - regex: 'tar.*Cannot open.*File exists'
+    flags: 'i'
+  - regex: 'golang\.org/x/telemetry.*Cannot open: File exists'
+    flags: 'i'
+  - regex: 'Exiting with failure status due to previous errors.*setup-go|setup-go.*tar.*Exiting with failure'
+    flags: 'i'
+  - regex: 'Failed to restore.*tar.*failed.*exit code 2'
+    flags: 'i'
+error_messages:
+  - "/usr/bin/tar: ../../../go/pkg/mod/golang.org/x/telemetry/config@v0.31.0/config.json: Cannot open: File exists"
+  - "/usr/bin/tar: Exiting with failure status due to previous errors"
+  - "Warning: Failed to restore: \"/usr/bin/tar\" failed with error: The process '/usr/bin/tar' failed with exit code 2"
+root_cause: |
+  When `actions/setup-go` restores a cached Go module cache, tar attempts to extract
+  the full archive into the Go module cache directory. Starting with Go 1.23, the Go
+  toolchain automatically downloads and writes `golang.org/x/telemetry` configuration
+  files (config.json, LICENSE, go.mod, doc.go) to the module cache during normal
+  operations like `go build` or `go test`.
+
+  If those telemetry files were written to the module cache on disk BEFORE the cache
+  restore runs (e.g., by a previous go command or by the go toolchain's automatic
+  background telemetry update), tar encounters them as pre-existing files and fails with
+  "Cannot open: File exists" when trying to overwrite them without the `--overwrite` flag.
+
+  The failure exits with code 2, causing setup-go to log:
+    "Warning: Failed to restore: '/usr/bin/tar' failed with error: exit code 2"
+
+  This is a regression introduced by Go 1.23's automatic telemetry module behavior
+  combined with tar's default strict mode. The issue is most common on self-hosted
+  runners that may have a partially-populated Go module cache from a previous run or
+  from a pre-warmed runner image.
+
+  Reported in actions/setup-go#506 (September 2024). The underlying cause is the
+  interaction between Go 1.23 telemetry auto-download and tar's overwrite behavior.
+fix: |
+  Several workarounds are available depending on your runner environment:
+
+  1. **Upgrade actions/setup-go to v6+**: newer versions add `--overwrite` to the tar
+     extraction command, preventing the "File exists" error.
+  2. **Clear the telemetry files before cache restore**: add a step before setup-go
+     that removes the conflicting telemetry path.
+  3. **Disable Go telemetry**: set GOTELEMETRY=off to prevent auto-download.
+  4. **Use a fresh module cache**: delete the Go module cache directory before
+     setup-go runs (acceptable on ephemeral runners but not self-hosted with warm cache).
+fix_code:
+  - language: yaml
+    label: "Fix 1: upgrade to actions/setup-go@v6 or later (recommended)"
+    code: |
+      - uses: actions/setup-go@v6   # ✅ v6+ fixes tar --overwrite handling
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+  - language: yaml
+    label: "Fix 2: remove conflicting telemetry files before cache restore"
+    code: |
+      - name: Clear Go telemetry cache to prevent tar conflict
+        run: |
+          rm -rf "$(go env GOPATH)/pkg/mod/golang.org/x/telemetry" 2>/dev/null || true
+        # Run this BEFORE setup-go so the cache restore has no pre-existing files to conflict with
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+  - language: yaml
+    label: "Fix 3: disable Go telemetry to prevent auto-download"
+    code: |
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Disable Go telemetry
+        run: go env -w GOTELEMETRY=off
+prevention:
+  - "Prefer `actions/setup-go@v6` or later which handles the Go 1.23 telemetry file conflict natively"
+  - "On self-hosted runners with pre-warmed module caches, add a periodic cleanup of golang.org/x/telemetry from the module cache to prevent stale files accumulating"
+  - "If stuck on setup-go@v5, set GOTELEMETRY=off early in the workflow to prevent the telemetry module from being written to disk during the job"
+docs:
+  - url: "https://github.com/actions/setup-go/issues/506"
+    label: "actions/setup-go#506: Cache restore fails with tar 'File exists' on Go 1.23"
+  - url: "https://pkg.go.dev/golang.org/x/telemetry"
+    label: "golang.org/x/telemetry — Go telemetry module docs"
+  - url: "https://github.com/actions/setup-go/releases"
+    label: "actions/setup-go releases — upgrade to v6+"
