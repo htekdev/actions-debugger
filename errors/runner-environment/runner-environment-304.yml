@@ -1,0 +1,105 @@
+id: runner-environment-304
+title: macOS 26 host OS version lags behind xcodebuild deployment target — test phase fails before tests run
+category: runner-environment
+severity: error
+tags:
+  - macos-26
+  - xcode
+  - deployment-target
+  - xcodebuild
+  - ios
+  - macos-version
+patterns:
+  - regex: 'xcodebuild: error:.*Cannot test target .+ on "My Mac": My Mac''s macOS \d+\.\d+ doesn''t match .+''s macOS \d+\.\d+ deployment target'
+    flags: i
+  - regex: 'Cannot test target ".+" on "My Mac": My Mac''s macOS [\d.]+ doesn''t match'
+    flags: i
+  - regex: 'macOS [\d.]+ doesn''t match .+''s macOS [\d.]+ deployment target'
+    flags: i
+error_messages:
+  - "xcodebuild: error: Failed to build project CypherAir with scheme CypherAir.: Cannot test target \"CypherAirTests\" on \"My Mac\": My Mac's macOS 26.3 doesn't match CypherAirTests's macOS 26.4 deployment target."
+  - "Cannot test target \"AppTests\" on \"My Mac\": My Mac's macOS 26.3 doesn't match AppTests's macOS 26.4 deployment target."
+root_cause: |
+  GitHub runner images are updated on a delay after Apple releases new macOS minor
+  versions. During the gap, the macOS 26 runner image may ship a newer Xcode SDK
+  (e.g. Xcode with the 26.4 SDK) while the actual host OS on the runner remains
+  at the previous minor version (e.g. macOS 26.3).
+
+  Xcode's test runner validates that the host OS version is at least equal to the
+  project's MACOSX_DEPLOYMENT_TARGET or the scheme's test plan deployment target
+  before running tests. If the host is 26.3 but the project targets 26.4, xcodebuild
+  exits immediately with a deployment-target mismatch error before any test runs.
+
+  This is a recurring pattern: it occurs every time Apple ships a macOS minor update
+  and the runner image host OS has not yet been refreshed. The SDK upgrade lands in
+  Xcode (bundled with the image) before the underlying OS is updated.
+
+  Source: actions/runner-images#13901 (Apr 10, 2026 — 4 reactions, closed May 27 after
+  image update to macOS 26.4).
+fix: |
+  Option 1 — Lower deployment target to match current runner host OS:
+  Check the runner's OS version at the start of the job and set
+  MACOSX_DEPLOYMENT_TARGET dynamically. The runner-images README lists the
+  current host OS version.
+
+  Option 2 — Pin MACOSX_DEPLOYMENT_TARGET to a known-stable version:
+  Instead of tracking the very latest minor version, pin to the highest version
+  you know is stable on the runner (e.g. 26.3 until the image is confirmed updated).
+
+  Option 3 — Add an xcrun check step:
+  Detect mismatches before xcodebuild runs by comparing sw_vers output to the
+  project's deployment target, then skip or fail fast with a useful message.
+
+  Option 4 — Wait for image update:
+  GitHub typically updates runner images within weeks. If the project requires an
+  exact minor version, pin `runs-on: macos-26` and monitor runner-images releases
+  for the host OS to advance.
+fix_code:
+  - language: yaml
+    label: Detect host OS version and dynamically lower deployment target
+    code: |
+      jobs:
+        test:
+          runs-on: macos-26
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Check host macOS version
+              run: |
+                HOST_VER=$(sw_vers -productVersion)
+                echo "Runner host macOS: $HOST_VER"
+                echo "MACOS_HOST_VERSION=$HOST_VER" >> "$GITHUB_ENV"
+
+            - name: Run unit tests
+              run: |
+                xcodebuild test \
+                  -scheme MyApp \
+                  -project MyApp.xcodeproj \
+                  -destination 'platform=macOS,arch=arm64' \
+                  MACOSX_DEPLOYMENT_TARGET="$MACOS_HOST_VERSION"
+
+  - language: yaml
+    label: Pin deployment target to a known-stable minor version
+    code: |
+      # In your Xcode project or xcodebuild invocation:
+      # Set MACOSX_DEPLOYMENT_TARGET to the version you have confirmed
+      # is the current runner host OS, rather than the latest minor version.
+      - name: Run unit tests
+        run: |
+          xcodebuild test \
+            -scheme MyApp \
+            -destination 'platform=macOS,arch=arm64' \
+            MACOSX_DEPLOYMENT_TARGET=26.3  # pin to confirmed runner OS version
+prevention:
+  - "Never set MACOSX_DEPLOYMENT_TARGET to a macOS minor version newer than the runner image's documented host OS version"
+  - "Check the runner-images README for the image version used in the job to confirm the host OS before pinning deployment targets"
+  - "Use dynamic OS version detection (sw_vers) rather than hardcoding the newest macOS minor version in CI scripts"
+  - "Monitor github.com/actions/runner-images releases for host OS updates on macOS 26 images"
+  - "Pin MACOSX_DEPLOYMENT_TARGET to the prior minor version (N-1) when targeting the very latest macOS minor version"
+docs:
+  - url: https://github.com/actions/runner-images/issues/13901
+    label: "runner-images#13901: macOS 26 host OS still 26.3, blocks tests targeting 26.4"
+  - url: https://developer.apple.com/documentation/xcode/running-your-app-in-simulator-or-on-a-device
+    label: "Apple Developer: Deployment target requirements"
+  - url: https://github.com/actions/runner-images/blob/main/images/macos/macos-26-arm64-Readme.md
+    label: "macOS 26 arm64 runner image software README"

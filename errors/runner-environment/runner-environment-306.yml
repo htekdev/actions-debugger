@@ -1,0 +1,119 @@
+id: runner-environment-306
+title: windows-2025 label routes to windows-2025-vs2026 image — VS 2022 hardcoded paths not found
+category: runner-environment
+severity: error
+tags:
+  - windows-2025
+  - visual-studio-2026
+  - visual-studio-2022
+  - vs2026
+  - runner-migration
+  - msbuild
+  - cuda
+patterns:
+  - regex: 'Cannot find path ''C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise'
+    flags: i
+  - regex: 'because it does not exist\.'
+    flags: i
+  - regex: 'Microsoft Visual Studio\\2022\\Enterprise.*does not exist'
+    flags: i
+  - regex: 'unsupported Microsoft Visual Studio version.*Only the versions between 2019 and 2022'
+    flags: i
+error_messages:
+  - "Cannot find path 'C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\MSBuild\\Microsoft\\VC' because it does not exist."
+  - "error: -- unsupported Microsoft Visual Studio version! Only the versions between 2019 and 2022 (inclusive) are supported!"
+  - "Image: windows-2025-vs2026"
+root_cause: |
+  As of the Windows runner migration in June 2026, the `windows-2025` label is
+  served the `windows-2025-vs2026` image variant, which installs Visual Studio at
+  `C:\Program Files\Microsoft Visual Studio\18\Enterprise\` (version 18.x, VS2026)
+  instead of the previously expected
+  `C:\Program Files\Microsoft Visual Studio\2022\Enterprise\` (version 17.x, VS2022).
+
+  Any workflow, script, or build system that hardcodes the VS2022 installation path
+  fails because the `\2022\Enterprise\` directory no longer exists on the runner.
+  Common failure patterns:
+  - Copying NVIDIA CUDA MSBuild BuildCustomizations into `\2022\...\BuildCustomizations\`
+  - CMake generators explicitly referencing "Visual Studio 17 2022"
+  - Custom PowerShell steps using `$env:VS2022INSTALLDIR` or hardcoded path strings
+  - CUDA builds: CUDA 13.x and earlier only support VS2019 and VS2022 as host
+    compilers; VS2026 triggers a fatal error C1189 from host_config.h
+
+  The `windows-2025-vs2026` image was previously a separate beta label
+  (`windows-2025-vs2026`); GitHub began routing the `windows-2025` label to this
+  image during a gradual rollout that started May 2026 and completed in June 2026.
+
+  Source: actions/runner-images#14004 (May 5, 2026 — 5 reactions, open),
+  actions/runner-images#14017 (official announcement, May 7, 2026).
+fix: |
+  Option 1 — Use vswhere to discover the VS installation path dynamically (recommended):
+  Replace hardcoded VS2022 path strings with vswhere.exe queries that return the
+  correct path regardless of VS version installed on the runner.
+
+  Option 2 — Use the VSINSTALLDIR environment variable:
+  The runner image sets `VSINSTALLDIR` to the actual installation path.
+  Use this variable instead of hardcoding `\2022\Enterprise\`.
+
+  Option 3 — Pin to windows-2022 for VS2022 compatibility:
+  If the project requires VS2022 specifically (e.g. CUDA <14.x), switch to
+  `runs-on: windows-2022` where Visual Studio 2022 is still the installed version.
+
+  Option 4 — Upgrade CUDA to support VS2026:
+  CUDA 14.0+ supports Visual Studio 2026. Upgrade the CUDA toolkit if pinning to
+  windows-2022 is not a long-term solution.
+fix_code:
+  - language: yaml
+    label: Discover VS installation path with vswhere instead of hardcoding
+    code: |
+      - name: Locate Visual Studio installation
+        shell: pwsh
+        run: |
+          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
+            -latest -property installationPath
+          Write-Host "VS installation path: $vsPath"
+          echo "VS_INSTALL_PATH=$vsPath" >> $env:GITHUB_ENV
+
+      - name: Copy CUDA MSBuild customizations
+        shell: pwsh
+        run: |
+          $vcDir = "$env:VS_INSTALL_PATH\MSBuild\Microsoft\VC"
+          $buildCustom = Join-Path $env:CUDA_PATH "extras\visual_studio_integration\MSBuildExtensions\*"
+          Get-ChildItem (Split-Path $vcDir -Parent) -Directory |
+            ForEach-Object { Copy-Item $buildCustom "$($_.FullName)\BuildCustomizations\" -Force }
+
+  - language: yaml
+    label: Pin to windows-2022 for CUDA builds requiring VS2022
+    code: |
+      jobs:
+        build-cuda:
+          # windows-2022 retains VS2022; use until CUDA toolkit supports VS2026
+          runs-on: windows-2022
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build CUDA project
+              run: cmake --build . --config Release
+
+  - language: yaml
+    label: Use VSINSTALLDIR environment variable
+    code: |
+      - name: Copy BuildCustomizations
+        shell: pwsh
+        run: |
+          # VSINSTALLDIR is set by the runner image to the actual VS install root
+          $vcDir = "$env:VSINSTALLDIR\MSBuild\Microsoft\VC"
+          # Use this path instead of hardcoded \2022\Enterprise\...
+prevention:
+  - "Never hardcode 'Microsoft Visual Studio\\2022\\Enterprise' or similar versioned VS paths; always use vswhere for discovery"
+  - "Use $env:VSINSTALLDIR or $env:VS2022INSTALLDIR / $env:VS2026INSTALLDIR environment variables provided by the runner image"
+  - "Check the runner-images announcements repository for upcoming label migrations before they take effect"
+  - "Verify CUDA toolkit version supports the Visual Studio version on the target runner image before upgrading the runner"
+  - "Subscribe to github.com/actions/runner-images issues labeled 'Announcement' for advance notice of image migrations"
+docs:
+  - url: https://github.com/actions/runner-images/issues/14004
+    label: "runner-images#14004: windows-2025 label serving VS2026 image; breaks VS2022 paths"
+  - url: https://github.com/actions/runner-images/issues/14017
+    label: "runner-images#14017: Official announcement — windows-latest/windows-2025 will use VS2026 in June 2026"
+  - url: https://github.com/microsoft/vswhere
+    label: "vswhere: Visual Studio installation discovery tool"
+  - url: https://docs.nvidia.com/cuda/cuda-installation-guide-microsoft-windows/index.html
+    label: "CUDA Installation Guide — Supported Visual Studio versions"
