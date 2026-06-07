@@ -1,0 +1,104 @@
+id: caching-artifacts-101
+title: "rust-cache cache-bin:true Restores Stale Cargo/Rustc Symlinks After macos-latest → macOS 26 Migration"
+category: caching-artifacts
+severity: error
+tags:
+  - rust
+  - cargo
+  - macos
+  - cache
+  - symlink
+  - runner-image
+  - macos-26
+  - macos-latest
+patterns:
+  - regex: 'error: unexpected argument .fmt. found\s*Usage: rustup-init'
+    flags: "si"
+  - regex: 'error: unexpected argument .check. found\s*Usage: rustup-init'
+    flags: "si"
+  - regex: 'rustup-init\[EXE\].*--help|Usage: rustup-init.*OPTIONS'
+    flags: "i"
+  - regex: 'cargo: error: unexpected argument|rustc: error: unrecognized option'
+    flags: "i"
+error_messages:
+  - "error: unexpected argument 'fmt' found"
+  - "Usage: rustup-init[EXE] [OPTIONS]"
+  - "error: unexpected argument 'check' found"
+  - "For more information, try '--help'."
+root_cause: |
+  Swatinem/rust-cache with `cache-bin: true` (which became the default in newer
+  versions) caches `~/.cargo/bin/` entries including the `rustc`, `cargo`, and
+  `cargo-fmt` symlinks. On macOS these are typically thin shims that point to the
+  rustup toolchain binaries at a versioned path under `~/.rustup/toolchains/`.
+
+  When `macos-latest` migrated from macOS 15 to macOS 26 (beginning June 2026),
+  old caches that were saved on the previous macOS image are restored on the new
+  image. The rustup toolchain paths changed across the OS boundary, so the
+  restored `~/.cargo/bin/rustc`, `~/.cargo/bin/cargo`, etc. now point to
+  non-existent paths or — worse — resolve to the `rustup-init` binary instead of
+  the actual toolchain binary.
+
+  Result: any `cargo` subcommand (`cargo fmt`, `cargo clippy`, `cargo build`) is
+  intercepted by the `rustup-init` stub, which prints its own usage message and
+  exits 1. The error looks like a `rustup-init` invocation, not a Rust compilation
+  failure, which makes it extremely confusing to diagnose.
+
+  This affects any repo where:
+  1. `cache-bin: true` (or default new version) was previously in use.
+  2. The runner recently switched to macOS 26 via the `macos-latest` label.
+  3. An existing valid-looking cache entry is found and restored.
+
+  Source: Swatinem/rust-cache#341 (May 2026, 15 👍, open).
+fix: |
+  **Immediate fix — disable bin caching:**
+  Set `cache-bin: false` in your rust-cache step. This prevents `~/.cargo/bin/`
+  from being saved/restored across runner image boundaries.
+
+  **Alternative — purge the stale cache:**
+  Go to Actions → Caches, find and delete the cache entries for the affected
+  workflow branch. The next run will rebuild from scratch and create a fresh,
+  correct cache for macOS 26.
+
+  **Long-term — pin to a specific runner image:**
+  Use `runs-on: macos-26` instead of `macos-latest` so cache keys are stable
+  across image upgrades and your caches don't bleed between OS versions.
+fix_code:
+  - language: yaml
+    label: "Disable cache-bin to avoid stale symlink restoration"
+    code: |
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: 'false'   # prevents ~/.cargo/bin/ from being cached/restored
+  - language: yaml
+    label: "Include runner image label in cache key to prevent cross-image pollution"
+    code: |
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ runner.os }}-${{ runner.arch }}-rust
+          # Note: the runner OS version is NOT included in runner.os;
+          # consider adding a matrix variable or image version env var
+          cache-bin: 'false'
+  - language: yaml
+    label: "Pin to explicit macOS version so macos-latest migration doesn't break cache"
+    code: |
+      jobs:
+        build:
+          runs-on: macos-26   # pin rather than macos-latest to stabilize cache keys
+          steps:
+            - uses: actions/checkout@v4
+            - uses: Swatinem/rust-cache@v2
+prevention:
+  - "Set `cache-bin: false` when using runner images that migrate between major OS versions (e.g., macos-latest)."
+  - "Subscribe to actions/runner-images announcements — any macos-latest label migration invalidates bin caches."
+  - "Include the runner image version in your cache key when caching compiled binaries or tool symlinks."
+  - "After a macos-latest label change, manually purge all existing caches to avoid restoring stale entries."
+  - "Prefer pinning `runs-on: macos-26` over `macos-latest` for stable cache behavior during migration windows."
+docs:
+  - url: "https://github.com/Swatinem/rust-cache/issues/341"
+    label: "rust-cache#341 — cache-bin:true breaks cargo on new macOS runner"
+  - url: "https://github.com/actions/runner-images/issues/14167"
+    label: "runner-images#14167 — macos-latest will use macos-26 in June 2026"
+  - url: "https://github.com/Swatinem/rust-cache#configuration"
+    label: "Swatinem/rust-cache — cache-bin configuration option"
