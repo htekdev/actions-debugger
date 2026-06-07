@@ -1,0 +1,98 @@
+id: runner-environment-276
+title: 'ubuntu-24.04 AF_XDP Socket Hang — Kernel 6.17 veth XDP txq Race Condition'
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-24.04
+  - kernel
+  - af-xdp
+  - veth
+  - networking
+  - hang
+  - xdp
+  - open-vswitch
+patterns:
+  - regex: 'AF_XDP.*timeout|xdp.*socket.*stuck|veth.*XDP.*lock'
+    flags: 'i'
+  - regex: 'exceeded the maximum execution time.*ubuntu-24'
+    flags: 'i'
+  - regex: 'xsk_bind.*hang|XDP_USE_NEED_WAKEUP.*stall'
+    flags: 'i'
+error_messages:
+  - 'The job running on runner Hosted Agent has exceeded the maximum execution time of 360 minutes.'
+  - 'Error: The operation was canceled.'
+  - 'Canceling since no output has been received in the last 10 minutes'
+root_cause: |
+  Ubuntu 24.04 hosted runners shipping kernel 6.17.0-1008-azure through 6.17.0-1015-azure
+  contain a race condition in the veth driver's AF_XDP (eXpress Data Path) ring buffer
+  handling. When CI jobs attempt to send or receive traffic via veth interfaces opened
+  with AF_XDP sockets, the kernel txq gets permanently stuck — the job hangs with no
+  output and eventually times out.
+
+  The specific upstream kernel bugs are:
+  - CVE-2025-68232: "veth: more robust handling of race to avoid txq getting stuck"
+    (LP: #2137723, v6.17.10 stable)
+  - CVE-2025-68341: "veth: reduce XDP no_direct return section to fix race"
+    (LP: #2138824, v6.17.11 stable)
+
+  These fixes are in Ubuntu's linux-azure changelog from 6.17.0-1009.9 onwards, but
+  GitHub's runner images did not pick up the fixed kernel in time. The ubuntu-22.04
+  runner (kernel 6.8.0-azure) predates both bugs and is unaffected.
+
+  Particularly impacted: Open vSwitch (OVS), DPDK-based tests, eBPF/XDP networking
+  test suites, and any project using veth+AF_XDP for packet-forwarding CI.
+
+  Source: actions/runner-images#13871 (open March 2026, confirmed by OVS project);
+  Ubuntu changelog LP: #2137723 and #2138824.
+fix: |
+  Pin AF_XDP networking jobs to ubuntu-22.04. Kernel 6.8.0-azure does not have the
+  veth XDP txq race condition.
+
+  To restore ubuntu-24.04 once fixed: monitor the runner-images ubuntu24 release notes
+  for a kernel version >= 6.17.0-1009 (which contains the CVE-2025-68232/68341 backports).
+  As of ubuntu24/20260525.161 (kernel 6.17.0-1015-azure), the issue is still open.
+
+  Alternatively, use a self-hosted runner with kernel 6.17.0-1009+ installed from
+  Ubuntu's official linux-azure package (the fix is in Canonical's packages even if
+  GitHub's runner image hasn't updated).
+fix_code:
+  - language: yaml
+    label: 'Pin AF_XDP jobs to ubuntu-22.04 (unaffected kernel 6.8.0-azure)'
+    code: |
+      jobs:
+        ovs-xdp-tests:
+          # ubuntu-24.04 kernel 6.17 has AF_XDP veth txq race; hang until timeout.
+          # CVE-2025-68232/68341 fix is in 6.17.0-1009+. Pin to 22.04 until patched.
+          # Track: https://github.com/actions/runner-images/issues/13871
+          runs-on: ubuntu-22.04
+          steps:
+            - uses: actions/checkout@v4
+            - name: Install OVS and run XDP tests
+              run: |
+                sudo apt-get install -y openvswitch-switch
+                make check TESTSUITEFLAGS="xdp"
+  - language: yaml
+    label: 'Conditional job skip for AF_XDP on ubuntu-24.04 with clear comment'
+    code: |
+      jobs:
+        network-test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run AF_XDP tests
+              # WORKAROUND: ubuntu-24.04 (kernel 6.17) hangs on AF_XDP veth tests.
+              # Re-enable once runner-images#13871 is resolved (fix in kernel 6.17.0-1009+).
+              if: false
+              run: make test-af-xdp
+prevention:
+  - 'Track actions/runner-images#13871 for the kernel fix landing in ubuntu-24.04 runner images'
+  - 'When CI hangs with no output and times out, check if AF_XDP or XDP ring buffers are involved'
+  - 'Include runner image version in hang bug reports — this class of bug is kernel-version-specific'
+  - 'For network-intensive CI, consider ubuntu-22.04 as a stable baseline until ubuntu-24.04 kernel stabilizes'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/13871'
+    label: 'actions/runner-images#13871: AF_XDP socket hang on ubuntu-24.04 20260323.65.1 (open March 2026)'
+  - url: 'https://changelogs.ubuntu.com/changelogs/pool/main/l/linux-azure/linux-azure_6.17.0-1009.9/changelog'
+    label: 'Ubuntu linux-azure 6.17.0-1009.9 changelog: CVE-2025-68232 and CVE-2025-68341 veth XDP fixes'
+  - url: 'https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners'
+    label: 'GitHub Docs: About GitHub-hosted runners'

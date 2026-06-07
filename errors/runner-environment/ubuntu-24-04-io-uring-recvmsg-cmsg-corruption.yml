@@ -1,0 +1,102 @@
+id: runner-environment-277
+title: 'ubuntu-24.04 kernel 6.17 io_uring recvmsg CMSG Corruption — Control Messages Silently Wrong'
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-24.04
+  - kernel
+  - io_uring
+  - recvmsg
+  - cmsg
+  - liburing
+  - networking
+  - corruption
+patterns:
+  - regex: 'cmsg.*corrupt|recvmsg.*cmsg.*wrong|CMSG_LEVEL.*unexpected'
+    flags: 'i'
+  - regex: 'liburing.*recvmsg.*fail|io_uring.*MSG_CMSG|cmsg.*truncat'
+    flags: 'i'
+  - regex: 'Assertion.*CMSG|assert.*cmsg_level|cmsg_type.*mismatch'
+    flags: 'i'
+error_messages:
+  - 'Assertion failed: expected CMSG_LEVEL to be SOL_SOCKET'
+  - 'recvmsg cmsg data corrupt: expected IP_RECVERR got 0'
+  - 'CMSG_FIRSTHDR returned NULL unexpectedly after io_uring recvmsg'
+root_cause: |
+  Ubuntu 24.04 hosted runner images that shipped with kernel 6.17.0-1008-azure and
+  subsequent 6.17.x azure kernel builds contain a bug in the kernel's io_uring
+  recvmsg implementation that corrupts control message (CMSG) data. Specifically,
+  CMSG metadata passed via the control buffer in a recvmsg call through io_uring is
+  silently wrong — CMSG_LEVEL, CMSG_TYPE, or CMSG_LEN fields arrive with incorrect
+  values when the call goes through the io_uring path.
+
+  This affects any code that:
+  - Uses io_uring (directly via liburing or indirectly via Netty, Vert.x, or other
+    io_uring-based Java/Rust/Go networking stacks) to perform recvmsg
+  - Relies on control messages (ancillary data): IP_RECVERR, IP_PKTINFO, SO_TIMESTAMPNS,
+    MSG_CMSG_CLOEXEC, or SCM_RIGHTS file descriptor passing
+
+  The upstream fix is in the linux 6.17-stable branch (axboe/liburing#1509 references
+  the relevant backports). GitHub closed the runner-images issue as not_planned because
+  they do not control Azure kernel package backports; the fix must come through
+  Ubuntu/Canonical channels first.
+
+  The kernel 6.17.0-1008 through 6.17.0-1015 azure builds are confirmed affected.
+  Ubuntu-22.04 (kernel 6.8.0-azure) is unaffected.
+
+  Source: actions/runner-images#13917 (closed not_planned April 2026);
+  axboe/liburing#1509; netty/netty#16647.
+fix: |
+  Pin io_uring recvmsg CMSG-dependent jobs to ubuntu-22.04. Kernel 6.8.0-azure does
+  not have the io_uring CMSG corruption bug.
+
+  If ubuntu-24.04 cannot be avoided, implement a fallback: use the traditional
+  epoll/poll + recvmsg (non-io_uring) code path. Most io_uring libraries provide a
+  feature flag to disable io_uring and fall back to syscalls for testing purposes.
+
+  Monitor the ubuntu-24.04 runner image release notes for a kernel version that includes
+  the 6.17-stable backports for the io_uring CMSG fix.
+fix_code:
+  - language: yaml
+    label: 'Pin io_uring-dependent networking tests to ubuntu-22.04'
+    code: |
+      jobs:
+        netty-tests:
+          # ubuntu-24.04 kernel 6.17 corrupts CMSG data in io_uring recvmsg.
+          # Known issue: actions/runner-images#13917 (closed not_planned).
+          # Fix must come via Ubuntu/Azure kernel update. Pin to 22.04 in the meantime.
+          runs-on: ubuntu-22.04
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-java@v4
+              with:
+                java-version: '21'
+                distribution: temurin
+            - name: Run transport tests
+              run: ./mvnw test -pl transport -Dtransport.type=io_uring
+  - language: yaml
+    label: 'Disable io_uring in tests when running on ubuntu-24.04 as workaround'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-24.04
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run tests with io_uring disabled
+              # Workaround: ubuntu-24.04 kernel 6.17 corrupts CMSG in io_uring recvmsg.
+              # Disable io_uring transport until runner-images#13917 kernel fix ships.
+              run: ./gradlew test -Dio_uring.enabled=false
+prevention:
+  - 'If CI tests that use io_uring recvmsg start failing with CMSG assertion errors, check the ubuntu-24.04 kernel version first'
+  - 'Monitor axboe/liburing#1509 and Ubuntu azure kernel changelogs for the recvmsg CMSG backport'
+  - 'For networking libraries with io_uring backends, keep a non-io_uring CI job as a canary'
+  - 'Test CMSG-dependent code on ubuntu-22.04 as the stable baseline during ubuntu-24.04 kernel churn'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/13917'
+    label: 'actions/runner-images#13917: Backport fix for msg corruption in recvmsg (closed not_planned April 2026)'
+  - url: 'https://github.com/axboe/liburing/issues/1509'
+    label: 'axboe/liburing#1509: io_uring recvmsg CMSG corruption on kernel 6.17.0-1008'
+  - url: 'https://github.com/netty/netty/issues/16647'
+    label: 'netty/netty#16647: Update Linux CI runners once io_uring fixes are backported'
+  - url: 'https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners'
+    label: 'GitHub Docs: About GitHub-hosted runners'

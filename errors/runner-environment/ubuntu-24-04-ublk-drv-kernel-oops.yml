@@ -1,0 +1,92 @@
+id: runner-environment-275
+title: 'ubuntu-24.04 kernel 6.17 ublk_drv Oops — UBLK_U_CMD_ADD_DEV Crashes Job'
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-24.04
+  - kernel
+  - ublk
+  - userspace-block
+  - io_uring
+  - kernel-oops
+  - self-hosted
+patterns:
+  - regex: 'ublk_init_queues.*ublk_drv|RIP.*ublk_init_queues'
+    flags: 'i'
+  - regex: 'ublk_ctrl_add_dev.*ublk_drv|ublk_ctrl_uring_cmd'
+    flags: 'i'
+  - regex: 'iou-wrk.*exited with irqs disabled'
+    flags: 'i'
+error_messages:
+  - 'RIP: 0010:ublk_init_queues+0x4e/0x1e0 [ublk_drv]'
+  - 'ublk_ctrl_add_dev+0x31a/0x5e0 [ublk_drv]'
+  - 'ublk_ctrl_uring_cmd+0x7f/0x754 [ublk_drv]'
+  - 'note: iou-wrk-* exited with irqs disabled'
+  - 'Call Trace: ublk_ctrl_add_dev'
+root_cause: |
+  The ubuntu-24.04 hosted runner image ships kernel 6.17.0-1015-azure, which contains
+  a bug in the ublk_drv kernel module. When userspace code issues a single
+  UBLK_U_CMD_ADD_DEV io_uring command to register a new ublk device, the kernel
+  panics with a NULL pointer dereference inside ublk_init_queues. The command never
+  completes, and the io_uring worker thread exits with interrupts disabled, causing
+  the entire job to hang until it times out.
+
+  This affects any project that uses the Linux userspace block device (ublk) API —
+  a relatively new subsystem for building userspace block device drivers using io_uring.
+  The ubuntu-22.04 runner (kernel 6.8.0-azure) does NOT have this bug.
+
+  The regression was introduced in the kernel 6.17.x line used by ubuntu-24.04 and has
+  not been fixed in the azure kernel packages as of the 6.17.0-1015-azure image
+  (runner-images ubuntu24/20260525.161). GitHub's position is that the fix must come
+  from upstream Ubuntu/Canonical kernel packages; the issue remains open.
+
+  Source: actions/runner-images#14175 (open May 2026); repro at e2b-dev/ublk-adddev-repro.
+fix: |
+  Pin the job to ubuntu-22.04 (kernel 6.8.0-azure), which does not have this regression.
+  Monitor actions/runner-images#14175 for upstream kernel fix inclusion in ubuntu-24.04
+  images. Once a fixed kernel version ships, you can restore ubuntu-24.04.
+
+  If ubuntu-24.04 is required for other reasons (e.g., specific tool versions), consider
+  using a self-hosted runner with a fixed kernel version of 6.17.0-1009+ (which carries
+  the LP: #2137723 backport for veth/XDP ring fixes, though the ublk-specific fix may
+  need a separate kernel update).
+fix_code:
+  - language: yaml
+    label: 'Pin ublk-dependent jobs to ubuntu-22.04 as workaround'
+    code: |
+      jobs:
+        ublk-test:
+          # ubuntu-24.04 (kernel 6.17.x) has a ublk_drv kernel Oops on UBLK_U_CMD_ADD_DEV.
+          # Pin to ubuntu-22.04 (kernel 6.8.0-azure) until runner-images#14175 is resolved.
+          runs-on: ubuntu-22.04
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run ublk tests
+              run: make test-ublk
+  - language: yaml
+    label: 'Matrix to test both ubuntu-22.04 (working) and ubuntu-24.04 (skip ublk) conditionally'
+    code: |
+      jobs:
+        test:
+          runs-on: ${{ matrix.os }}
+          strategy:
+            matrix:
+              os: [ubuntu-22.04, ubuntu-24.04]
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run ublk tests
+              # Skip ublk on 24.04 until kernel fix ships (runner-images#14175)
+              if: matrix.os != 'ubuntu-24.04'
+              run: make test-ublk
+prevention:
+  - 'Track actions/runner-images#14175 to know when the ublk_drv fix ships in ubuntu-24.04 images'
+  - 'For new ublk-based CI, always verify the kernel version in the runner log before assuming compatibility'
+  - 'Include the runner kernel version in bug reports — ublk issues are highly kernel-version-specific'
+  - 'Consider self-hosted runners with pinned kernel versions for projects requiring bleeding-edge kernel APIs'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14175'
+    label: 'actions/runner-images#14175: ubuntu-24.04 amd64 kernel 6.17.0-1015-azure Oopses in ublk_drv (open May 2026)'
+  - url: 'https://github.com/e2b-dev/ublk-adddev-repro'
+    label: 'Minimal standalone repro for the ublk_drv Oops (e2b-dev/ublk-adddev-repro)'
+  - url: 'https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners'
+    label: 'GitHub Docs: About GitHub-hosted runners'
