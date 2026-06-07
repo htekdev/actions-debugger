@@ -1,0 +1,152 @@
+id: silent-failures-141
+title: "github.event.workflow_run.pull_requests is empty for PRs from forked repositories"
+category: silent-failures
+severity: silent-failure
+tags:
+  - workflow_run
+  - fork
+  - pull_requests
+  - event-payload
+  - cross-fork
+  - secure-ci
+patterns:
+  - regex: 'github\.event\.workflow_run\.pull_requests\[0\]'
+    flags: "i"
+  - regex: 'pull_requests.*length.*0|pull_requests.*empty|workflow_run.*pr.*number'
+    flags: "i"
+  - regex: 'Cannot read propert.*pull_requests|undefined.*pull_requests.*workflow_run'
+    flags: "i"
+error_messages:
+  - "github.event.workflow_run.pull_requests[0].number"
+  - "Error: Cannot read properties of undefined (reading 'number')"
+  - "fromJSON: '[]' has length 0"
+root_cause: |
+  When a `workflow_run` event is triggered by a workflow that ran for a **pull request
+  from a fork**, the `github.event.workflow_run.pull_requests` array is **always empty**.
+
+  This is explicitly documented by GitHub:
+  > "For pull requests from forks, the pull_requests array is empty."
+
+  The `pull_requests` array is populated only for PRs from branches within the same
+  repository. For fork PRs, GitHub omits this data for security reasons — the fork's
+  workflow cannot access the parent repository's PR metadata directly through the event
+  payload.
+
+  **Why this matters for secure cross-fork CI patterns:**
+  A common pattern is to use `workflow_run` to safely run privileged CI steps (with
+  secrets) after a fork's untrusted workflow completes. Developers typically access
+  `github.event.workflow_run.pull_requests[0].number` to identify which PR triggered
+  the original workflow. This always evaluates to undefined for fork PRs, causing
+  downstream steps to fail silently (incorrect PR number) or throw expression errors.
+
+  **What IS available in the payload for fork PRs:**
+  - `github.event.workflow_run.head_sha` — the commit SHA being tested
+  - `github.event.workflow_run.head_branch` — the branch name in the fork
+  - `github.event.workflow_run.head_repository.full_name` — the fork's repo name
+  - `github.event.workflow_run.repository.full_name` — the base (parent) repo name
+fix: |
+  Do not rely on `github.event.workflow_run.pull_requests` for fork PRs. Instead, use
+  the GitHub API to locate the PR by searching for open PRs where the head SHA matches
+  `github.event.workflow_run.head_sha`.
+
+  **Option 1 — Query the API for the PR number (recommended):**
+  Use `actions/github-script` to call the Search API or List Pull Requests API and
+  find the PR that matches the triggering commit SHA.
+
+  **Option 2 — Pass PR number as an artifact:**
+  In the triggering workflow (which runs in the fork context), write the PR number to
+  an artifact or a job output and upload it. The `workflow_run` listener can then
+  download the artifact to get the PR number.
+
+  **Option 3 — Use `pull_requests[0]?.number` with conditional:**
+  If same-repo PRs also need to work, check for the array length before accessing:
+  use `fromJSON(toJSON(github.event.workflow_run.pull_requests))[0].number` guarded
+  by a non-empty check, and fall back to the API lookup for fork PRs.
+fix_code:
+  - language: yaml
+    label: "Look up PR number from head SHA using GitHub API (works for fork PRs)"
+    code: |
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+
+      jobs:
+        process-results:
+          runs-on: ubuntu-latest
+          permissions:
+            pull-requests: write
+          steps:
+            - name: Find PR number for fork workflows
+              id: find-pr
+              uses: actions/github-script@v7
+              with:
+                script: |
+                  const headSha = context.payload.workflow_run.head_sha;
+                  const owner = context.repo.owner;
+                  const repo = context.repo.repo;
+
+                  // pull_requests is empty for forks — search by SHA instead
+                  const pulls = await github.rest.pulls.list({
+                    owner, repo,
+                    state: 'open',
+                    head: `${context.payload.workflow_run.head_repository.owner.login}:${context.payload.workflow_run.head_branch}`,
+                  });
+
+                  const pr = pulls.data.find(p => p.head.sha === headSha);
+                  if (!pr) {
+                    core.warning(`No open PR found for SHA ${headSha}`);
+                    return null;
+                  }
+                  core.setOutput('number', pr.number);
+                  return pr.number;
+
+            - name: Comment on PR
+              if: steps.find-pr.outputs.number
+              uses: actions/github-script@v7
+              with:
+                script: |
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: ${{ steps.find-pr.outputs.number }},
+                    body: 'CI results from fork PR workflow_run are available.',
+                  });
+  - language: yaml
+    label: "Upload PR number as artifact in the fork-side workflow"
+    code: |
+      # In the fork's CI workflow (runs with restricted permissions):
+      on: [pull_request]
+
+      jobs:
+        ci:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run tests
+              run: npm test
+
+            # Save PR number so the workflow_run listener can retrieve it
+            - name: Save PR metadata
+              run: echo "${{ github.event.number }}" > pr_number.txt
+            - uses: actions/upload-artifact@v4
+              with:
+                name: pr-metadata
+                path: pr_number.txt
+
+      # In the privileged workflow_run listener:
+      # - Download the artifact and read pr_number.txt
+      # - Use the number for comments, deployments, etc.
+prevention:
+  - "Never access github.event.workflow_run.pull_requests[0] without first checking that the array is non-empty."
+  - "Use the GitHub Search API (rest.pulls.list) keyed by head_sha as the canonical way to find a PR number in workflow_run listeners."
+  - "Consider the artifact-relay pattern: fork-side workflow writes PR number to an artifact, workflow_run listener reads it."
+  - "Add an explicit guard: if: github.event.workflow_run.pull_requests[0] != null to skip processing when pull_requests is empty."
+  - "Document this limitation in your team's CI runbook so engineers know why the API lookup pattern is used."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run"
+    label: "GitHub Docs: workflow_run event (note on fork PR pull_requests array)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#using-data-from-the-triggering-workflow"
+    label: "GitHub Docs: Using data from the triggering workflow"
+  - url: "https://securitylab.github.com/research/github-actions-preventing-pwn-requests/"
+    label: "GitHub Security Lab: Preventing pwn requests (secure fork CI pattern)"

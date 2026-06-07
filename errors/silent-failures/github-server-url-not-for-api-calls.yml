@@ -1,0 +1,126 @@
+id: silent-failures-143
+title: "github.server_url used for API calls instead of github.api_url — returns 404"
+category: silent-failures
+severity: silent-failure
+tags:
+  - context-variables
+  - github-api
+  - server-url
+  - api-url
+  - ghes
+  - curl
+  - rest-api
+patterns:
+  - regex: 'github\.server_url.*repos|github\.server_url.*/api|curl.*github\.server_url'
+    flags: "i"
+  - regex: '\$\{\{\s*github\.server_url\s*\}\}/repos'
+    flags: "i"
+  - regex: '404.*Not Found.*github\.com/repos|HTTP 404.*server_url'
+    flags: "i"
+error_messages:
+  - "curl: (22) The requested URL returned error: 404"
+  - "Error: HTTP 404: Not Found"
+  - "RequestError [HttpError]: Not Found"
+  - "Could not resolve host: github.com/repos"
+root_cause: |
+  `github.server_url` and `github.api_url` are two distinct context variables that
+  are frequently confused:
+
+  | Variable | GitHub.com value | GHES value |
+  |---|---|---|
+  | `github.server_url` | `https://github.com` | `https://ghes.example.com` |
+  | `github.api_url` | `https://api.github.com` | `https://ghes.example.com/api/v3` |
+
+  `github.server_url` is the **HTML web URL** of the GitHub instance (the URL you
+  visit in a browser). It is correct for generating links to PRs, commits, and repos
+  in Markdown or log output.
+
+  `github.api_url` is the **REST API base URL**. All programmatic API calls (curl,
+  fetch, Octokit, etc.) must use this URL.
+
+  **Common mistake — constructing API calls with `server_url`:**
+  ```yaml
+  - run: |
+      curl -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+        "${{ github.server_url }}/repos/${{ github.repository }}/issues"
+  ```
+  On GitHub.com, this calls `https://github.com/repos/owner/repo/issues` which returns
+  a 404 HTML page (the GitHub web interface URL, not the API endpoint). The correct
+  URL is `https://api.github.com/repos/owner/repo/issues`.
+
+  **Why GHES makes this especially dangerous:**
+  On GitHub Enterprise Server, both URLs share the same hostname:
+  - `server_url` = `https://ghes.example.com`
+  - `api_url` = `https://ghes.example.com/api/v3`
+
+  Using `server_url` constructs `https://ghes.example.com/repos/...` (missing `/api/v3`)
+  which returns a 404 from the GHES web UI. The error is not always obvious because
+  the same curl command works on neither platform when `server_url` is used.
+
+  **The environment variables are similarly distinct:**
+  - `GITHUB_SERVER_URL` → `https://github.com` (or GHES web URL)
+  - `GITHUB_API_URL` → `https://api.github.com` (or GHES API URL)
+fix: |
+  Replace `github.server_url` (or `$GITHUB_SERVER_URL`) with `github.api_url`
+  (or `$GITHUB_API_URL`) everywhere you construct GitHub REST API request URLs.
+
+  Keep `github.server_url` only for generating HTML links (e.g., in PR comments,
+  step summaries, or notification messages).
+
+  **Quick reference:**
+  - API calls → use `github.api_url`
+  - Web links → use `github.server_url`
+fix_code:
+  - language: yaml
+    label: "Correct API call using github.api_url"
+    code: |
+      - name: Create issue comment via REST API
+        run: |
+          curl -f -s \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "${{ github.api_url }}/repos/${{ github.repository }}/issues/${{ github.event.number }}/comments" \
+            -d '{"body":"Deployment complete."}'
+  - language: yaml
+    label: "Incorrect vs correct — side-by-side comparison"
+    code: |
+      # ❌ WRONG — uses web URL, returns 404 on all GitHub variants
+      - run: |
+          curl "${{ github.server_url }}/repos/${{ github.repository }}/pulls"
+
+      # ✅ CORRECT — uses API URL
+      - run: |
+          curl -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "${{ github.api_url }}/repos/${{ github.repository }}/pulls"
+
+      # ✅ CORRECT — server_url is right for HTML links
+      - run: |
+          echo "View PR at ${{ github.server_url }}/${{ github.repository }}/pull/${{ github.event.number }}"
+  - language: yaml
+    label: "Using environment variables for portability (works on GitHub.com and GHES)"
+    code: |
+      - name: Call GitHub API portably
+        env:
+          GH_API_URL: ${{ github.api_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          # $GH_API_URL is correct for both GitHub.com and GHES
+          curl -f -s \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$GH_API_URL/repos/$REPO/releases" | jq '.[0].tag_name'
+prevention:
+  - "Use github.api_url (not github.server_url) for all REST API calls — bookmark this rule."
+  - "Use github.server_url only when generating clickable HTML links for humans (PR comments, step summaries)."
+  - "In shell scripts, prefer $GITHUB_API_URL over hardcoding https://api.github.com for GHES portability."
+  - "Consider using actions/github-script or the gh CLI instead of raw curl — they handle the correct API URL automatically."
+  - "Actionlint does not catch this mistake — add a grep check in your action linting pipeline for server_url.*repos patterns."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context"
+    label: "GitHub Docs: github context — server_url and api_url"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/store-information-in-variables#default-environment-variables"
+    label: "GitHub Docs: Default environment variables — GITHUB_API_URL vs GITHUB_SERVER_URL"
+  - url: "https://docs.github.com/en/rest/using-the-rest-api/getting-started-with-the-rest-api"
+    label: "GitHub REST API: Getting started"
