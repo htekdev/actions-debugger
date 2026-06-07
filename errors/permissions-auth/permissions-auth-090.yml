@@ -1,0 +1,109 @@
+id: permissions-auth-090
+title: 'checkout@v6 credentials inaccessible inside Docker container actions — includeIf path not mounted'
+category: permissions-auth
+severity: error
+tags:
+  - checkout-v6
+  - docker-container-action
+  - credentials
+  - includeif
+  - runner-temp
+  - git-auth
+patterns:
+  - regex: 'fatal: could not read Username|authentication required|could not read Password'
+    flags: 'i'
+  - regex: 'git.*fatal.*repository.*not found|remote.*403|remote.*401'
+    flags: 'i'
+  - regex: 'credential.*helper.*no.*such.*file|includeIf.*gitdir.*not.*accessible'
+    flags: 'i'
+error_messages:
+  - 'fatal: could not read Username for ''https://github.com'': No such device or address'
+  - 'remote: Repository not found.'
+  - 'fatal: Authentication failed for ''https://github.com/...'''
+  - 'Error: Process completed with exit code 128.'
+root_cause: |
+  actions/checkout@v6 changed credential storage from HTTP Authorization headers in .git/config
+  (used by v5 and earlier) to a path-based includeIf.gitdir conditional config plus a
+  credentials file written to RUNNER_TEMP. This new mechanism requires:
+    1. The git working directory path inside the consumer to match the includeIf.gitdir pattern
+    2. The RUNNER_TEMP directory to be accessible to the credential consumer
+
+  GitHub-hosted runners auto-mount RUNNER_TEMP as /github/runner_temp/ for steps that use
+  `run:` — but Docker container ACTIONS (steps that use `uses:` pointing to a Docker-based
+  action, either `uses: docker://image` or `uses: org/action@ref` where the action is a Docker
+  container action) run in a fully isolated container environment. That container:
+    - Does NOT get the RUNNER_TEMP mount unless explicitly configured
+    - May not have the workspace at the same path as the includeIf.gitdir pattern expects
+
+  As a result, git operations inside Docker container actions cannot resolve the includeIf
+  credential chain and fail with authentication errors. This is a known open limitation of
+  checkout@v6 (issue #2359, 12+ reactions, open as of June 2026).
+
+  This is DISTINCT from:
+    - permissions-auth-088 (manually-invoked `docker run` steps not getting RUNNER_TEMP mount)
+    - checkout@v6 with symlinked _work directories (permissions-auth separate entry)
+
+  The only reliable workaround currently is to downgrade to actions/checkout@v5, which uses
+  HTTP Authorization headers that are universally accessible from any container context.
+fix: |
+  Option 1 (Recommended): Downgrade to actions/checkout@v5 for workflows containing
+  Docker container actions that need git credentials:
+    - uses: actions/checkout@v5
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+  Option 2: Use persist-credentials: false and manually configure git credentials using
+  an HTTP-header-based method that Docker container actions can access. Note: this approach
+  requires the container to have git configured before checkout occurs.
+
+  Option 3: Use a shell `run:` step to perform all git operations instead of Docker container
+  actions, avoiding the container isolation issue entirely.
+
+  Option 4: Build your action as a JavaScript/composite action rather than a Docker container
+  action — JavaScript actions share the runner's environment and can access RUNNER_TEMP.
+fix_code:
+  - language: yaml
+    label: 'Downgrade checkout to v5 when using Docker container actions'
+    code: |
+      steps:
+        # Use v5 for workflows containing Docker container actions
+        # v5 uses HTTP Authorization headers accessible from any container context
+        - name: Checkout
+          uses: actions/checkout@v5
+          with:
+            token: ${{ secrets.GITHUB_TOKEN }}
+            fetch-depth: 0
+
+        # Docker container action can now access git credentials
+        - name: Release
+          uses: my-org/my-docker-action@v1
+          with:
+            github_token: ${{ secrets.GITHUB_TOKEN }}
+  - language: yaml
+    label: 'Replace Docker container action with shell steps to avoid isolation'
+    code: |
+      steps:
+        - uses: actions/checkout@v6
+          with:
+            token: ${{ secrets.GITHUB_TOKEN }}
+
+        # Instead of: uses: my-org/docker-release-action@v1
+        # Run equivalent logic in a shell step which has RUNNER_TEMP access
+        - name: Run release logic
+          run: |
+            docker run --rm \
+              -v "$RUNNER_TEMP:/github/runner_temp" \
+              -e GITHUB_TOKEN="${{ secrets.GITHUB_TOKEN }}" \
+              my-release-image:latest
+prevention:
+  - 'Audit workflows using checkout@v6 alongside Docker container actions (uses: docker:// or uses: org/action where action is Docker-based)'
+  - 'Prefer JavaScript/TypeScript or composite actions over Docker container actions in workflows that need git credentials'
+  - 'Pin checkout@v5 in shared workflow libraries until this checkout@v6 Docker credential limitation is resolved upstream'
+  - 'Check actions/checkout changelog before upgrading to v6 — any action relying on git auth inside a Docker container action is affected'
+docs:
+  - url: 'https://github.com/actions/checkout/issues/2359'
+    label: 'actions/checkout#2359 — checkout@v6 credentials don't work with Docker container actions'
+  - url: 'https://github.com/actions/checkout/releases/tag/v6.0.0'
+    label: 'actions/checkout v6 release notes — new credential mechanism'
+  - url: 'https://docs.github.com/en/actions/sharing-automations/creating-actions/creating-a-docker-container-action'
+    label: 'GitHub Docs — Creating a Docker container action'
