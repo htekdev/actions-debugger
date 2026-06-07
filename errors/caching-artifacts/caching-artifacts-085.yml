@@ -1,0 +1,143 @@
+id: caching-artifacts-085
+title: 'upload-artifact v4+ rejects artifact names with forbidden characters (forward slash, colon, asterisk, etc.)'
+category: caching-artifacts
+severity: error
+tags:
+  - upload-artifact
+  - artifact-name
+  - matrix
+  - playwright
+  - matrix-shard
+  - v4
+patterns:
+  - regex: 'The artifact name is not valid:.*Contains the following character'
+    flags: 'i'
+  - regex: 'artifact name.*is not valid.*forward slash'
+    flags: 'i'
+  - regex: 'artifact name.*is not valid.*colon'
+    flags: 'i'
+  - regex: 'artifact name.*not valid.*\bContains\b'
+    flags: 'i'
+error_messages:
+  - "Error: The artifact name is not valid: all-blob-reports-1/5. Contains the following character: Forward slash"
+  - "Error: The artifact name is not valid: build:linux. Contains the following character: Colon"
+  - "Error: The artifact name is not valid: build*output. Contains the following character: Asterisk (*)"
+  - "Error: The artifact name is not valid: results<debug>. Contains the following character: Left angle bracket (<)"
+root_cause: |
+  `actions/upload-artifact@v4` (and v5+) enforces strict artifact name validation
+  that was NOT present in v3. The following characters are FORBIDDEN in artifact names:
+
+  - `/` (Forward slash) — most commonly hit
+  - `\` (Backslash)
+  - `:` (Colon)
+  - `*` (Asterisk)
+  - `?` (Question mark)
+  - `"` (Double quote)
+  - `<` (Left angle bracket)
+  - `>` (Right angle bracket)
+  - `|` (Pipe)
+
+  The most common trigger is the **Playwright matrix shard pattern**:
+  ```yaml
+  strategy:
+    matrix:
+      shard: [1/5, 2/5, 3/5, 4/5, 5/5]
+  ```
+  When developers reference `${{ matrix.shard }}` in an artifact name:
+  ```yaml
+  name: blob-reports-${{ matrix.shard }}   # → "blob-reports-1/5" — INVALID
+  ```
+  ...the resulting artifact name contains a forward slash, which is forbidden
+  because `/` is a path separator in the artifact storage backend.
+
+  This was intentionally introduced in v4 to prevent artifacts from being stored
+  in ambiguous path hierarchies. v3 allowed slashes and silently stored them as
+  directory separators, leading to confusing behavior on download.
+fix: |
+  Replace forbidden characters in the artifact name before using it. For the
+  common Playwright shard pattern, replace `/` with `-` or `_`:
+
+  ```yaml
+  name: blob-reports-${{ matrix.shard }}           # BROKEN — contains "/"
+  name: blob-reports-${{ matrix.shard }}-of-total  # BROKEN if shard is "1/5"
+  ```
+
+  Fix using the `replace()` expression function:
+  ```yaml
+  name: blob-reports-${{ matrix.shard | replace('/', '-') }}  # WRONG — not valid GHA expression syntax
+  ```
+
+  Note: GitHub Actions expressions do NOT have a `replace()` function. Use a
+  run step to sanitize the name, then write it to `GITHUB_OUTPUT`:
+  ```yaml
+  - name: Sanitize shard name
+    id: shard
+    run: echo "name=${{ matrix.shard }}" | tr '/' '-' | xargs -I{} echo "shard={}" >> $GITHUB_OUTPUT
+
+  - uses: actions/upload-artifact@v4
+    with:
+      name: blob-reports-${{ steps.shard.outputs.shard }}
+      path: playwright/blob-report
+  ```
+
+  Or simplify by using a numeric shard index instead of the fraction string:
+  ```yaml
+  strategy:
+    matrix:
+      shard: [1, 2, 3, 4, 5]
+  steps:
+    - uses: actions/upload-artifact@v4
+      with:
+        name: blob-reports-shard-${{ matrix.shard }}-of-5
+        path: playwright/blob-report
+  ```
+fix_code:
+  - language: yaml
+    label: 'Fix: use numeric shard index instead of fraction string'
+    code: |
+      jobs:
+        test:
+          strategy:
+            fail-fast: false
+            matrix:
+              shard: [1, 2, 3, 4, 5]
+              total_shards: [5]
+          steps:
+            - name: Run Playwright tests
+              run: npx playwright test --shard ${{ matrix.shard }}/${{ matrix.total_shards }}
+
+            - uses: actions/upload-artifact@v4
+              if: always()
+              with:
+                name: blob-reports-${{ matrix.shard }}-of-${{ matrix.total_shards }}
+                path: playwright/blob-report
+                retention-days: 1
+  - language: yaml
+    label: 'Fix: sanitize name with a run step writing to GITHUB_OUTPUT'
+    code: |
+      steps:
+        - name: Set sanitized artifact name
+          id: artifact_name
+          run: |
+            SHARD="${{ matrix.shard }}"
+            SANITIZED="${SHARD//\//-}"
+            echo "name=blob-reports-${SANITIZED}" >> $GITHUB_OUTPUT
+
+        - uses: actions/upload-artifact@v4
+          if: always()
+          with:
+            name: ${{ steps.artifact_name.outputs.name }}
+            path: playwright/blob-report
+            retention-days: 1
+prevention:
+  - 'Avoid using matrix values that contain path separators (/, \\) or filesystem-special characters directly in artifact names.'
+  - 'Use numeric shards (1, 2, 3) instead of fraction strings (1/5, 2/5) in matrix when shard values will appear in artifact names.'
+  - 'When migrating from v3 to v4, audit all artifact names that include matrix values — v3 silently allowed slashes where v4 raises an error.'
+  - 'Test artifact name generation in a dry run or check names against the forbidden character list: / \\ : * ? " < > |'
+docs:
+  - url: 'https://github.com/actions/upload-artifact/issues/692'
+    label: 'upload-artifact#692 — name field does not support matrix.shard with slashes (open)'
+  - url: 'https://github.com/actions/upload-artifact/tree/main?tab=readme-ov-file#upload-an-artifact'
+    label: 'upload-artifact README — supported artifact name characters'
+  - url: 'https://playwright.dev/docs/test-sharding#merging-reports-from-multiple-shards'
+    label: 'Playwright docs — test sharding and report merging'
