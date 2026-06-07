@@ -1,0 +1,101 @@
+id: concurrency-timing-075
+title: "concurrency: Block Does Not Support if: Condition — YAML Schema Error"
+category: concurrency-timing
+severity: error
+tags:
+  - concurrency
+  - yaml-schema
+  - if-condition
+  - actionlint
+  - workflow-validation
+patterns:
+  - regex: 'The key .if. is not allowed'
+    flags: 'i'
+  - regex: 'Unexpected value .if.'
+    flags: 'i'
+  - regex: 'concurrency:\s*\n\s+if:'
+    flags: 'im'
+error_messages:
+  - "The key 'if' is not allowed in 'concurrency'."
+  - "Unexpected value 'if'."
+  - "['concurrency' contains an unsupported property 'if']"
+root_cause: |
+  The GitHub Actions `concurrency:` block only accepts two keys: `group` and
+  `cancel-in-progress`. Adding any other key — including `if:` — causes a YAML schema
+  validation error when the workflow is parsed by GitHub, and actionlint reports it as
+  an unexpected key.
+
+  Developers commonly want conditional concurrency, for example:
+  - Serialize push events but not workflow_dispatch (avoid blocking manual runs)
+  - Cancel-in-progress only on the default branch, not on feature branches
+  - Apply different concurrency groups per event type
+
+  Because `if:` is not supported inside `concurrency:`, these patterns require expression
+  workarounds directly in the `group:` or `cancel-in-progress:` values. The workaround
+  uses the fact that both fields accept GitHub Actions expressions (`${{ }}`), allowing
+  conditional logic inline.
+
+  Using `github.run_id` as a fallback in the group expression makes each run use a unique
+  group key, effectively opting out of the concurrency mechanism for specific event types.
+
+  This limitation is tracked in actions/runner#1420 (open since 2021, no planned fix).
+  It is a GitHub Actions schema design decision.
+fix: |
+  Use conditional expressions directly within the `group:` or `cancel-in-progress:` value.
+  Both fields accept GitHub Actions expression syntax (`${{ <expression> }}`).
+
+  To serialize only push events (not dispatch):
+    group: ${{ github.event_name == 'push' && format('ci-{0}', github.ref) || github.run_id }}
+
+  The `|| github.run_id` fallback assigns each non-push run a unique group, so those
+  runs are never queued or cancelled by the concurrency mechanism.
+
+  To cancel-in-progress only on the default branch:
+    cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
+fix_code:
+  - language: yaml
+    label: "Wrong: if: inside concurrency block causes YAML schema error"
+    code: |
+      # WRONG — 'if' is not a valid key inside concurrency:
+      concurrency:
+        if: github.event_name == 'push'   # Error: The key 'if' is not allowed
+        group: ci-${{ github.ref }}
+        cancel-in-progress: true
+  - language: yaml
+    label: "Correct: serialize pushes per branch; give each dispatch a unique group"
+    code: |
+      # Each workflow_dispatch gets a unique group (no queuing/cancellation for manual runs).
+      # Push events share a group per branch and cancel-in-progress is enabled.
+      concurrency:
+        group: ${{ github.event_name == 'push' && format('ci-{0}', github.ref) || github.run_id }}
+        cancel-in-progress: ${{ github.event_name == 'push' }}
+  - language: yaml
+    label: "Correct: cancel-in-progress only on main branch"
+    code: |
+      concurrency:
+        group: ci-${{ github.ref }}
+        cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
+  - language: yaml
+    label: "Correct: different group keys per event type using ternary expression"
+    code: |
+      # PRs group per PR number; scheduled runs have one shared slot; dispatch runs are unique
+      concurrency:
+        group: >-
+          ${{
+            github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) ||
+            github.event_name == 'schedule' && 'nightly' ||
+            github.run_id
+          }}
+        cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+prevention:
+  - "Use expressions within `group:` and `cancel-in-progress:` for conditional concurrency — `if:` inside `concurrency:` is not valid per GitHub's schema."
+  - "Use `${{ github.run_id }}` as a fallback in the group expression to opt specific event types out of concurrency."
+  - "Run `actionlint` locally — it catches unsupported keys inside `concurrency:` before pushing."
+  - "Both `group:` and `cancel-in-progress:` accept full GitHub Actions expressions including ternary-style `&&`/`||` logic."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs"
+    label: "GitHub Docs — Control the concurrency of workflows and jobs"
+  - url: "https://github.com/actions/runner/issues/1420"
+    label: "actions/runner#1420 — Allow concurrency groups to have conditions"
+  - url: "https://stackoverflow.com/questions/74117321/if-condition-in-concurrency-in-gha"
+    label: "Stack Overflow — if condition in concurrency in GHA"

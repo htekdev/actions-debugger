@@ -1,0 +1,104 @@
+id: concurrency-timing-074
+title: "cancel-in-progress: false Still Cancels Queued Pending Runs — Only One Pending Slot Exists"
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - cancel-in-progress
+  - queue
+  - pending
+  - deployment
+patterns:
+  - regex: 'cancel-in-progress:\s*false'
+    flags: 'i'
+  - regex: 'This run was cancelled\.'
+    flags: 'i'
+  - regex: 'Cancelled run'
+    flags: 'i'
+error_messages:
+  - "This run was cancelled."
+root_cause: |
+  `cancel-in-progress: false` only protects the **currently running** workflow from being
+  cancelled when a newer run arrives. It does NOT preserve all queued (pending) runs.
+
+  GitHub Actions concurrency groups allow exactly **one pending slot** regardless of the
+  `cancel-in-progress` setting. When a new run arrives while another run is already pending:
+
+  - The existing pending run is **silently cancelled and replaced** by the newest run.
+
+  This means with three consecutive triggers and `cancel-in-progress: false`:
+  - Run 1 starts (active/running)
+  - Run 2 arrives → queues as the single pending slot
+  - Run 3 arrives → Run 2 is cancelled silently; Run 3 takes the pending slot
+  - Run 1 finishes → Run 3 starts; Run 2 never executed
+
+  The common misconception is that `cancel-in-progress: false` means "queue all runs and
+  execute them all in sequence." In reality it means "don't cancel the currently active
+  run." The pending queue is still limited to one slot. GitHub docs state: "If a pending
+  job or run exists in the queue, GitHub Actions will cancel the pending job or run and
+  start the new job or run" — this applies regardless of `cancel-in-progress`.
+
+  This is especially painful for deployment pipelines triggered by rapid successive pushes,
+  where intermediate commits are silently skipped.
+fix: |
+  If every triggered run must eventually execute (no runs dropped), concurrency groups
+  alone cannot achieve this. Options:
+
+  1. **Unique group per run** — use `github.run_id` as the concurrency group key so each
+     run gets its own group and is never cancelled. All runs execute in parallel; combine
+     with `strategy.max-parallel` for throttling.
+
+  2. **External queue** — push work items to an external queue (SQS, Redis, GitHub Issues)
+     and have a consumer workflow drain the queue, ensuring no items are lost.
+
+  3. **Accept pending-drop** — for deployment pipelines, deploying only the latest commit
+     is usually correct. Run 2's intermediate state is intentionally dropped; Run 3
+     (the newest commit) deploys cleanly after Run 1 finishes. Use `cancel-in-progress:
+     false` and accept that only Run 1 and Run 3 will deploy.
+fix_code:
+  - language: yaml
+    label: "Misconception: cancel-in-progress: false does NOT preserve all queued runs"
+    code: |
+      # With 3 pushes in rapid succession, only Runs 1 and 3 execute — Run 2 is
+      # silently cancelled even though cancel-in-progress is false.
+      concurrency:
+        group: deploy-${{ github.ref }}
+        cancel-in-progress: false   # Only prevents cancelling the RUNNING job
+  - language: yaml
+    label: "If every run must execute: use github.run_id to disable concurrency"
+    code: |
+      # Each run gets a unique group — no run ever waits or gets cancelled.
+      # WARNING: all runs execute in parallel. Combine with max-parallel if throttling needed.
+      concurrency:
+        group: deploy-${{ github.run_id }}
+        cancel-in-progress: false
+  - language: yaml
+    label: "Correct pattern for deployments: accept pending-drop, ensure clean sequential deploys"
+    code: |
+      # Run 1 deploys cleanly. Run 3 (newest commit) deploys after. Run 2's intermediate
+      # state is intentionally dropped — correct for deploy pipelines.
+      concurrency:
+        group: deploy-production
+        cancel-in-progress: false   # Don't interrupt an active deploy
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          environment: production
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./deploy.sh
+prevention:
+  - "Read `cancel-in-progress: false` as 'don't cancel the RUNNING job' — not 'preserve all queued jobs and run them all'."
+  - "If every commit must eventually be processed, use an external queue or unique concurrency groups per run_id."
+  - "For deployment pipelines, pending-drop is usually acceptable — always deploy the newest commit, not an intermediate one."
+  - "Monitor workflow run history for unexpected 'cancelled' status on runs that should have executed."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs"
+    label: "GitHub Docs — Control the concurrency of workflows and jobs"
+  - url: "https://github.com/actions/runner/issues/3722"
+    label: "actions/runner#3722 — Why is my job cancelling when I have cancel-in-progress set to false?"
+  - url: "https://dev.to/kanta13jp1/github-actions-concurrency-trap-cancel-in-progress-false-still-drops-queued-runs-5hg3"
+    label: "DEV Community — GitHub Actions Concurrency Trap: cancel-in-progress: false Still Drops Queued Runs"
+  - url: "https://github.com/github/docs/pull/30647"
+    label: "github/docs#30647 — Clarify concurrency cancel-in-progress behaviour"

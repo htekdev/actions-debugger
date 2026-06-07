@@ -1,0 +1,134 @@
+id: concurrency-timing-076
+title: "Reusable Workflow with Own concurrency: Block — github.ref Resolves to Caller's Branch, Causing Unexpected Serialization"
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - reusable-workflow
+  - workflow-call
+  - github-ref
+  - serialization
+patterns:
+  - regex: 'uses:\s+\.?\.?/\.github/workflows/'
+    flags: 'i'
+  - regex: 'concurrency:\s*\n\s+group:\s*\$\{\{.*github\.ref'
+    flags: 'im'
+error_messages:
+  - "Run was cancelled due to a newer queued run."
+root_cause: |
+  When a reusable workflow (called with `uses:`) defines its own `concurrency:` block,
+  all GitHub Actions context variables — including `github.ref`, `github.sha`,
+  `github.workflow`, and `github.actor` — resolve to the **caller's** values, not the
+  called workflow's own values.
+
+  This means a reusable deploy workflow with `concurrency: group: deploy-${{ github.ref }}`
+  will create concurrency groups keyed to the CALLER'S branch (e.g., `deploy-refs/heads/main`).
+
+  Consequences:
+  - Two different calling workflows on the same branch (e.g., `ci.yml` and `release.yml`,
+    both on `main`) calling the same reusable workflow will **share the same concurrency
+    group** — they serialize or cancel each other, even though they are independent pipelines.
+  - A developer expecting the called workflow to have its own isolated concurrency is
+    surprised to find that an unrelated calling workflow on the same branch blocked or
+    cancelled their run.
+
+  Separately, `github.workflow` inside the called workflow returns the calling workflow's
+  display name (not the called file's name), so `concurrency: group: ${{ github.workflow }}`
+  does not isolate the called workflow either.
+
+  Source: actions/runner#2577, actions/toolkit#1264 (120 👍 — "make reference accessible
+  in reusable workflow"), Stack Overflow question 79511940.
+fix: |
+  To give the called workflow a unique, isolated concurrency group, include both the
+  calling workflow reference and a scope discriminator in the group key. Options:
+
+  1. **Pass the caller's workflow name as an input** and include it in the concurrency
+     group:
+       inputs:
+         caller_workflow:
+           type: string
+       concurrency:
+         group: deploy-${{ inputs.caller_workflow }}-${{ github.ref }}
+
+  2. **Include `github.workflow_ref`** in the called workflow's concurrency key — it
+     contains the full `owner/repo/.github/workflows/file.yml@ref` path of the **calling**
+     workflow (this is the only context variable that uniquely identifies the caller):
+       concurrency:
+         group: deploy-${{ github.workflow_ref }}-${{ github.ref }}
+
+  3. **Define concurrency in the caller, not the called workflow** — let each calling
+     workflow control its own serialization. Remove `concurrency:` from the reusable
+     workflow and add it to each caller with an appropriate key.
+fix_code:
+  - language: yaml
+    label: "Problematic: two callers on same branch share the concurrency group"
+    code: |
+      # reusable workflow: .github/workflows/deploy.yml
+      # github.ref resolves to the CALLER's branch, not the called file's path.
+      # Two callers on main → both use group "deploy-refs/heads/main" → they serialize.
+      on:
+        workflow_call:
+          inputs:
+            environment:
+              type: string
+
+      concurrency:
+        group: deploy-${{ github.ref }}         # Caller's ref — shared across all callers on same branch
+        cancel-in-progress: false
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying to ${{ inputs.environment }}"
+  - language: yaml
+    label: "Fix: use github.workflow_ref to isolate concurrency per calling workflow"
+    code: |
+      # github.workflow_ref = "owner/repo/.github/workflows/ci.yml@refs/heads/main"
+      # Each calling workflow file gets its own concurrency group, even on the same branch.
+      on:
+        workflow_call:
+          inputs:
+            environment:
+              type: string
+
+      concurrency:
+        group: deploy-${{ github.workflow_ref }}-${{ inputs.environment }}
+        cancel-in-progress: false
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying to ${{ inputs.environment }}"
+  - language: yaml
+    label: "Alternative: define concurrency in each caller, not the called workflow"
+    code: |
+      # caller: .github/workflows/ci.yml
+      # Each calling workflow owns its own concurrency group.
+      concurrency:
+        group: ci-deploy-${{ github.ref }}
+        cancel-in-progress: false
+
+      jobs:
+        deploy:
+          uses: ./.github/workflows/deploy.yml
+          with:
+            environment: production
+          secrets: inherit
+prevention:
+  - "Inside a reusable workflow, `github.ref`, `github.sha`, and `github.workflow` reflect the CALLER's context — not the called file's identity."
+  - "Use `github.workflow_ref` in called workflow concurrency groups — it uniquely identifies the calling workflow file and prevents cross-caller group collisions."
+  - "Prefer defining concurrency in the calling workflow rather than the called workflow to keep each pipeline's serialization logic self-contained."
+  - "When sharing a reusable deploy workflow across multiple CI pipelines, pass a discriminator (caller name, environment) as an input and include it in the concurrency group key."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs"
+    label: "GitHub Docs — Control the concurrency of workflows and jobs"
+  - url: "https://docs.github.com/en/actions/sharing-automations/reusing-workflows#limitations"
+    label: "GitHub Docs — Reusing workflows: limitations"
+  - url: "https://github.com/actions/runner/issues/2577"
+    label: "actions/runner#2577 — Reusable Workflows: predefined variables load for the called job"
+  - url: "https://github.com/actions/toolkit/issues/1264"
+    label: "actions/toolkit#1264 — Make caller workflow reference accessible in reusable workflow (120 👍)"
+  - url: "https://stackoverflow.com/questions/79511940/using-workflow-filename-in-concurrency-group-for-workflows-started-by-workflow-call"
+    label: "Stack Overflow #79511940 — Using workflow filename in concurrency group for workflow_call"

@@ -1,0 +1,157 @@
+id: concurrency-timing-077
+title: "Manually Cancelled Workflow with Matrix + if: always() Downstream Job Stuck Permanently Queued"
+category: concurrency-timing
+severity: error
+tags:
+  - matrix
+  - cancellation
+  - if-always
+  - needs
+  - stuck-queued
+  - cleanup-job
+patterns:
+  - regex: 'if:\s+always\(\)'
+    flags: 'i'
+  - regex: 'needs:\s*\[.*\]'
+    flags: 'i'
+  - regex: 'This run was cancelled\.'
+    flags: 'i'
+error_messages:
+  - "This run was cancelled."
+root_cause: |
+  When a workflow containing **matrix jobs** is manually cancelled from the GitHub Actions
+  Runs list (not via a concurrency group), a downstream job with `needs: [matrix-job]`
+  and `if: always()` can get stuck permanently in the **"Queued"** state — never starting
+  and never resolving to "cancelled."
+
+  The root cause is a scheduling race in the GitHub Actions backend:
+  - When the workflow is cancelled, the in-progress matrix jobs receive a cancellation signal.
+  - Each matrix job posts its individual "cancelled" conclusion asynchronously.
+  - The dependent job's scheduler evaluates its `needs:` condition before all matrix job
+    conclusions have been committed — it sees some matrix jobs as still "in_progress."
+  - Because `if: always()` means "run regardless of needs result," the scheduler attempts
+    to queue the dependent job. However, it never receives the final matrix-cancelled
+    signal needed to actually dispatch it.
+  - Result: the dependent job is stuck in "Queued" indefinitely. The workflow run stays
+    "In progress" in the GitHub UI and is never marked as complete.
+
+  This blocks subsequent concurrency group runs (they see the workflow as still active)
+  and consumes workflow run display space. A page refresh does not resolve it; the
+  workflow run must be manually cancelled a second time or times out (72 hours max).
+
+  Reproduced with matrix strategies that have 2+ configurations. Actions/runner#4411
+  (open 2026) tracks this as a confirmed bug with multiple reproductions.
+fix: |
+  Workarounds (none are perfect — this is a backend scheduling bug):
+
+  1. **Use `if: failure() || cancelled() || success()` instead of `if: always()`** — the
+     explicit conditions sometimes force the scheduler to re-evaluate immediately, though
+     this is not guaranteed to prevent the stuck state.
+
+  2. **Use a separate `on: workflow_run` cleanup workflow** instead of a downstream job
+     in the same workflow. The `workflow_run` event fires when the parent workflow
+     completes (including via cancellation), running independently of matrix conclusion
+     synchronization.
+
+  3. **Avoid `needs:` pointing to matrix jobs for cleanup jobs** — restructure so the
+     cleanup job depends on a non-matrix sentinel job, and the sentinel job depends on
+     the matrix with `if: always()`.
+
+  4. **Set `timeout-minutes:` on the cleanup job** — ensures the workflow eventually
+     terminates even if the job stays queued. The run will be marked as timed-out rather
+     than stuck indefinitely.
+fix_code:
+  - language: yaml
+    label: "Problematic: if: always() cleanup job stuck queued after matrix cancel"
+    code: |
+      jobs:
+        test:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest, macos-latest]
+            fail-fast: false
+          runs-on: ${{ matrix.os }}
+          steps:
+            - run: npm test
+
+        cleanup:
+          needs: [test]
+          if: always()           # Stuck queued when matrix is manually cancelled
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Cleanup complete"
+  - language: yaml
+    label: "Workaround 1: add a timeout to prevent indefinite stuck state"
+    code: |
+      jobs:
+        test:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest, macos-latest]
+            fail-fast: false
+          runs-on: ${{ matrix.os }}
+          steps:
+            - run: npm test
+
+        cleanup:
+          needs: [test]
+          if: always()
+          timeout-minutes: 10    # Ensures workflow eventually ends even if stuck queued
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Cleanup complete"
+  - language: yaml
+    label: "Workaround 2: sentinel non-matrix job breaks the stuck-queued chain"
+    code: |
+      jobs:
+        test:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest, macos-latest]
+            fail-fast: false
+          runs-on: ${{ matrix.os }}
+          steps:
+            - run: npm test
+
+        # Non-matrix sentinel — matrix conclusions aggregate here first
+        sentinel:
+          needs: [test]
+          if: always()
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "All matrix done"
+
+        # Cleanup depends on sentinel (non-matrix), not test (matrix) directly
+        cleanup:
+          needs: [sentinel]
+          if: always()
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Cleanup complete"
+  - language: yaml
+    label: "Workaround 3: separate workflow_run cleanup workflow (most robust)"
+    code: |
+      # cleanup.yml — runs after the parent workflow completes in any state
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+
+      jobs:
+        cleanup:
+          runs-on: ubuntu-latest
+          # github.event.workflow_run.conclusion: success | failure | cancelled | etc.
+          steps:
+            - run: echo "Cleanup for ${{ github.event.workflow_run.conclusion }}"
+prevention:
+  - "Set `timeout-minutes:` on any cleanup job using `if: always()` + `needs: [matrix-job]` — prevents indefinitely stuck workflow runs."
+  - "Use a non-matrix sentinel job as an intermediary between matrix jobs and cleanup jobs to provide a clean single-conclusion boundary."
+  - "For critical cleanup (environment teardown, deployment rollback), prefer a separate `on: workflow_run` workflow over an in-workflow cleanup job."
+  - "Track actions/runner#4411 for upstream fix status — the bug is confirmed but unfixed as of June 2026."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/running-variations-of-jobs-in-a-workflow"
+    label: "GitHub Docs — Running variations of jobs in a workflow (matrix)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run"
+    label: "GitHub Docs — Events that trigger workflows: workflow_run"
+  - url: "https://github.com/actions/runner/issues/4411"
+    label: "actions/runner#4411 — Workflow cancellation leaves downstream needs job permanently queued (matrix + if: always())"
