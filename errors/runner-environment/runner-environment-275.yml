@@ -1,0 +1,108 @@
+id: runner-environment-275
+title: "actions/checkout filter: 'tree:0' incompatible with lfs: true — LFS scan fails with missing object"
+category: runner-environment
+severity: error
+tags:
+  - checkout
+  - git-lfs
+  - partial-clone
+  - filter
+  - tree-filter
+  - lfs
+  - missing-object
+patterns:
+  - regex: 'Could not scan for Git LFS files'
+    flags: 'i'
+  - regex: 'missing object: [0-9a-f]{40}'
+    flags: 'i'
+  - regex: 'filter.*tree:0.*lfs|lfs.*filter.*tree:0'
+    flags: 'i'
+error_messages:
+  - "Could not scan for Git LFS files"
+  - "missing object: <40-char-sha>"
+  - "Error: Process completed with exit code 1."
+root_cause: |
+  Combining `filter: 'tree:0'` (a partial clone filter) with `lfs: true` in
+  `actions/checkout` is incompatible because the two options operate in conflicting ways
+  on the Git object store.
+
+  `filter: 'tree:0'` instructs Git to perform a "treeless" partial clone: blob objects
+  (file contents) are not downloaded until they are explicitly accessed. The repository
+  is cloned with all commits and trees but with blobs lazily deferred.
+
+  When `lfs: true` is also set, `actions/checkout` runs `git lfs fetch` after the clone
+  to download LFS pointer files' actual content. The `git lfs fetch` command internally
+  calls `git rev-list` or scans the worktree to enumerate LFS objects, which in turn
+  requires reading blob metadata — but those blobs were excluded by the `tree:0` filter.
+  Git LFS therefore encounters non-LFS blob objects that are "missing" from the local
+  object store and aborts with "Could not scan for Git LFS files missing object: <sha>".
+
+  The missing SHA is typically a regular (non-LFS) blob that git-lfs attempted to inspect
+  to determine whether it is an LFS pointer. The objects aren't available because they
+  were excluded by the partial clone filter.
+
+  This issue was reported in actions/checkout#2251 (August 2025, open). The underlying
+  incompatibility exists in how git-lfs enumerates objects relative to partial clone
+  blobless/treeless filters.
+fix: |
+  Choose one of the following alternatives:
+
+  Option 1 — Use blob:none filter instead of tree:0:
+    `filter: 'blob:none'` defers blob download but still fetches tree objects. Git LFS
+    can scan for LFS pointers without encountering missing blobs because tree metadata
+    is present. Combined with `lfs: true`, it works correctly.
+
+  Option 2 — Disable lfs in checkout and fetch LFS files manually:
+    Set `lfs: false` to prevent actions/checkout from running git-lfs. After checkout,
+    manually run `git lfs pull --include="path/to/lfs-files/**"` to download only the
+    LFS objects you need. This avoids the incompatibility while still benefiting from
+    fast partial clones.
+
+  Option 3 — Remove the filter entirely:
+    If the repository is small enough, omit `filter:` and let actions/checkout perform
+    a full clone. Use `fetch-depth: 1` for shallow clone performance without the
+    LFS incompatibility.
+fix_code:
+  - language: yaml
+    label: 'Option 1: Use blob:none filter (compatible with lfs: true)'
+    code: |
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+          filter: 'blob:none'   # treeless partial clone — compatible with git-lfs
+          fetch-depth: 1
+
+  - language: yaml
+    label: 'Option 2: Manual LFS fetch after partial clone'
+    code: |
+      - uses: actions/checkout@v4
+        with:
+          lfs: false             # Do NOT run git-lfs automatically
+          filter: 'tree:0'       # Treeless partial clone for fast checkout
+          fetch-depth: 1
+
+      - name: Fetch only required LFS objects
+        run: git lfs pull --include="assets/images/**,models/*.bin"
+
+  - language: yaml
+    label: 'BROKEN: filter: tree:0 with lfs: true (incompatible)'
+    code: |
+      # This combination fails with "Could not scan for Git LFS files"
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+          filter: 'tree:0'   # INCOMPATIBLE with lfs: true — do not use together
+prevention:
+  - "Do not combine filter: 'tree:0' with lfs: true in actions/checkout."
+  - "Use filter: 'blob:none' when you need both a partial clone and LFS downloads."
+  - "If you only need specific LFS files, use lfs: false and run git lfs pull with --include to fetch selectively."
+  - "Test LFS workflows locally with the same filter setting before deploying to CI."
+docs:
+  - url: 'https://github.com/actions/checkout/issues/2251'
+    label: "actions/checkout#2251: filter: 'tree:0' incompatible with lfs: true (open Aug 2025)"
+  - url: 'https://github.com/git-lfs/git-lfs/issues/5796'
+    label: 'git-lfs#5796: sparse index requirement for LFS + sparse-checkout compatibility'
+  - url: 'https://git-scm.com/docs/partial-clone'
+    label: 'Git documentation: Partial clone filters (blob:none vs tree:0)'
+  - url: 'https://github.com/actions/checkout#usage'
+    label: 'actions/checkout: filter and lfs input documentation'

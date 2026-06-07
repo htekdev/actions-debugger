@@ -1,0 +1,108 @@
+id: caching-artifacts-088
+title: 'actions/cache v4 save-always input silently non-functional — post-if cannot read inputs context'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - cache
+  - save-always
+  - post-if
+  - v4
+  - job-failure
+  - inputs-context
+  - silent
+patterns:
+  - regex: 'save-always.*true'
+    flags: 'i'
+  - regex: "Warning: The 'save-always' input is deprecated"
+    flags: 'i'
+  - regex: 'Post job cleanup\.'
+    flags: 'i'
+error_messages:
+  - "Warning: The 'save-always' input is deprecated. Please use the `actions/cache/save` action instead."
+  - "Post job cleanup."
+root_cause: |
+  The `save-always: true` input was added to `actions/cache@v4` with the intent of saving
+  the cache even when a job step fails. However, the feature was never functional due to a
+  fundamental limitation in GitHub Actions: `post-if` expressions cannot read the `inputs`
+  context at evaluation time.
+
+  The action's `post-if` condition was written as:
+    post-if: success() || inputs.save-always == 'true'
+
+  Because `inputs` is not available in `post-if` expressions, `inputs.save-always` always
+  evaluates to null, making the condition equivalent to `success()` only. The cache post-step
+  is therefore silently skipped whenever a job step fails — the exact opposite of what the
+  `save-always` feature was supposed to do.
+
+  Developers who set `save-always: true` received no error and no warning (until the deprecation
+  notice was added later). Their workflows silently failed to cache dependencies after build or
+  test failures, causing every failing run to re-download all dependencies from scratch.
+
+  The maintainer acknowledged the bug in June 2024 and deprecated `save-always` in v4 (PR #1452).
+  The input was removed entirely in v5. The recommended replacement is the explicit
+  `actions/cache/save` sub-action with an `if: always()` condition.
+fix: |
+  Replace `actions/cache` (combined restore+save) with the separate
+  `actions/cache/restore` and `actions/cache/save` sub-actions. Place the save
+  step immediately after the install step and use `if: always() && steps.restore.outputs.cache-hit != 'true'`
+  so it runs regardless of later failures without duplicating an exact-key cache.
+
+  If you are on `actions/cache@v5` or later, `save-always` no longer exists — use the
+  explicit sub-action pattern shown below.
+fix_code:
+  - language: yaml
+    label: 'Correct pattern: separate restore + save with always() (v4+ and v5+)'
+    code: |
+      steps:
+        - uses: actions/checkout@v4
+
+        - name: Restore cached dependencies
+          id: cache-restore
+          uses: actions/cache/restore@v4
+          with:
+            path: ~/.npm
+            key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+            restore-keys: |
+              ${{ runner.os }}-npm-
+
+        - name: Install dependencies
+          run: npm ci
+
+        # Save runs even if build/test steps fail.
+        # cache-hit != 'true' guard prevents overwriting an exact-key hit.
+        - name: Save cache
+          if: always() && steps.cache-restore.outputs.cache-hit != 'true'
+          uses: actions/cache/save@v4
+          with:
+            path: ~/.npm
+            key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+
+        - name: Build
+          run: npm run build
+
+        - name: Test
+          run: npm test
+
+  - language: yaml
+    label: 'Broken pattern: save-always: true in v4 (silently non-functional)'
+    code: |
+      # BROKEN — save-always never worked in v4 due to post-if limitation.
+      # Do NOT use this pattern even if it appears in older examples.
+      steps:
+        - uses: actions/cache@v4
+          with:
+            path: ~/.npm
+            key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+            save-always: true  # This input was always silently ignored in v4.
+prevention:
+  - 'Never rely on save-always: true in actions/cache@v4 — it was never functional and is removed in v5.'
+  - 'Use the separate actions/cache/restore + actions/cache/save sub-actions with if: always() for always-save behavior.'
+  - 'Place the save step immediately after the install/build step it is caching, not at the end of the job.'
+  - 'Add the cache-hit != ''true'' guard on the save step to avoid overwriting existing exact-key caches.'
+docs:
+  - url: 'https://github.com/actions/cache/issues/1315'
+    label: 'actions/cache#1315: v4.0 save-always not working (36 reactions, confirmed by maintainer)'
+  - url: 'https://github.com/actions/cache/pull/1452'
+    label: 'actions/cache PR #1452: Deprecate save-always input (maintainer explanation)'
+  - url: 'https://github.com/actions/cache/blob/main/save/README.md#always-save-cache'
+    label: 'actions/cache: Always save cache — official recommended pattern'
