@@ -1,0 +1,104 @@
+id: permissions-auth-069
+title: 'GitHub App installation token new format (~520 chars) breaks hardcoded regex and length checks'
+category: permissions-auth
+severity: silent-failure
+tags:
+  - github-app
+  - installation-token
+  - ghs-token
+  - GITHUB_TOKEN
+  - token-format
+  - regex
+patterns:
+  - regex: 'ghs_[A-Za-z0-9]{36}'
+    flags: ''
+  - regex: 'token\s+length.*40'
+    flags: 'i'
+  - regex: 'invalid.*token.*format'
+    flags: 'i'
+  - regex: 'Validation failed.*token'
+    flags: 'i'
+error_messages:
+  - 'Validation failed: token is invalid'
+  - 'Bad credentials'
+  - 'Error: Input required and not supplied: token'
+  - 'authentication required'
+root_cause: |
+  Starting April 27, 2026 and rolling out through mid-to-late June 2026, GitHub
+  changed the format of GitHub App installation tokens (ghs_ tokens), including
+  the GITHUB_TOKEN issued to Actions workflows. The new format is stateless
+  (ghs_APPID_JWT) and is approximately 520 characters long with variable length,
+  compared to the previous fixed 40-character alphanumeric token.
+
+  Applications, scripts, or third-party Actions that contain hardcoded regex
+  patterns such as ghs_[A-Za-z0-9]{36} or length checks like len(token) == 40
+  will fail to match or validate the new token format, causing silent authentication
+  failures, incorrect "missing token" errors, or database truncation if columns
+  were sized for 40-character tokens.
+
+  The ghs_ prefix is unchanged. The JWT embedded in the token is signed by a
+  GitHub-internal issuer and must not be validated or decoded by client code.
+
+  Source: GitHub Changelog, April 24 2026 (staged rollout April 27 – June 2026).
+fix: |
+  Treat tokens as opaque strings. Remove all hardcoded length checks and format
+  regex patterns that assume 40-character tokens:
+
+  1. Replace ghs_[A-Za-z0-9]{36} with ghs_[A-Za-z0-9_.-]+ (matches both formats)
+  2. Remove any len(token) == 40 guards
+  3. Expand database columns storing tokens to VARCHAR(1024) or TEXT
+  4. Use starts_with(token, 'ghs_') for basic prefix validation only
+
+  In GitHub Actions workflows, always pass GITHUB_TOKEN via the secrets context
+  rather than re-validating its format — it is always valid for the current run.
+fix_code:
+  - language: yaml
+    label: 'Pass GITHUB_TOKEN correctly without format validation'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Call GitHub API
+              env:
+                GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                # Do NOT validate token format — treat as opaque string
+                gh api repos/${{ github.repository }}/releases
+  - language: yaml
+    label: 'Safe token regex — matches both old and new ghs_ formats'
+    code: |
+      # Old (BROKEN — rejects new ~520-char tokens):
+      # pattern: ghs_[A-Za-z0-9]{36}
+      #
+      # New (SAFE — matches both formats by prefix only):
+      # pattern: ^ghs_[A-Za-z0-9_.+/=-]+$
+      #
+      # Best practice: use starts-with check only:
+      # if token.startswith('ghs_'):
+      #     # token is a GitHub App installation token
+      jobs:
+        validate-token:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Verify token present (prefix check only)
+              run: |
+                if [[ "$GH_TOKEN" != ghs_* ]] && [[ "$GH_TOKEN" != ghp_* ]]; then
+                  echo "Unexpected token prefix — check secret configuration"
+                  exit 1
+                fi
+              env:
+                GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+prevention:
+  - 'Never hardcode token length assumptions — token formats change over time'
+  - 'Replace ghs_[A-Za-z0-9]{36} regex with a prefix-only check: startswith("ghs_")'
+  - 'Size database columns storing GitHub tokens to at least VARCHAR(1024)'
+  - 'Treat all GitHub tokens as opaque strings; never decode or validate the JWT portion'
+  - 'Audit any GitHub App integrations, custom Actions, or scripts that validate token format before the rollout completes in June 2026'
+docs:
+  - url: 'https://github.blog/changelog/2026-04-24-notice-about-upcoming-new-format-for-github-app-installation-tokens/'
+    label: 'GitHub Changelog: New format for GitHub App installation tokens (April 24, 2026)'
+  - url: 'https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/about-authentication-with-a-github-app'
+    label: 'GitHub Docs: About authentication with a GitHub App'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication'
+    label: 'GitHub Docs: Automatic token authentication (GITHUB_TOKEN)'
