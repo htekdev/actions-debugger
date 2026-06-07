@@ -1,0 +1,114 @@
+id: runner-environment-318
+title: "actions/setup-go go-version-file Pointing to go.tool.mod (Go 1.24+ Tools Modfile) Fails with 'Unable to find Go version'"
+category: runner-environment
+severity: error
+tags:
+  - setup-go
+  - go
+  - go-version-file
+  - go1.24
+  - tools
+  - modfile
+  - version-resolution
+patterns:
+  - regex: 'Unable to find Go version .module .*. for platform'
+    flags: "i"
+  - regex: 'Unable to find Go version .module\b'
+    flags: "i"
+  - regex: 'go-version-file.*go\.tool\.mod|go\.tool\.mod.*go-version-file'
+    flags: "i"
+  - regex: "Unable to find Go version '(module|tool|go module)' for platform \\w+ and architecture \\w+"
+    flags: "i"
+error_messages:
+  - "Unable to find Go version 'module nuclei-tools' for platform linux and architecture x64."
+  - "Unable to find Go version 'module ...' for platform linux and architecture x64."
+root_cause: |
+  `actions/setup-go` reads `go-version-file` by finding the `go` or `toolchain`
+  directive in the specified file. However, it only recognises the standard
+  `go.mod` and `go.work` formats (line starting with `go X.Y.Z`). When pointed at
+  a `go.tool.mod` file — introduced by Go 1.24 as the standard pattern for
+  tool-dependency management — the action reads the file's `module` line first and
+  passes it wholesale as the version string.
+
+  A typical `go.tool.mod` begins with:
+  ```
+  module nuclei-tools
+
+  go 1.26.1
+
+  tool (
+    golang.org/x/vuln/cmd/govulncheck
+    ...
+  )
+  ```
+
+  setup-go receives `"module nuclei-tools"` as the version and cannot find a Go
+  distribution matching that string, so it exits 1 with:
+  `Unable to find Go version 'module nuclei-tools' for platform linux and architecture x64.`
+
+  Go 1.24+ tool modfiles are an increasingly common pattern — they allow
+  `go run tool@latest` via a separate modfile invoked with `-modfile=go.tool.mod`,
+  keeping tool dependencies out of the main go.mod and go.sum. As more projects
+  adopt this pattern, workflows that use `go-version-file: go.tool.mod` will hit
+  this parse failure.
+
+  The issue is tracked in actions/setup-go#746 (open, April 2026).
+fix: |
+  **Option 1 — Point go-version-file at go.mod instead:**
+  Keep the tool dependencies in `go.tool.mod` but derive the Go version from the
+  main `go.mod` or `go.work` file, which setup-go already parses correctly.
+
+  **Option 2 — Use go-version input directly:**
+  Hardcode the Go version in the workflow rather than relying on file discovery.
+  Combine with Dependabot or Renovate to keep it up to date.
+
+  **Option 3 — Extract the version with a pre-step:**
+  Run a shell step to parse the Go version from `go.tool.mod` and pass it to
+  setup-go via an output variable.
+fix_code:
+  - language: yaml
+    label: "Option 1: point go-version-file at go.mod (not go.tool.mod)"
+    code: |
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod     # always use go.mod for version discovery
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            go.tool.sum
+  - language: yaml
+    label: "Option 2: hardcode go-version"
+    code: |
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'    # keep in sync with go directive in go.tool.mod
+          cache: true
+  - language: yaml
+    label: "Option 3: pre-step to extract version from go.tool.mod"
+    code: |
+      - name: Read Go version from go.tool.mod
+        id: goversion
+        run: |
+          GO_VER=$(grep -m1 '^go ' go.tool.mod | awk '{print $2}')
+          echo "version=$GO_VER" >> $GITHUB_OUTPUT
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ steps.goversion.outputs.version }}
+          cache: true
+prevention:
+  - "Only pass `go.mod` or `go.work` to `go-version-file`; never point it at a tool modfile (`go.tool.mod`)."
+  - "When adopting Go 1.24+ tool dependencies, keep a `go.mod` in the root so setup-go can resolve the version normally."
+  - "If using a separate tool modfile pattern, document the workflow restriction so future maintainers don't accidentally set go-version-file to the tool modfile."
+docs:
+  - url: "https://github.com/actions/setup-go/issues/746"
+    label: "setup-go#746 — go-version-file treats go.tool.mod contents as version string"
+  - url: "https://go.dev/blog/tool-dependencies"
+    label: "Go 1.24 tool dependency management blog post"
+  - url: "https://pkg.go.dev/cmd/go#hdr-Module_files"
+    label: "Go module file reference"
+  - url: "https://github.com/actions/setup-go#inputs"
+    label: "actions/setup-go inputs reference"
