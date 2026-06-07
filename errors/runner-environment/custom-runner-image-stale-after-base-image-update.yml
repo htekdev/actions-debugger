@@ -1,0 +1,109 @@
+id: runner-environment-303
+title: 'Custom runner image goes stale when GitHub base image updates — tools and security patches not applied'
+category: runner-environment
+severity: silent-failure
+tags:
+  - custom-image
+  - runner-image
+  - security
+  - stale-image
+  - base-image
+  - larger-runners
+patterns:
+  - regex: 'error.*version.*not found.*custom.*image'
+    flags: 'i'
+  - regex: 'Certificate.*expired|Certificate.*untrusted'
+    flags: 'i'
+  - regex: 'The action.*requires.*which is not present'
+    flags: 'i'
+error_messages:
+  - 'Error: Version X not found. Available versions: ...'
+  - 'Unable to locate package <tool>'
+  - 'Certificate has expired or is not yet valid'
+  - 'E: Unable to locate package build-essential'
+root_cause: |
+  Custom runner images for GitHub-hosted runners (GA March 26, 2026) let organizations
+  build their own VM images on top of a GitHub-curated base image. The custom image
+  is a snapshot built at a point in time.
+
+  When the underlying GitHub-curated base image is updated (OS patches, tool version
+  bumps, security fixes), the custom image does NOT automatically receive those updates.
+  The custom image continues to run the version locked at build time until it is
+  explicitly rebuilt.
+
+  Silent failure patterns:
+  1. Security vulnerabilities: The base image may receive CVE patches but the custom
+     image silently continues running unpatched versions.
+  2. Runner agent version: GitHub's hosted runner agent is updated periodically. If the
+     custom image's agent falls too far behind, it may stop receiving job dispatch.
+  3. CA certificate expiry: System CA bundles in the base image are updated; old custom
+     images may fail TLS connections to package registries after cert rotation.
+  4. Tool EOL: Pre-installed tools (Node.js versions, Python runtimes) reach EOL and
+     are removed from base images; a stale custom image retains them but they may have
+     known vulnerabilities.
+
+  Source: GitHub Changelog March 26 2026 (Custom images GA); GitHub Actions documentation
+  on custom runner images lifecycle.
+fix: |
+  Rebuild and republish the custom runner image regularly. Treat custom images like
+  application Docker images — they need a rebuild cadence tied to base image updates.
+
+  1. Monitor the GitHub-curated base image changelog (actions/runner-images) for security
+     patches and breaking changes. Subscribe to announcements.
+  2. Set up a scheduled workflow to rebuild your custom image weekly or when the base
+     image is updated.
+  3. Use image labels or tags that include the build date so stale images are immediately
+     visible: my-org/runner-image:2026-06-07.
+  4. Enable Dependabot or a similar tool to notify when the base image digest changes.
+fix_code:
+  - language: yaml
+    label: 'Scheduled workflow to rebuild custom runner image weekly'
+    code: |
+      name: Rebuild Custom Runner Image
+      on:
+        schedule:
+          - cron: '0 2 * * 1'   # every Monday at 02:00 UTC
+        workflow_dispatch:        # allow manual trigger when base image CVE announced
+
+      jobs:
+        build-image:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build and push custom runner image
+              uses: docker/build-push-action@v6
+              with:
+                context: ./runner-image
+                push: true
+                tags: |
+                  ghcr.io/${{ github.repository }}/runner:latest
+                  ghcr.io/${{ github.repository }}/runner:${{ github.run_id }}
+  - language: yaml
+    label: 'Use dated image tags to detect stale images in workflow runs'
+    code: |
+      jobs:
+        build:
+          runs-on:
+            group: custom-runners
+            labels: [self-hosted, linux, x64, custom-image-2026-06-07]
+          steps:
+            - name: Verify image freshness
+              run: |
+                IMAGE_DATE=$(cat /etc/runner-image-build-date 2>/dev/null || echo "unknown")
+                DAYS_OLD=$(( ($(date +%s) - $(date -d "$IMAGE_DATE" +%s)) / 86400 ))
+                if [ "$DAYS_OLD" -gt 30 ]; then
+                  echo "::warning::Custom runner image is $DAYS_OLD days old. Rebuild recommended."
+                fi
+prevention:
+  - 'Treat custom runner images like production Docker images — establish a weekly or bi-weekly rebuild cadence'
+  - 'Subscribe to actions/runner-images announcements to be notified of base image security patches'
+  - 'Include the build date in custom image tags so stale images are visible from workflow logs'
+  - 'Set up a monitoring job that checks image age and creates a task or alert when the image exceeds 30 days old'
+  - 'Pin the GitHub-curated base image by digest (not latest) and update the digest consciously in your image build config'
+docs:
+  - url: 'https://github.blog/changelog/2026-03-26-custom-images-for-github-hosted-runners-are-now-generally-available/'
+    label: 'GitHub Changelog: Custom images for GitHub-hosted runners GA (March 26, 2026)'
+  - url: 'https://docs.github.com/en/actions/using-github-hosted-runners/using-larger-runners/using-custom-images'
+    label: 'GitHub Docs: Using custom images with GitHub-hosted runners'
+  - url: 'https://github.com/actions/runner-images'
+    label: 'actions/runner-images: GitHub-curated base image changelogs and announcements'
