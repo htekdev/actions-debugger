@@ -1,0 +1,99 @@
+id: runner-environment-301
+title: 'Ephemeral JIT runner reports "lost communication" despite successful job completion'
+category: runner-environment
+severity: error
+tags:
+  - ephemeral-runner
+  - jit-runner
+  - lost-communication
+  - broker
+  - self-hosted
+  - v2-broker-flow
+patterns:
+  - regex: 'The self-hosted runner lost communication with the server'
+    flags: 'i'
+  - regex: 'messageQueueLoopTokenSource\.Cancel|Stop message queue looping'
+    flags: 'i'
+  - regex: 'GET request to broker\.actions\.githubusercontent\.com/message.*has been cancelled'
+    flags: 'i'
+error_messages:
+  - 'The self-hosted runner lost communication with the server'
+  - 'GET request to broker.actions.githubusercontent.com/message... has been cancelled.'
+  - 'TaskCanceledException: The operation was canceled.'
+  - 'Job has finished at backend, the runner will exit since it is running under onetime use mode.'
+root_cause: |
+  Ephemeral (one-time-use) JIT runners using the V2 broker flow (Ephemeral: true, UseV2Flow: true)
+  immediately cancel the message queue TCP connection as soon as the job worker process exits —
+  with zero grace period. This is implemented in Runner.cs ~line 576 where
+  messageQueueLoopTokenSource.Cancel() fires the instant the RunOnceJobCompleted task completes.
+
+  GitHub's backend has two independent systems:
+    1. Pipeline service — receives CompleteJobAsync and marks the job succeeded
+    2. Broker health monitor — detects the TCP disconnect and flags "runner lost communication"
+
+  When the broker health monitor wins the race (which is common for short jobs < 60s), the UI
+  shows "lost communication" or the job stays stuck in "in_progress" / "queued" for 10–30+
+  minutes before GitHub eventually reconciles the pipeline service result. In some cases the
+  workflow_job.completed webhook is never delivered.
+
+  The runner logs confirm the completion was acknowledged by GitHub
+  ("Received job status event. JobState: Online") at the exact same timestamp as the broker
+  disconnect — there is no delay between the two events.
+
+  Observed on runner v2.331.0 and v2.333.0. Affects ~5–10% of runs in environments with many
+  ephemeral JIT runners, with short jobs being most susceptible.
+fix: |
+  No runner-side fix is available yet (open issue as of June 2026). Workarounds:
+
+  1. Add a post-job sleep step using a composite action or a final `run:` step to introduce
+     a brief delay before the runner exits, reducing the likelihood of the race:
+       - name: Grace period (ephemeral JIT workaround)
+         if: always()
+         run: sleep 5
+
+  2. If you control the runner image, pin to a version before v2.331.0 where the V1 broker
+     flow did not have this race condition.
+
+  3. Implement retry logic in webhook consumers — treat workflow_job.completed delivery as
+     eventually consistent and poll the REST API for final status.
+
+  4. Add `timeout-minutes` to all jobs to prevent runaway stuck-in-progress states.
+fix_code:
+  - language: yaml
+    label: 'Add post-job grace sleep to reduce broker race window'
+    code: |
+      jobs:
+        build:
+          runs-on: [self-hosted]
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build and test
+              run: make test
+
+            # Workaround: 5-second grace period before ephemeral runner exits
+            # Prevents false "lost communication" from broker health monitor race
+            - name: Ephemeral JIT grace period
+              if: always()
+              run: sleep 5
+  - language: yaml
+    label: 'Add timeout-minutes to prevent jobs stuck in-progress indefinitely'
+    code: |
+      jobs:
+        build:
+          runs-on: [self-hosted]
+          timeout-minutes: 30   # prevents stuck-in-progress if race is lost
+          steps:
+            - uses: actions/checkout@v4
+            - run: make test
+prevention:
+  - 'Set timeout-minutes on all jobs using ephemeral JIT runners'
+  - 'Implement idempotent webhook consumers that poll the REST API for final status on delivery failure'
+  - 'Monitor for jobs stuck in "in_progress" state longer than expected and trigger a status recheck'
+  - 'Use non-ephemeral self-hosted runners for workflows with strict webhook delivery requirements'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4309'
+    label: 'actions/runner#4309 — Ephemeral/JIT runner reports "lost communication" despite successful completion'
+  - url: 'https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners/about-github-hosted-runners'
+    label: 'GitHub Docs — About GitHub-hosted runners'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-jobs-in-a-workflow#setting-a-timeout-for-a-job'
+    label: 'GitHub Docs — Setting a timeout for a job'

@@ -1,0 +1,81 @@
+id: caching-artifacts-094
+title: 'Cache action fails with ENOTFOUND when cache server URL is an IPv6 literal address'
+category: caching-artifacts
+severity: error
+tags:
+  - cache
+  - ipv6
+  - enotfound
+  - network
+  - self-hosted
+  - ghes
+patterns:
+  - regex: 'getaddrinfo ENOTFOUND \[2[0-9a-fA-F:]+\]'
+    flags: 'i'
+  - regex: 'Failed to restore.*getaddrinfo ENOTFOUND \['
+    flags: 'i'
+  - regex: 'Failed to save.*getaddrinfo ENOTFOUND \['
+    flags: 'i'
+error_messages:
+  - '::warning::Failed to restore: getCacheEntry failed: getaddrinfo ENOTFOUND [2001:bc8:1d90:1fc1:dc00:ff:fe2b:3f97]'
+  - '::warning::Failed to save: reserveCache failed: getaddrinfo ENOTFOUND [2001:bc8:1d90:1fc1:dc00:ff:fe2b:3f97]'
+root_cause: |
+  The Node.js HTTP client used by the actions/cache action (via @actions/cache in @actions/toolkit)
+  does not correctly handle IPv6 literal addresses in URLs. When the GitHub Actions cache server
+  (or a self-hosted GHES/GHAE cache backend) returns an IPv6 literal address such as
+  [2001:bc8:1d90:1fc1:dc00:ff:fe2b:3f97], the http-client constructs a URL with the bracket-
+  enclosed literal (e.g., http://[2001:...]:443/...) but then passes the bracketed string as
+  the hostname to Node.js's dns.getaddrinfo(). Node.js treats the bracket-enclosed string as a
+  literal hostname — not as an IPv6 address — resulting in a DNS lookup failure:
+    getaddrinfo ENOTFOUND [2001:bc8:1d90:1fc1:dc00:ff:fe2b:3f97]
+
+  This affects:
+    - Self-hosted runners on networks where cache servers advertise IPv6 addresses
+    - GitHub Enterprise Server (GHES) environments with IPv6 cache infrastructure
+    - Any environment where ACTIONS_CACHE_URL resolves to an IPv6 literal
+
+  The fix is in @actions/http-client (actions/toolkit PR #2298): strip the surrounding
+  brackets from IPv6 literals before passing to Node.js DNS resolution. The fix was merged but
+  may not be picked up by all versions of actions/cache depending on the toolkit dependency
+  version in use.
+fix: |
+  1. Update to the latest version of actions/cache (v4+) which includes the fixed @actions/http-client.
+
+  2. If on a self-managed runner environment, ensure ACTIONS_CACHE_URL does not expose a bare
+     IPv6 literal — use a hostname alias or configure a DNS entry that resolves to the IPv6 address
+     so the http-client receives a hostname, not a literal address.
+
+  3. As a temporary workaround, set ACTIONS_CACHE_URL to a DNS hostname that resolves to the
+     IPv6 address rather than passing the literal address directly.
+fix_code:
+  - language: yaml
+    label: 'Use actions/cache v4+ which includes the IPv6 fix'
+    code: |
+      - name: Cache dependencies
+        uses: actions/cache@v4   # v4+ includes fix for IPv6 literal ENOTFOUND
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+  - language: yaml
+    label: 'Workaround: override ACTIONS_CACHE_URL with a hostname alias'
+    code: |
+      env:
+        # Replace IPv6 literal with a resolvable hostname pointing to the same address
+        ACTIONS_CACHE_URL: https://cache.internal.example.com/
+      steps:
+        - name: Cache dependencies
+          uses: actions/cache@v4
+          with:
+            path: ~/.npm
+            key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+prevention:
+  - 'Use actions/cache@v4 or later which bundles the patched @actions/http-client with IPv6 support'
+  - 'Configure cache infrastructure with DNS hostnames rather than raw IPv6 literal addresses'
+  - 'On GHES, verify cache backend URLs exposed to runners do not contain raw IPv6 bracket literals'
+docs:
+  - url: 'https://github.com/actions/cache/issues/1718'
+    label: 'actions/cache#1718 — Caching fails on IPv6 cache server'
+  - url: 'https://github.com/actions/toolkit/pull/2298'
+    label: 'actions/toolkit PR#2298 — fix(http-client): correctly handle IPv6 literals'
+  - url: 'https://github.com/actions/cache'
+    label: 'actions/cache — Cache dependencies and build outputs in GitHub Actions'

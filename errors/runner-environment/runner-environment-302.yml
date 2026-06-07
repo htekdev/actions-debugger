@@ -1,0 +1,110 @@
+id: runner-environment-302
+title: 'Self-hosted runner stuck in active state after hanging subprocess — new jobs queue indefinitely'
+category: runner-environment
+severity: error
+tags:
+  - self-hosted-runner
+  - hung-process
+  - stuck-active
+  - subprocess
+  - timeout
+  - worker-process
+patterns:
+  - regex: 'Waiting for a runner to pick up this job'
+    flags: 'i'
+  - regex: 'runner.*active.*state.*hung|worker.*process.*remains.*attached'
+    flags: 'i'
+  - regex: 'A session for this runner already exists'
+    flags: 'i'
+error_messages:
+  - 'Waiting for a runner to pick up this job...'
+  - 'Requested labels: self-hosted'
+  - 'A session for this runner already exists.'
+  - 'Runner connect error: Error: Conflict. Retrying until reconnected.'
+root_cause: |
+  When a subprocess spawned by a workflow step hangs without exiting (e.g., a test runner
+  with a coverage reporter that deadlocks on pipe writes, a long-running Node.js process, or
+  any background daemon that the step does not explicitly kill), the GitHub Actions runner
+  cannot proceed to the next job — it stays in the "active" (busy) state for as long as the
+  subprocess lives.
+
+  The runner's worker process (Runner.Worker) remains attached to the hanging subprocess and
+  does not time out or kill the orphan process on its own without an explicit timeout-minutes
+  configuration at the workflow, job, or step level. GitHub's UI shows the runner as "Active"
+  and new jobs queue indefinitely with "Waiting for a runner to pick up this job..." because
+  the runner is not idle.
+
+  If the runner is force-restarted while a subprocess is still running:
+    - Non-ephemeral runners: the next run picks up normally (subprocess is orphaned)
+    - Ephemeral JIT runners: the new runner process tries to create a broker session but gets
+      HTTP 409 Conflict "A session for this runner already exists" because the previous session
+      was never cleanly closed. The runner retries every 30 seconds until the old session TTL
+      expires (typically ~2 minutes), then connects successfully.
+
+  Common hanging subprocess patterns:
+    - Test runners with coverage (vitest --coverage, jest --coverage with open handles)
+    - Node.js servers that don't call process.exit() on completion
+    - Gradle/Maven daemons that stay alive after build
+    - Background processes started with & that are not explicitly waited on or killed
+fix: |
+  1. Add timeout-minutes at the job level to enforce a hard ceiling:
+       jobs:
+         test:
+           timeout-minutes: 30
+
+  2. Add timeout-minutes at the step level for known long-running steps:
+       - name: Run tests
+         timeout-minutes: 15
+         run: npm test
+
+  3. For test runners, explicitly force exit after completion:
+       - name: Run tests
+         run: npx vitest run --coverage --reporter=verbose; pkill -P $$ node || true
+
+  4. For Node.js-based steps, set --forceExit on Jest or use vitest's --no-file-parallelism
+     to prevent open handle leaks that prevent exit.
+
+  5. If a session conflict occurs after an unexpected runner restart, wait 2–3 minutes for
+     the previous session TTL to expire before trying to reconnect.
+fix_code:
+  - language: yaml
+    label: 'Add job-level timeout to prevent runner stuck in active state'
+    code: |
+      jobs:
+        test:
+          runs-on: [self-hosted]
+          timeout-minutes: 30  # hard ceiling — runner returns to idle after 30min
+          steps:
+            - uses: actions/checkout@v4
+            - name: Install dependencies
+              run: npm ci
+            - name: Run tests with coverage
+              run: npm test -- --coverage
+  - language: yaml
+    label: 'Force-kill hanging test subprocesses after test step completes'
+    code: |
+      jobs:
+        test:
+          runs-on: [self-hosted]
+          timeout-minutes: 30
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run vitest with coverage
+              run: |
+                npx vitest run --coverage || EXIT_CODE=$?
+                # Force-kill any remaining node processes from this job
+                pkill -P $$ node 2>/dev/null || true
+                exit ${EXIT_CODE:-0}
+prevention:
+  - 'Always set timeout-minutes at the job level on self-hosted runner workflows'
+  - 'Audit test runners for open handle leaks — use --detectOpenHandles (Jest) or --no-file-parallelism (Vitest)'
+  - 'Use --forceExit on Jest to prevent coverage reporter from blocking runner exit'
+  - 'Add a post-job cleanup step with if: always() that kills background processes by process group'
+  - 'Monitor runner active-time metrics — alert when any runner stays "active" longer than your longest expected job'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4312'
+    label: 'actions/runner#4312 — Self-hosted runner gets stuck in active state, blocking queued jobs'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-jobs-in-a-workflow#setting-a-timeout-for-a-job'
+    label: 'GitHub Docs — Setting a timeout for a job'
+  - url: 'https://vitest.dev/guide/cli.html'
+    label: 'Vitest CLI docs — --no-file-parallelism and related flags'
