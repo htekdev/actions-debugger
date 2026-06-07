@@ -1,0 +1,91 @@
+id: caching-artifacts-090
+title: "Windows %LocalAppData% and %AppData% Paths Not Expanded by actions/cache"
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - windows
+  - cache
+  - environment-variables
+  - path-expansion
+  - localappdata
+patterns:
+  - regex: 'path.*%LocalAppData%|path.*%AppData%|path.*%USERPROFILE%'
+    flags: 'i'
+  - regex: 'Received 0 bytes from cache entry'
+    flags: 'i'
+error_messages:
+  - "Warning: Cache not found for input keys: windows-pip-..."
+  - "Received 0 bytes from cache entry"
+  - "Cache restored from key: ... (empty archive)"
+root_cause: |
+  Windows batch-style environment variables using `%VariableName%` notation (e.g., `%LocalAppData%`,
+  `%AppData%`, `%USERPROFILE%`) are NOT expanded by the `actions/cache` action when specified in the
+  `path:` input. The action does not shell-expand percent-notation variables — only the tilde `~`
+  shortcut is recognised and expanded to the runner home directory.
+
+  When a developer writes:
+    path: '%LocalAppData%\pip\Cache'
+
+  the cache action treats `%LocalAppData%` literally, resolving to a non-existent path. The cache
+  save step may create an empty archive (typically ~192 bytes) referencing this non-existent path.
+  On the next run, the restore step either reports a cache miss or restores the empty archive — either
+  way, the actual dependency cache is never stored or retrieved.
+
+  This is explicitly documented in the actions/cache README under "Windows environment variables":
+    "Please note that Windows environment variables (like %LocalAppData%) will NOT be expanded by
+    this action. Instead, prefer using ~ in your paths which will expand to the HOME directory."
+
+  The bug is silent: cache steps exit 0, the cache key is created in the cache store, but no usable
+  cached content is present because the path pointed to nothing real on the runner filesystem.
+fix: |
+  Replace all Windows `%ENV_VAR%` references in `path:` with tilde-based equivalents:
+    - `%LocalAppData%`  → `~\AppData\Local`
+    - `%AppData%`       → `~\AppData\Roaming`
+    - `%USERPROFILE%`   → `~`
+    - `%TEMP%`          → use `${{ runner.temp }}` or `~\AppData\Local\Temp`
+
+  Alternatively, capture the expanded path in an earlier PowerShell step, write it to `$GITHUB_ENV`,
+  and reference it via `${{ env.MY_CACHE_PATH }}` in the cache `path:` input.
+fix_code:
+  - language: yaml
+    label: "WRONG — %LocalAppData% is never expanded, cache misses every run"
+    code: |
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: '%LocalAppData%\pip\Cache'
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+  - language: yaml
+    label: "CORRECT — use ~ which expands to C:\\Users\\runneradmin on hosted runners"
+    code: |
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+  - language: yaml
+    label: "ALTERNATIVE — export path via PowerShell for dynamic resolution"
+    code: |
+      - name: Export AppData cache path
+        shell: pwsh
+        run: echo "PIP_CACHE=$env:LOCALAPPDATA\pip\Cache" >> $env:GITHUB_ENV
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PIP_CACHE }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+prevention:
+  - "Audit all Windows cache `path:` values for `%VariableName%` syntax — replace with `~\\...` equivalents."
+  - "Add a diagnostic step on first CI run that prints the effective cache path to confirm it resolves correctly."
+  - "Use `${{ runner.temp }}` for temp directory paths; use `~\\AppData\\Local` for LocalAppData equivalents."
+  - "The common pattern `%AppData%\npm` should be written as `~\\AppData\\Roaming\\npm`."
+docs:
+  - url: "https://github.com/actions/cache/blob/main/README.md"
+    label: "actions/cache README — Windows environment variables section"
+  - url: "https://github.com/actions/cache/pull/651"
+    label: "actions/cache#651 — %AppData% not expanded, cache restored to empty path"
+  - url: "https://github.com/actions/cache/pull/762"
+    label: "actions/cache#762 — Remove incorrect %AppData% / %LocalAppData% examples"
+  - url: "https://github.com/actions/cache/issues/101"
+    label: "actions/cache#101 — How to use env vars in path on Windows"
