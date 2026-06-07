@@ -1,0 +1,81 @@
+id: runner-environment-299
+title: 'ARC kubernetes-novolume: Local Composite Actions Fail — Runner Pod Cannot Find action.yml'
+category: runner-environment
+severity: error
+tags:
+  - arc
+  - actions-runner-controller
+  - kubernetes-novolume
+  - composite-action
+  - local-action
+patterns:
+  - regex: 'Can.t find .action\.yml.*action\.yaml.*Dockerfile.*_work.*Did you forget.*checkout'
+    flags: 'i'
+  - regex: 'Can.t find .action\.yml., .action\.yaml. or .Dockerfile. under.*_work'
+    flags: 'i'
+  - regex: 'RUNNER_WORKSPACE.*/__w.*action\.yml.*not found'
+    flags: 'i'
+error_messages:
+  - "Can't find 'action.yml', 'action.yaml' or 'Dockerfile' under '/home/runner/_work/org/repo/.github/actions/my-action'. Did you forget to run actions/checkout before running your local action?"
+root_cause: |
+  In ARC (Actions Runner Controller) `kubernetes-novolume` mode the runner pod and the
+  job container pod are separate with NO shared volume between them. The repository
+  checkout (via `actions/checkout`) writes files to the job container at `/__w/<org>/<repo>/`
+  but the runner pod NEVER receives those files.
+
+  When a workflow uses a local composite action reference (e.g., `uses: ./.github/actions/foo`),
+  the runner resolves `action.yml` from the runner pod's workspace path:
+    /home/runner/_work/<org>/<repo>/.github/actions/foo/action.yml
+
+  Because kubernetes-novolume does not copy the checked-out repository to the runner pod,
+  this path does not exist. The runner only receives shell scripts for individual steps
+  via `_runner_file_commands` — not the full workspace contents. Local composite action
+  resolution requires reading `action.yml` from the repository, which only exists in
+  the job container's filesystem at `/__w/`.
+
+  The error message "Did you forget to run actions/checkout?" is misleading — checkout
+  DID run and IS present in the job container, but the runner pod never sees the files.
+
+  Source: actions/runner-container-hooks#280 (open Nov 2025, confirmed by ARC maintainers
+  as a known limitation). Full workspace copy was considered but rejected as prohibitively
+  expensive.
+fix: |
+  Replace all local composite action references (`uses: ./.github/actions/<name>`) with
+  fully-qualified external references pointing to the same repository:
+
+    uses: org/repo/.github/actions/<name>@<ref>
+
+  Using an external reference causes the runner to download the action archive from
+  GitHub's API into `_work/_actions/` on the runner pod itself — bypassing the missing
+  workspace. This works reliably in kubernetes-novolume mode.
+
+  Limitation: `@main` always resolves to the default branch, not the current PR commit.
+  For workflows that test changes to composite actions, use the full commit SHA as `<ref>`.
+fix_code:
+  - language: yaml
+    label: 'Replace local path with external repo reference'
+    code: |
+      steps:
+        # ❌ Fails in kubernetes-novolume mode
+        - uses: actions/checkout@v4
+        - uses: ./.github/actions/my-action   # runner pod can't find this
+
+        # ✅ Works in kubernetes-novolume mode
+        - uses: actions/checkout@v4
+        - uses: my-org/my-repo/.github/actions/my-action@main  # runner downloads from API
+  - language: yaml
+    label: 'Pin to exact SHA for reproducible builds'
+    code: |
+      steps:
+        - uses: actions/checkout@v4
+        # Pin to the SHA you want to test, not main
+        - uses: my-org/my-repo/.github/actions/my-action@abc1234567890abcdef
+prevention:
+  - "Avoid `uses: ./.github/actions/...` references in ARC kubernetes-novolume mode — use `org/repo/.github/actions/name@ref` instead."
+  - "Test workflows with kubernetes-novolume mode on a staging scale set before migrating from kubernetes (with PVC) mode."
+  - "Track actions/runner-container-hooks#280 for an upstream fix; a proper solution would require runner-side workspace syncing."
+docs:
+  - url: 'https://docs.github.com/en/actions/tutorials/use-actions-runner-controller/deploy-runner-scale-sets#configuring-kubernetes-mode-with-container-lifecycle-hooks'
+    label: 'GitHub Docs: ARC — Kubernetes mode with container lifecycle hooks'
+  - url: 'https://github.com/actions/runner-container-hooks/issues/280'
+    label: 'runner-container-hooks#280: kubernetes-novolume breaks local composite action resolution (open)'
