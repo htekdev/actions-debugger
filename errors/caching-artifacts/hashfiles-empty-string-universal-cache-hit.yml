@@ -1,0 +1,89 @@
+id: caching-artifacts-089
+title: "hashFiles() returns empty string when no files match, silently creating universal cache key"
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - hashFiles
+  - cache-key
+  - cache-hit
+  - package-lock
+  - stale-cache
+  - silent
+patterns:
+  - regex: 'Cache restored from key:\s+\S+-\S+-\s*$'
+    flags: "im"
+  - regex: 'hashFiles\s*\(\s*[''"][^''"]+[''"]\s*\)'
+    flags: "i"
+error_messages:
+  - "Cache restored from key: Linux-deps-"
+  - "Cache hit occurred on the primary key Linux-deps-, not saving cache."
+root_cause: |
+  The hashFiles() function returns an empty string "" when no files match the
+  provided glob pattern. When used in a cache key expression such as:
+
+    key: ${{ runner.os }}-deps-${{ hashFiles('**/package-lock.json') }}
+
+  and no matching file exists in the repository, the resulting key is just:
+
+    Linux-deps-
+
+  This bare prefix key matches any previously cached archive that was also saved
+  under the same bare prefix — restoring stale or wrong dependency data silently.
+
+  The cache restore step reports success ("Cache restored from key: Linux-deps-"),
+  giving no indication that the hash was empty. No warning or error is emitted.
+
+  Common triggers:
+  - Package manager migration (npm → yarn/pnpm removes package-lock.json)
+  - Monorepo setup where the lock file is in a subdirectory not matched by the glob
+  - New workflow run before the lock file has been committed
+  - Typo in the glob pattern (e.g., '**/package-lock.json' vs '**/package.lock')
+fix: |
+  1. Verify the glob pattern matches the intended file with a debug step before
+     the cache step:
+       run: find . -name 'package-lock.json' | head -5 || echo "::warning::No lock file found"
+
+  2. Add a fallback hash to prevent a bare-prefix key:
+       key: ${{ runner.os }}-deps-${{ hashFiles('**/package-lock.json') || github.sha }}
+
+  3. Use the cache action's restore-keys selectively — they are designed for
+     partial matches and will amplify the bare-prefix problem if the primary key
+     is also a prefix.
+
+  4. In monorepos, pin to specific lock file paths instead of wide globs:
+       key: ${{ runner.os }}-deps-${{ hashFiles('frontend/package-lock.json', 'backend/package-lock.json') }}
+fix_code:
+  - language: yaml
+    label: "Fallback expression prevents empty hash from creating a universal cache key"
+    code: |
+      - name: Cache node modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          # Fallback to github.sha if no lock file exists — prevents bare-prefix key
+          key: ${{ runner.os }}-deps-${{ hashFiles('**/package-lock.json') || github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-deps-
+  - language: yaml
+    label: "Debug step — verify hashFiles glob resolves before caching"
+    code: |
+      - name: Verify lock file exists for cache key
+        run: |
+          count=$(find . -name 'package-lock.json' 2>/dev/null | wc -l)
+          if [ "$count" -eq 0 ]; then
+            echo "::warning::No package-lock.json found — hashFiles will return empty string"
+            echo "::warning::Cache key will be a bare prefix and may hit stale caches"
+          else
+            echo "Found $count lock file(s) — cache key will be properly scoped"
+          fi
+prevention:
+  - "Always verify hashFiles() glob patterns resolve to existing files before relying on them"
+  - "Use a fallback: hashFiles('**/lock.json') || github.sha to prevent bare-prefix cache keys"
+  - "After migrating package managers, update cache key glob patterns to match the new lock file name"
+  - "In monorepos, use explicit paths in hashFiles() rather than recursive globs to avoid cross-app stale cache"
+  - "Enable step debug logging (ACTIONS_STEP_DEBUG=true) to see the resolved cache key in logs"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#hashfiles"
+    label: "hashFiles() function — returns empty string when no files match"
+  - url: "https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows"
+    label: "Caching dependencies to speed up workflows"

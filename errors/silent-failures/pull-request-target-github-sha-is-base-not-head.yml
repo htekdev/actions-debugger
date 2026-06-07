@@ -1,0 +1,104 @@
+id: silent-failures-138
+title: "pull_request_target: github.sha is the base branch commit, not the PR head"
+category: silent-failures
+severity: silent-failure
+tags:
+  - pull_request_target
+  - github.sha
+  - checkout
+  - fork
+  - wrong-commit
+  - security
+patterns:
+  - regex: 'pull_request_target'
+    flags: "i"
+  - regex: 'ref:\s*\$\{\{\s*github\.sha\s*\}\}'
+    flags: "im"
+error_messages:
+  - "Checking out the ref"
+  - "HEAD is now at"
+root_cause: |
+  In workflows triggered by pull_request_target, github.sha refers to the
+  HEAD commit of the BASE branch (e.g., main), NOT the PR's head commit.
+
+  This is by design: pull_request_target runs in the context of the target
+  repository to safely provide access to secrets and write permissions, even
+  when triggered by a fork PR. The synthetic merge commit is not used here.
+
+  Consequences:
+  - actions/checkout without an explicit ref checks out the base branch
+  - Using ref: ${{ github.sha }} explicitly also checks out the base commit
+  - Tests and linting run against the base code, not the PR changes
+  - CI passes even when the PR introduces breaking changes
+  - The workflow log shows success with no indication the wrong commit was used
+
+  The correct context for the PR head commit is:
+    github.event.pull_request.head.sha
+
+  However, checking out untrusted code from a fork in a pull_request_target
+  workflow (which has access to secrets) is a known security risk — see docs.
+fix: |
+  Option 1 — If secrets are NOT needed: switch to pull_request trigger.
+  The pull_request event sets github.sha to the PR head commit correctly,
+  but the GITHUB_TOKEN is read-only for fork PRs and secrets are not available.
+
+  Option 2 — If secrets ARE needed and you must check out PR code:
+  Reference the PR head SHA explicitly and understand the security implications:
+    ref: ${{ github.event.pull_request.head.sha }}
+
+  Option 3 — Split into two workflows (recommended):
+  Use pull_request for build/test (no secrets required).
+  Use pull_request_target only for labeling, deployment, or steps that need
+  write permissions — these jobs should NOT check out the PR's code.
+fix_code:
+  - language: yaml
+    label: "Preferred: use pull_request event for build/test (secrets not available but github.sha is correct)"
+    code: |
+      on:
+        pull_request:
+          types: [opened, synchronize, reopened]
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              # github.sha correctly resolves to the PR head commit here
+            - run: npm test
+  - language: yaml
+    label: "If pull_request_target is required: checkout PR head explicitly (security risk for fork PRs)"
+    code: |
+      on:
+        pull_request_target:
+          types: [opened, synchronize, reopened]
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                # Explicitly reference PR head commit
+                # WARNING: this checks out untrusted code from fork with write-permission token
+                ref: ${{ github.event.pull_request.head.sha }}
+            - run: npm test
+  - language: yaml
+    label: "Debug: log both SHAs to confirm which commit is being tested"
+    code: |
+      - name: Show commit SHAs for debugging
+        run: |
+          echo "github.sha (BASE): ${{ github.sha }}"
+          echo "PR head SHA:       ${{ github.event.pull_request.head.sha }}"
+          echo "Checked out:       $(git rev-parse HEAD)"
+prevention:
+  - "Prefer pull_request over pull_request_target for build and test jobs that do not need repository secrets"
+  - "When using pull_request_target, never assume github.sha is the PR head — it is the base branch HEAD"
+  - "Add a debug step logging github.sha vs github.event.pull_request.head.sha to audit which commit is tested"
+  - "Review GitHub's security hardening guide before using pull_request_target with fork PR code checkout"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request_target"
+    label: "pull_request_target event — github.sha behavior explained"
+  - url: "https://securitylab.github.com/research/github-actions-preventing-pwn-requests/"
+    label: "GitHub Security Lab: Preventing pwn requests with pull_request_target"
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions"
+    label: "Security hardening for GitHub Actions"
