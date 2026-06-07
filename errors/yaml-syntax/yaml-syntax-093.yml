@@ -1,0 +1,112 @@
+id: yaml-syntax-093
+title: 'env: block forward reference — sibling variables in the same env: mapping evaluate to empty string'
+category: yaml-syntax
+severity: silent-failure
+tags:
+  - env-context
+  - forward-reference
+  - env-block
+  - variable-interpolation
+  - empty-string
+  - expression-evaluation
+patterns:
+  - regex: 'env\.\w+.*empty|env.*forward.*ref|sibling.*env.*not.*available'
+    flags: 'i'
+  - regex: '\$\{\{.*env\.\w+.*\}\}.*same.*env.*block|env.*block.*self.*reference.*empty'
+    flags: 'i'
+error_messages:
+  - 'env variable evaluates to empty string when referenced from the same env: block'
+  - 'Composed URL or path is missing the base value set in the same env: mapping'
+root_cause: |
+  GitHub Actions evaluates each entry in an env: mapping against the environment state
+  that existed BEFORE the current env: block was applied. Variables defined in the SAME
+  env: block are not visible to sibling entries within the same mapping — each entry
+  sees only previously-committed env values from outer scopes (workflow-level, job-level,
+  or previous steps), not the values being defined alongside it.
+
+  Example that silently fails:
+    env:
+      BASE_URL: 'https://api.example.com'
+      HEALTH_ENDPOINT: '${{ env.BASE_URL }}/health'  # BASE_URL is '' here!
+      API_VERSION_URL: '${{ env.BASE_URL }}/v2'      # BASE_URL is '' here!
+
+  HEALTH_ENDPOINT evaluates to '/health' and API_VERSION_URL evaluates to '/v2' because
+  env.BASE_URL has not been committed to the environment yet at the time the expressions
+  are evaluated. The workflow does not error — the env values are silently wrong.
+
+  This applies at ALL env: scopes:
+    - workflow-level env: block
+    - job-level env: block
+    - step-level env: block
+
+  A step-level env: entry CAN reference job-level or workflow-level env variables
+  (they are already set), but it CANNOT reference sibling entries defined in the same
+  step-level env: block.
+fix: |
+  Option A — Set the base variable once and compose derived values in run steps:
+    Define BASE_URL at the job or workflow level, then build derived URLs inside
+    shell steps where variable expansion ($BASE_URL) works sequentially.
+
+  Option B — Use GITHUB_ENV to compose values from a previous step:
+    Use echo "VAR=value" >> $GITHUB_ENV in one step; the next step can then
+    reference ${{ env.VAR }} from a previously-committed env value.
+
+  Option C — Reference the literal value directly in each env entry:
+    Repeat the base string in each derived entry instead of referencing a sibling.
+    Verbose but explicit and always correct.
+fix_code:
+  - language: yaml
+    label: 'Option A — compose URL in run step where sequential evaluation works'
+    code: |
+      env:
+        BASE_URL: 'https://api.example.com'   # ✅ defined once at job level
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Health check
+              run: |
+                # Shell variable expansion IS sequential — this works correctly
+                HEALTH="${BASE_URL}/health"
+                curl -f "$HEALTH"
+              env:
+                BASE_URL: ${{ env.BASE_URL }}
+  - language: yaml
+    label: 'Option B — commit base URL via GITHUB_ENV first, use in next step'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Set base URL
+              run: echo "BASE_URL=https://api.example.com" >> "$GITHUB_ENV"
+
+            - name: Use derived URL
+              # env.BASE_URL is now available because it was committed in the previous step
+              run: curl -f "${{ env.BASE_URL }}/health"
+  - language: yaml
+    label: 'Option C — repeat the literal base value (explicit, no reference)'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          env:
+            BASE_URL: 'https://api.example.com'
+            # Repeat the literal instead of referencing BASE_URL from the same block
+            HEALTH_ENDPOINT: 'https://api.example.com/health'
+            API_VERSION_URL: 'https://api.example.com/v2'
+          steps:
+            - run: curl -f "$HEALTH_ENDPOINT"
+prevention:
+  - 'Never reference a sibling env: variable from within the same env: block — it will evaluate to empty string'
+  - 'Set base values at the workflow or job level; compose derived values in run steps using shell expansion'
+  - 'Use GITHUB_ENV output from a prior step when you need to compose values from previously-set env variables'
+  - 'Verify composed env variables by adding a debug step: run: env | grep MY_VAR'
+docs:
+  - url: 'https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#jobsjob_idenv'
+    label: 'GitHub Docs: jobs.<job_id>.env — evaluation context'
+  - url: 'https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#env'
+    label: 'GitHub Docs: workflow-level env — evaluation rules'
+  - url: 'https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#setting-an-environment-variable'
+    label: 'GitHub Docs: Setting an environment variable via GITHUB_ENV'

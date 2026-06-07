@@ -1,0 +1,105 @@
+id: known-unsolved-091
+title: 'workflow_run cannot trigger another workflow_run — second-level event chaining blocked by design'
+category: known-unsolved
+severity: limitation
+tags:
+  - workflow-run
+  - chaining
+  - cascading-pipelines
+  - cd-pipeline
+  - event-trigger
+  - no-workaround
+patterns:
+  - regex: 'workflow_run.*not.*trigger.*another.*workflow_run|second.*level.*workflow_run.*not.*fired'
+    flags: 'i'
+  - regex: 'chain.*workflow_run.*not.*work|workflow_run.*downstream.*not.*triggered'
+    flags: 'i'
+error_messages:
+  - 'Downstream workflow_run event never fires when the upstream workflow was itself triggered by workflow_run'
+  - 'CD pipeline workflow not triggered after CI workflow (which was triggered by workflow_run) completes'
+root_cause: |
+  GitHub Actions explicitly prevents workflow_run events from being triggered by another
+  workflow_run event. This is a hard platform constraint documented in the GitHub Actions
+  reference: "A workflow triggered by the workflow_run event is not itself triggered by
+  another workflow_run event."
+
+  Consequence: you cannot build a 3-tier cascade like:
+    push → Workflow A (workflow_run) → Workflow B (workflow_run) → Workflow C
+
+  When Workflow A completes (triggered by push via workflow_run), Workflow B fires
+  correctly. But Workflow B's completion does NOT fire Workflow C's workflow_run trigger.
+  Workflow C is simply never triggered, silently.
+
+  This limitation exists to prevent unbounded cascading chains that could consume
+  unlimited Actions minutes and create hard-to-debug execution graphs.
+
+  There is no server-side error or warning — Workflow C simply does not start.
+fix: |
+  Replace second-level workflow_run chaining with repository_dispatch or workflow_dispatch.
+
+  Option A — repository_dispatch at the end of Workflow B:
+    Workflow B sends a repository_dispatch event at its completion step.
+    Workflow C listens on on.repository_dispatch with the matching event_type.
+
+  Option B — Merge the pipelines:
+    Combine Workflow B and Workflow C into a single workflow using job-level
+    dependencies (needs:). The entire cascade runs as one workflow run.
+
+  Option C — Re-trigger via API call:
+    Use the GitHub REST API (workflow dispatch) at the end of Workflow B to
+    trigger Workflow C by name. Requires a PAT or GitHub App token.
+fix_code:
+  - language: yaml
+    label: 'Workflow B — dispatch a repository_dispatch to trigger Workflow C'
+    code: |
+      # workflow-b.yml — triggered by workflow_run from Workflow A
+      on:
+        workflow_run:
+          workflows: ['Workflow A']
+          types: [completed]
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Run Workflow B tasks
+              run: echo "Doing Workflow B work..."
+
+            # Trigger Workflow C via repository_dispatch (NOT workflow_run)
+            - name: Trigger Workflow C
+              uses: actions/github-script@v7
+              with:
+                github-token: ${{ secrets.PAT_DISPATCH }}
+                script: |
+                  await github.rest.repos.createDispatchEvent({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    event_type: 'workflow-c-trigger',
+                    client_payload: { sha: '${{ github.event.workflow_run.head_sha }}' }
+                  });
+  - language: yaml
+    label: 'Workflow C — listen on repository_dispatch instead of workflow_run'
+    code: |
+      # workflow-c.yml — triggered by repository_dispatch, NOT workflow_run
+      on:
+        repository_dispatch:
+          types: [workflow-c-trigger]
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Deploy
+              run: echo "Deploying SHA ${{ github.event.client_payload.sha }}"
+prevention:
+  - 'Design multi-stage pipelines as a single workflow with job dependencies (needs:) where possible'
+  - 'For cross-workflow cascades, use repository_dispatch at each intermediate stage instead of workflow_run chaining'
+  - 'Document the dispatch chain explicitly — workflow_run → repository_dispatch → workflow is the supported pattern'
+  - 'Avoid relying on workflow_run for more than one level of dependency; it only reliably chains once'
+docs:
+  - url: 'https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#workflow_run'
+    label: 'GitHub Docs: workflow_run event — chaining limitation noted'
+  - url: 'https://docs.github.com/en/rest/repos/repos#create-a-repository-dispatch-event'
+    label: 'GitHub REST API: Create a repository dispatch event'
+  - url: 'https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#repository_dispatch'
+    label: 'GitHub Docs: repository_dispatch event trigger'
