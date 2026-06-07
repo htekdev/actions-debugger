@@ -1,0 +1,123 @@
+id: runner-environment-308
+title: 'ARC Ephemeral Runner Enters Zombie State After Job Is Canceled or Interrupted'
+category: runner-environment
+severity: error
+tags:
+  - arc
+  - kubernetes
+  - ephemeral-runner
+  - zombie
+  - stuck
+  - job-cancel
+  - gha-runner-scale-set
+  - cleanup
+patterns:
+  - regex: 'Skipping message Job\. Job message not found.*job was canceled'
+    flags: 'i'
+  - regex: 'job assignment is invalid: MissingKey'
+    flags: 'i'
+  - regex: 'Registration \S+ was not found'
+    flags: 'i'
+  - regex: 'acquirejob.*HTTP Status: Conflict'
+    flags: 'i'
+error_messages:
+  - "[RUNNER INFO Runner] Skipping message Job. Job message not found 'e420db7b-c780-5ae4-8145-4eea09b87aea'. job was canceled"
+  - "[RUNNER ERR GitHubActionsService] POST request to https://.../acquirejob failed. HTTP Status: Conflict"
+  - "[RUNNER INFO Runner] Skipping message Job. Job message already acquired '...'. job assignment is invalid: MissingKey"
+  - "[RUNNER ERR BrokerServer] GitHub.Services.OAuth.VssOAuthTokenRequestException: Registration xxx was not found."
+root_cause: |
+  When a GitHub Actions job is manually canceled or interrupted (e.g., via the UI, API,
+  or a workflow timeout), the ARC ephemeral runner pod may not receive a clean shutdown
+  signal. The runner enters a loop where it continuously tries to acquire or confirm the
+  canceled job but receives Conflict or MissingKey responses because the job has already
+  been canceled server-side.
+
+  The runner process does not terminate itself in this case — it stays alive in a tight
+  retry loop. The runner pod remains in the Running state indefinitely. Since the runner
+  registered as an ephemeral runner, the runner controller does not re-create a replacement
+  pod while the old pod is still alive. New workflow jobs queue but find no available
+  runner; the queue grows until pods are manually deleted.
+
+  A secondary symptom occurs when the runner's broker token expires (typically after hours
+  of being stuck): it logs "Registration <ID> was not found" and enters a crash state,
+  finally allowing the pod to terminate, but by then the job queue may have accumulated
+  many stuck runs.
+
+  Root confirmed in actions/actions-runner-controller#4307 (open Nov 2025, 11 reactions).
+  Intermittent and hard to reproduce but appears to be more common with:
+  - Long-running jobs that are manually canceled mid-execution
+  - Workflows canceled via the GitHub UI while a job is between state transitions
+  - Controller version 0.13.x on ARC scale-set mode (gha-runner-scale-set chart)
+fix: |
+  **Immediate recovery**: Delete the stuck EphemeralRunner object to force pod cleanup:
+
+  ```bash
+  # List stuck EphemeralRunners (look for pods running >1 hour with no job activity)
+  kubectl get ephemeralrunners -n <namespace>
+
+  # Delete the stuck one — controller will clean up the pod and register a fresh runner
+  kubectl delete ephemeralrunner <stuck-runner-name> -n <namespace>
+  ```
+
+  **Mitigation (automated cleanup)**: Add a cron job or Kubernetes CronJob that
+  identifies and deletes EphemeralRunner objects whose pods have been running for longer
+  than your job timeout, ensuring the runner pool self-heals:
+
+  ```bash
+  # Example: delete EphemeralRunners with Running pods older than 2 hours
+  kubectl get ephemeralrunners -n <namespace> -o json | \
+    jq -r '.items[] | select(.status.phase=="Running") |
+           select((now - (.metadata.creationTimestamp | fromdateiso8601)) > 7200) |
+           .metadata.name' | \
+    xargs -r kubectl delete ephemeralrunner -n <namespace>
+  ```
+
+  **Upgrade ARC**: Newer versions of the gha-runner-scale-set controller have improved
+  cancellation handling. Upgrade to the latest chart version before applying workarounds.
+fix_code:
+  - language: yaml
+    label: 'Kubernetes CronJob to auto-clean stuck EphemeralRunner pods older than 2 hours'
+    code: |
+      apiVersion: batch/v1
+      kind: CronJob
+      metadata:
+        name: arc-stuck-runner-cleanup
+        namespace: arc-runners    # replace with your ARC namespace
+      spec:
+        schedule: '*/15 * * * *'   # every 15 minutes
+        jobTemplate:
+          spec:
+            template:
+              spec:
+                serviceAccountName: arc-cleanup-sa  # needs get/list/delete on ephemeralrunners
+                containers:
+                  - name: cleanup
+                    image: bitnami/kubectl:latest
+                    command:
+                      - /bin/sh
+                      - -c
+                      - |
+                        STALE_SECONDS=7200  # 2-hour threshold
+                        kubectl get ephemeralrunners -n arc-runners -o json | \
+                          jq -r --argjson threshold "$STALE_SECONDS" \
+                            '.items[] |
+                             select(.status.phase=="Running") |
+                             select((now - (.metadata.creationTimestamp | fromdateiso8601)) > $threshold) |
+                             .metadata.name' | \
+                          while read name; do
+                            echo "Deleting stuck EphemeralRunner: $name"
+                            kubectl delete ephemeralrunner "$name" -n arc-runners
+                          done
+                restartPolicy: OnFailure
+prevention:
+  - 'Upgrade to the latest ARC gha-runner-scale-set chart version — cancellation handling improves across releases.'
+  - 'Set a `terminationGracePeriodSeconds` on runner pods that matches your job timeout so Kubernetes forcefully kills stuck runners eventually.'
+  - 'Monitor EphemeralRunner object age; alert if any has been Running for more than 2× the typical job duration.'
+  - 'Use `kubectl get ephemeralrunners` output in your platform health checks to detect accumulation of old pods.'
+docs:
+  - url: 'https://github.com/actions/actions-runner-controller/issues/4307'
+    label: 'actions-runner-controller#4307 — Ephemeral Runners stuck when job is canceled'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners-with-actions-runner-controller/troubleshooting-actions-runner-controller-errors'
+    label: 'Troubleshooting Actions Runner Controller errors'
+  - url: 'https://github.com/actions/actions-runner-controller/blob/main/docs/gha-runner-scale-set-controller/README.md'
+    label: 'ARC gha-runner-scale-set controller documentation'

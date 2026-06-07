@@ -1,0 +1,148 @@
+id: runner-environment-309
+title: 'actions/checkout Fails — "The ref does not point to the expected commit"'
+category: runner-environment
+severity: error
+tags:
+  - checkout
+  - ref
+  - sha
+  - force-push
+  - race-condition
+  - tag
+  - commit-mismatch
+patterns:
+  - regex: 'The ref .+ does not point to the expected commit'
+    flags: 'i'
+  - regex: 'The ref may have been updated after the workflow was triggered'
+    flags: 'i'
+  - regex: 'refs/heads/\S+ does not point to the expected commit'
+    flags: 'i'
+  - regex: 'refs/tags/\S+ does not point to the expected commit'
+    flags: 'i'
+error_messages:
+  - "Error: The ref 'refs/heads/main' does not point to the expected commit 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'. The ref may have been updated after the workflow was triggered."
+  - "Error: The ref 'refs/tags/v1.2.3' does not point to the expected commit 'abc123'. The ref may have been updated after the workflow was triggered."
+root_cause: |
+  `actions/checkout` records the expected commit SHA from the workflow trigger event
+  (`github.sha`) and verifies that the ref it checks out points to that same SHA before
+  completing. If the ref has moved since the workflow was triggered, the checkout fails
+  with this error.
+
+  **Common causes:**
+
+  1. **Force-push to a branch**: A collaborator force-pushes or rebases the branch
+     between when the push trigger fires and when the checkout step executes. The branch
+     ref now points to a different commit than the one that triggered the workflow.
+
+  2. **Tag moved or force-pushed**: A release workflow force-pushes a tag to a new
+     commit (e.g., `git tag -f v1.0.0`) between the tag-push trigger and the checkout
+     step in a downstream job. The tag SHA no longer matches `github.sha`.
+
+  3. **Transient GitHub platform degradation**: During brief API or git outages,
+     ref resolution can transiently return unexpected data. Re-running the job usually
+     resolves this. (Confirmed in actions/checkout#2378 where both concurrent jobs
+     of a PR failed simultaneously and succeeded on re-run.)
+
+  4. **Concurrent PR commit race**: In a monorepo with many concurrent PRs, a
+     `pull_request` workflow can occasionally check out a merge commit whose underlying
+     branch was pushed to again before the job started.
+
+  The checkout action intentionally validates the ref-SHA match as a safety mechanism
+  to prevent running stale or wrong code, but the error is opaque and rarely explains
+  WHICH of the four causes applies.
+fix: |
+  **Cause 1 & 4 (force-push / race)**: Pin checkout to the triggering SHA explicitly so
+  it doesn't depend on the branch ref pointing to the right commit:
+
+  ```yaml
+  - uses: actions/checkout@v4
+    with:
+      ref: ${{ github.sha }}   # checkout the exact triggering commit, not the branch tip
+  ```
+
+  Note: For pull_request events, use `github.event.pull_request.head.sha` to check
+  out the PR head, not the auto-merge commit.
+
+  **Cause 2 (moved tag)**: If your release workflow moves a tag, structure it so the
+  checkout happens BEFORE the tag is moved, or pin checkout to the original SHA:
+
+  ```yaml
+  - uses: actions/checkout@v4
+    with:
+      ref: ${{ github.sha }}   # the commit the tag pointed to at trigger time
+  ```
+
+  **Cause 3 (transient platform issue)**: Re-run the failed job. No code change needed.
+fix_code:
+  - language: yaml
+    label: 'FRAGILE — default checkout (fails if branch or tag moves post-trigger)'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            # Default: checks out whatever the ref points to NOW
+            # Fails if a force-push happened between trigger and this step
+            - uses: actions/checkout@v4
+  - language: yaml
+    label: 'ROBUST — pin to triggering SHA for branch push workflows'
+    code: |
+      on:
+        push:
+          branches: [main]
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            # Pin to the exact commit that triggered the workflow
+            # Survives force-pushes and concurrent branch updates
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.sha }}
+  - language: yaml
+    label: 'ROBUST — pin to PR head SHA for pull_request workflows'
+    code: |
+      on:
+        pull_request:
+          branches: [main]
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            # Use PR head SHA (not auto-merge commit SHA) for PR workflows
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.pull_request.head.sha }}
+  - language: yaml
+    label: 'ROBUST — pin release workflow checkout before moving the tag'
+    code: |
+      on:
+        push:
+          tags: ['v*']
+
+      jobs:
+        release:
+          runs-on: ubuntu-latest
+          steps:
+            # Checkout the original commit the tag pointed to when the workflow triggered
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.sha }}   # safe even if tag is later force-pushed
+            - name: Build release artifacts
+              run: ./scripts/build.sh
+            # Tag manipulation (if any) can happen AFTER checkout
+prevention:
+  - 'Use `ref: ${{ github.sha }}` in checkout steps for push-triggered workflows to guard against force-push race conditions.'
+  - 'For PR workflows, prefer `ref: ${{ github.event.pull_request.head.sha }}` over the default to avoid merge-commit SHA mismatches.'
+  - 'If you move or force-push tags as part of a release workflow, perform the checkout before any tag manipulation.'
+  - 'When this error appears intermittently without any force-push, re-run the job — it is likely a transient platform issue.'
+  - 'Enable automatic retry logic for checkout steps in critical release pipelines using `continue-on-error` + `retry-on-exit-code`.'
+docs:
+  - url: 'https://github.com/actions/checkout/issues/2378'
+    label: 'actions/checkout#2378 — The ref does not point to the expected commit (platform degradation)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context'
+    label: 'GitHub context — github.sha'
+  - url: 'https://github.com/actions/checkout'
+    label: 'actions/checkout — ref input documentation'
