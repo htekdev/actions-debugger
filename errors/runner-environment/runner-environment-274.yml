@@ -1,0 +1,131 @@
+id: runner-environment-274
+title: "actions/checkout@v6 Fails with 'The ref may have been updated after the workflow was triggered'"
+category: runner-environment
+severity: error
+tags:
+  - actions/checkout
+  - v6
+  - ref
+  - tag
+  - force-push
+  - race-condition
+  - breaking-change
+patterns:
+  - regex: 'The ref may have been updated after the workflow was triggered'
+    flags: 'i'
+  - regex: 'Error: The ref .* may have been updated after the workflow was triggered'
+    flags: 'i'
+  - regex: 'ref.*updated.*after.*workflow.*triggered'
+    flags: 'i'
+error_messages:
+  - "Error: The ref 'refs/tags/v1.2.3' may have been updated after the workflow was triggered."
+  - "##[error]The ref 'refs/heads/main' may have been updated after the workflow was triggered."
+  - "The ref may have been updated after the workflow was triggered. See https://github.com/actions/checkout/issues/2372"
+root_cause: |
+  `actions/checkout@v6.0.2` introduced a new ref-freshness validation check in PR #2356
+  (merged 2026-01-09). The check compares the ref's current commit SHA at checkout time
+  against the SHA that was recorded when the workflow was triggered.
+
+  If the ref (tag or branch) has been force-pushed, re-pointed, or had a new commit added
+  between the time the workflow was triggered and the time the checkout step executes,
+  checkout@v6 now fails with this error instead of silently checking out the new state.
+
+  Checkout@v4 and @v5 did NOT have this check — they would silently check out whatever
+  the ref currently pointed to. The v6 change was intended to improve tag annotation
+  handling (#290) and explicit fetch-tags support (#1471), but the added ref-freshness
+  guard introduced a regression for workflows that intentionally or inadvertently update
+  refs between trigger and checkout.
+
+  Common scenarios that trigger this error:
+  - **Release workflows**: a validate job creates a version bump commit and force-pushes
+    a tag (e.g., v0.0.61) to the new commit; a parallel test job then tries to checkout
+    the same tag but sees a different SHA than at trigger time.
+  - **Auto-commit bots**: workflows that push formatting fixes or changelog updates between
+    being triggered and running subsequent jobs.
+  - **Multi-job pipelines**: Job A updates a branch; Job B (triggered by the same push event)
+    tries to checkout but the branch SHA has changed since the event was recorded.
+  - **Repository mirroring**: mirror workflows that sync branches immediately after trigger,
+    causing the SHA to drift.
+
+  This is an open regression reported in actions/checkout#2372 and #2378 (Feb 2026).
+fix: |
+  Several workarounds exist depending on the root cause:
+
+  1. **Fetch the latest ref before checkout** — use `fetch-depth: 0` and `fetch-tags: true`
+     to ensure checkout uses the current state of the ref, not the triggered SHA.
+     Note: this may check out a different commit than intended in some release scenarios.
+
+  2. **Check out by branch/tag name, not SHA** — ensure `ref:` is a symbolic ref
+     (e.g., `refs/tags/v1.2.3` or `main`), not a pinned SHA, so checkout resolves
+     the ref at execution time rather than checking a cached trigger SHA.
+
+  3. **Separate trigger from update** — restructure the pipeline so the job that updates
+     the ref runs BEFORE the workflow is triggered (e.g., use workflow_run instead of
+     parallel needs:), eliminating the race window.
+
+  4. **Pin checkout to @v5** — as a temporary measure until the issue is resolved upstream
+     in actions/checkout.
+fix_code:
+  - language: yaml
+    label: "Workaround — fetch full history to allow ref re-resolution at checkout time"
+    code: |
+      steps:
+        # Using fetch-depth: 0 ensures the checkout action re-fetches the ref
+        # rather than relying on the SHA cached at workflow-trigger time.
+        - uses: actions/checkout@v6
+          with:
+            ref: ${{ github.ref }}
+            fetch-depth: 0
+            fetch-tags: true
+  - language: yaml
+    label: "Structural fix — use workflow_run to chain jobs after the ref-update job"
+    code: |
+      # workflow 1: validate.yml — creates version bump commit, force-pushes tag
+      name: Validate and tag
+      on: push
+      jobs:
+        validate:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v6
+            - run: ./scripts/bump-version.sh
+            - run: git tag -f v$VERSION && git push origin refs/tags/v$VERSION --force
+
+      # workflow 2: test.yml — triggered AFTER validate finishes (not in parallel)
+      name: Test
+      on:
+        workflow_run:
+          workflows: ["Validate and tag"]
+          types: [completed]
+      jobs:
+        test:
+          if: ${{ github.event.workflow_run.conclusion == 'success' }}
+          runs-on: ubuntu-latest
+          steps:
+            # workflow_run fires AFTER validate is done — ref is now stable
+            - uses: actions/checkout@v6
+              with:
+                ref: ${{ github.event.workflow_run.head_sha }}
+  - language: yaml
+    label: "Temporary pin to checkout@v5 to avoid the regression"
+    code: |
+      steps:
+        # Pin to v5 until checkout@v6 resolves the ref-freshness regression
+        # Track: https://github.com/actions/checkout/issues/2372
+        - uses: actions/checkout@v5
+          with:
+            ref: ${{ github.ref }}
+prevention:
+  - "Avoid updating refs (force-pushes, new commits) in Job A of a pipeline while Job B in the same triggered run tries to checkout the same ref."
+  - "In release workflows, chain the version-bump step to run BEFORE the checkout-dependent jobs via `workflow_run` rather than parallel `needs:` ordering."
+  - "If using `actions/checkout@v6` with tags in release pipelines, test the tag-push → checkout → test sequence end-to-end after upgrading from v4/v5."
+  - "Monitor actions/checkout#2372 for an official fix from the maintainer team."
+docs:
+  - url: "https://github.com/actions/checkout/issues/2372"
+    label: "actions/checkout#2372 — 'ref may have been updated' is a regression in checkout@v6 (open Feb 2026)"
+  - url: "https://github.com/actions/checkout/issues/2378"
+    label: "actions/checkout#2378 — Same error appearing for 'repository not found' scenario (open Feb 2026)"
+  - url: "https://github.com/actions/checkout/commit/de0fac2e4500dabe0009e67214ff5f5447ce83dd"
+    label: "actions/checkout PR #2356 — Fix tag handling that introduced the ref-freshness check"
+  - url: "https://github.com/troykelly/openclaw-projects/issues/2588"
+    label: "openclaw-projects#2588 — Release workflow failing at checkout after validate job force-pushes tag"

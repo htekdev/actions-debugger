@@ -1,0 +1,118 @@
+id: permissions-auth-086
+title: "checkout@v5 Intermittently Fails Push with 'Unable to Determine if Workflow Can Be Updated — workflows Scope May Be Required'"
+category: permissions-auth
+severity: error
+tags:
+  - actions/checkout
+  - v5
+  - workflows-scope
+  - push
+  - intermittent
+  - github-token
+  - timeout
+patterns:
+  - regex: 'Unable to determine if workflow can be created or updated due to timeout'
+    flags: 'i'
+  - regex: 'Unable to determine if workflow can be created or updated.*workflows.*scope.*may be required'
+    flags: 'i'
+  - regex: 'remote: error: Unable to determine if workflow.*timeout.*workflows.*scope'
+    flags: 'im'
+error_messages:
+  - "remote: error: Unable to determine if workflow can be created or updated due to timeout; `workflows` scope may be required."
+  - "! [remote rejected] HEAD -> deploy/<branch> (Unable to determine if workflow can be created or updated due to timeout; `workflows` scope may be required.)"
+  - "error: failed to push some refs to 'https://github.com/<org>/<repo>'"
+root_cause: |
+  `actions/checkout@v5` changed how the persisted Git credential helper interacts with
+  GitHub's server-side workflow-permission check. When a workflow pushes a branch (e.g.,
+  archival/deploy branches) that has previously contained — or GitHub suspects might contain
+  — `.github/workflows/` files, GitHub performs a server-side check to determine whether
+  the push would modify workflow files.
+
+  In checkout@v5, this check is triggered more aggressively than in v4. If GitHub's
+  server-side check times out (typically due to large pushes, high API load, or repository
+  size), the push is rejected with "Unable to determine if workflow can be created or
+  updated due to timeout; `workflows` scope may be required." — even when the branch does
+  NOT contain workflow file changes.
+
+  The error message misleads developers into thinking they need to add `workflow` scope to
+  their GITHUB_TOKEN or PAT. However, the root cause is a transient GitHub API timeout, not
+  a missing permission. The same workflow and push succeed when run again, often immediately.
+
+  Specific conditions that increase timeout likelihood:
+  - Branches with a long commit history that includes `.github/workflows/` changes in the past
+  - Force-pushes resetting archival/deploy branches to a new base
+  - Large repositories with many changed files in the push
+  - High GitHub API load periods
+
+  This behavior was first reported after upgrading from checkout@v4 to @v5 because v5
+  changed the credential helper implementation (Node.js 24 runtime) and how it serialises
+  the push token context.
+fix: |
+  This error is intermittent and transient — in most cases, simply re-running the workflow
+  resolves it. However, to reduce frequency:
+
+  1. **Add `persist-credentials: true` explicitly** (it is the default but explicit is clearer):
+     This ensures credentials are cached correctly on the first checkout and not re-negotiated
+     during the push.
+
+  2. **Use a PAT with `workflow` scope** instead of GITHUB_TOKEN if the branch ever contains
+     or has historically contained workflow files. This sidesteps the server-side check entirely
+     because the token already has the permission.
+
+  3. **Pin push operations to use `GH_TOKEN` with the workflow scope**:
+     If you need to push from a workflow that modifies non-workflow files on branches that once
+     had workflow history, use `secrets.WORKFLOW_PAT` for the credential.
+
+  4. **Add a retry wrapper** around the git push step using `stefanzweifel/git-auto-commit-action`
+     or a shell retry loop, since the timeout is transient.
+
+  Note: This is an open issue in `actions/checkout` (#2287) with no fix released as of June 2026.
+fix_code:
+  - language: yaml
+    label: "Workaround — add explicit persist-credentials and retry push on failure"
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v5
+              with:
+                token: ${{ secrets.GITHUB_TOKEN }}
+                persist-credentials: true  # explicit (this is the default)
+
+            # ... build steps ...
+
+            - name: Push deploy branch (with retry for intermittent timeout)
+              run: |
+                for i in 1 2 3; do
+                  git push origin HEAD:deploy/main && break || {
+                    echo "Push attempt $i failed, retrying in 5s..."
+                    sleep 5
+                  }
+                done
+  - language: yaml
+    label: "Long-term fix — use PAT with workflow scope to bypass the server-side check"
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            # Use a PAT with 'workflow' scope — avoids the server-side timeout check entirely
+            - uses: actions/checkout@v5
+              with:
+                token: ${{ secrets.WORKFLOW_PAT }}  # classic PAT with workflow scope
+
+            - name: Push deploy branch
+              run: git push origin HEAD:deploy/main
+prevention:
+  - "When upgrading from checkout@v4 to @v5 in push-heavy workflows, test with force-pushes and large payloads to surface intermittent timeout failures before production rollout."
+  - "Use a PAT with `workflow` scope for any workflow that pushes branches with a history of containing `.github/workflows/` files, regardless of current push content."
+  - "Add retry logic around git push steps in automated deploy/archival workflows to handle transient GitHub API timeouts."
+  - "Monitor the actions/checkout issue tracker (#2287) for an official fix — GitHub may change the server-side timeout behaviour in a future update."
+docs:
+  - url: "https://github.com/actions/checkout/issues/2287"
+    label: "actions/checkout#2287 — checkout@v5 intermittently requires workflow-scope token to push (11 reactions, open)"
+  - url: "https://github.com/tenstorrent/tt-metal/issues/32354"
+    label: "tenstorrent/tt-metal#32354 — Mirroring workflow stopped working (workflow scope timeout, Nov 2025)"
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#permissions-for-the-github_token"
+    label: "GitHub Docs — GITHUB_TOKEN permissions reference"
