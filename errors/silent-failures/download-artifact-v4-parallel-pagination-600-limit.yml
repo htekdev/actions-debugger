@@ -1,0 +1,126 @@
+id: 'silent-failures-148'
+title: 'download-artifact@v4 parallel pagination fetches only 600 of 1000+ artifacts'
+category: silent-failures
+severity: silent-failure
+tags:
+  - download-artifact
+  - pagination
+  - artifacts
+  - large-matrix
+  - parallel-fetch
+  - v4
+patterns:
+  - regex: 'Workflow run \d+ has more than 1000 artifacts\. Results will be incomplete'
+    flags: 'i'
+  - regex: 'Found (\d+) artifact\(s\).*only.*first 1000'
+    flags: 'i'
+error_messages:
+  - 'Warning: Workflow run 11844124814 has more than 1000 artifacts. Results will be incomplete as only the first 1000 artifacts will be returned'
+  - 'Found 600 artifact(s)'
+root_cause: |
+  `actions/download-artifact@v4` fetches the artifact list using concurrent parallel requests.
+  When a workflow run has more than 1000 artifacts, the action spawns concurrent page fetches
+  but only requests even-numbered pages (2, 4, 6, 8, 10) due to how its parallel pagination
+  loop is implemented. Each page holds 100 artifacts, so 10 even pages × 100 = 1000 max,
+  but because odd pages are skipped the effective cap is 600 artifacts (6 even pages × 100),
+  not the 1000 advertised in the warning.
+
+  The warning message "only the first 1000 artifacts will be returned" is itself misleading —
+  the real ceiling in practice is 600. Any artifact whose alphabetical sort position falls on
+  an odd page is silently omitted. Downstream aggregation jobs then process incomplete data
+  and produce wrong results with a successful exit code.
+
+  This affects large matrix workflows where each parallel job uploads one or more artifacts
+  (e.g., 200 matrix jobs × 3–6 artifacts each = 600–1200 total artifacts per run).
+
+  Source: actions/download-artifact#363 (Nov 2024, still open).
+fix: |
+  Keep per-run artifact counts below 1000 by restructuring the matrix strategy:
+
+  1. **Reduce total artifact count**: Upload a single consolidated artifact per matrix job
+     (e.g., bundle all outputs into one archive) rather than multiple individual artifacts.
+
+  2. **Use artifact name patterns**: Download with `pattern:` input to target only the
+     artifacts you need rather than downloading all artifacts for the run.
+
+  3. **Split into multiple workflow runs**: If >1000 artifacts is unavoidable, shard
+     the matrix across multiple workflow_dispatch runs and combine results externally.
+
+  4. **Use GitHub API directly**: For precise control, use `actions/github-script` to
+     paginate the Artifacts REST API manually and download each artifact by ID.
+fix_code:
+  - language: yaml
+    label: 'Consolidate artifacts per matrix job to stay below the 1000-artifact limit'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              shard: [1, 2, 3, 4, 5]
+          runs-on: ubuntu-latest
+          steps:
+            - name: Run tests and collect all results
+              run: |
+                ./run-tests.sh --shard ${{ matrix.shard }}
+                # Bundle all outputs into ONE artifact per matrix job
+                tar czf results-${{ matrix.shard }}.tar.gz ./test-results/
+
+            # Upload ONE artifact per matrix job, not one per test file
+            - uses: actions/upload-artifact@v4
+              with:
+                name: results-shard-${{ matrix.shard }}
+                path: results-${{ matrix.shard }}.tar.gz
+
+        aggregate:
+          needs: build
+          runs-on: ubuntu-latest
+          steps:
+            # Now downloads only 5 artifacts total (one per shard)
+            - uses: actions/download-artifact@v4
+              with:
+                pattern: 'results-shard-*'
+                merge-multiple: true
+  - language: yaml
+    label: 'Use GitHub Script to paginate artifact list manually when >1000 artifacts required'
+    code: |
+      jobs:
+        aggregate:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Download all artifacts via API pagination
+              uses: actions/github-script@v7
+              with:
+                script: |
+                  const fs = require('fs');
+                  const runId = context.runId;
+                  let page = 1;
+                  let allArtifacts = [];
+
+                  while (true) {
+                    const { data } = await github.rest.actions.listWorkflowRunArtifacts({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      run_id: runId,
+                      per_page: 100,
+                      page: page,
+                    });
+                    allArtifacts = allArtifacts.concat(data.artifacts);
+                    if (data.artifacts.length < 100) break;
+                    page++;
+                  }
+
+                  console.log(`Total artifacts found: ${allArtifacts.length}`);
+                  // Download each artifact by ID...
+prevention:
+  - 'Keep the total number of artifacts per workflow run below 1000 by consolidating outputs'
+  - 'Upload one artifact per matrix job, not one per test file or sub-result'
+  - 'Use artifact name patterns (pattern: input) to download only required artifacts'
+  - 'Monitor artifact counts in large matrix workflows — add a step that logs artifact count'
+  - 'Consider using a blob store (S3, GCS) or GitHub Releases for builds with hundreds of outputs'
+docs:
+  - url: 'https://github.com/actions/download-artifact/issues/363'
+    label: 'actions/download-artifact#363: Only 600 of 1243 artifacts are downloaded'
+  - url: 'https://github.com/actions/download-artifact?tab=readme-ov-file#inputs'
+    label: 'actions/download-artifact: Inputs reference (name and pattern)'
+  - url: 'https://docs.github.com/en/rest/actions/artifacts'
+    label: 'GitHub REST API: List workflow run artifacts (paginated)'

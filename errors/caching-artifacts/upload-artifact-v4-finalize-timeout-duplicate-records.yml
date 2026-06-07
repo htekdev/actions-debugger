@@ -1,0 +1,118 @@
+id: 'caching-artifacts-095'
+title: 'upload-artifact@v4 FinalizeArtifact RPC timeout creates duplicate artifact records'
+category: caching-artifacts
+severity: error
+tags:
+  - upload-artifact
+  - finalize-artifact
+  - duplicate
+  - timeout
+  - retry
+  - large-artifact
+  - self-hosted
+patterns:
+  - regex: 'Attempt \d+ of \d+ failed with error: Request timeout: .*/FinalizeArtifact'
+    flags: 'i'
+  - regex: 'More than one artifact found for a single name, returning newest'
+    flags: 'i'
+  - regex: 'FinalizeArtifact.*Retrying request in \d+ ms'
+    flags: 'i'
+error_messages:
+  - 'Attempt 1 of 5 failed with error: Request timeout: /twirp/github.actions.results.api.v1.ArtifactService/FinalizeArtifact. Retrying request in 3000 ms...'
+  - '##[debug]More than one artifact found for a single name, returning newest (id: ...)'
+  - 'Found 2 artifact(s)'
+root_cause: |
+  `actions/upload-artifact@v4` uploads artifact content to blob storage in chunks, then
+  calls the `FinalizeArtifact` gRPC-over-Twirp RPC to register the completed upload in
+  GitHub's artifact service. If the network round-trip for `FinalizeArtifact` exceeds the
+  client-side timeout (default 30 seconds as of toolkit PR#1774), the action logs a timeout
+  error and retries up to 5 times with exponential back-off.
+
+  The server may have already processed the first `FinalizeArtifact` call before the timeout
+  fired on the client. When the retry succeeds, a second artifact record is created with the
+  same name — both records pointing to the same blob content but with different database IDs
+  and timestamps.
+
+  Consequences:
+  - `download-artifact@v4` prints "More than one artifact found for a single name, returning
+    newest (id: N)" and returns only the most recent record — the older record is silently
+    ignored but still counts against artifact storage quota.
+  - Actions that list artifacts (e.g., `geekyeggo/delete-artifact`, custom scripts) find
+    unexpected duplicates and may delete the wrong record, leaving dangling references.
+  - `actions/deploy-pages` will error with "An artifact with this name already exists" on
+    re-runs because the duplicate record from the first run is still present.
+
+  Most likely to occur with:
+  - Large artifacts (>1 GB) on self-hosted runners with high-latency network to GitHub
+  - Self-hosted runners behind a proxy or NAT that resets connections after idle timeout
+  - Any runner experiencing transient network congestion during the finalize RPC call
+
+  Source: actions/upload-artifact#531 (open since Feb 2024, v4 label).
+fix: |
+  1. **Use `overwrite: true`** on the `upload-artifact` step. When `overwrite: true` is
+     set and a duplicate finalize creates a second record, the action attempts to clean up
+     the older record. This is the recommended short-term mitigation.
+
+  2. **Increase network reliability**: On self-hosted runners, ensure the runner host has
+     a stable, low-latency path to `results-receiver.actions.githubusercontent.com`. Avoid
+     aggressive firewall idle-connection timeouts that reset long-lived HTTP/2 streams.
+
+  3. **Delete duplicate artifacts explicitly**: If duplicates are detected downstream (e.g.,
+     your pipeline sees `Found 2 artifact(s)` for one name), use the REST API to delete the
+     older duplicate by its database ID before proceeding with the download step.
+
+  4. **Pin to latest upload-artifact version**: The chunk timeout was regressed from 5 min
+     to 30 s in a toolkit change; later versions restored sensible defaults. Keep
+     `actions/upload-artifact` pinned to the latest patch release.
+fix_code:
+  - language: yaml
+    label: 'Use overwrite: true to handle duplicate finalize records on retry'
+    code: |
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ github.run_id }}
+          path: ./dist/
+          overwrite: true  # Clean up duplicate records if FinalizeArtifact retry fires
+  - language: yaml
+    label: 'Delete older duplicate artifact via REST API when download reports multiple records'
+    code: |
+      - name: Remove duplicate artifacts (defensive cleanup)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const artifactName = 'build-${{ github.run_id }}';
+            const { data } = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId,
+            });
+
+            const duplicates = data.artifacts
+              .filter(a => a.name === artifactName)
+              .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+            // Keep only the newest; delete all older duplicates
+            for (const dup of duplicates.slice(1)) {
+              console.log(`Deleting duplicate artifact id=${dup.id} created_at=${dup.created_at}`);
+              await github.rest.actions.deleteArtifact({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                artifact_id: dup.id,
+              });
+            }
+prevention:
+  - 'Always set overwrite: true on upload-artifact steps in workflows that may be re-run'
+  - 'Keep actions/upload-artifact pinned to the latest patch release to get timeout fixes'
+  - 'Ensure self-hosted runner network path to results-receiver.actions.githubusercontent.com is stable'
+  - 'Avoid firewall rules that reset HTTP/2 connections after short idle periods on runner hosts'
+  - 'Monitor artifact counts per run — more than one artifact with the same name signals a duplicate'
+docs:
+  - url: 'https://github.com/actions/upload-artifact/issues/531'
+    label: 'actions/upload-artifact#531: Duplicate artifacts after FinalizeArtifact timeout'
+  - url: 'https://github.com/actions/toolkit/pull/1774'
+    label: 'actions/toolkit#1774: Fix artifact upload chunk timeout logic'
+  - url: 'https://github.com/actions/upload-artifact?tab=readme-ov-file#inputs'
+    label: 'actions/upload-artifact: Inputs reference (overwrite option)'
+  - url: 'https://docs.github.com/en/rest/actions/artifacts'
+    label: 'GitHub REST API: Delete an artifact'

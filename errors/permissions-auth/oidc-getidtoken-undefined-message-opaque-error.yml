@@ -1,0 +1,130 @@
+id: 'permissions-auth-091'
+title: 'OIDC getIDToken throws "Cannot read properties of undefined (reading ''message'')" masking real error'
+category: permissions-auth
+severity: error
+tags:
+  - oidc
+  - getidtoken
+  - configure-aws-credentials
+  - azure-login
+  - ghes
+  - tls
+  - custom-ca
+patterns:
+  - regex: 'Cannot read propert(?:ies|y) of undefined \(reading .message.\)'
+    flags: 'i'
+  - regex: 'Error message: Cannot read properties of undefined'
+    flags: 'i'
+  - regex: 'Failed to fetch federated token from GitHub.*Cannot read properties of undefined'
+    flags: 'i'
+error_messages:
+  - 'Error: Error message: Cannot read properties of undefined (reading ''message'')'
+  - 'Error: Failed to fetch federated token from GitHub. Please make sure to give write permissions to id-token in the workflow.'
+  - 'Error: Login failed with Error: Error message: Cannot read properties of undefined (reading ''message''). Double check if the ''auth-type'' is correct.'
+root_cause: |
+  The `@actions/core` `getIDToken()` function in the GitHub Actions toolkit catches
+  all errors from the OIDC token HTTP request and re-throws them with:
+
+      throw new Error(`Error message: ${error.message}`)
+
+  When the underlying network failure returns a non-Error object (e.g., a plain object,
+  null, or undefined — which can happen with certain Node.js TLS rejection events,
+  HTTP/2 RST_STREAM responses, or GHES proxy interruptions), `error.message` itself is
+  undefined. The re-throw then produces the confusing message "Cannot read properties of
+  undefined (reading 'message')" — a meta-error that completely hides the real failure.
+
+  Common root causes behind the opaque message:
+  - **GHES with custom CA**: The runner does not trust the GHES TLS certificate because
+    `NODE_EXTRA_CA_CERTS` is not set. Node.js rejects the TLS handshake with a non-Error
+    object path in some versions.
+  - **Transient OIDC service overload**: GitHub's token-issuance endpoint occasionally
+    returns a 5xx with an empty body; the toolkit's response parser produces undefined.
+  - **Proxy/firewall blocking ACTIONS_ID_TOKEN_REQUEST_URL**: The OIDC token URL is
+    reachable for most requests but intermittently blocked by a corporate proxy, producing
+    a connection reset that surfaces as an undefined error object.
+  - **Rate limiting under parallel matrix jobs**: With many concurrent jobs all fetching
+    OIDC tokens simultaneously, some requests are throttled and return malformed errors.
+    (See also: `oidc-token-rate-limited-large-parallel-matrix`.)
+
+  Affects `aws-actions/configure-aws-credentials`, `Azure/login`, `google-github-actions/auth`,
+  and any custom action that calls `core.getIDToken()`.
+
+  Source: actions/toolkit#1441 (open since Jun 2023, 9 reactions); Azure/login#508 (Feb 2025).
+fix: |
+  Diagnose the real cause by enabling debug logging, then apply the appropriate fix:
+
+  1. **Enable debug logging** to expose the actual HTTP error before the catch block
+     swallows it: set the `ACTIONS_STEP_DEBUG` secret to `true` in your repo settings.
+
+  2. **GHES / custom CA**: Set `NODE_EXTRA_CA_CERTS` to the path of your CA bundle
+     so Node.js trusts the TLS certificate when making the OIDC token request.
+
+  3. **Verify `id-token: write` permission** is set at the job level (not just the
+     workflow level). Missing this permission produces a similar opaque error in some
+     action versions.
+
+  4. **Add retry logic**: For intermittent failures, use a step-level retry or the
+     `nick-fields/retry` action around the OIDC-dependent step.
+
+  5. **Check proxy configuration**: If running on a self-hosted runner behind a
+     corporate proxy, ensure `ACTIONS_ID_TOKEN_REQUEST_URL` is on the proxy allowlist.
+fix_code:
+  - language: yaml
+    label: 'Enable debug logging to reveal the real error behind the opaque message'
+    code: |
+      # In repository Settings → Secrets and variables → Actions, add:
+      # Secret name:  ACTIONS_STEP_DEBUG
+      # Secret value: true
+      #
+      # Then re-run the failed job. The debug output will show the actual HTTP
+      # error from the getIDToken request before the catch block masks it.
+  - language: yaml
+    label: 'Set NODE_EXTRA_CA_CERTS for GHES with a custom TLS certificate authority'
+    code: |
+      jobs:
+        deploy:
+          runs-on: self-hosted
+          permissions:
+            id-token: write
+            contents: read
+          steps:
+            - name: Configure custom CA for OIDC token fetch
+              run: |
+                echo "NODE_EXTRA_CA_CERTS=/etc/ssl/certs/my-company-ca.pem" >> $GITHUB_ENV
+
+            - name: Configure AWS credentials (OIDC)
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-to-assume: arn:aws:iam::123456789012:role/MyRole
+                aws-region: us-east-1
+  - language: yaml
+    label: 'Ensure id-token write permission at job level (required, not just workflow level)'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          permissions:
+            id-token: write   # REQUIRED at job level for OIDC
+            contents: read
+          steps:
+            - name: Authenticate to cloud provider
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+                aws-region: us-east-1
+prevention:
+  - 'Always enable ACTIONS_STEP_DEBUG when diagnosing opaque OIDC errors'
+  - 'Set NODE_EXTRA_CA_CERTS on self-hosted runners with custom certificate authorities'
+  - 'Declare id-token: write at the job level, not only at the workflow level'
+  - 'Add retry logic around cloud-login steps for transient OIDC token fetch failures'
+  - 'Ensure the OIDC token URL (ACTIONS_ID_TOKEN_REQUEST_URL) is accessible through corporate proxies'
+  - 'For parallel matrix jobs, use max-parallel to reduce concurrent OIDC token requests'
+docs:
+  - url: 'https://github.com/actions/toolkit/issues/1441'
+    label: 'actions/toolkit#1441: "Cannot read properties of undefined (reading ''message'')" on getIdToken'
+  - url: 'https://github.com/Azure/login/issues/508'
+    label: 'Azure/login#508: Error message: Cannot read properties of undefined (reading ''message'')'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect'
+    label: 'GitHub Docs: About security hardening with OpenID Connect'
+  - url: 'https://docs.github.com/en/actions/monitoring-and-troubleshooting-workflows/enabling-debug-logging'
+    label: 'GitHub Docs: Enabling debug logging'
