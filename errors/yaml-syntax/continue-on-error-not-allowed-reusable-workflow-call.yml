@@ -1,0 +1,95 @@
+id: yaml-syntax-086
+title: "continue-on-error Not Allowed on Jobs That Call Reusable Workflows"
+category: yaml-syntax
+severity: error
+tags:
+  - continue-on-error
+  - reusable-workflow
+  - workflow-call
+  - schema-validation
+  - uses
+patterns:
+  - regex: 'Property continue-on-error is not allowed'
+    flags: 'i'
+  - regex: 'continue-on-error[^#\n]*\n[^#\n]*uses:'
+    flags: 'im'
+error_messages:
+  - "Property continue-on-error is not allowed."
+  - "continue-on-error is not a valid property for this job"
+root_cause: |
+  The `continue-on-error` property is not supported on jobs that call a reusable workflow via the
+  `uses:` key. GitHub Actions validates workflow YAML against a schema, and the schema for
+  reusable-workflow caller jobs (`uses:` jobs) only permits a restricted set of properties.
+
+  Properties SUPPORTED on jobs with `uses:` (reusable workflow callers):
+    `uses`, `with`, `secrets`, `needs`, `if`, `permissions`, `strategy`, `name`, `concurrency`
+
+  Properties NOT supported (schema error if present on a `uses:` job):
+    `continue-on-error`, `runs-on`, `steps`, `container`, `services`, `environment`, `outputs`
+
+  Developers commonly add `continue-on-error: true` to a matrix of reusable workflow call jobs
+  intending to prevent the overall matrix from failing when one variant fails. The correct mechanism
+  for that intent is `strategy.fail-fast: false` — but using `continue-on-error` instead produces
+  a hard schema validation error that prevents the entire workflow file from running.
+
+  The error surfaces at workflow-parse time (before any jobs run) and typically appears as
+  "Property continue-on-error is not allowed" in the workflow run's annotation or in a linter like
+  actionlint. The workflow file is rejected in its entirety.
+fix: |
+  Remove `continue-on-error` from any job that uses `uses:` to call a reusable workflow.
+  For matrix resilience (allow other variants to continue when one fails), use `strategy.fail-fast: false`.
+  For making a reusable workflow call truly optional in the broader pipeline, check its `result`
+  in downstream jobs using `needs.<job>.result` with `if: always()`.
+fix_code:
+  - language: yaml
+    label: "WRONG — continue-on-error on a reusable call job causes schema validation error"
+    code: |
+      jobs:
+        deploy:
+          strategy:
+            matrix:
+              environment: [staging, production]
+          uses: ./.github/workflows/deploy.yml
+          with:
+            env: ${{ matrix.environment }}
+          continue-on-error: true   # ERROR: "Property continue-on-error is not allowed"
+  - language: yaml
+    label: "CORRECT — use strategy.fail-fast: false to allow other matrix variants to continue"
+    code: |
+      jobs:
+        deploy:
+          strategy:
+            fail-fast: false        # allows remaining matrix variants to run on failure
+            matrix:
+              environment: [staging, production]
+          uses: ./.github/workflows/deploy.yml
+          with:
+            env: ${{ matrix.environment }}
+  - language: yaml
+    label: "CORRECT — make a reusable call optional by checking result downstream"
+    code: |
+      jobs:
+        optional-check:
+          uses: ./.github/workflows/optional-check.yml
+
+        next-job:
+          needs: optional-check
+          if: always() && needs.optional-check.result != 'cancelled'
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "optional check result: ${{ needs.optional-check.result }}"
+            - name: Handle failure gracefully
+              if: needs.optional-check.result == 'failure'
+              run: echo "optional check failed — continuing anyway"
+prevention:
+  - "Do not use `continue-on-error` on `uses:` jobs — it is a schema error; use `strategy.fail-fast: false` instead."
+  - "Run actionlint (or the VS Code GitHub Actions extension) locally to catch unsupported property combinations before pushing."
+  - "Consult the GitHub docs list of properties valid for reusable workflow caller jobs before adding any job-level keys."
+  - "Remember the distinction: `fail-fast: false` keeps other matrix variants running; `continue-on-error` marks the job outcome as success even on failure — the latter is not available for `uses:` jobs."
+docs:
+  - url: "https://docs.github.com/en/actions/sharing-automations/reusing-workflows#calling-a-reusable-workflow"
+    label: "Calling a reusable workflow — supported job properties"
+  - url: "https://stackoverflow.com/questions/77617682"
+    label: "Stack Overflow: Cannot use continue-on-error in a job that uses a reusable workflow"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idstrategy"
+    label: "workflow syntax — strategy.fail-fast"

@@ -1,0 +1,106 @@
+id: triggers-084
+title: "workflow_run with types:[completed] Fires Early with Null Conclusion Before Upstream Finishes"
+category: triggers
+severity: warning
+tags:
+  - workflow_run
+  - completed
+  - early-trigger
+  - conclusion
+  - double-fire
+patterns:
+  - regex: 'workflow_run.*types.*\[.*completed'
+    flags: 'i'
+  - regex: 'github\.event\.workflow_run\.conclusion.*==.*null'
+    flags: 'i'
+error_messages:
+  - "Deploy workflow triggered while CI is still running"
+  - "github.event.workflow_run.conclusion: ''"
+root_cause: |
+  The `workflow_run` event with `types: [completed]` is documented to fire only after the referenced
+  workflow finishes. A known platform bug (actions/runner#4035, filed 2025-09-10) causes the event
+  to fire TWICE per upstream run:
+
+  1. Once immediately after the upstream workflow is *requested* (~12 seconds after it starts),
+     with `github.event.workflow_run.conclusion` equal to `null` or an empty string and
+     `github.event.workflow_run.status` equal to `"in_progress"`.
+  2. Once correctly after the upstream workflow finishes, with the expected conclusion value
+     (`'success'`, `'failure'`, `'cancelled'`, etc.).
+
+  The first, premature trigger creates a ghost workflow run in the Actions history tab. Jobs gated on
+  `if: github.event.workflow_run.conclusion == 'success'` are correctly skipped (conclusion is null),
+  but the run consumes runner allocation, clutters deployment environment histories with "Skipped"
+  entries, and makes debugging deployment sequences harder.
+
+  Without a conclusion guard, the premature trigger can cause downstream jobs to execute (e.g.,
+  deploys, notifications) while the upstream CI is still in progress — deploying unvalidated code
+  or sending false success alerts.
+fix: |
+  Always gate every job in a `workflow_run`-triggered workflow on the conclusion value. This turns
+  the premature trigger into a clean skip while letting the real completion trigger proceed normally:
+
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+
+  For workflows that must handle multiple conclusions (notifications, multi-outcome handlers), guard
+  against the early-fire null value explicitly before branching on the outcome:
+
+    if: ${{ github.event.workflow_run.conclusion != '' }}
+fix_code:
+  - language: yaml
+    label: "WRONG — no conclusion check; deploy job runs on the premature null-conclusion trigger"
+    code: |
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./deploy.sh   # executes while CI is still in progress!
+  - language: yaml
+    label: "CORRECT — gate on conclusion; premature trigger is safely skipped"
+    code: |
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          if: ${{ github.event.workflow_run.conclusion == 'success' }}
+          steps:
+            - run: ./deploy.sh
+
+        notify-failure:
+          runs-on: ubuntu-latest
+          if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+          steps:
+            - run: ./notify-slack.sh "CI failed"
+  - language: yaml
+    label: "DEBUGGING — log conclusion and status to distinguish early-fire from real trigger"
+    code: |
+      jobs:
+        debug-trigger:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Log workflow_run event context
+              run: |
+                echo "conclusion : ${{ github.event.workflow_run.conclusion }}"
+                echo "status     : ${{ github.event.workflow_run.status }}"
+                echo "run_id     : ${{ github.event.workflow_run.id }}"
+                echo "run_number : ${{ github.event.workflow_run.run_number }}"
+              # early-fire: conclusion='', status='in_progress'
+              # real trigger: conclusion='success'/'failure', status='completed'
+prevention:
+  - "Always add `if: github.event.workflow_run.conclusion == 'success'` to every job in a workflow_run-triggered workflow."
+  - "Never assume `types: [completed]` guarantees the referenced workflow has finished — check the conclusion explicitly."
+  - "Add a debug logging step when troubleshooting workflow_run chains; the null conclusion distinguishes the early-fire trigger."
+  - "Track the open platform bug (actions/runner#4035) to detect when this double-fire behavior is resolved."
+docs:
+  - url: "https://github.com/actions/runner/issues/4035"
+    label: "actions/runner#4035 — workflow_run completed fires before workflow actually completes (open)"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run"
+    label: "workflow_run event — conclusion values and conditional filtering"
