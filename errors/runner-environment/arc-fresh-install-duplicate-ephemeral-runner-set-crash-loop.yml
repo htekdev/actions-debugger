@@ -1,0 +1,140 @@
+id: runner-environment-291
+title: 'ARC v0.14.0/v0.14.1 Fresh Install Duplicate EphemeralRunnerSet — AutoscalingListener Infinite Crash Loop'
+category: runner-environment
+severity: error
+tags:
+  - arc
+  - actions-runner-controller
+  - kubernetes
+  - ephemeral-runner-set
+  - crash-loop
+  - fresh-install
+  - autoscaling-listener
+patterns:
+  - regex: 'could not patch ephemeral runner set.*not found|patch.*ephemeralrunnersets.*not found'
+    flags: 'i'
+  - regex: 'ephemeralrunnersets\.actions\.github\.com.*not found|EphemeralRunnerSet.*404'
+    flags: 'i'
+  - regex: 'handling initial message failed.*patch.*ephemeral|Application returned an error.*ephemeral runner set'
+    flags: 'i'
+error_messages:
+  - "Application returned an error: handling initial message failed: could not patch ephemeral runner set, patch JSON: {\"spec\":{\"patchID\":0,\"replicas\":2}}, error: ephemeralrunnersets.actions.github.com \"<name>\" not found"
+  - "could not patch ephemeral runner set, error: ephemeralrunnersets.actions.github.com not found"
+root_cause: |
+  In ARC v0.14.0 and v0.14.1, the AutoscalingRunnerSet reconciler contains a race
+  condition that triggers on the **first** reconcile loop of a fresh Helm install
+  under light timing pressure.
+
+  The reconciler creates multiple EphemeralRunnerSets within the same second:
+
+  1. `Created EphemeralRunnerSet <scaleset>-hpns6`
+  2. `Created EphemeralRunnerSet <scaleset>-k7phr`  ← duplicate (race)
+  3. `Deleted EphemeralRunnerSet <scaleset>-hpns6`
+  4. `Deleted EphemeralRunnerSet <scaleset>-k7phr`  ← both originals gone
+  5. `Created EphemeralRunnerSet <scaleset>-8g45d`  ← third survives
+
+  The AutoscalingListener CR, its config Secret, and its RBAC Role are populated
+  with the name of one of the **deleted** EphemeralRunnerSets (e.g., `-k7phr`).
+
+  On every restart the listener pod:
+  1. Authenticates with `api.github.com` and opens a broker session
+  2. Receives initial scale instruction (replicas: N)
+  3. Attempts to PATCH `ephemeralrunnersets/<deleted-name>` → **HTTP 404**
+  4. Logs `Application returned an error: handling initial message failed`
+  5. Exits with error
+
+  The `arc-gha-rs-controller` sees the exited pod, terminates it, and creates a
+  new one — which mounts the same stale config Secret and repeats the 404 loop.
+  The cycle repeats every ~5 seconds indefinitely. No runner pods are ever created
+  and all queued jobs timeout.
+
+  This is intermittent: most fresh installs succeed. The race requires the first
+  reconcile to trigger multiple concurrent creates within the same second, which
+  is more likely on overloaded Kubernetes API servers or when the controller's
+  informer cache is not fully warmed.
+
+  Reproduced on ARC v0.14.0 and v0.14.1 with both `dind` and `k8s` container
+  modes. Source: actions/actions-runner-controller#4489 (May 7, 2026).
+fix: |
+  **Recovery (no code change needed):**
+
+  Delete the stale AutoscalingListener and its config Secret to force the
+  controller to recreate them bound to the surviving EphemeralRunnerSet:
+
+  ```bash
+  NAMESPACE=<runner-namespace>
+  SCALESET_NAME=<release-name>   # Helm release name for gha-runner-scale-set
+
+  # Delete the stale AutoscalingListener
+  kubectl delete autoscalinglistener -n ${NAMESPACE} -l \
+    actions.github.com/scale-set-name=${SCALESET_NAME}
+
+  # Delete the stale listener config secret
+  kubectl delete secret -n ${NAMESPACE} \
+    -l actions.github.com/scale-set-name=${SCALESET_NAME} \
+    --field-selector type=Opaque
+  ```
+
+  The controller will reconcile within seconds and create a new AutoscalingListener
+  bound to the surviving EphemeralRunnerSet. Monitor with:
+
+  ```bash
+  kubectl get pods -n ${NAMESPACE} -w
+  ```
+
+  **Prevention:**
+  Upgrade to ARC v0.14.2+ which is the recommended production version. While
+  the duplicate-EphemeralRunnerSet race fix is not explicitly listed in the
+  v0.14.2 changelog, several reconcile-loop stability fixes (empty GVK in
+  OwnerReferences, listener pod secret reconciliation) reduce the likelihood.
+
+  **Alternative: Scale to 0 and back**
+
+  ```bash
+  kubectl patch autoscalingrunnersets ${SCALESET_NAME} -n ${NAMESPACE} \
+    --type=merge -p '{"spec":{"maxRunners":0}}'
+  sleep 5
+  kubectl patch autoscalingrunnersets ${SCALESET_NAME} -n ${NAMESPACE} \
+    --type=merge -p '{"spec":{"maxRunners":10}}'
+  ```
+fix_code:
+  - language: yaml
+    label: 'Upgrade ARC to v0.14.2+ to reduce reconcile-loop instability'
+    code: |
+      # Upgrade gha-runner-scale-set-controller to v0.14.2
+      helm upgrade gha-runner-scale-set-controller \
+        oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller \
+        --version 0.14.2 \
+        --namespace arc-systems \
+        -f controller_values.yaml
+
+      # Upgrade gha-runner-scale-set to v0.14.2
+      helm upgrade <release> \
+        oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set \
+        --version 0.14.2 \
+        --namespace <runner-namespace> \
+        -f runner_scale_set_values.yaml
+  - language: yaml
+    label: 'Diagnose: check AutoscalingListener bound to deleted EphemeralRunnerSet'
+    code: |
+      # List EphemeralRunnerSets (find the surviving one)
+      kubectl get ephemeralrunnersets -n <runner-namespace>
+
+      # Check what name the AutoscalingListener is bound to
+      kubectl get autoscalinglistener -n <runner-namespace> -o \
+        jsonpath='{.items[*].spec.ephemeralRunnerSetName}'
+
+      # Compare — if bound name is NOT in the EphemeralRunnerSet list, crash loop is confirmed
+      # Fix: delete the AutoscalingListener and its config secret (see fix above)
+prevention:
+  - "Use ARC v0.14.2+ for new installations; the v0.14.0/v0.14.1 first-reconcile race is most impactful on fresh installs"
+  - "After helm install, immediately check that AutoscalingListener is bound to an existing EphemeralRunnerSet before trusting the install is healthy"
+  - "Set up a readiness check: kubectl wait --for=condition=Available autoscalingrunnersets/<name> --timeout=120s"
+  - "If using minRunners > 0, the crash loop manifests immediately; with minRunners: 0 the race has less impact"
+docs:
+  - url: 'https://github.com/actions/actions-runner-controller/issues/4489'
+    label: 'ARC#4489 — AutoscalingListener stuck in recreate loop after duplicate EphemeralRunnerSet on fresh install'
+  - url: 'https://github.com/actions/actions-runner-controller/releases/tag/gha-runner-scale-set-0.14.2'
+    label: 'ARC v0.14.2 Release Notes'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners-with-actions-runner-controller/troubleshooting-actions-runner-controller-errors'
+    label: 'ARC Troubleshooting Guide'

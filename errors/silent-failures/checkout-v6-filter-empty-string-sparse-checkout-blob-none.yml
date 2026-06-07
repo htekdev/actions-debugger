@@ -1,0 +1,136 @@
+id: silent-failures-146
+title: "actions/checkout v6 filter: '' (Empty String) with sparse-checkout Silently Falls Back to blob:none"
+category: silent-failures
+severity: silent-failure
+tags:
+  - checkout
+  - sparse-checkout
+  - filter
+  - partial-clone
+  - blob-none
+  - v6
+  - empty-string
+patterns:
+  - regex: '--filter=blob:none.*sparse-checkout|sparse.checkout.*--filter=blob:none'
+    flags: 'i'
+  - regex: 'git fetch.*--filter=blob:none.*sparse|filter.*blob:none.*despite.*filter.*empty'
+    flags: 'i'
+  - regex: 'missing object.*partial.clone|cannot checkout.*missing blob|blob.*not.*found.*sparse'
+    flags: 'i'
+error_messages:
+  - "git checkout failed: object not found (blob missing due to partial clone blob:none filter)"
+  - "error: Server does not allow request for unadvertised object"
+  - "fatal: failed to unpack tree object"
+root_cause: |
+  In `actions/checkout` v6.0.2, the `filter` input is processed in TypeScript
+  where an empty string `''` evaluates as falsy. In `git-source-provider.ts` and
+  `input-helper.ts`, the condition `if (settings.filter)` skips the filter
+  assignment when `filter: ''` is provided.
+
+  The fallback logic then checks `if (settings.sparseCheckout)` and automatically
+  applies `--filter=blob:none` to the git fetch command. This means:
+
+  ```typescript
+  if (settings.filter) {
+    fetchOptions.filter = settings.filter          // '' is falsy → skipped
+  } else if (settings.sparseCheckout) {
+    fetchOptions.filter = 'blob:none'              // ← fallback always fires
+  }
+  ```
+
+  Developers who set `filter: ''` intend to **disable** the blob:none filter and
+  get a full clone alongside sparse-checkout. Instead, they get a partial clone
+  with no blobs fetched on demand. Operations like `git show <SHA>`, `git diff`,
+  or any step that reads file content not already in the sparse working tree will
+  fail with "missing object" errors, especially in sandboxed environments without
+  git credentials for on-demand blob fetching.
+
+  This was confirmed in `actions/checkout` v6.0.2 source code and observed in
+  production workflows using `actions/checkout@v6.0.2` (github/gh-aw#36253,
+  June 1, 2026). The v6.0.3 release (June 2, 2026) does not contain a fix for
+  this specific issue; the GH-AW team worked around it by running post-checkout
+  git config cleanup steps.
+fix: |
+  **Option 1 (recommended): Use a non-empty harmless filter value**
+
+  Use `filter: blob:0` instead of `filter: ''` to produce a non-empty string
+  that prevents the blob:none fallback while still being effectively equivalent
+  to a full clone for most purposes:
+
+  ```yaml
+  - uses: actions/checkout@v6
+    with:
+      sparse-checkout: |
+        src/
+        tests/
+      filter: 'blob:0'   # non-empty → prevents blob:none fallback
+  ```
+
+  **Option 2: Remove partial-clone config post-checkout**
+
+  Run a cleanup step immediately after checkout to strip the partial-clone
+  configuration and optionally re-fetch without the filter:
+
+  ```yaml
+  - uses: actions/checkout@v6
+    with:
+      sparse-checkout: |
+        src/
+        tests/
+      filter: ''
+
+  - name: Remove partial-clone blob filter
+    run: |
+      git config --unset remote.origin.partialclonefilter || true
+      git config --unset extensions.partialClone || true
+  ```
+
+  **Option 3: Avoid filter: '' when sparse-checkout is set**
+
+  If you need both sparse-checkout and full blob access, omit the `filter` key
+  entirely and rely on the fact that sparse-checkout without `filter` uses the
+  cone mode which still fetches all needed blobs:
+
+  ```yaml
+  - uses: actions/checkout@v6
+    with:
+      sparse-checkout: |
+        src/
+        tests/
+      # No filter key → sparse-checkout without blob:none
+  ```
+fix_code:
+  - language: yaml
+    label: 'Use filter: blob:0 to prevent empty-string falsy bypass'
+    code: |
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            src/
+            lib/
+          filter: 'blob:0'   # Non-empty; avoids falsy '' bypass; equivalent to full blob fetch
+  - language: yaml
+    label: 'Post-checkout cleanup to remove partial-clone config'
+    code: |
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            src/
+          filter: ''   # Intended: no filter. Actual: blob:none (bug in v6.0.2)
+
+      - name: Strip partial-clone filter (workaround for checkout v6 filter:'' bug)
+        run: |
+          git config --unset remote.origin.partialclonefilter || true
+          git config --unset extensions.partialClone || true
+prevention:
+  - "Never use filter: '' (empty string) to disable blob filtering in actions/checkout v6; use filter: blob:0 instead"
+  - "When using sparse-checkout with v6, test that blob content is accessible after checkout before assuming full clone"
+  - "Run 'git config --list | grep partial' in CI to verify no partial-clone config is active after checkout"
+  - "Pin to actions/checkout@v6.0.3+ and track the upstream issue for a permanent fix to empty-string filter handling"
+docs:
+  - url: 'https://github.com/actions/checkout/blob/v6.0.2/src/git-source-provider.ts'
+    label: 'actions/checkout v6.0.2 git-source-provider.ts — filter falsy check'
+  - url: 'https://github.com/github/gh-aw/issues/36253'
+    label: 'gh-aw#36253 — Checkout filter: '' does not suppress blob:none when sparse-checkout is set'
+  - url: 'https://git-scm.com/docs/partial-clone'
+    label: 'Git Partial Clone documentation'
