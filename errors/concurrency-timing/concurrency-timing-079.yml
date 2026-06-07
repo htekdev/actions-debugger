@@ -1,0 +1,97 @@
+id: concurrency-timing-079
+title: 'ARC Duplicate runnerScaleSetName Across Helm Releases Causes Jobs to Wait 30-60 Minutes for a Runner'
+category: concurrency-timing
+severity: error
+tags:
+  - arc
+  - actions-runner-controller
+  - runner-scale-set
+  - helm
+  - duplicate-name
+  - message-broker
+  - dispatch-delay
+  - queue-wait
+patterns:
+  - regex: 'Waiting for a runner to pick up this job'
+    flags: 'i'
+  - regex: 'runnerScaleSetName.*already.*registered|duplicate.*runnerScaleSetName'
+    flags: 'i'
+  - regex: 'job.*waiting.*runner.*30\s*min|queued.*60\s*min.*no.*runner'
+    flags: 'i'
+error_messages:
+  - "Waiting for a runner to pick up this job"
+  - "Your job is queued and waiting for a runner to pick it up"
+root_cause: |
+  ARC identifies a runner pool by its `runnerScaleSetName` value (set in `values.yaml`).
+  GitHub's MessageBroker uses this name to route `AcquireJobsV2` messages to the
+  correct listener. When **two separate Helm releases** are deployed with the **same
+  `runnerScaleSetName`**, both listeners register under the same pool name with GitHub.
+
+  This creates an ambiguous dispatch state:
+  - GitHub's broker sees N registered listeners for a single pool name.
+  - Incoming job messages are delivered to one listener; the other listener is unaware
+    of the pending job and does not scale up runners for it.
+  - If the listener that received the message has its pool at capacity or in a
+    transient state, the job waits until the MessageSession TTL expires and the
+    message is re-queued (typically 30–60 minutes in ARC ≤ v0.12.x).
+  - Jobs appear "stuck queued" in the GitHub Actions UI with no visible error.
+
+  This pattern is commonly used during Helm chart upgrades (blue-green style: deploy
+  new release, drain old one). While it may appear to work intermittently, it creates
+  a race condition at the broker layer that produces unpredictable long queue delays.
+fix: |
+  **Ensure each Helm release uses a unique `runnerScaleSetName`.** During upgrades,
+  use a blue-green approach with distinct names, or perform in-place upgrades (`helm
+  upgrade` on the same release name).
+
+  **If you need zero-downtime upgrades:**
+  1. Deploy the new release with a temporary `runnerScaleSetName` (e.g., append `-v2`).
+  2. Gradually migrate workflow `runs-on:` labels to the new name.
+  3. Once all jobs use the new name, uninstall the old release.
+
+  **Detect duplicate names:** Use the GitHub REST API or `gh` CLI to list registered
+  runner scale sets and check for duplicates.
+fix_code:
+  - language: yaml
+    label: "Use unique runnerScaleSetName values — never share a name across two Helm releases"
+    code: |
+      # ❌ WRONG: two releases with the same runnerScaleSetName
+      # values-v1.yaml
+      runnerScaleSetName: "my-org-runners"   # Release: arc-runners-v1
+
+      # values-v2.yaml
+      runnerScaleSetName: "my-org-runners"   # Release: arc-runners-v2  ← DUPLICATE!
+
+      ---
+
+      # ✅ CORRECT: unique names during blue-green upgrade
+      # values-v1.yaml
+      runnerScaleSetName: "my-org-runners"   # Keep old name for existing jobs
+
+      # values-v2.yaml
+      runnerScaleSetName: "my-org-runners-v2"  # New name — migrate workflows to this
+  - language: yaml
+    label: "Check for duplicate runner scale set names via GitHub REST API"
+    code: |
+      #!/bin/bash
+      # List all runner scale sets registered for the org and detect duplicates
+      gh api \
+        /orgs/<org>/actions/runner-groups \
+        --jq '.runner_groups[] | .name' | sort | uniq -d
+      # Or check runner scale sets specifically:
+      gh api \
+        "/repos/<owner>/<repo>/actions/runners" \
+        --jq '[.runners[].name] | group_by(.) | map(select(length > 1)) | .[]'
+prevention:
+  - "Never deploy two ARC Helm releases with the same `runnerScaleSetName` simultaneously — even briefly during upgrades."
+  - "Prefer `helm upgrade` on the same release name over parallel blue-green releases sharing the same pool name."
+  - "If blue-green ARC upgrades are required, use distinct `runnerScaleSetName` values and maintain separate `runs-on:` labels for each generation."
+  - "Add a CI check that verifies no duplicate `runnerScaleSetName` values exist across your Helm value files before deploying."
+  - "Upgrade to ARC ≥ v0.13.0 for improved MessageSession management that reduces the message re-queue window."
+docs:
+  - url: "https://github.com/actions/actions-runner-controller/issues/3953"
+    label: "ARC #3953 — Sometimes a job needs to wait 30/60 minutes before getting a runner (19 reactions)"
+  - url: "https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners-with-actions-runner-controller/deploying-runner-scale-sets-with-actions-runner-controller"
+    label: "GitHub Docs: Deploying runner scale sets with ARC"
+  - url: "https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners-with-actions-runner-controller/troubleshooting-actions-runner-controller-errors"
+    label: "GitHub Docs: Troubleshooting ARC errors"
