@@ -1,0 +1,119 @@
+id: silent-failures-139
+title: "github.ref_name contains slash for PR events, breaking Docker tags and artifact names"
+category: silent-failures
+severity: error
+tags:
+  - github.ref_name
+  - pull_request
+  - docker
+  - docker-tag
+  - invalid-reference
+  - artifact
+patterns:
+  - regex: 'invalid reference format'
+    flags: "i"
+  - regex: 'github\.ref_name'
+    flags: "i"
+  - regex: 'Artifact name.*contains.*invalid.*character'
+    flags: "i"
+  - regex: 'invalid tag\s+[''"][0-9]+/merge[''"]'
+    flags: "i"
+error_messages:
+  - "invalid reference format"
+  - "ERROR: invalid tag \"42/merge\""
+  - "Artifact name is not valid: '42/merge'. Contains the following character(s) not allowed: '/'"
+  - "invalid tag format"
+root_cause: |
+  github.ref_name for pull_request events resolves to the PR merge ref in the
+  format "{PR_NUMBER}/merge" (e.g., "42/merge"), NOT the source branch name.
+
+  The pull_request event uses the synthetic merge commit at refs/pull/{N}/merge.
+  github.ref_name strips the refs/pull/ prefix, leaving "{number}/merge".
+
+  Common failure patterns:
+
+  1. Docker image tags — OCI spec forbids "/" in tag names:
+       tags: ghcr.io/org/app:${{ github.ref_name }}
+       → tag becomes "ghcr.io/org/app:42/merge" → "invalid reference format"
+
+  2. Upload artifact names — "/" is not allowed in artifact names:
+       name: build-${{ github.ref_name }}
+       → artifact name "build-42/merge" → upload step fails
+
+  3. Cache keys — "/" creates unexpected nested key structures in some backends:
+       key: ${{ runner.os }}-${{ github.ref_name }}-cache
+       → key "Linux-42/merge-cache" (may behave unexpectedly)
+
+  4. Release tag creation — git tag with "/" creates path-like hierarchy:
+       git tag ${{ github.ref_name }} → creates "42/merge" tag (confusing)
+
+  github.head_ref is the correct context for the PR source branch name
+  (e.g., "feature/my-branch") on pull_request events, but it is empty
+  on push events. No single context works correctly for both event types
+  without sanitization or conditional logic.
+fix: |
+  Use the correct context for the intended purpose:
+  - PR source branch name: github.head_ref (e.g., "feature/my-branch")
+  - Push branch name: github.ref_name (safe on push, NOT on pull_request)
+  - Universal sanitized value: replace(github.ref_name, '/', '-')
+
+  For Docker tags, use docker/metadata-action which automatically handles
+  PR merge refs and sanitizes the output for all event types.
+
+  For artifact names, use a conditional or sanitized expression:
+    name: build-${{ github.head_ref || github.ref_name }}
+fix_code:
+  - language: yaml
+    label: "Replace slash with dash for Docker tags and artifact names"
+    code: |
+      - name: Sanitize ref name
+        id: ref
+        run: |
+          REF="${{ github.ref_name }}"
+          echo "safe=${REF//\//-}" >> $GITHUB_OUTPUT
+
+      - uses: docker/build-push-action@v6
+        with:
+          tags: ghcr.io/org/app:${{ steps.ref.outputs.safe }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ steps.ref.outputs.safe }}
+          path: dist/
+  - language: yaml
+    label: "Preferred: use docker/metadata-action — handles PR refs automatically"
+    code: |
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/org/app
+          # metadata-action converts PR refs to pr-{number} tags automatically
+          # e.g., pull_request event → tag: pr-42
+
+      - uses: docker/build-push-action@v6
+        with:
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+  - language: yaml
+    label: "Use github.head_ref for PR source branch, fallback to ref_name for push"
+    code: |
+      - uses: actions/upload-artifact@v4
+        with:
+          # head_ref is the PR source branch (e.g., "feature/my-branch")
+          # Falls back to ref_name on push events where head_ref is empty
+          name: build-${{ github.head_ref || github.ref_name }}
+          path: dist/
+prevention:
+  - "Never use github.ref_name directly as a Docker tag or artifact name without sanitization"
+  - "Use docker/metadata-action for all Docker tagging — it handles PR, push, and tag events correctly"
+  - "Use github.head_ref for the PR source branch name; use github.ref_name only on push/tag events"
+  - "Sanitize any ref-derived string used in Docker tags, artifact names, or cache keys: replace(github.ref_name, '/', '-')"
+  - "Test workflows on actual PR events — many ref-related bugs are invisible in push-only testing"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context"
+    label: "GitHub context — ref_name, head_ref, and ref documentation"
+  - url: "https://github.com/docker/metadata-action"
+    label: "docker/metadata-action — handles PR merge refs and sanitizes Docker tags"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request"
+    label: "pull_request event — ref and SHA behavior"

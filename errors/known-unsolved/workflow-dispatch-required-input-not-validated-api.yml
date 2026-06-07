@@ -1,0 +1,104 @@
+id: known-unsolved-088
+title: "workflow_dispatch required: true input not validated when triggered via REST API or gh CLI"
+category: known-unsolved
+severity: silent-failure
+tags:
+  - workflow_dispatch
+  - inputs
+  - required
+  - api
+  - gh-cli
+  - validation
+patterns:
+  - regex: 'required:\s*true'
+    flags: "im"
+  - regex: 'workflow_dispatch'
+    flags: "i"
+error_messages:
+  - "inputs context"
+  - "gh workflow run"
+root_cause: |
+  The workflow_dispatch event supports required: true on input definitions,
+  which prevents the GitHub Actions UI from submitting the form without a value.
+  This validation is ONLY enforced in the browser UI.
+
+  When a workflow is triggered via:
+  - REST API: POST /repos/{owner}/{repo}/actions/workflows/{id}/dispatches
+  - GitHub CLI: gh workflow run <workflow> --ref <ref>
+  - Any automation calling the workflow_dispatch REST endpoint
+
+  The required constraint is silently ignored. If an input is omitted from the
+  API payload, the inputs context returns an empty string "" — no error,
+  no warning, and no indication the required value is missing.
+
+  Impact examples:
+  - A deployment workflow with required input "environment" deploys to an empty
+    target, causing a confusing downstream failure
+  - A release workflow with required input "version" creates a tag named ""
+  - A notification workflow with required input "message" sends empty notifications
+
+  GitHub has acknowledged this behavior is by design — the API is intended to
+  allow flexibility for automation. There are no current plans to enforce
+  required: true at the API layer (Community Discussion #24152, open since 2022).
+fix: |
+  Since GitHub will not enforce required: true at the API layer, add explicit
+  input validation as the first step in your workflow. This provides consistent
+  enforcement regardless of trigger method.
+
+  Use a validate-inputs job that other jobs depend on via needs:, so a missing
+  required input fails fast before any meaningful work is done.
+fix_code:
+  - language: yaml
+    label: "Add explicit validation job that enforces required inputs from any trigger source"
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            environment:
+              description: "Target deployment environment"
+              required: true
+              type: string
+            version:
+              description: "Release version tag (e.g. v1.2.3)"
+              required: true
+              type: string
+
+      jobs:
+        validate-inputs:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Validate required inputs
+              run: |
+                errors=0
+                if [ -z "${{ inputs.environment }}" ]; then
+                  echo "::error::Input 'environment' is required but was not provided"
+                  errors=$((errors + 1))
+                fi
+                if [ -z "${{ inputs.version }}" ]; then
+                  echo "::error::Input 'version' is required but was not provided"
+                  errors=$((errors + 1))
+                fi
+                if [ "$errors" -gt 0 ]; then
+                  echo "::error::$errors required input(s) missing. Trigger via GitHub UI or provide all inputs in API payload."
+                  exit 1
+                fi
+                echo "All required inputs provided"
+
+        deploy:
+          needs: validate-inputs
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying ${{ inputs.version }} to ${{ inputs.environment }}"
+prevention:
+  - "Never rely on required: true alone for workflow_dispatch inputs — it only enforces the browser UI"
+  - "Always add an explicit validation step that checks for empty inputs and fails with a descriptive error"
+  - "Document required inputs in workflow comments or README so API callers know what to provide"
+  - "Use default: values for optional inputs to avoid unexpected empty-string behavior in downstream steps"
+  - "In gh workflow run commands, use --field to pass inputs: gh workflow run deploy.yml --ref main --field environment=prod"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_dispatch"
+    label: "workflow_dispatch event and inputs documentation"
+  - url: "https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event"
+    label: "REST API: Create a workflow dispatch event"
+  - url: "https://github.com/orgs/community/discussions/24152"
+    label: "GitHub Community: required inputs not enforced via API (open since 2022)"
