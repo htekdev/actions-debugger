@@ -1,0 +1,138 @@
+id: concurrency-timing-067
+title: "cancel-in-progress: false does not protect a pending queued run — third run silently cancels it"
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - cancel-in-progress
+  - pending
+  - queued
+  - silent-cancel
+  - deployment
+patterns:
+  - regex: 'This run has been cancelled'
+    flags: 'i'
+  - regex: 'cancelled.*concurrency group'
+    flags: 'i'
+error_messages:
+  - "This run has been cancelled."
+  - "Canceling since a higher priority queued run was found for the same concurrency group."
+root_cause: |
+  `cancel-in-progress: false` only prevents GitHub Actions from cancelling the
+  **currently running** job or workflow when a new run enters the same concurrency
+  group. It does NOT protect **pending/queued** runs.
+
+  A concurrency group allows at most **one in-progress run** and **one pending run**
+  at any given time (without opt-in to the newer `queue: max` feature). When a third
+  run enters the group:
+  - The **in-progress run** is safe — `cancel-in-progress: false` protects it.
+  - The **pending/queued run** is silently cancelled and replaced by the new arrival.
+
+  This means:
+  - With `cancel-in-progress: false`, runs A (in-progress) and B (pending) → run C
+    arrives → B is cancelled, C becomes the new pending run.
+  - Developers expect `cancel-in-progress: false` to guarantee "finish every run in
+    order", but only the currently executing run is guaranteed to finish.
+
+  This is documented in GitHub's concurrency docs, but the implication — that
+  `cancel-in-progress: false` does NOT make queued runs safe from cancellation — is
+  easy to miss. It is particularly harmful for deployment workflows where every commit
+  must be deployed in sequence, since intermediate commits silently get dropped.
+
+  Source: https://github.com/actions/runner/issues/3722 (open, multiple confirmations)
+  Source: https://github.blog/changelog/2026-05-07-github-actions-concurrency-groups-now-allow-larger-queues/
+fix: |
+  **Option 1 (recommended — GitHub Actions, May 2026+):** Use `queue: max` (or
+  `queue: N` for a specific limit) in the concurrency block to allow multiple pending
+  runs to queue rather than cancel each other:
+
+  ```yaml
+  concurrency:
+    group: deploy-${{ github.ref }}
+    cancel-in-progress: false
+    queue: max          # allows up to 100 pending runs
+  ```
+
+  Available on GitHub.com and GHES 3.15+. Not yet available on older GHES versions.
+
+  **Option 2:** Accept the behaviour and use `cancel-in-progress: true` deliberately —
+  only the latest run matters, so cancel all stale runs. This is the recommended
+  pattern for CI (test) workflows where only the newest code is relevant.
+
+  **Option 3:** Add a SHA-guard step that checks whether the current run's SHA is
+  still the HEAD of the branch before running the deploy. If stale, skip deployment:
+
+  ```yaml
+  - name: Check if still HEAD
+    id: head_check
+    run: |
+      CURRENT_HEAD=$(gh api repos/${{ github.repository }}/git/ref/heads/${{ github.ref_name }} --jq '.object.sha')
+      if [ "$CURRENT_HEAD" != "${{ github.sha }}" ]; then
+        echo "Stale run — newer commit is HEAD. Skipping deploy."
+        echo "skip=true" >> "$GITHUB_OUTPUT"
+      fi
+    env:
+      GH_TOKEN: ${{ github.token }}
+  - name: Deploy
+    if: steps.head_check.outputs.skip != 'true'
+    run: ./deploy.sh
+  ```
+fix_code:
+  - language: yaml
+    label: "Wrong: cancel-in-progress: false does NOT guarantee all queued runs complete"
+    code: |
+      # Developers expect all 3 runs to deploy in order — only the FIRST is guaranteed.
+      # Run B (pending) is silently cancelled when run C arrives.
+
+      concurrency:
+        group: deploy-${{ github.ref }}
+        cancel-in-progress: false   # Only protects the IN-PROGRESS run, not queued ones
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./deploy.sh   # B silently skipped; A and C run, C may overwrite A
+
+  - language: yaml
+    label: "Correct: use queue: max (May 2026+) to allow all runs to queue safely"
+    code: |
+      # All runs queue and execute in order — no silent cancellation.
+
+      concurrency:
+        group: deploy-${{ github.ref }}
+        cancel-in-progress: false
+        queue: max                  # Up to 100 pending runs allowed per group
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./deploy.sh   # A, B, C all run in order
+
+  - language: yaml
+    label: "Alternative: cancel-in-progress: true if only the latest matters (CI/test)"
+    code: |
+      # For test workflows: cancel everything and only run the latest
+      concurrency:
+        group: ci-${{ github.ref }}
+        cancel-in-progress: true   # Explicitly drop stale runs
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - run: npm test
+prevention:
+  - "Understand that cancel-in-progress: false only protects the currently running job — not pending ones."
+  - "Use queue: max (GitHub Actions May 2026+) for deployment workflows that must process every commit in order."
+  - "For test/lint workflows, prefer cancel-in-progress: true — stale runs waste minutes."
+  - "Add a SHA-guard step in deployment jobs to skip stale commits if queue: max is not available."
+  - "Document concurrency behaviour explicitly in your workflow file comments so teammates understand the tradeoffs."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs"
+    label: "GitHub Docs: Control the concurrency of workflows and jobs"
+  - url: "https://github.com/actions/runner/issues/3722"
+    label: "actions/runner#3722: Why is my job cancelling when I have cancel-in-progress set to false?"
+  - url: "https://github.blog/changelog/2026-05-07-github-actions-concurrency-groups-now-allow-larger-queues/"
+    label: "GitHub Changelog: Concurrency groups now allow larger queues (queue: max, May 2026)"

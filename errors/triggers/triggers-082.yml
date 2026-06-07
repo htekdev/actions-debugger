@@ -1,0 +1,160 @@
+id: triggers-082
+title: "workflow_call nesting depth exceeds 4 levels — Workflow nested depth exceeded error"
+category: triggers
+severity: error
+tags:
+  - workflow-call
+  - reusable-workflow
+  - nesting
+  - depth-limit
+  - modular-workflows
+patterns:
+  - regex: 'Workflow nested depth exceeded'
+    flags: 'i'
+  - regex: 'nested.*level.*not supported'
+    flags: 'i'
+  - regex: 'reusable workflow.*nested.*more than'
+    flags: 'i'
+error_messages:
+  - "Workflow nested depth exceeded. Workflow can only be nested up to 4 levels."
+  - "Calling a reusable workflow in nested level 5 is not supported."
+  - "Nested reusable workflows are not supported at this depth."
+root_cause: |
+  GitHub Actions enforces a maximum **4-level nesting depth** for `workflow_call`
+  (reusable workflow) chains. The count includes the top-level caller workflow:
+
+  - Level 1: top-level workflow (e.g., `ci.yml`)
+  - Level 2: first reusable workflow called by ci.yml (e.g., `build.yml`)
+  - Level 3: second reusable workflow called by build.yml (e.g., `compile.yml`)
+  - Level 4: third reusable workflow called by compile.yml (e.g., `setup.yml`)
+
+  Attempting to add a 5th level (setup.yml calling another workflow) triggers the
+  "Workflow nested depth exceeded" error and the run is cancelled immediately.
+
+  **When this is encountered:**
+  - Large engineering orgs that create deeply modular workflow libraries.
+  - Automated workflow generation (e.g., generating caller → orchestrator → builder →
+    tester → deployer chains where each level adds abstraction).
+  - Platform/DevEx teams that wrap standard workflows in org-specific wrappers,
+    unaware of how many levels of indirection already exist in the chain.
+
+  **Important:** The limit counts CALL DEPTH, not total workflows invoked. A single
+  workflow calling 20 different reusable workflows in sequence (not nested) does NOT
+  hit this limit — only depth (nesting/chaining) is restricted.
+
+  **Also important:** Composite actions do NOT count toward this depth limit —
+  composite actions use `uses:` at the STEP level and have a separate nesting limit.
+  Only `workflow_call` at the JOB level (`jobs.<id>.uses:`) counts.
+
+  Source: https://docs.github.com/en/actions/sharing-automations/reusing-workflows#limitations
+  Source: https://github.com/orgs/community/discussions/17245 (multiple reports of teams hitting this)
+fix: |
+  Flatten the call hierarchy to stay within 4 levels. Strategies:
+
+  **Option 1 — Replace deep reusable workflows with composite actions:**
+  If the deepest levels are performing setup/utility tasks (installing tools, setting
+  environment variables, configuring caches), convert them to composite actions.
+  Composite actions run at the step level and do not consume workflow nesting depth.
+
+  **Option 2 — Merge intermediate wrapper layers:**
+  Identify "pass-through" reusable workflow layers that add no value other than
+  delegation, and inline their logic into the parent level.
+
+  **Option 3 — Use `needs:` chaining within a single workflow:**
+  Instead of nesting reusable workflows, use `needs:` to sequence jobs within one
+  reusable workflow. This achieves sequential execution without adding nesting depth.
+
+  **Option 4 — Redesign at the orchestration level:**
+  Use a single top-level orchestrator workflow that calls multiple flat (non-nested)
+  reusable workflows using `needs:` job dependencies rather than deep chains.
+fix_code:
+  - language: yaml
+    label: "Wrong: 5-level nesting chain — level 5 triggers the depth error"
+    code: |
+      # ci.yml (level 1) → orchestrate.yml (level 2) → build.yml (level 3)
+      #   → compile.yml (level 4) → setup.yml (level 5) — ERROR!
+
+      # ci.yml
+      on: [push]
+      jobs:
+        run:
+          uses: ./.github/workflows/orchestrate.yml    # level 2
+
+      # orchestrate.yml
+      on: [workflow_call]
+      jobs:
+        build:
+          uses: ./.github/workflows/build.yml          # level 3
+
+      # build.yml
+      on: [workflow_call]
+      jobs:
+        compile:
+          uses: ./.github/workflows/compile.yml        # level 4
+
+      # compile.yml — CANNOT call another workflow (would be level 5)
+      on: [workflow_call]
+      jobs:
+        setup:
+          uses: ./.github/workflows/setup.yml          # ERROR: level 5 not allowed
+
+  - language: yaml
+    label: "Correct option A: replace deepest level with a composite action"
+    code: |
+      # Convert setup.yml (deepest level) into a composite action instead.
+      # Composite actions run at the STEP level and do not count toward workflow depth.
+
+      # .github/actions/setup/action.yml (composite action — no depth cost)
+      name: Setup
+      description: Install tools and configure environment
+      runs:
+        using: composite
+        steps:
+          - run: echo "Installing tools..."
+            shell: bash
+          - uses: actions/setup-node@v4
+            with:
+              node-version: '20'
+
+      # compile.yml (level 4) — calls composite action at step level, not workflow level
+      on: [workflow_call]
+      jobs:
+        compile:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: ./.github/actions/setup       # composite action, not a workflow_call
+            - run: ./compile.sh
+
+  - language: yaml
+    label: "Correct option B: flatten orchestration using needs: instead of nesting"
+    code: |
+      # Instead of: ci.yml → orchestrate.yml → build.yml → test.yml → deploy.yml
+      # Use a flat orchestrator that calls all stages with needs: dependencies
+
+      # orchestrate.yml (level 2) — calls all stages, uses needs: for sequencing
+      on: [workflow_call]
+      jobs:
+        build:
+          uses: ./.github/workflows/build.yml    # level 3
+
+        test:
+          needs: build
+          uses: ./.github/workflows/test.yml     # level 3 (same level as build)
+
+        deploy:
+          needs: test
+          uses: ./.github/workflows/deploy.yml   # level 3 (same level, not deeper)
+      # Total depth: ci.yml(1) → orchestrate.yml(2) → build/test/deploy.yml(3) — safe!
+prevention:
+  - "Track your workflow call depth when building modular pipeline libraries."
+  - "Prefer composite actions for utility/setup logic — they run at step level and do not consume nesting depth."
+  - "Use needs: for sequential job orchestration within a single reusable workflow rather than chaining more nesting levels."
+  - "Document the current nesting depth in your platform team's workflow library README."
+  - "actionlint can detect excessive nesting depth statically before pushing changes."
+docs:
+  - url: "https://docs.github.com/en/actions/sharing-automations/reusing-workflows#limitations"
+    label: "GitHub Docs: Reusable workflows — limitations (includes 4-level nesting limit)"
+  - url: "https://docs.github.com/en/actions/sharing-automations/creating-actions/creating-a-composite-action"
+    label: "GitHub Docs: Creating a composite action (alternative to deep workflow nesting)"
+  - url: "https://github.com/orgs/community/discussions/17245"
+    label: "GitHub Community: Reports of teams hitting the 4-level reusable workflow nesting limit"

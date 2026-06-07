@@ -1,0 +1,140 @@
+id: known-unsolved-083
+title: "Workflow run logs expire and are permanently deleted after retention period — no export mechanism"
+category: known-unsolved
+severity: limitation
+tags:
+  - logs
+  - retention
+  - expiry
+  - deleted
+  - audit
+  - debugging
+patterns:
+  - regex: 'Logs for this run are not available'
+    flags: 'i'
+  - regex: 'This run.s log has expired'
+    flags: 'i'
+  - regex: 'Log not found.*404'
+    flags: 'i'
+error_messages:
+  - "Logs for this run are not available."
+  - "This run's log has expired and is no longer available."
+  - "404 Not Found — logs endpoint returned empty response for expired run"
+root_cause: |
+  GitHub Actions workflow run logs are stored for a **configurable retention period**,
+  after which they are **permanently and irrecoverably deleted**. Once deleted, the
+  logs cannot be recovered regardless of GitHub plan or support request.
+
+  **Default retention periods by plan:**
+  - Public repositories: 90 days
+  - Private repositories (GitHub Free/Pro/Team): 90 days
+  - GitHub Enterprise Cloud: configurable, 1–400 days
+  - GitHub Enterprise Server: configurable, 1–400 days
+
+  After expiry:
+  - `gh run view --log <run-id>` returns an error or empty output.
+  - The REST API endpoint `GET /repos/{owner}/{repo}/actions/runs/{run_id}/logs`
+    returns HTTP 404 or a redirect to an expired URL.
+  - The GitHub Actions UI shows the run summary (status, duration, job names) but
+    displays "Logs for this run are not available." for all step logs.
+  - The run itself remains in the run history (metadata is retained indefinitely),
+    but the actual console output is gone.
+
+  **There is no native log export or archiving feature** built into GitHub Actions.
+  Logs must be exported during the retention window by the team, or they are lost.
+
+  This affects debugging of historic failures, compliance audits requiring log
+  retention beyond 90 days, and post-incident analysis of runs older than the
+  retention period.
+
+  Source: https://docs.github.com/en/actions/administering-github-actions/usage-limits-billing-and-administration#artifact-and-log-retention-policy
+  Source: https://github.com/orgs/community/discussions/74616 (developers requesting longer retention)
+fix: |
+  There is no way to recover deleted logs. Mitigation options before expiry:
+
+  **Option 1 — Upload logs as artifacts (pre-expiry):**
+  At the end of each workflow, capture the job log and upload it as an artifact with
+  a longer retention period (up to 400 days on GHEC, or before artifact retention
+  also expires). Artifacts have separate retention configuration from job logs.
+
+  **Option 2 — Stream logs to external storage:**
+  Send logs to an external observability platform (Datadog, Splunk, Elastic, AWS S3)
+  during the run using the `@actions/core` toolkit or shell log forwarding. Popular
+  approaches:
+  - Use `tee` in shell steps to duplicate output to a file, then upload to S3 or
+    another store as a post-job step.
+  - Use OpenTelemetry exporters compatible with GitHub Actions.
+
+  **Option 3 — Increase retention for GHEC/GHES:**
+  GitHub Enterprise Cloud and GHES admins can configure retention up to 400 days:
+  Organization Settings → Actions → Artifact and log retention.
+
+  **Option 4 — Export logs programmatically before expiry:**
+  Use the REST API to download all run logs before the retention window closes:
+  `GET /repos/{owner}/{repo}/actions/runs/{run_id}/logs` returns a zip file.
+  Automate this with a scheduled workflow that archives logs for important runs.
+fix_code:
+  - language: yaml
+    label: "Upload step logs as artifact with extended retention (workaround)"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Build
+              id: build
+              run: |
+                # Redirect all output to a log file AND stdout simultaneously
+                exec > >(tee build.log) 2>&1
+                ./build.sh
+
+            - name: Upload build log as artifact
+              if: always()   # Capture even on failure
+              uses: actions/upload-artifact@v4
+              with:
+                name: build-log-${{ github.run_id }}-${{ github.run_attempt }}
+                path: build.log
+                retention-days: 400   # Max on GHEC; 90 on free plans
+
+  - language: yaml
+    label: "Scheduled log archiver — export logs before expiry (GHEC/GHES)"
+    code: |
+      # Run weekly to archive logs from the past 7 days to S3
+      on:
+        schedule:
+          - cron: '0 2 * * 0'   # Every Sunday at 2 AM UTC
+
+      jobs:
+        archive-logs:
+          runs-on: ubuntu-latest
+          permissions:
+            actions: read
+          steps:
+            - name: Archive recent run logs
+              run: |
+                gh api repos/${{ github.repository }}/actions/runs \
+                  --paginate \
+                  --jq '.workflow_runs[] | select(.created_at > (now - 7*86400 | todate)) | .id' \
+                  | while read run_id; do
+                      echo "Archiving run $run_id"
+                      gh api repos/${{ github.repository }}/actions/runs/$run_id/logs \
+                        --accept application/vnd.github.v3+json \
+                        -H "Accept: application/zip" \
+                        > "run-$run_id-logs.zip" 2>/dev/null || true
+                    done
+                # Upload to S3, Blob Storage, or GCS as needed
+              env:
+                GH_TOKEN: ${{ github.token }}
+prevention:
+  - "Set up log archiving to external storage for audit-sensitive workflows before the retention window closes."
+  - "On GitHub Enterprise Cloud/GHES, configure retention up to 400 days at the org level."
+  - "Add tee-based log capture in critical build/deploy steps to duplicate output to artifact files."
+  - "Periodically download important run logs via the REST API (GET /repos/.../runs/{id}/logs) before expiry."
+  - "For compliance requirements, stream logs in real-time to an external SIEM or log aggregation platform."
+docs:
+  - url: "https://docs.github.com/en/actions/administering-github-actions/usage-limits-billing-and-administration#artifact-and-log-retention-policy"
+    label: "GitHub Docs: Artifact and log retention policy"
+  - url: "https://docs.github.com/en/rest/actions/workflow-runs?apiVersion=2022-11-28#download-workflow-run-logs"
+    label: "REST API: Download workflow run logs (zip)"
+  - url: "https://github.com/orgs/community/discussions/74616"
+    label: "GitHub Community: Request for longer log retention period"

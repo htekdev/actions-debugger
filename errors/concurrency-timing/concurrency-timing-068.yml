@@ -1,0 +1,123 @@
+id: concurrency-timing-068
+title: "Static job-level concurrency group serializes all matrix permutations into sequential execution"
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - matrix
+  - job-level
+  - sequential
+  - parallel
+  - performance
+patterns:
+  - regex: 'Waiting for a pending job to finish'
+    flags: 'i'
+  - regex: 'job.*waiting.*concurrency group'
+    flags: 'i'
+error_messages:
+  - "Waiting for a pending job to finish..."
+  - "Job is waiting for a concurrent job to finish in the same concurrency group."
+root_cause: |
+  When `concurrency:` is defined at the **job level** with a **static group name**
+  (one that does not vary per matrix dimension), every matrix permutation is assigned
+  to the **same concurrency group**. GitHub Actions serialises all jobs within the
+  same concurrency group, allowing only one to run at a time.
+
+  The result is that a matrix that should run N jobs in parallel runs them one after
+  another. With 10 matrix dimensions and 5-minute jobs, the workflow takes 50 minutes
+  instead of 5 minutes. No error is emitted — the jobs silently queue.
+
+  **Why this happens:**
+  Developers add job-level concurrency to a job (e.g., to prevent duplicate deployments)
+  and later add a `strategy: matrix:` without updating the concurrency group expression
+  to include a matrix variable. The static group name serialises the newly added matrix.
+
+  Another common path: copy-pasting a concurrency block from a single-job workflow
+  into a matrix workflow without adjusting the group key.
+
+  **Contrast with the intended behaviour:**
+  - Static concurrency at JOB level on a non-matrix job → correct: serialises job
+    across concurrent workflow runs (e.g., prevents two deploy jobs running at once).
+  - Static concurrency at JOB level on a MATRIX job → unintended: serialises ALL
+    matrix permutations into a single slot.
+
+  Source: Widely documented on Stack Overflow [github-actions] + concurrency tag
+  (many questions titled "why are my matrix jobs running one at a time?")
+fix: |
+  Include a matrix variable in the concurrency group expression so each permutation
+  gets its own unique slot:
+
+  ```yaml
+  concurrency:
+    group: deploy-${{ matrix.environment }}-${{ github.ref }}
+    cancel-in-progress: false
+  ```
+
+  If the intent is to serialise deployments **per environment** (not across ALL
+  environments), this is the correct pattern — each environment gets its own queue.
+
+  If the intent was to serialise ALL matrix jobs globally (e.g., for a shared resource),
+  the static group is technically correct, but consider whether that resource contention
+  can be resolved differently (separate mutex job, external lock service, etc.).
+fix_code:
+  - language: yaml
+    label: "Wrong: static group name serializes ALL matrix jobs — they queue one-by-one"
+    code: |
+      jobs:
+        deploy:
+          strategy:
+            matrix:
+              environment: [staging, production, canary]
+          runs-on: ubuntu-latest
+          concurrency:
+            group: deploy-${{ github.ref }}   # SAME group for all 3 — queued serially!
+            cancel-in-progress: false
+          steps:
+            - run: ./deploy.sh ${{ matrix.environment }}
+            # staging, production, canary run one after the other (not in parallel)
+
+  - language: yaml
+    label: "Correct: include matrix variable in group name — each permutation gets own slot"
+    code: |
+      jobs:
+        deploy:
+          strategy:
+            matrix:
+              environment: [staging, production, canary]
+          runs-on: ubuntu-latest
+          concurrency:
+            # Each environment has its own concurrency group — all 3 run in parallel
+            # but two staging deploys for different commits queue behind each other
+            group: deploy-${{ matrix.environment }}-${{ github.ref }}
+            cancel-in-progress: false
+          steps:
+            - run: ./deploy.sh ${{ matrix.environment }}
+
+  - language: yaml
+    label: "Multiple matrix dimensions: include all relevant keys"
+    code: |
+      jobs:
+        test:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest]
+              node: [18, 20, 22]
+          runs-on: ${{ matrix.os }}
+          concurrency:
+            group: test-${{ matrix.os }}-${{ matrix.node }}-${{ github.ref }}
+            cancel-in-progress: true
+          steps:
+            - uses: actions/setup-node@v4
+              with:
+                node-version: ${{ matrix.node }}
+            - run: npm test
+prevention:
+  - "After adding strategy: matrix: to a job, check whether any concurrency: group: expression needs a matrix variable."
+  - "Use ${{ matrix.<key> }} in the concurrency group name whenever the job has a matrix strategy."
+  - "Review job-level concurrency when copying workflow templates from non-matrix workflows."
+  - "A telltale sign is matrix jobs showing 'Waiting for a pending job...' in the Actions UI when they should run in parallel."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs"
+    label: "GitHub Docs: Control the concurrency of workflows and jobs"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/running-variations-of-jobs-in-a-workflow"
+    label: "GitHub Docs: Running variations of jobs in a workflow (matrix)"
