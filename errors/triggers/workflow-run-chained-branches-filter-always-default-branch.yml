@@ -1,0 +1,89 @@
+id: triggers-088
+title: "workflow_run branches filter broken for chained (2nd-level) workflow_run triggers"
+category: triggers
+severity: warning
+tags:
+  - workflow_run
+  - branches-filter
+  - chained-workflows
+  - default-branch
+  - GITHUB_REF
+patterns:
+  - regex: 'on:\s+workflow_run:'
+    flags: 'si'
+error_messages:
+  - "Workflow triggered unexpectedly when branches filter should have excluded it"
+  - "Workflow never triggers despite branches filter matching the pushed branch"
+root_cause: |
+  For all `workflow_run` events, `GITHUB_REF` is always set to the repository's default
+  branch (e.g., `refs/heads/main`), regardless of which branch the triggering workflow
+  actually ran on. The `branches` (and `branches-ignore`) filter on `on: workflow_run`
+  evaluates against this `GITHUB_REF` value.
+
+  This creates a critical asymmetry:
+  - **1st-level `workflow_run`** (triggered directly by a push/PR): the `branches` filter
+    appears to work because the triggering workflow's branch is captured in the event
+    payload and GitHub applies the filter correctly.
+  - **2nd-level (chained) `workflow_run`** (workflow_C triggered by workflow_B which was
+    triggered by workflow_A): `GITHUB_REF` for workflow_C is always the default branch.
+    A `branches: [develop]` filter will NEVER match, and `branches: [main]` will ALWAYS
+    match regardless of the original push branch.
+
+  As a result, `branches` filters in chained `workflow_run` workflows are silently
+  ineffective — they either block all triggers or allow all triggers depending on whether
+  the filter matches the default branch name.
+fix: |
+  Remove the `branches` filter from chained `workflow_run` triggers and replace it with
+  an explicit `if:` condition inside the job using `github.event.workflow_run.head_branch`,
+  which correctly reflects the branch of the original triggering workflow:
+
+  ```yaml
+  jobs:
+    deploy:
+      if: github.event.workflow_run.head_branch == 'develop'
+      runs-on: ubuntu-latest
+  ```
+
+  This approach works correctly for both 1st-level and chained `workflow_run` triggers.
+fix_code:
+  - language: yaml
+    label: "Broken: branches filter in chained workflow_run does not work"
+    code: |
+      # workflow_c.yml — triggered by workflow_B (which was triggered by workflow_A push)
+      on:
+        workflow_run:
+          workflows: [workflow_B]
+          types: [completed]
+          branches: [develop]   # BROKEN: always evaluates against default branch ref
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "deploying develop"
+  - language: yaml
+    label: "Fix: use if condition with head_branch for chained workflow_run"
+    code: |
+      # workflow_c.yml — correct branch routing via if condition
+      on:
+        workflow_run:
+          workflows: [workflow_B]
+          types: [completed]
+          # branches filter removed — unreliable for chained workflow_run
+      jobs:
+        deploy:
+          if: >-
+            github.event.workflow_run.conclusion == 'success' &&
+            github.event.workflow_run.head_branch == 'develop'
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "deploying develop"
+prevention:
+  - "Never rely on the `branches` filter for 2nd-level (chained) `workflow_run` triggers."
+  - "Use `if: github.event.workflow_run.head_branch == 'branch'` for branch routing in all `workflow_run` listeners."
+  - "Test chained workflow_run filtering from a non-default branch to catch silent filter breakage."
+  - "Also check `github.event.workflow_run.conclusion` in the `if:` condition — don't rely on `types: [completed]` alone."
+docs:
+  - url: "https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#workflow_run"
+    label: "workflow_run event — GitHub Docs"
+  - url: "https://github.com/actions/runner/issues/1628"
+    label: "actions/runner#1628: workflow_run trigger filters wrong branch for chained events"

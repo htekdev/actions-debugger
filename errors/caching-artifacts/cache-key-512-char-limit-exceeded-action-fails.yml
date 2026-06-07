@@ -1,0 +1,93 @@
+id: caching-artifacts-093
+title: "Cache key exceeds 512-character limit causing cache action to fail"
+category: caching-artifacts
+severity: error
+tags:
+  - cache
+  - cache-key
+  - key-length-limit
+  - actions/cache
+  - hashFiles
+  - validation-error
+patterns:
+  - regex: 'Cache key is (invalid|too long).*512'
+    flags: 'i'
+  - regex: 'Key Validation Error.*512'
+    flags: 'i'
+  - regex: 'cannot be larger than 512'
+    flags: 'i'
+error_messages:
+  - "Key Validation Error: Cache key is invalid. Cache key cannot be larger than 512 characters."
+  - "Cache key is too long. The maximum length is 512 characters."
+  - "Key cannot be larger than 512 characters."
+root_cause: |
+  GitHub Actions cache keys have a hard maximum length of 512 characters. Cache keys
+  exceeding this limit cause the `actions/cache` (and `actions/cache/save`,
+  `actions/cache/restore`) action to fail with a validation error and abort the step.
+
+  This limit is easy to exceed when building descriptive cache keys that combine:
+  - Multiple `hashFiles()` calls — each expands to a 64-character SHA-256 hex string
+  - Matrix parameters containing long version strings (e.g., `1.0.0-preview.20240501.1`)
+  - Multiple path segment discriminators (OS, arch, tool versions, job name)
+  - Restore-key prefixes repeated across cache key and restore-keys
+
+  Example key that exceeds 512 chars (= ~600 chars expanded):
+  `${{ runner.os }}-${{ runner.arch }}-myworkflow-${{ matrix.node }}-${{ matrix.python }}-
+  ${{ matrix.os-variant }}-${{ hashFiles('**/package-lock.json') }}-
+  ${{ hashFiles('**/yarn.lock') }}-${{ hashFiles('**/pnpm-lock.yaml') }}-
+  ${{ hashFiles('**/Pipfile.lock') }}-${{ hashFiles('**/requirements.txt') }}`
+
+  Each `hashFiles()` expands to 64 characters; five calls alone add 320 characters to the key.
+fix: |
+  1. Combine multiple lock file paths into a single `hashFiles()` call — it hashes all
+     matching files together and still produces one 64-character digest:
+     `${{ hashFiles('**/package-lock.json', '**/yarn.lock', '**/Pipfile.lock') }}`
+
+  2. Remove redundant discriminators. `runner.os` alone is usually sufficient; adding
+     `runner.arch` and a full workflow name is rarely necessary.
+
+  3. Use short version aliases in matrix: `node: [20, 22]` not full version strings.
+
+  4. Verify key lengths in CI by printing `echo "Key length: ${#KEY}"` before the cache step.
+fix_code:
+  - language: yaml
+    label: "Broken: multiple hashFiles calls produce a key > 512 chars"
+    code: |
+      # Key expands to ~600 characters — exceeds 512-char limit
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: >-
+            ${{ runner.os }}-${{ runner.arch }}-${{ github.workflow }}-
+            ${{ matrix.node-version }}-${{ matrix.python-version }}-
+            ${{ hashFiles('**/package-lock.json') }}-
+            ${{ hashFiles('**/yarn.lock') }}-
+            ${{ hashFiles('**/pnpm-lock.yaml') }}-
+            ${{ hashFiles('**/Pipfile.lock') }}-
+            ${{ hashFiles('**/requirements.txt') }}
+  - language: yaml
+    label: "Fix: single combined hashFiles call, short key"
+    code: |
+      # Key expands to ~100 characters — well under 512-char limit
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            ~/.cache/pip
+          key: >-
+            ${{ runner.os }}-${{ matrix.node-version }}-
+            ${{ hashFiles('**/package-lock.json', '**/yarn.lock', '**/Pipfile.lock', '**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.node-version }}-
+            ${{ runner.os }}-
+prevention:
+  - "Count the expanded length of your cache key: each `hashFiles()` call adds exactly 64 characters."
+  - "Combine multiple lock file globs into one `hashFiles('glob1', 'glob2')` call instead of concatenating separate calls."
+  - "Avoid including long workflow names, full version strings, or runner architecture in cache keys unless strictly necessary."
+  - "Keep restore-keys short — they are prefixes and don't need to match the full key structure."
+  - "Print `echo \"Cache key length: ${#CACHE_KEY}\"` in a prior step to catch length issues before they reach the cache step."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows#using-the-cache-action"
+    label: "Caching dependencies — GitHub Docs (512-character key limit)"
+  - url: "https://github.com/actions/cache"
+    label: "actions/cache README — Cache Limits"

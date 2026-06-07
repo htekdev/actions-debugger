@@ -1,0 +1,90 @@
+id: permissions-auth-089
+title: "Ephemeral runner JIT token expires after ~60 minutes causing sequential jobs to fail"
+category: permissions-auth
+severity: error
+tags:
+  - jit
+  - ephemeral-runners
+  - self-hosted
+  - generate-jitconfig
+  - token-expiry
+  - max-parallel
+patterns:
+  - regex: 'The operation was canceled'
+    flags: 'i'
+  - regex: 'runner.*registration.*was not found'
+    flags: 'i'
+  - regex: 'Registration.*was not found'
+    flags: 'i'
+error_messages:
+  - "The operation was canceled."
+  - "An error occurred: The operation was canceled."
+  - "Registration was not found"
+root_cause: |
+  When using ephemeral self-hosted runners with the `generate-jitconfig` API, a
+  Just-In-Time (JIT) token is generated at runner registration time with a validity
+  window of approximately 60 minutes. This token controls the runner's ability to
+  connect to the GitHub Actions service and accept jobs.
+
+  Workflows with `max-parallel: 1` and multiple sequential matrix jobs, or chains of
+  `needs`-dependent jobs, can easily exceed 60 minutes of total elapsed wall-clock time.
+  Jobs queued after the JIT token expires are assigned to a runner whose registration
+  GitHub has already invalidated — the runner cannot authenticate to receive the job and
+  the job fails immediately with "The operation was canceled."
+
+  This is architecturally distinct from `GITHUB_TOKEN` expiry (which caps at 6 hours for
+  GitHub-hosted runners and 24 hours for self-hosted) and from GitHub App token expiry.
+  JIT token expiry prevents the runner from RECEIVING the job, not from executing it.
+  The error message gives no indication that token expiry is the cause.
+fix: |
+  1. Increase `max-parallel` so all matrix jobs dispatch simultaneously before the 60-minute
+     window closes.
+  2. For long `needs`-chained pipelines, use registration-based (non-JIT) persistent
+     runners rather than ephemeral JIT runners.
+  3. Split the workflow into multiple independently-triggered workflows so each triggers
+     a fresh JIT token registration.
+  4. Reduce total sequential wall-clock time below 60 minutes through parallelism or
+     caching.
+fix_code:
+  - language: yaml
+    label: "Fix: increase max-parallel so all jobs dispatch before JIT token expires"
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              target: [unit, integration, e2e, lint]
+            max-parallel: 4   # all jobs dispatched at once; each gets a fresh JIT token
+          runs-on: [self-hosted, ephemeral]
+          steps:
+            - run: echo "Running ${{ matrix.target }}"
+  - language: yaml
+    label: "Fix: use persistent (non-JIT) runner for long sequential chains"
+    code: |
+      jobs:
+        build:
+          runs-on: [self-hosted, persistent]   # registered runner, no 60-min JIT window
+          steps:
+            - run: make build
+        test:
+          needs: build
+          runs-on: [self-hosted, persistent]
+          steps:
+            - run: make test
+        deploy:
+          needs: test
+          runs-on: [self-hosted, persistent]
+          steps:
+            - run: make deploy
+prevention:
+  - "Keep total sequential workflow wall-clock time (including queue wait) under 60 minutes when using JIT runners."
+  - "Prefer `max-parallel` > 1 to dispatch all matrix jobs before the JIT token window closes."
+  - "Use registration-based (non-ephemeral) runners for long-running multi-job pipelines."
+  - "Monitor job queue wait times — time spent waiting for a runner also counts against the 60-minute JIT token."
+docs:
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions#using-just-in-time-runners"
+    label: "Using just-in-time runners — GitHub Docs"
+  - url: "https://github.com/actions/runner/issues/4248"
+    label: "actions/runner#4248: JIT Token Expiration with Long-Running Sequential Workflows"
+  - url: "https://github.com/orgs/community/discussions/25699"
+    label: "Community Discussion #25699: JIT token validity window (~60 minutes)"

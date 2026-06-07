@@ -1,0 +1,107 @@
+id: silent-failures-147
+title: "inputs context is empty object on non-dispatch events; inputs.key == null always false"
+category: silent-failures
+severity: silent-failure
+tags:
+  - inputs
+  - workflow_dispatch
+  - null-comparison
+  - event-detection
+  - context
+  - push
+patterns:
+  - regex: 'inputs\.\w+\s*==\s*null'
+    flags: 'i'
+  - regex: 'inputs\s*==\s*null'
+    flags: 'i'
+error_messages:
+  - "if: inputs.key == null always evaluates false on push/schedule/pull_request events"
+  - "inputs context is empty object not null on non-dispatch triggers"
+root_cause: |
+  When a workflow is triggered by `workflow_dispatch`, the `inputs` context is populated
+  with the values provided by the caller (user or API). When triggered by any other event
+  (push, pull_request, schedule, workflow_run, etc.), the `inputs` context is present as
+  an EMPTY OBJECT — it is NOT null or absent.
+
+  This causes several silent logic failures:
+
+  - `inputs.foo == null` → always false on push/schedule/pull_request, because
+    `inputs.foo` evaluates to `''` (empty string) when the key is declared but no
+    dispatch input was provided — and `'' != null` in GitHub Actions expression syntax
+  - `inputs == null` → always false because `inputs` is `{}` (empty object), not null
+  - `!inputs` → always false because an empty object `{}` is truthy in GHA expressions
+  - `inputs.undeclared_key == null` → also false; undeclared keys return empty string
+
+  The intent of `inputs.foo == null` is usually "detect whether we're in a dispatch run",
+  but this check silently fails — the `null` branch never executes on push/schedule,
+  meaning fallback logic is silently skipped.
+fix: |
+  Use `github.event_name == 'workflow_dispatch'` to explicitly detect dispatch triggers.
+  Use the `||` operator to provide default values for absent inputs:
+
+  ```yaml
+  # Correct dispatch detection
+  if: github.event_name == 'workflow_dispatch'
+
+  # Correct default for absent input
+  run: echo "env=${{ inputs.deploy_env || 'staging' }}"
+  ```
+
+  Do NOT use `inputs.key == null` or `inputs == null` to infer the trigger type.
+fix_code:
+  - language: yaml
+    label: "Broken: inputs.key == null to detect non-dispatch trigger (always false)"
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            deploy_env:
+              type: string
+              default: staging
+        push:
+          branches: [main]
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Default deploy — BROKEN, this if is always false on push
+              if: inputs.deploy_env == null
+              run: echo "deploying to staging (default)"
+            - name: Custom deploy — BROKEN, this if is always true on push
+              if: inputs.deploy_env != null
+              run: echo "deploying to ${{ inputs.deploy_env }}"
+  - language: yaml
+    label: "Fix: use github.event_name and || operator for dispatch detection"
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            deploy_env:
+              type: string
+              default: staging
+        push:
+          branches: [main]
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Deploy to correct environment
+              run: |
+                ENV="${{ inputs.deploy_env || 'staging' }}"
+                echo "deploying to $ENV"
+
+            - name: Only on dispatch — correct
+              if: github.event_name == 'workflow_dispatch'
+              run: echo "manually triggered with env=${{ inputs.deploy_env }}"
+prevention:
+  - "Never use `inputs.key == null` or `inputs == null` to detect whether the workflow was triggered by dispatch."
+  - "Use `github.event_name == 'workflow_dispatch'` for explicit dispatch detection."
+  - "Use the `||` operator (`inputs.key || 'default'`) to provide fallback values for absent dispatch inputs."
+  - "Remember: on push/schedule, `inputs.declared_key` is `''` (empty string), not `null`."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#inputs-context"
+    label: "inputs context — GitHub Docs"
+  - url: "https://github.com/actions/runner/issues/1483"
+    label: "actions/runner#1483: Boolean inputs are not actually booleans (dispatch vs call types)"
+  - url: "https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#workflow_dispatch"
+    label: "workflow_dispatch event — GitHub Docs"
