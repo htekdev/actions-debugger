@@ -1,0 +1,106 @@
+id: concurrency-timing-071
+title: "timeout-minutes Counts Down During Environment Approval Wait — Job Silently Killed"
+category: concurrency-timing
+severity: error
+tags:
+  - timeout-minutes
+  - environment
+  - deployment
+  - approval
+  - protection-rules
+  - waiting
+patterns:
+  - regex: 'The job running on runner .+ has exceeded the maximum execution time'
+    flags: 'i'
+  - regex: 'timeout-minutes:\s*\d+'
+    flags: 'i'
+  - regex: 'environment:\s*\S+'
+    flags: 'i'
+error_messages:
+  - "The job running on runner has exceeded the maximum execution time of N minutes."
+  - "Error: The operation was canceled."
+root_cause: |
+  `timeout-minutes` measures elapsed time from the moment a job **starts** — i.e., when
+  it transitions from "Queued" to the "Waiting" or "In Progress" state on a runner.
+  This includes the time the job spends in the "Waiting" state awaiting environment
+  protection rule approval.
+
+  Unlike **queue wait time** (before a runner is allocated — which does NOT count against
+  `timeout-minutes`), environment review wait begins after the runner is allocated and the
+  job has started. GitHub counts this entire period against the job's `timeout-minutes`
+  budget.
+
+  The confusion arises because:
+  - The GitHub docs state "Wait time will not count towards your billable time" for the
+    environment `wait-timer` protection rule — this refers to **billing**, not
+    `timeout-minutes`.
+  - A separate "Gate approval time" platform limit of 30 days applies, but it does not
+    override a shorter `timeout-minutes` value on the job.
+  - The failure message "exceeded the maximum execution time of N minutes" provides no
+    indication that environment approval wait time was the cause.
+
+  Example: `timeout-minutes: 60` with a required reviewer who takes 70 minutes to
+  approve → the job is killed with a timeout error before it ever executes a single step.
+fix: |
+  1. Set `timeout-minutes` high enough to cover the expected reviewer response time
+     plus actual job execution time.
+  2. Configure the environment's `wait-timer` protection rule to add a minimum delay —
+     this gives reviewers advance notice without burning the job's timeout budget
+     (wait-timer time does NOT count against billable minutes, but DOES count against
+     timeout-minutes).
+  3. Add proactive Slack/Teams/PagerDuty notifications at deployment queue time so
+     reviewers act before the timeout expires.
+  4. For automated deployments where human approval is rarely needed, replace blocking
+     approval gates with post-deployment audit webhooks or async approval flows.
+fix_code:
+  - language: yaml
+    label: "Set timeout-minutes to cover approval wait + actual deploy time"
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          environment: production
+          # Budget: up to 90 min for approver + 30 min deploy = 120 min total
+          timeout-minutes: 120
+          steps:
+            - name: Deploy
+              run: ./deploy.sh
+  - language: yaml
+    label: "Notify reviewers immediately so they act before timeout expires"
+    code: |
+      jobs:
+        notify:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Notify reviewers that approval is pending
+              uses: slackapi/slack-github-action@v2
+              with:
+                webhook: ${{ secrets.SLACK_DEPLOY_WEBHOOK }}
+                webhook-type: incoming-webhook
+                payload: |
+                  {
+                    "text": ":rocket: Deploy to *production* is awaiting approval.\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Approve here>"
+                  }
+
+        deploy:
+          needs: notify
+          runs-on: ubuntu-latest
+          environment: production
+          timeout-minutes: 120
+          steps:
+            - name: Deploy
+              run: ./deploy.sh
+prevention:
+  - "Never set `timeout-minutes` below your team's maximum realistic reviewer response time for environment-gated jobs."
+  - "Monitor the gap between job start and first step execution — a large gap means environment wait is consuming the budget."
+  - "Send an immediate notification when a deployment enters the approval queue; do not rely on reviewers polling GitHub."
+  - "Document in team runbooks that `timeout-minutes` is a wall-clock timer from job start, not from first step execution."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idtimeout-minutes"
+    label: "GitHub Docs — timeout-minutes syntax"
+  - url: "https://docs.github.com/en/actions/deployment/targeting-different-environments/using-environments-for-deployment#wait-timer"
+    label: "GitHub Docs — Environment wait-timer protection rule"
+  - url: "https://docs.github.com/en/actions/reference/limits"
+    label: "GitHub Docs — Actions limits (Gate approval time vs execution time)"
+  - url: "https://github.com/actions/runner/discussions/3699"
+    label: "actions/runner Discussion #3699 — timeout-minutes includes setup and wait time, not just step duration"
