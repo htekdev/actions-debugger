@@ -1,0 +1,111 @@
+id: runner-environment-262
+title: 'github-script@v7 routes API calls to api.github.com instead of GHES endpoint — 404 Not Found'
+category: runner-environment
+severity: error
+tags:
+  - github-script
+  - ghes
+  - github-enterprise-server
+  - api-routing
+  - base-url
+  - 404
+patterns:
+  - regex: 'RequestError \[HttpError\]: Not Found'
+    flags: 'i'
+  - regex: 'url:.*https://api\.github\.com/.*status: 404'
+    flags: 'i'
+  - regex: 'HttpError.*Not Found.*api\.github\.com.*enterprise'
+    flags: 'i'
+error_messages:
+  - 'RequestError [HttpError]: Not Found'
+  - 'HttpError: Not Found'
+  - 'status: 404'
+  - 'url: ''https://api.github.com/repos/org/repo/issues/...'', status: 404'
+root_cause: |
+  `actions/github-script@v7` (and its bundled `@actions/github@6.0.0`) contains a bug
+  where the Octokit client does not correctly pick up the `GITHUB_API_URL` environment
+  variable on GitHub Enterprise Server (GHES). Instead of sending API requests to the
+  GHES endpoint (`https://your-ghes.example.com/api/v3`), requests are routed to the
+  public `https://api.github.com`, which returns 404 for GHES-hosted resources (since
+  those repos don't exist on github.com).
+
+  The bug was introduced when the @actions/github package was updated and broke the
+  automatic base URL detection from the runner environment. It affects:
+  - Any `github.rest.*` API call in github-script on GHES
+  - `context.repo`, `context.ref`, and related context properties
+  - All REST API calls via `octokit`
+
+  The fix was released in `github-script@v7.0.1` which restores correct use of
+  `GITHUB_API_URL`. The root cause in the underlying toolkit was the Octokit client
+  not reading `process.env.GITHUB_API_URL` as the baseUrl in some configurations.
+
+  Source: actions/github-script#436 (multiple GHES users affected)
+fix: |
+  **Option 1 (recommended): Upgrade to github-script@v7.0.1 or later**
+  Pin to the patched release that restores automatic GHES base URL detection.
+
+  **Option 2: Pass `base-url` explicitly in the step**
+  Add `github-server-url: ${{ github.server_url }}` and a custom Octokit client
+  initialized with `github.api_url` as the base URL.
+
+  **Option 3: Use the `github-server-url` input (github-script@v6+)**
+  In the `with:` block, pass the GHES API URL via the `github-server-url` parameter
+  so the action uses it instead of the default api.github.com.
+fix_code:
+  - language: yaml
+    label: 'Wrong — github-script@v7.0.0 on GHES routes to api.github.com'
+    code: |
+      - name: Comment on issue
+        uses: actions/github-script@v7   # v7.0.0 has GHES routing bug
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: 'Hello!'
+            });
+            # Fails: RequestError [HttpError]: Not Found
+            # url: 'https://api.github.com/repos/...' (wrong host for GHES)
+  - language: yaml
+    label: 'Fixed — pin to v7.0.1+ which restores GHES base URL detection'
+    code: |
+      - name: Comment on issue
+        uses: actions/github-script@v7.0.1   # patched release
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: 'Hello!'
+            });
+  - language: yaml
+    label: 'Fixed — pass github-server-url explicitly for GHES compatibility'
+    code: |
+      - name: Comment on issue (GHES-safe)
+        uses: actions/github-script@v7
+        with:
+          github-server-url: ${{ github.server_url }}
+          script: |
+            const octokit = github.getOctokit(process.env.GITHUB_TOKEN, {
+              baseUrl: process.env.GITHUB_API_URL,
+            });
+            await octokit.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: 'Hello from GHES!'
+            });
+prevention:
+  - 'Pin to actions/github-script@v7.0.1 or later when running workflows on GHES'
+  - 'Always test action upgrades on GHES in a staging workflow before rolling out to production'
+  - 'Use ${{ github.api_url }} instead of hardcoding api.github.com in any API calls'
+  - 'When building custom Octokit clients in github-script, always pass baseUrl: process.env.GITHUB_API_URL'
+docs:
+  - url: 'https://github.com/actions/github-script/issues/436'
+    label: 'actions/github-script#436 — GHES API routing bug report'
+  - url: 'https://github.com/actions/github-script'
+    label: 'actions/github-script repository and changelog'
+  - url: 'https://docs.github.com/en/enterprise-server@latest/actions/writing-workflows/choosing-what-your-workflow-does/using-github-cli-in-workflows'
+    label: 'GitHub Docs — Using GitHub CLI in workflows on GHES'
