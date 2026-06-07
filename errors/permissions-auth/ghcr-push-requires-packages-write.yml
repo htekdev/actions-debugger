@@ -1,0 +1,151 @@
+id: permissions-auth-087
+title: "Pushing to GitHub Container Registry (ghcr.io) Requires packages: write — GITHUB_TOKEN Lacks This by Default"
+category: permissions-auth
+severity: error
+tags:
+  - ghcr
+  - packages-write
+  - docker
+  - github-container-registry
+  - permissions
+  - denied
+  - build-push-action
+patterns:
+  - regex: 'denied: permission_denied: write_package'
+    flags: 'i'
+  - regex: 'unauthorized: authentication required.*ghcr\.io|ghcr\.io.*unauthorized'
+    flags: 'i'
+  - regex: 'failed to push.*ghcr\.io'
+    flags: 'i'
+  - regex: 'buildx failed.*error: failed to solve: failed to push'
+    flags: 'i'
+error_messages:
+  - "denied: permission_denied: write_package"
+  - "Error response from daemon: Get \"https://ghcr.io/v2/\": unauthorized: authentication required"
+  - "Error: buildx failed with: error: failed to solve: failed to push ghcr.io/org/image:tag"
+  - "Error: Process completed with exit code 1."
+  - "unauthorized: unauthenticated: User cannot be authenticated with the token provided."
+root_cause: |
+  The default `GITHUB_TOKEN` does not include `packages: write` permission. Without it,
+  any push to GitHub Container Registry (ghcr.io) — whether through
+  `docker/build-push-action`, `docker/bake-action`, or direct `docker push` — is rejected
+  at the registry level with "denied: permission_denied: write_package".
+
+  The confusion arises because the authentication step (`docker login ghcr.io`) often
+  **succeeds** even without `packages: write`. Login uses the token's read credentials,
+  which are typically available by default. The permission failure only surfaces at the
+  moment of the actual `docker push` operation, after potentially minutes of build time.
+
+  Common triggers for this error:
+  - A new workflow is created without an explicit `permissions:` block; the repo's
+    default token permissions are "Read repository contents and packages" (no write)
+  - An existing `permissions:` block is added for another purpose (e.g., `id-token: write`
+    for OIDC, `security-events: write` for SARIF), which silently drops all unlisted
+    permissions to 'none' — including any previously implied `packages: write`
+  - The workflow was working when the org's default was "Read and write", then the
+    org admin tightened the default to "Read-only" via Settings → Actions → General
+  - A Dependabot security update bumps `docker/build-push-action` to a version that
+    validates permissions earlier, surfacing what was previously a latent misconfiguration
+
+  Note: `packages: write` is distinct from `packages: read`. The read variant
+  (covered separately) enables pulling from ghcr.io; the write variant is required for
+  pushing/publishing new image layers or tags.
+fix: |
+  Add `packages: write` explicitly to the job-level `permissions` block. Pair it with
+  `contents: read` (for checkout) and any other permissions the job requires. Setting
+  permissions at the job level is preferred over workflow level to limit blast radius.
+
+  Also ensure the workflow authenticates with `docker/login-action` using `GITHUB_TOKEN`
+  before invoking `docker/build-push-action` with `push: true`.
+fix_code:
+  - language: yaml
+    label: "Add packages: write permission to the build-and-push job"
+    code: |
+      jobs:
+        build-and-push:
+          runs-on: ubuntu-latest
+          permissions:
+            contents: read    # for actions/checkout
+            packages: write   # required for docker push to ghcr.io
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Log in to GitHub Container Registry
+              uses: docker/login-action@v3
+              with:
+                registry: ghcr.io
+                username: ${{ github.actor }}
+                password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Extract metadata
+              id: meta
+              uses: docker/metadata-action@v5
+              with:
+                images: ghcr.io/${{ github.repository }}
+
+            - name: Build and push
+              uses: docker/build-push-action@v6
+              with:
+                context: .
+                push: true
+                tags: ${{ steps.meta.outputs.tags }}
+                labels: ${{ steps.meta.outputs.labels }}
+  - language: yaml
+    label: "Workflow-level permissions (alternative — applies to all jobs)"
+    code: |
+      # Add at the top of your workflow file (before 'jobs:').
+      # Only use workflow-level permissions if ALL jobs in the workflow need these.
+      permissions:
+        contents: read
+        packages: write
+
+      jobs:
+        build-and-push:
+          runs-on: ubuntu-latest
+          # No separate permissions block needed — inherits from workflow level
+          steps:
+            - uses: actions/checkout@v4
+            - uses: docker/login-action@v3
+              with:
+                registry: ghcr.io
+                username: ${{ github.actor }}
+                password: ${{ secrets.GITHUB_TOKEN }}
+            - uses: docker/build-push-action@v6
+              with:
+                push: true
+                tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
+  - language: yaml
+    label: "Diagnose: test login separately from push to isolate the failure"
+    code: |
+      steps:
+        - name: Log in to ghcr.io
+          uses: docker/login-action@v3
+          with:
+            registry: ghcr.io
+            username: ${{ github.actor }}
+            password: ${{ secrets.GITHUB_TOKEN }}
+
+        # If login succeeds but push fails with permission_denied: write_package,
+        # the token lacks packages: write — add it to the job's permissions: block.
+        - name: Test push access (dry-run)
+          run: |
+            docker pull hello-world
+            docker tag hello-world ghcr.io/${{ github.repository }}:test-push
+            docker push ghcr.io/${{ github.repository }}:test-push
+prevention:
+  - "Always include an explicit `permissions:` block with `packages: write` on jobs that push to ghcr.io."
+  - "Test `docker login` and `docker push` in separate named steps — login success does NOT guarantee push permission."
+  - "When adding any new permission key (e.g., `id-token: write`), audit all other permissions your job needs — adding one key drops all unspecified permissions to 'none'."
+  - "Pin your org's default GITHUB_TOKEN permissions to 'Read-only' and always use explicit `permissions:` blocks — this surfaces missing permissions early rather than in production pushes."
+  - "Add `docker/metadata-action` to generate image tags; its output automatically handles lowercase conversion for `github.repository` casing issues in tag names."
+docs:
+  - url: "https://docs.github.com/en/actions/use-cases-and-examples/publishing-packages/publishing-docker-images"
+    label: "GitHub Docs — Publishing Docker images"
+  - url: "https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry"
+    label: "GitHub Docs — Working with the Container Registry"
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#permissions-for-the-github_token"
+    label: "GitHub Docs — GITHUB_TOKEN permissions reference"
+  - url: "https://stackoverflow.com/questions/69014742/github-denied-permission-denied-write-package"
+    label: "Stack Overflow #69014742 — denied: permission_denied: write_package"
+  - url: "https://github.com/orgs/community/discussions/26274"
+    label: "GitHub Community Discussion #26274 — GHCR push permission denied"

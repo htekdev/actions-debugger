@@ -1,0 +1,120 @@
+id: concurrency-timing-072
+title: "strategy.max-parallel is Scoped Per Workflow Run — Not Enforced Globally Across Concurrent Runs"
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - matrix
+  - max-parallel
+  - concurrency
+  - self-hosted-runners
+  - runner-pool
+  - strategy
+patterns:
+  - regex: 'max-parallel:\s*\d+'
+    flags: 'i'
+  - regex: 'Job is waiting for a hosted runner to come online'
+    flags: 'i'
+  - regex: 'No hosted runner matching the label'
+    flags: 'i'
+error_messages:
+  - "Job is waiting for a hosted runner to come online."
+  - "No hosted runner matching the label(s) was found."
+  - "Requested labels: self-hosted, large-runner"
+root_cause: |
+  `strategy.max-parallel` limits the maximum number of simultaneous matrix jobs
+  within a **single workflow run instance**. It does NOT enforce a global cap across
+  multiple concurrent workflow runs. Each run enforces its own `max-parallel` budget
+  independently.
+
+  When multiple triggers fire the same workflow concurrently — for example, 3 PRs
+  push commits at the same time — each run instance gets its own `max-parallel` limit.
+  With `max-parallel: 2` and each run containing a 6-job matrix, up to 6 jobs
+  (3 × 2) can run simultaneously across the repository — not 2.
+
+  This misconception is especially costly for teams protecting self-hosted runner pools.
+  Engineers set `max-parallel: 2` believing this caps total concurrent load on their
+  runner group to 2. Under burst push conditions, the pool receives N_runs × max-parallel
+  jobs simultaneously, causing:
+  - Runner allocation failures ("Job is waiting for hosted runner")
+  - Queue thrashing on self-hosted runner pools
+  - Unexpected resource exhaustion (CPU, memory, build cache contention)
+  - Cascading timeouts as jobs wait for queued runners
+
+  GitHub Docs define `max-parallel` as: "The maximum number of jobs that can run
+  simultaneously when using a matrix strategy." The scope qualifier ("when using a
+  matrix strategy") means within one run's matrix expansion only.
+fix: |
+  To limit concurrency **across** multiple workflow runs (protecting shared runner pools),
+  use the `concurrency:` key at the workflow or job level. The `concurrency:` key creates
+  a named group that serializes or cancels competing runs globally across the repository.
+
+  `strategy.max-parallel` remains useful for controlling ordering within a single run's
+  matrix expansion — combine it with a workflow-level `concurrency:` block for full control.
+fix_code:
+  - language: yaml
+    label: "Wrong: max-parallel alone does not cap concurrency across concurrent runs"
+    code: |
+      # WRONG: With 3 PRs pushing simultaneously, each run uses its own max-parallel
+      # budget. Total concurrent jobs = 3 runs × 2 = 6, not 2.
+      jobs:
+        test:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest, macos-latest]
+              node: [18, 20, 22]
+            max-parallel: 2  # Only limits THIS run, not all concurrent runs
+          runs-on: ${{ matrix.os }}
+          steps:
+            - run: npm test
+  - language: yaml
+    label: "Correct: add a workflow-level concurrency group to serialize across runs"
+    code: |
+      # Serializes all runs of this workflow so only one run is active at a time.
+      # Protects self-hosted runner pools from burst load.
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: true   # or false to queue instead of cancel
+
+      jobs:
+        test:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest, macos-latest]
+              node: [18, 20, 22]
+            max-parallel: 2  # Still useful: limits parallel jobs within the one active run
+          runs-on: ${{ matrix.os }}
+          steps:
+            - run: npm test
+  - language: yaml
+    label: "For self-hosted runner pools: queue all runs, limit matrix slots per run"
+    code: |
+      # Queue runs instead of cancelling — ensures all PRs eventually build.
+      # One run at a time, each run uses at most max-parallel slots simultaneously.
+      concurrency:
+        group: ci-runner-pool
+        cancel-in-progress: false  # Queue, don't cancel
+
+      jobs:
+        build:
+          strategy:
+            matrix:
+              target: [linux-amd64, linux-arm64, windows-amd64, macos-arm64]
+            max-parallel: 2  # Limits slots within this run (2 of 4 matrix jobs at once)
+          runs-on: [self-hosted, ${{ matrix.target }}]
+          steps:
+            - run: make build TARGET=${{ matrix.target }}
+prevention:
+  - "Use `concurrency:` at the workflow level to protect shared self-hosted runner pools from burst load — `max-parallel` alone is not sufficient."
+  - "Treat `max-parallel` as an intra-run ordering tool, not a global concurrency limiter."
+  - "Monitor runner pool queue depth during burst push events — if it spikes beyond max-parallel, a concurrency group is needed."
+  - "For fine-grained global runner pool control, consider GitHub's runner group concurrency limits (Enterprise) or Actions Runner Controller (ARC) with `maxConcurrentRuns`."
+  - "Document to your team that `max-parallel: 2` means 2 matrix jobs at once per run, not 2 total jobs across the entire organization."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/running-variations-of-jobs-in-a-workflow#defining-the-maximum-number-of-concurrent-jobs"
+    label: "GitHub Docs — Defining the maximum number of concurrent jobs"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs"
+    label: "GitHub Docs — Control the concurrency of workflows and jobs"
+  - url: "https://stackoverflow.com/questions/73441260/how-to-set-concurency-x-for-limiting-number-of-concurrent-workflows-in-github"
+    label: "Stack Overflow #73441260 — Limiting concurrent GitHub Actions workflows"
+  - url: "https://github.com/orgs/community/discussions/102771"
+    label: "GitHub Community Discussion #102771 — max-parallel across multiple concurrent runs"
