@@ -1,0 +1,106 @@
+id: silent-failures-127
+title: 'context.runAttempt returns undefined in actions/github-script@v7 — @actions/github 6.0.0 missing this property'
+category: silent-failures
+severity: silent-failure
+tags:
+  - github-script
+  - context
+  - run-attempt
+  - undefined
+  - actions-github
+  - toolkit
+patterns:
+  - regex: 'context\.runAttempt.*undefined'
+    flags: 'i'
+  - regex: 'runAttempt.*undefined'
+    flags: 'i'
+  - regex: 'context\.runAttempt content: undefined'
+    flags: 'i'
+error_messages:
+  - "Warning: context.runAttempt content: undefined - 1"
+  - "context.runAttempt is undefined"
+root_cause: |
+  In `actions/github-script`, the `context` object is provided by `@actions/github`, the
+  GitHub toolkit package bundled with the action. The `runAttempt` property was added to
+  the `Context` class in the `@actions/github` source repository (GitHub commit from
+  October 28, 2023), but this commit was merged AFTER the `@actions/github@6.0.0` npm
+  package was published on October 10, 2023.
+
+  As a result, `@actions/github@6.0.0` — the version shipped with `github-script@v7` —
+  does NOT expose `context.runAttempt`. Accessing it returns `undefined` silently with
+  no error thrown.
+
+  This is a silent failure: workflows that use `context.runAttempt` in conditions, string
+  interpolation, or retry logic receive `undefined` instead of the expected integer (1 for
+  the first attempt, 2 for the first re-run, etc.):
+
+  - `if (context.runAttempt > 1)` → always false (undefined > 1 is false)
+  - `` `attempt-${context.runAttempt}` `` → produces `"attempt-undefined"` as a string
+  - `parseInt(context.runAttempt, 10)` → produces `NaN`
+
+  The `GITHUB_RUN_ATTEMPT` environment variable IS populated correctly by the runner
+  regardless of which `@actions/github` version is bundled with github-script.
+fix: |
+  Replace every use of `context.runAttempt` with `process.env.GITHUB_RUN_ATTEMPT`
+  (a string) or `parseInt(process.env.GITHUB_RUN_ATTEMPT, 10)` (an integer):
+
+  ```javascript
+  // BROKEN — returns undefined in github-script@v7
+  const attempt = context.runAttempt;
+
+  // FIXED — use the environment variable, always populated by the runner
+  const attempt = parseInt(process.env.GITHUB_RUN_ATTEMPT, 10);  // integer
+  // or
+  const attemptStr = process.env.GITHUB_RUN_ATTEMPT;  // string: "1", "2", etc.
+  ```
+
+  Note: `GITHUB_RUN_ATTEMPT` is always a decimal string; use `parseInt(..., 10)` for
+  numeric comparisons to avoid unexpected coercions.
+fix_code:
+  - language: yaml
+    label: 'Use GITHUB_RUN_ATTEMPT env var instead of context.runAttempt'
+    code: |
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            // BROKEN — undefined in github-script@v7
+            // const attempt = context.runAttempt;
+
+            // FIXED — GITHUB_RUN_ATTEMPT is always set by the runner
+            const attempt = parseInt(process.env.GITHUB_RUN_ATTEMPT, 10);
+            core.info(`Run attempt: ${attempt}`);
+
+            // Example: add a label when this is a re-run (attempt > 1)
+            if (attempt > 1) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                labels: ['re-run'],
+              });
+            }
+  - language: yaml
+    label: 'Detect re-runs to skip expensive setup on retry'
+    code: |
+      - uses: actions/github-script@v7
+        id: check-rerun
+        with:
+          result-encoding: string
+          script: |
+            // Use GITHUB_RUN_ATTEMPT instead of the broken context.runAttempt
+            return process.env.GITHUB_RUN_ATTEMPT;
+
+      - name: Skip slow setup on re-runs
+        if: steps.check-rerun.outputs.result != '1'
+        run: echo "This is a re-run (attempt ${{ steps.check-rerun.outputs.result }}), skipping initial setup"
+prevention:
+  - 'Never use context.runAttempt in actions/github-script@v7; use process.env.GITHUB_RUN_ATTEMPT instead'
+  - 'When a context property behaves unexpectedly, log the full context: core.info(JSON.stringify(context)) to see which properties are present'
+  - 'Check the @actions/github npm version bundled with your github-script version before relying on newer Context properties'
+docs:
+  - url: 'https://github.com/actions/github-script/issues/566'
+    label: 'context.runAttempt is undefined using github-script v7 (github-script#566)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/store-information-in-variables#default-environment-variables'
+    label: 'GITHUB_RUN_ATTEMPT — default environment variables documentation'
+  - url: 'https://www.npmjs.com/package/@actions/github/v/6.0.0'
+    label: '@actions/github v6.0.0 npm release (missing runAttempt property)'

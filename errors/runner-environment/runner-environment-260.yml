@@ -1,0 +1,128 @@
+id: runner-environment-260
+title: 'checkout@v6 with create-pull-request causes "Duplicate header: Authorization" HTTP 400'
+category: runner-environment
+severity: error
+tags:
+  - checkout
+  - create-pull-request
+  - authorization
+  - git-credentials
+  - v6
+  - credential-conflict
+patterns:
+  - regex: 'remote: Duplicate header: "Authorization"'
+    flags: 'i'
+  - regex: 'fatal: unable to access .+ The requested URL returned error: 400'
+    flags: 'i'
+  - regex: 'Duplicate header.*Authorization'
+    flags: 'i'
+error_messages:
+  - 'remote: Duplicate header: "Authorization"'
+  - 'fatal: unable to access ''https://github.com/org/repo/'': The requested URL returned error: 400'
+  - 'Error: The process ''/usr/bin/git'' failed with exit code 128'
+root_cause: |
+  `actions/checkout@v6` introduced a new credential mechanism (requires runner v2.329.0+)
+  that stores GitHub HTTPS credentials using a per-token store in the runner's credential
+  infrastructure. When `peter-evans/create-pull-request` is used alongside `checkout@v6`,
+  both actions attempt to configure git credentials for the HTTPS push:
+
+  1. `actions/checkout@v6` stores credentials via the new runner-token mechanism
+  2. `peter-evans/create-pull-request` also injects credentials via git's insteadOf URL
+     rewriting or a credential helper to enable its push-to-create-branch operation
+
+  The result is two valid Authorization headers being emitted on the same git HTTPS
+  request. GitHub's git server rejects this with `Duplicate header: "Authorization"` and
+  HTTP 400.
+
+  Affected version combinations (as of June 2026):
+  - checkout@v6 + create-pull-request@v6 → HTTP 400 (UNLESS persist-credentials: false)
+  - checkout@v6 + create-pull-request@v7 → HTTP 400
+  - checkout@v6 + create-pull-request@v8 → HTTP 400 (even with persist-credentials: false)
+
+  Setting `persist-credentials: false` in checkout@v6 disables one credential layer but
+  does not fix the conflict with create-pull-request@v8, which adds its own credential
+  setup that bypasses the persist-credentials guard.
+fix: |
+  Option 1 — Downgrade checkout to v5 (safest short-term fix):
+
+  ```yaml
+  - uses: actions/checkout@v5        # stay on v5 until CPR compatibility is fixed
+    with:
+      token: ${{ secrets.GITHUB_TOKEN }}
+  - uses: peter-evans/create-pull-request@v8
+  ```
+
+  Option 2 — Use persist-credentials: false with create-pull-request@v6 only
+  (does NOT work with v7 or v8):
+
+  ```yaml
+  - uses: actions/checkout@v6
+    with:
+      persist-credentials: false
+      token: ${{ secrets.GITHUB_TOKEN }}
+  - uses: peter-evans/create-pull-request@v6   # v7 and v8 do not work here
+  ```
+
+  Option 3 — Pin checkout to v6 with a PAT-only approach:
+
+  Use a PAT (Personal Access Token) instead of GITHUB_TOKEN and configure
+  credentials manually so create-pull-request does not need to inject its own:
+
+  ```yaml
+  - uses: actions/checkout@v6
+    with:
+      token: ${{ secrets.PAT_TOKEN }}
+      persist-credentials: true
+  - uses: peter-evans/create-pull-request@v8
+    with:
+      token: ${{ secrets.PAT_TOKEN }}
+  ```
+
+  Track the upstream fix: https://github.com/peter-evans/create-pull-request/issues/4272
+fix_code:
+  - language: yaml
+    label: 'Downgrade to checkout@v5 as temporary workaround'
+    code: |
+      jobs:
+        create-pr:
+          runs-on: ubuntu-latest
+          permissions:
+            contents: write
+            pull-requests: write
+          steps:
+            # Downgrade to v5 until create-pull-request is fully compatible with v6
+            - uses: actions/checkout@v5
+              with:
+                token: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Make automated changes
+              run: |
+                echo "updated at $(date)" >> changelog.txt
+
+            - name: Create Pull Request
+              uses: peter-evans/create-pull-request@v8
+              with:
+                title: 'Automated changes'
+                branch: automated-changes
+  - language: yaml
+    label: 'Use persist-credentials: false with create-pull-request@v6 (not v7/v8)'
+    code: |
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false    # Disable v6 credential layer
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Only v6 of create-pull-request is known to work with this approach
+      - uses: peter-evans/create-pull-request@v6
+prevention:
+  - 'Test create-pull-request compatibility after upgrading actions/checkout to v6; the combination can cause HTTP 400 on git push'
+  - 'Pin checkout to v5 in workflows that use peter-evans/create-pull-request until upstream compatibility is confirmed'
+  - 'Monitor https://github.com/peter-evans/create-pull-request/issues/4272 for a checkout@v6-compatible release'
+  - 'If the error appears after upgrading checkout, try reverting to the previous checkout version first before investigating elsewhere'
+docs:
+  - url: 'https://github.com/peter-evans/create-pull-request/issues/4272'
+    label: 'Duplicate header "Authorization" with checkout v6+ (create-pull-request#4272)'
+  - url: 'https://github.com/peter-evans/create-pull-request/issues/4271'
+    label: 'Authentication issues with checkout and create-pull-request even with latest versions'
+  - url: 'https://github.com/actions/checkout/releases/tag/v6.0.0'
+    label: 'actions/checkout v6.0.0 release notes — new credential mechanism'
