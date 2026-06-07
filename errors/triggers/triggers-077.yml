@@ -1,0 +1,134 @@
+id: triggers-077
+title: 'push and pull_request both fire for same commit on intra-repo PRs — duplicate workflow runs'
+category: triggers
+severity: warning
+tags:
+  - push
+  - pull-request
+  - duplicate-runs
+  - intra-repo
+  - status-checks
+  - usage-minutes
+patterns:
+  - regex: 'on:\s*\n(\s+\w[^\n]*\n)*\s+push:'
+    flags: 'im'
+  - regex: 'on:\s*\[.*push.*pull_request|on:\s*\[.*pull_request.*push'
+    flags: 'i'
+error_messages:
+  - "No error — workflow runs twice for the same commit push on a branch with an open PR"
+  - "Duplicate status checks appearing on commit for the same workflow"
+root_cause: |
+  When a branch has an open pull request from within the SAME repository (an
+  "intra-repo" PR, as opposed to a fork PR), pushing to that branch fires TWO
+  separate GitHub Actions events simultaneously:
+
+  1. `push` event — triggered for the branch ref `refs/heads/feature-branch`
+  2. `pull_request: synchronize` event — triggered for the open PR
+
+  If the workflow file listens to BOTH `on: push` and `on: pull_request`, both
+  trigger independently, creating two separate workflow runs for the identical
+  commit SHA.
+
+  This results in:
+  - Two sets of status check annotations on the commit
+  - Doubled usage minutes (especially costly for expensive matrix jobs)
+  - Two sets of comments/notifications from CI bots
+  - Confusing duplicate check entries in the GitHub PR status UI
+  - Race conditions if both runs try to update the same external system
+
+  Fork PRs are NOT affected: when a PR comes from a fork, the push to the fork
+  does NOT trigger the base repo's `push` event. Fork PRs only fire the
+  `pull_request` event in the base repo. This means the duplicate-run problem
+  only manifests for same-repo feature-branch workflows.
+
+  The duplicate runs each get their own `github.run_id` so concurrency groups
+  using `github.run_id` as the identifier will not de-duplicate them. Only
+  concurrency groups based on `github.ref` / `github.head_ref` will merge them.
+fix: |
+  The standard fix is to restrict the `push` trigger to only production/protected
+  branches, and use `pull_request` exclusively for PR validation:
+
+  ```yaml
+  on:
+    push:
+      branches: [main, master]     # Only fire for direct pushes to main
+    pull_request:
+      branches: [main, master]     # Fire for all PRs targeting main
+  ```
+
+  If you need the same workflow to run on both pushes to main AND PR activity,
+  and want to avoid duplicates for feature branches:
+
+  ```yaml
+  on:
+    push:
+      branches: [main]
+    pull_request:
+
+  jobs:
+    ci:
+      # Run on: push to main, OR any pull_request event
+      # Avoids duplicate runs because push filter only fires for main
+      runs-on: ubuntu-latest
+  ```
+
+  For cases where `push` must fire on feature branches, add an `if:` guard
+  to skip one event type when both would fire:
+
+  ```yaml
+  jobs:
+    ci:
+      # Skip push events if there is an open PR for this branch
+      # (pull_request: synchronize will handle those)
+      if: >-
+        github.event_name == 'pull_request' ||
+        (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      runs-on: ubuntu-latest
+  ```
+fix_code:
+  - language: yaml
+    label: 'Restrict push to main only — use pull_request for PR checks'
+    code: |
+      # Most common fix: scope push to production branches only
+      on:
+        push:
+          branches: [main, master]   # No duplicate: feature branches only trigger pull_request
+        pull_request:
+          branches: [main, master]
+
+      jobs:
+        ci:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm ci && npm test
+  - language: yaml
+    label: 'Guard with if condition to prevent duplicate execution'
+    code: |
+      on:
+        push:
+        pull_request:
+
+      jobs:
+        ci:
+          # Runs on: ALL pull_request events, OR direct push to main only
+          # For feature branch pushes with open PRs: only pull_request fires
+          if: >-
+            github.event_name == 'pull_request' ||
+            (github.event_name == 'push' && github.ref == 'refs/heads/main')
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+prevention:
+  - 'Scope push trigger to production branches (main/master) unless feature-branch push runs are specifically needed'
+  - 'Use pull_request trigger alone for all PR validation; reserve push for post-merge deployment'
+  - 'For fork PRs: duplicate runs are not an issue — fork pushes do not trigger the base repo push event'
+  - 'Add concurrency groups scoped to github.head_ref || github.ref to at least deduplicate execution timing'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#push'
+    label: 'push event trigger documentation'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request'
+    label: 'pull_request event trigger documentation'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/avoiding-duplicate-workflow-runs'
+    label: 'Avoiding duplicate workflow runs (GitHub docs)'
