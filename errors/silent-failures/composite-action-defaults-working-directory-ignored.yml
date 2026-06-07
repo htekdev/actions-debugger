@@ -1,0 +1,150 @@
+id: silent-failures-142
+title: "Composite action steps ignore calling job's defaults.run.working-directory"
+category: silent-failures
+severity: silent-failure
+tags:
+  - composite-action
+  - working-directory
+  - defaults
+  - run-step
+  - scope
+patterns:
+  - regex: 'defaults\s*:\s*\n\s+run\s*:\s*\n\s+working-directory'
+    flags: "im"
+  - regex: 'No such file or directory.*composite|composite.*working.dir.*not.*found'
+    flags: "i"
+  - regex: 'can\s+not\s+find.*path|path.*does.*not.*exist.*composite.*action'
+    flags: "i"
+error_messages:
+  - "Error: The process '/bin/bash' failed with exit code 1"
+  - "No such file or directory"
+  - "ENOENT: no such file or directory"
+root_cause: |
+  When a job sets `defaults.run.working-directory`, that default applies **only to
+  `run` steps defined directly in the job** — it does NOT propagate into composite
+  action steps.
+
+  Composite action steps run in their own isolated scope. Each `run:` step inside a
+  composite action uses `${{ github.workspace }}` as the default working directory,
+  regardless of what the caller job configured in `defaults.run`.
+
+  **Example scenario that fails silently:**
+  ```yaml
+  # Caller job
+  jobs:
+    build:
+      defaults:
+        run:
+          working-directory: ./frontend  # Only applies to THIS job's steps
+      steps:
+        - uses: actions/checkout@v4
+        - uses: ./.github/actions/build  # Composite action ignores ./frontend default
+  ```
+  ```yaml
+  # Composite action — runs from $GITHUB_WORKSPACE, not ./frontend
+  runs:
+    using: composite
+    steps:
+      - run: npm install  # Runs from $GITHUB_WORKSPACE, not ./frontend
+        shell: bash
+  ```
+
+  The `npm install` step runs from `$GITHUB_WORKSPACE` rather than `./frontend`,
+  silently finding a `package.json` in the wrong directory (or failing to find one).
+  The error appears as a missing file or incorrect build output, not as a
+  defaults-related issue.
+
+  **Scope rules for defaults.run:**
+  - Workflow-level `defaults.run` → applies to all job steps in the workflow
+  - Job-level `defaults.run` → applies to that job's direct `run` steps only
+  - Composite action's own `defaults.run` → applies to steps inside the composite
+  - **Caller's `defaults.run` does NOT propagate into composite action steps**
+fix: |
+  Pass the working directory explicitly when calling the composite action. There are
+  three approaches:
+
+  **Option 1 — Add a `working-directory` input to the composite action (recommended):**
+  Define an explicit input in the composite action for the working directory, then
+  use it in each `run` step inside the composite via `working-directory: ${{ inputs.working-directory }}`.
+
+  **Option 2 — Use `defaults.run` inside the composite action itself:**
+  Set `defaults.run.working-directory` inside the composite action's `runs:` block
+  if the composite action always operates in a fixed subdirectory.
+
+  **Option 3 — Use an absolute path input:**
+  Pass `${{ github.workspace }}/frontend` as an input to the composite action
+  rather than a relative path.
+fix_code:
+  - language: yaml
+    label: "Composite action with explicit working-directory input"
+    code: |
+      # .github/actions/build/action.yml
+      name: Build
+      description: Build the project
+      inputs:
+        working-directory:
+          description: 'Directory to run build commands in'
+          required: false
+          default: '.'
+      runs:
+        using: composite
+        steps:
+          - name: Install dependencies
+            shell: bash
+            working-directory: ${{ inputs.working-directory }}  # Explicit override
+            run: npm install
+
+          - name: Build
+            shell: bash
+            working-directory: ${{ inputs.working-directory }}
+            run: npm run build
+  - language: yaml
+    label: "Caller job passing working-directory input to composite action"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          defaults:
+            run:
+              working-directory: ./frontend  # Only affects direct job steps
+          steps:
+            - uses: actions/checkout@v4
+
+            # Direct run step — uses ./frontend from defaults.run
+            - run: echo "In frontend directory"
+
+            # Composite action — must pass working-directory explicitly
+            - uses: ./.github/actions/build
+              with:
+                working-directory: ./frontend   # <-- Required: defaults don't propagate
+  - language: yaml
+    label: "Composite action using its own defaults.run (fixed subdirectory case)"
+    code: |
+      # .github/actions/build/action.yml — always operates in ./frontend
+      name: Build Frontend
+      description: Always builds the frontend subdirectory
+      runs:
+        using: composite
+        defaults:
+          run:
+            working-directory: ./frontend  # Composite's own default
+        steps:
+          - name: Install
+            shell: bash
+            run: npm install
+          - name: Build
+            shell: bash
+            run: npm run build
+prevention:
+  - "Never assume defaults.run.working-directory will propagate into composite action steps — it won't."
+  - "When extracting workflow steps into a composite action, audit every `run:` step for implicit working-directory assumptions."
+  - "Add a `working-directory` input to composite actions that operate on a subdirectory, with a sensible default of `'.'`."
+  - "Use absolute paths (${{ github.workspace }}/my-dir) when passing directory inputs to composite actions to avoid ambiguity."
+  - "Composite actions can set their own defaults.run — use this if the composite always targets a fixed subdirectory."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#defaultsrun"
+    label: "GitHub Docs: defaults.run workflow syntax"
+  - url: "https://docs.github.com/en/actions/sharing-automations/creating-actions/creating-a-composite-action"
+    label: "GitHub Docs: Creating a composite action"
+  - url: "https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idstepsworking-directory"
+    label: "GitHub Docs: Step-level working-directory"

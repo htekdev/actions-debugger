@@ -1,0 +1,125 @@
+id: silent-failures-144
+title: "github.event.pull_request.body is null (not empty string) when PR has no description"
+category: silent-failures
+severity: silent-failure
+tags:
+  - pull_request
+  - event-payload
+  - null
+  - contains
+  - expression
+  - body
+patterns:
+  - regex: 'contains\s*\(\s*github\.event\.pull_request\.body'
+    flags: "i"
+  - regex: 'Null.*not supported|Operand.*Null.*not supported|null.*pull_request\.body'
+    flags: "i"
+  - regex: 'Object reference not set.*body|body.*null.*pull.request'
+    flags: "i"
+error_messages:
+  - "An error occurred trying to get the property body.contains: Object reference not set to an instance of an object."
+  - "Error: Operand of type Null is not supported for operator '='"
+  - "contains: Argument must be a String or Array"
+  - "startsWith: Argument must be a String"
+root_cause: |
+  When a pull request is created or updated without a description (empty body),
+  the GitHub API returns `null` for the `body` field — **not an empty string `""`**.
+
+  In GitHub Actions expression context, `github.event.pull_request.body` evaluates
+  to the JSON `null` value. Most GitHub Actions expression functions (`contains()`,
+  `startsWith()`, `endsWith()`) require a String or Array argument and throw a runtime
+  error when passed null.
+
+  **Functions that fail on null body:**
+  - `contains(github.event.pull_request.body, 'text')` → throws
+  - `startsWith(github.event.pull_request.body, '#')` → throws
+  - `github.event.pull_request.body != ''` → evaluates to `true` (null != '') — **silently wrong**
+  - `github.event.pull_request.body == ''` → evaluates to `false` (null != '') — **silently wrong**
+
+  The `!= ''` case is the most dangerous: it silently evaluates to `true` even when
+  the body is completely empty, causing steps gated on a non-empty body to run
+  unexpectedly when no description is provided.
+
+  **Other `body`-like fields with the same null behavior:**
+  - `github.event.pull_request.body_html` — also null when body is empty
+  - `github.event.issue.body` — same behavior for issues
+  - `github.event.release.body` — same behavior for releases
+  - `github.event.discussion.body` — same behavior for discussions
+fix: |
+  Guard against null using one of these patterns before passing the body to
+  expression functions:
+
+  **Option 1 — Use `|| ''` to coerce null to empty string (most concise):**
+  ```yaml
+  if: contains(github.event.pull_request.body || '', '[skip deploy]')
+  ```
+
+  **Option 2 — Explicit null check before string function:**
+  ```yaml
+  if: github.event.pull_request.body != null && contains(github.event.pull_request.body, 'text')
+  ```
+
+  **Option 3 — In shell via env var (null becomes empty string automatically):**
+  Set the body as an env var in a `run:` step. GitHub Actions sets null values as
+  empty strings in environment variable context, so `${{ github.event.pull_request.body }}`
+  in an env block becomes `""` when body is null.
+fix_code:
+  - language: yaml
+    label: "Null-safe contains() using || '' coercion (recommended)"
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Check for skip flag in PR body
+              # ❌ Throws "Object reference not set" when body is null:
+              # if: contains(github.event.pull_request.body, '[skip deploy]')
+
+              # ✅ Coerce null to '' before passing to contains():
+              if: contains(github.event.pull_request.body || '', '[skip deploy]') == false
+              run: ./deploy.sh
+  - language: yaml
+    label: "Explicit null guard for body-dependent conditions"
+    code: |
+      steps:
+        - name: Parse PR checklist
+          if: |
+            github.event.pull_request.body != null &&
+            contains(github.event.pull_request.body, '- [x] Ready for review')
+          run: echo "PR has review checklist checked"
+
+        - name: Require non-empty description
+          # ❌ WRONG: null != '' is true — silently passes when body is empty
+          # if: github.event.pull_request.body != ''
+
+          # ✅ CORRECT: null check correctly identifies no-description PRs
+          if: github.event.pull_request.body == null || github.event.pull_request.body == ''
+          run: |
+            echo "::error::Pull request must have a description"
+            exit 1
+  - language: yaml
+    label: "Body processing in a shell step via env var (null becomes empty string)"
+    code: |
+      steps:
+        - name: Parse PR body keywords
+          env:
+            PR_BODY: ${{ github.event.pull_request.body }}  # null → "" in env context
+          run: |
+            if echo "$PR_BODY" | grep -q '\[skip deploy\]'; then
+              echo "Skipping deploy"
+            else
+              echo "Running deploy"
+            fi
+prevention:
+  - "Always use '|| ''' to coerce github.event.pull_request.body before passing to contains(), startsWith(), or endsWith()."
+  - "Never compare github.event.pull_request.body to '' to check for an empty description — use != null && != '' instead."
+  - "Apply the same null guard to github.event.issue.body, github.event.release.body, and github.event.discussion.body."
+  - "In composite actions that accept a 'body' input, define a default value of '' to avoid null propagation."
+  - "Use a shell env var (run: step) when body processing is complex — null is automatically coerced to empty string."
+docs:
+  - url: "https://docs.github.com/en/webhooks/webhook-events-and-payloads#pull_request"
+    label: "GitHub Docs: pull_request webhook payload — body field"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#contains"
+    label: "GitHub Docs: contains() — expressions in workflows"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#literals"
+    label: "GitHub Docs: Literals and null in GitHub Actions expressions"
