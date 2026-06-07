@@ -1,0 +1,116 @@
+id: triggers-076
+title: 'pull_request default types excludes ready_for_review — draft-to-ready conversion silently skips CI'
+category: triggers
+severity: silent-failure
+tags:
+  - pull-request
+  - draft
+  - ready-for-review
+  - types
+  - default-types
+  - ci-skip
+patterns:
+  - regex: 'on:\s*\n\s*pull_request:\s*(\n\s*branches:|\s*$)'
+    flags: 'im'
+  - regex: 'types.*opened.*synchronize.*reopened(?!.*ready_for_review)'
+    flags: 'i'
+error_messages:
+  - "No message — workflow silently does not trigger when draft PR is marked ready for review"
+  - "Required status check never appears after marking PR ready for review"
+root_cause: |
+  The `on: pull_request` trigger's default `types:` list is:
+  `[opened, synchronize, reopened]`
+
+  The `ready_for_review` activity type is NOT included in the default.
+
+  When a developer converts a draft PR to "Ready for Review" (via GitHub UI button,
+  `gh pr ready`, or the REST API), this fires the `ready_for_review` activity type
+  exclusively — which is not one of the three defaults. The workflow silently skips.
+
+  Consequences:
+  - The required CI status check never appears on the PR after marking it ready
+  - The PR appears to have no CI results until a developer pushes a new commit
+  - Branch protection rules block merging because the required check was never run
+  - Reviewers are notified but can't merge — confusing delay before root cause is found
+
+  The inverse also applies: `converted_to_draft` is a separate type not in the
+  default list. Workflows meant to cancel CI when a PR is drafted back are also
+  silently skipped.
+
+  This is a GitHub-documented behavior, but the default type list is not shown
+  prominently in the workflow editor or in most CI templates, so it's a common trap.
+fix: |
+  Explicitly list all desired activity types, adding `ready_for_review`:
+
+  ```yaml
+  on:
+    pull_request:
+      types: [opened, synchronize, reopened, ready_for_review]
+  ```
+
+  If you also want to cancel CI when a PR is converted back to draft:
+
+  ```yaml
+  on:
+    pull_request:
+      types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+  ```
+
+  For workflows that should skip draft PRs entirely, combine with a job-level
+  `if:` condition:
+
+  ```yaml
+  on:
+    pull_request:
+      types: [opened, synchronize, reopened, ready_for_review]
+  jobs:
+    ci:
+      if: github.event.pull_request.draft == false
+      runs-on: ubuntu-latest
+  ```
+fix_code:
+  - language: yaml
+    label: 'Add ready_for_review to pull_request types'
+    code: |
+      # BROKEN — ready_for_review event is silently ignored
+      # on:
+      #   pull_request:
+      #     branches: [main]
+
+      # CORRECT — explicitly list all required activity types
+      on:
+        pull_request:
+          branches: [main]
+          types: [opened, synchronize, reopened, ready_for_review]
+
+      jobs:
+        ci:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm ci && npm test
+  - language: yaml
+    label: 'Skip CI for draft PRs, run when ready'
+    code: |
+      on:
+        pull_request:
+          types: [opened, synchronize, reopened, ready_for_review]
+
+      jobs:
+        ci:
+          # Skip if PR is still a draft — only run for non-draft PRs
+          if: github.event.pull_request.draft == false
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+prevention:
+  - 'Always check the default types list when using pull_request trigger with draft PR workflows'
+  - 'Add ready_for_review to types in any repo where developers use draft PRs during development'
+  - 'Consider adding a comment in the workflow file noting which types are in/out of the default list'
+  - 'Use actionlint to lint workflows — it will not flag missing ready_for_review but code review should'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request'
+    label: 'pull_request event — activity types reference'
+  - url: 'https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/proposing-changes-to-your-work-with-pull-requests/changing-the-stage-of-a-pull-request'
+    label: 'Changing the stage of a pull request (draft → ready)'

@@ -1,0 +1,140 @@
+id: concurrency-timing-065
+title: 'Scheduled workflows repeatedly cancelled when job duration exceeds cron interval with cancel-in-progress and github.ref group'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - schedule
+  - cancel-in-progress
+  - cron
+  - github-ref
+  - scheduled-workflow
+patterns:
+  - regex: 'cancel-in-progress:\s*true'
+    flags: 'i'
+  - regex: 'on:\s*\n\s*schedule:'
+    flags: 'im'
+  - regex: 'Canceling since a higher priority waiting request'
+    flags: 'i'
+error_messages:
+  - "Canceling since a higher priority waiting request for '<workflow>-refs/heads/main' exists"
+  - "This run has been cancelled"
+  - "The operation was canceled."
+root_cause: |
+  A common concurrency pattern for CI workflows is:
+
+  ```yaml
+  concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+  ```
+
+  This works well for `push` and `pull_request` events where `github.ref`
+  differentiates branches. However, for `schedule` (cron) events:
+
+  - ALL scheduled runs fire from the default branch
+  - `github.ref` is ALWAYS `refs/heads/main` (or `refs/heads/master`)
+  - Every scheduled run therefore shares the SAME concurrency group
+
+  With `cancel-in-progress: true`, when the next scheduled run fires, it
+  CANCELS the currently-running scheduled job. If the job takes longer than
+  the cron interval, it will ALWAYS be cancelled before it can complete.
+
+  Example scenario:
+  - Cron: `0 * * * *` (every hour)
+  - Job duration: 75 minutes (report generation, database backup, full test suite)
+  - At T+0: Run 1 starts
+  - At T+60: Run 2 fires → cancels Run 1 (cancel-in-progress), Run 2 starts
+  - At T+120: Run 3 fires → cancels Run 2, Run 3 starts
+  - Result: The scheduled job NEVER completes
+
+  Even when the job is shorter than the cron interval but execution is slow
+  (due to runner queue wait times), the timing can still cause cancellations
+  on peak-load days.
+
+  This is a silent failure because:
+  - The workflow appears to be "running" each hour in the Actions tab
+  - The cancellation reason ("higher priority waiting request") is not surfaced
+    prominently in Slack/Teams notifications
+  - Reports, backups, or nightly builds silently fail to complete for days/weeks
+fix: |
+  For scheduled workflows, use `github.run_id` as the concurrency group identifier
+  so each scheduled run gets its own unique slot and never cancels another:
+
+  ```yaml
+  concurrency:
+    group: ${{ github.workflow }}-${{ github.event_name == 'schedule' && github.run_id || github.ref }}
+    cancel-in-progress: ${{ github.event_name != 'schedule' }}
+  ```
+
+  This evaluates to:
+  - For `schedule` events: `"nightly-report-1234567890"` (unique per run, no cancellation)
+  - For `push`/`pull_request` events: `"nightly-report-refs/heads/main"` (cancel stale runs)
+
+  Alternatively, use separate workflow files — one for on-push CI (with
+  cancel-in-progress: true) and a separate dedicated schedule workflow (no
+  concurrency block or group by run_id):
+
+  ```yaml
+  # scheduled-report.yml — no cancel-in-progress needed
+  on:
+    schedule:
+      - cron: '0 * * * *'
+  # No concurrency block — each scheduled run completes independently
+  ```
+fix_code:
+  - language: yaml
+    label: 'Use run_id for schedule events, github.ref for push/PR events'
+    code: |
+      on:
+        push:
+          branches: [main]
+        pull_request:
+        schedule:
+          - cron: '0 2 * * *'   # Nightly at 2 AM
+
+      # BROKEN — all schedule runs share the same group → cancel each other
+      # concurrency:
+      #   group: ${{ github.workflow }}-${{ github.ref }}
+      #   cancel-in-progress: true
+
+      # CORRECT — schedule runs are isolated; push/PR runs cancel stale runs
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.event_name == 'schedule' && github.run_id || github.ref }}
+        cancel-in-progress: ${{ github.event_name != 'schedule' }}
+
+      jobs:
+        run:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./scripts/nightly-report.sh
+  - language: yaml
+    label: 'Dedicated schedule workflow with no concurrency block'
+    code: |
+      # File: .github/workflows/nightly-report.yml
+      # Separate file for scheduled work — no concurrency concerns
+      name: Nightly Report
+      on:
+        schedule:
+          - cron: '0 2 * * *'
+        workflow_dispatch:    # Allow manual trigger without cancellation risk
+
+      # No concurrency block — each run completes independently
+      jobs:
+        report:
+          runs-on: ubuntu-latest
+          timeout-minutes: 120   # Explicit timeout instead of cancel-in-progress
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./scripts/generate-report.sh
+prevention:
+  - 'Never use cancel-in-progress: true with github.ref in the concurrency group for workflows that include a schedule trigger'
+  - 'Use separate workflow files for scheduled jobs and on-push CI to avoid shared concurrency group collisions'
+  - 'Set explicit timeout-minutes on scheduled jobs instead of relying on cancellation for cleanup'
+  - 'Monitor scheduled workflow completion rate — repeated single-minute run durations are a sign of early cancellation'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs'
+    label: 'Controlling concurrency of workflows and jobs'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#schedule'
+    label: 'schedule event — cron trigger documentation'

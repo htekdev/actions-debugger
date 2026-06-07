@@ -1,0 +1,137 @@
+id: known-unsolved-080
+title: 'Workflow-level env block cannot reference env context — self-referential env expansion always returns empty string'
+category: known-unsolved
+severity: silent-failure
+tags:
+  - env
+  - workflow-level-env
+  - context
+  - expression
+  - limitation
+  - env-context
+patterns:
+  - regex: 'env:\s*\n(\s+\w+:[^\n]*\n)+\s+\w+:.*\$\{\{\s*env\.'
+    flags: 'im'
+  - regex: '\$\{\{\s*env\.\w+\s*\}\}.*#.*env.*unavailable'
+    flags: 'i'
+error_messages:
+  - "No error — ${{ env.BASE_URL }} evaluates to empty string in workflow-level env block"
+  - "No error — derived env variable silently becomes '/path' instead of 'https://host/path'"
+root_cause: |
+  GitHub Actions resolves the workflow-level `env:` block at parse time, before
+  any runtime context is populated. The `env` context (which provides access to
+  previously-defined env variables) is NOT available when evaluating entries in
+  the workflow-level `env:` block.
+
+  This means self-referential env definitions silently expand to empty string:
+
+  ```yaml
+  env:
+    BASE_URL: "https://api.example.com"
+    FULL_URL: "${{ env.BASE_URL }}/v2/endpoint"  # ← evaluates to "/v2/endpoint"
+  ```
+
+  `env.BASE_URL` is `""` (empty string) at workflow-level env parse time, so
+  `FULL_URL` becomes `"/v2/endpoint"` — not `"https://api.example.com/v2/endpoint"`.
+
+  Context availability by env block level:
+  | Level           | Contexts available in env block                          |
+  |-----------------|----------------------------------------------------------|
+  | Workflow-level  | `github`, `inputs`, `vars`, `secrets` — NOT `env`      |
+  | Job-level       | `github`, `inputs`, `vars`, `secrets`, `env` ✅          |
+  | Step-level      | `github`, `inputs`, `vars`, `secrets`, `env`, `steps` ✅ |
+
+  This limitation applies ONLY to the workflow-level `env:` block. Job-level and
+  step-level `env:` blocks DO have access to the `env` context, allowing them to
+  reference and build on variables defined at higher levels.
+
+  This is documented GitHub behavior, not a bug. There is no workaround at the
+  workflow-level — the `env` context is intentionally unavailable there.
+
+  Common patterns that silently break:
+  - Constructing API endpoint URLs from a base URL and path components
+  - Building Docker image tags from registry + image name + tag parts
+  - Creating composite paths from individual path segments
+  - Referencing shared configuration variables defined earlier in the same block
+fix: |
+  Move the dependent variable to job-level or step-level env where the `env`
+  context is available:
+
+  ```yaml
+  # Workflow-level: define base variables using supported contexts only
+  env:
+    BASE_URL: "https://api.example.com"
+
+  jobs:
+    deploy:
+      runs-on: ubuntu-latest
+      # Job-level: env context IS available here
+      env:
+        FULL_URL: "${{ env.BASE_URL }}/v2/endpoint"   # ← works correctly
+      steps:
+        - run: echo "$FULL_URL"
+  ```
+
+  For step-level construction, use a `run:` step to set GITHUB_OUTPUT or GITHUB_ENV:
+
+  ```yaml
+  steps:
+    - name: Build derived URLs
+      run: |
+        echo "FULL_URL=$BASE_URL/v2/endpoint" >> $GITHUB_ENV
+    - run: echo "$FULL_URL"
+  ```
+
+  If you need the variable available across all jobs, use a reusable workflow
+  output or a `needs:` dependency to pass computed values forward.
+fix_code:
+  - language: yaml
+    label: 'Move dependent variable to job-level env where env context is available'
+    code: |
+      # Workflow-level env: only base variables, no env context references
+      env:
+        BASE_URL: 'https://api.example.com'
+        IMAGE_REGISTRY: 'ghcr.io/myorg'
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          # Job-level env: env context IS available — this works correctly
+          env:
+            FULL_URL: '${{ env.BASE_URL }}/v2/endpoint'
+            FULL_IMAGE: '${{ env.IMAGE_REGISTRY }}/myapp:latest'
+          steps:
+            - name: Deploy
+              run: |
+                echo "Deploying to: $FULL_URL"
+                echo "Image: $FULL_IMAGE"
+  - language: yaml
+    label: 'Build derived values in a run step using GITHUB_ENV'
+    code: |
+      env:
+        BASE_URL: 'https://api.example.com'
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Set derived environment variables
+              run: |
+                echo "FULL_URL=$BASE_URL/v2/endpoint" >> $GITHUB_ENV
+                echo "HEALTH_URL=$BASE_URL/health" >> $GITHUB_ENV
+            - name: Use derived variables
+              run: |
+                curl "$FULL_URL/status"
+                curl "$HEALTH_URL"
+prevention:
+  - 'Only define base/static values in workflow-level env blocks — never reference env context there'
+  - 'Move any env variable that depends on another env variable to job-level or step-level env'
+  - 'For truly shared cross-job configuration, use vars context (repository/organization variables) or reusable workflow outputs'
+  - 'Add a comment in workflow-level env blocks noting the env context limitation to prevent future surprises'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#env-context'
+    label: 'env context — availability per workflow element'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/setting-environment-variables'
+    label: 'Setting environment variables in GitHub Actions'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#env'
+    label: 'Workflow syntax — env block reference'
