@@ -1,0 +1,142 @@
+id: silent-failures-128
+title: 'github.ref_name returns N/merge not branch name on pull_request events'
+category: silent-failures
+severity: silent-failure
+tags:
+  - github.ref_name
+  - pull_request
+  - merge-ref
+  - head_ref
+  - branch-name
+  - docker-tag
+patterns:
+  - regex: 'github\.ref_name'
+    flags: 'i'
+  - regex: '[0-9]+/merge'
+    flags: 'i'
+error_messages:
+  - 'ref_name: 16/merge'
+  - 'ref_name: 42/merge'
+  - 'invalid reference format'
+  - 'invalid tag "42/merge"'
+root_cause: |
+  On `pull_request` events, `github.ref` is set to `refs/pull/N/merge` (the synthetic
+  merge commit ref GitHub creates to test the PR merge). `github.ref_name` is derived
+  directly from this ref and evaluates to `N/merge` (e.g., `16/merge`, `42/merge`) —
+  NOT the source branch name.
+
+  This surprises developers who use `${{ github.ref_name }}` expecting the feature branch
+  name (e.g., `feat/my-feature`). Common silent failures:
+
+  1. **Docker image tags**: `docker/build-push-action` with `tags: ghcr.io/owner/app:${{ github.ref_name }}`
+     produces tags like `ghcr.io/owner/app:16/merge`. The slash makes this an invalid tag
+     and Docker pushes fail (explicit error) or produce unexpectedly named images.
+
+  2. **Cache keys**: `key: cache-${{ github.ref_name }}` produces `cache-16/merge` — each
+     PR gets a separate cache key but with a confusing name that may not match restore-keys.
+
+  3. **Conditional logic**: `if: github.ref_name == 'main'` never matches on PRs targeting
+     main (because ref_name is `N/merge`), silently skipping steps that should run.
+
+  4. **Deployment environments**: Branch-based environment selection fails silently.
+
+  The actual source branch for PRs is always in `github.head_ref` or
+  `github.event.pull_request.head.ref`. These are ONLY populated on pull_request events;
+  they are empty on push/tag events.
+
+  Sources:
+  - Stack Overflow #70901255 (7 votes — "github.ref_name doesn't give branch name")
+  - Stack Overflow #58033366 (high votes — "how to get current branch in GitHub Actions")
+  - GitHub Docs issue #15319 (documentation discussion)
+fix: |
+  Use the pattern `github.head_ref || github.ref_name` to handle both PR and non-PR events:
+
+  - `github.head_ref` is populated (with the source branch name) on `pull_request` events
+  - `github.ref_name` is the correct value for `push`, tag, and other events
+
+  This fallback pattern works correctly for all event types:
+  ```yaml
+  BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+  ```
+
+  For Docker tags, sanitize the branch name (replace `/` with `-`):
+  ```yaml
+  DOCKER_TAG: ${{ github.head_ref || github.ref_name }}
+  # Then in run: TAG="${DOCKER_TAG//\//-}"
+  ```
+
+  For conditional logic that must match only the main branch on push (not PRs):
+  ```yaml
+  if: github.event_name == 'push' && github.ref_name == 'main'
+  ```
+fix_code:
+  - language: yaml
+    label: 'Wrong — github.ref_name returns N/merge on pull_request events'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Build Docker image (WRONG — tag will be '16/merge' on PRs)
+              uses: docker/build-push-action@v6
+              with:
+                tags: ghcr.io/owner/app:${{ github.ref_name }}
+                # On PR #16, tag becomes: ghcr.io/owner/app:16/merge  ← INVALID
+  - language: yaml
+    label: 'Correct — use github.head_ref || github.ref_name fallback pattern'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          env:
+            BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+          steps:
+            - name: Build Docker image (CORRECT)
+              uses: docker/build-push-action@v6
+              with:
+                # github.head_ref = 'feat/my-feature' on PR events
+                # github.ref_name = 'main' on push events
+                tags: ghcr.io/owner/app:${{ github.head_ref || github.ref_name }}
+  - language: yaml
+    label: 'Correct — sanitize branch name for use as Docker tag (slashes → dashes)'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Derive safe Docker tag from branch name
+              id: meta
+              run: |
+                # Replace / with - so feat/my-feature becomes feat-my-feature
+                BRANCH="${{ github.head_ref || github.ref_name }}"
+                SAFE_TAG="${BRANCH//\//-}"
+                echo "tag=${SAFE_TAG}" >> $GITHUB_OUTPUT
+
+            - name: Build and push
+              uses: docker/build-push-action@v6
+              with:
+                tags: ghcr.io/owner/app:${{ steps.meta.outputs.tag }}
+  - language: yaml
+    label: 'Correct — conditional logic: check branch only on push events'
+    code: |
+      jobs:
+        deploy:
+          # WRONG: if: github.ref_name == 'main'  ← false on PR events (returns N/merge)
+          # CORRECT: scope to push events first, then check ref_name
+          if: github.event_name == 'push' && github.ref_name == 'main'
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying main branch"
+prevention:
+  - 'Never use github.ref_name alone for branch-based logic — it returns N/merge on pull_request events'
+  - 'Use the pattern "${{ github.head_ref || github.ref_name }}" for universal branch name extraction'
+  - 'For PR-specific logic, use github.head_ref (source branch) or github.base_ref (target branch)'
+  - 'For Docker tags derived from branch names, always sanitize slashes: ${BRANCH//\//-}'
+  - 'Check github.event_name == ''push'' before comparing github.ref_name to a branch name in if: conditions'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context'
+    label: 'GitHub Docs — GitHub context: github.ref, github.ref_name, github.head_ref'
+  - url: 'https://stackoverflow.com/questions/70901255/using-env-variable-github-ref-name-doesnt-give-me-branch-name'
+    label: 'Stack Overflow #70901255 — github.ref_name returns merge ref on PRs (7 votes)'
+  - url: 'https://stackoverflow.com/questions/58033366/how-to-get-the-current-branch-within-github-actions'
+    label: 'Stack Overflow #58033366 — how to get current branch in GitHub Actions'

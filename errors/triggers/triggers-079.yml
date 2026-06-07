@@ -1,0 +1,125 @@
+id: triggers-079
+title: 'workflow_run branches: filter silently ignored — trigger fires regardless of branch'
+category: triggers
+severity: silent-failure
+tags:
+  - workflow_run
+  - branches-filter
+  - trigger-filter
+  - silent-failure
+  - head-branch
+patterns:
+  - regex: 'on:\s*\n\s*workflow_run:'
+    flags: 'im'
+  - regex: 'workflow_run:.*\n(?:\s+.*\n)*\s+branches:'
+    flags: 'im'
+error_messages:
+  - 'workflow triggered unexpectedly on branch'
+  - 'workflow_run fired on feature branch despite branches filter'
+root_cause: |
+  The `branches:` filter under `workflow_run` does NOT filter by the head branch of the
+  triggering workflow's run. Instead it filters against branches that could trigger the
+  NAMED workflow — which is tied to the repository's default branch.
+
+  Since `workflow_run` only fires for named workflows that exist on the default branch,
+  adding `branches:` under `workflow_run` has no practical effect in most configurations:
+  the filter is silently ignored and the triggered workflow fires regardless of which
+  branch the upstream workflow ran on.
+
+  This is documented as expected behavior by GitHub, but it contradicts developer intuition
+  that `branches:` would filter by the branch the upstream workflow was triggered for
+  (e.g., the PR's head branch). The result is silent — no error is raised, the workflow
+  just fires when it shouldn't (or doesn't filter correctly).
+
+  The field `github.event.workflow_run.head_branch` contains the actual head branch of the
+  upstream run and must be checked explicitly in a job `if:` condition.
+
+  Sources:
+  - GitHub Community Discussion #136800 (branches filter not working with workflow_run)
+  - Stack Overflow #68629971 (~8 votes — how to use branches filter with workflow_run)
+  - GitHub Docs: workflow_run event (notes branch filter behavior)
+fix: |
+  Do NOT rely on `branches:` under `workflow_run` to filter by the upstream run's branch.
+
+  Instead, use an explicit `if:` condition on the job that checks
+  `github.event.workflow_run.head_branch`:
+
+  ```yaml
+  jobs:
+    deploy:
+      if: github.event.workflow_run.head_branch == 'main'
+      runs-on: ubuntu-latest
+  ```
+
+  For pattern matching (e.g., matching any `release/*` branch), use the `startsWith()`
+  or `contains()` expression functions:
+
+  ```yaml
+  jobs:
+    deploy:
+      if: startsWith(github.event.workflow_run.head_branch, 'release/')
+      runs-on: ubuntu-latest
+  ```
+fix_code:
+  - language: yaml
+    label: 'Wrong — branches: filter under workflow_run is silently ignored'
+    code: |
+      on:
+        workflow_run:
+          workflows: ['CI']
+          types: [completed]
+          branches:           # ← silently ignored; does NOT filter by upstream run branch
+            - main
+            - 'release/**'
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying..."
+  - language: yaml
+    label: 'Correct — use job-level if: with github.event.workflow_run.head_branch'
+    code: |
+      on:
+        workflow_run:
+          workflows: ['CI']
+          types: [completed]
+          # No branches: filter here — it doesn't work as expected
+
+      jobs:
+        deploy:
+          if: |
+            github.event.workflow_run.conclusion == 'success' &&
+            github.event.workflow_run.head_branch == 'main'
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying from main only"
+  - language: yaml
+    label: 'Correct — match multiple branches using startsWith or contains'
+    code: |
+      on:
+        workflow_run:
+          workflows: ['CI']
+          types: [completed]
+
+      jobs:
+        deploy:
+          if: |
+            github.event.workflow_run.conclusion == 'success' &&
+            (github.event.workflow_run.head_branch == 'main' ||
+             startsWith(github.event.workflow_run.head_branch, 'release/'))
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying from main or release/* branch"
+prevention:
+  - 'Never use branches: under workflow_run expecting it to filter by the upstream run''s branch — it is silently ignored'
+  - 'Always gate workflow_run jobs with if: github.event.workflow_run.head_branch == ''target-branch'' explicitly'
+  - 'Check github.event.workflow_run.conclusion as well — filter to only run on successful upstream runs'
+  - 'Test workflow_run triggers by inspecting the event payload: add a debug step that prints toJSON(github.event.workflow_run)'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run'
+    label: 'GitHub Docs — workflow_run event trigger'
+  - url: 'https://github.com/orgs/community/discussions/136800'
+    label: 'Community discussion #136800 — workflow_run branches filter not working'
+  - url: 'https://stackoverflow.com/questions/68629971/how-to-use-both-paths-branches-filter-with-workflow-run-event-in-github-action'
+    label: 'Stack Overflow #68629971 — how to use branches filter with workflow_run'
