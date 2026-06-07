@@ -1,0 +1,121 @@
+id: 'known-unsolved-090'
+title: 'Self-hosted runner broker session 24-hour hard limit cancels long-running jobs'
+category: known-unsolved
+severity: error
+tags:
+  - self-hosted
+  - long-running
+  - broker
+  - session-expiry
+  - 24-hour-limit
+  - job-cancelled
+patterns:
+  - regex: 'GET request to https://broker\.actions\.githubusercontent\.com/message\?sessionId=.*failed\. HTTP Status: NotFound'
+    flags: 'i'
+  - regex: 'JobDispatcher.*Shutting down.*cancel any running job'
+    flags: 'i'
+  - regex: 'The operation was canceled\.'
+    flags: 'i'
+error_messages:
+  - '[ERR GitHubActionsService] GET request to https://broker.actions.githubusercontent.com/message?sessionId=... failed. HTTP Status: NotFound'
+  - '[INFO JobDispatcher] Shutting down JobDispatcher. Make sure all WorkerDispatcher has finished.'
+  - '[INFO JobDispatcher] Send job cancellation message to worker for job ...'
+  - 'The operation was canceled.'
+root_cause: |
+  The GitHub Actions broker assigns each self-hosted runner a session token with a hard
+  24-hour server-side TTL. The runner polls the broker endpoint every ~60 seconds with a
+  GET request that includes the session ID to receive heartbeat renewals and job renewal
+  confirmations ("Successfully renew job request N, job is valid till ...").
+
+  After exactly 24 hours the broker discards the session. The next GET request returns
+  HTTP 404 Not Found. The runner's `GitHubActionsService` layer logs the 404 as an error,
+  the `JobDispatcher` interprets it as a fatal session loss, immediately sends a cancellation
+  message to the in-progress worker process, and the job fails with "The operation was
+  canceled." with no warning to the user beforehand.
+
+  Key characteristics:
+  - Failure is deterministic at ~24h: it does not occur earlier due to network or load
+  - The job logs show normal "Successfully renew job request" lines right up until the 404
+  - No GitHub notification or annotation is added; the job simply shows "The operation was
+    canceled" in the final step
+  - Affects only self-hosted runners; GitHub-hosted runners are not assigned 24h sessions
+  - The 6-hour timeout for GitHub-hosted runners is separate (enforced by the billing system)
+  - There is no configuration option to extend or disable the 24-hour session limit
+  - Restarting the runner or re-queuing the job resets the clock to a new 24h session
+
+  Source: actions/runner#3869 (May 2025, open).
+fix: |
+  There is no way to extend the 24-hour broker session TTL. The only solutions are to
+  ensure jobs complete within 24 hours or to checkpoint and resume across multiple runs:
+
+  1. **Restructure jobs to finish in under 24 hours**: Profile the slow stages and parallelize
+     them (matrix strategy, split large datasets, use faster runners with more CPUs/RAM).
+
+  2. **Checkpoint and resume across workflow runs**: Save intermediate state as artifacts
+     or to object storage (S3, GCS, Azure Blob) at the end of each chunk. Trigger the next
+     chunk with `workflow_dispatch` or a chained `workflow_run` trigger.
+
+  3. **Use GitHub-hosted large runners**: GitHub-hosted runners have a 6-hour job timeout
+     (not a session limit) with automatic resource management — consider whether the workload
+     fits within 6 hours on a larger runner type.
+
+  4. **External compute for truly long jobs**: Move jobs that genuinely need >24h to external
+     CI/CD systems (Jenkins, GitLab CI, Azure Pipelines) and report results back via the
+     GitHub Checks API or commit status API.
+fix_code:
+  - language: yaml
+    label: 'Checkpoint-and-resume pattern: save state to artifacts, chain runs with workflow_run'
+    code: |
+      # Job 1: Process first half, save checkpoint artifact
+      jobs:
+        build-chunk-1:
+          runs-on: self-hosted
+          outputs:
+            chunk1-done: ${{ steps.save.outputs.done }}
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Process chunk 1 (< 20h of work)
+              run: ./process.sh --chunk 1 --output-dir ./checkpoint/
+
+            - name: Save checkpoint artifact
+              id: save
+              uses: actions/upload-artifact@v4
+              with:
+                name: checkpoint-chunk1-${{ github.run_id }}
+                path: ./checkpoint/
+                retention-days: 1
+
+            - run: echo "done=true" >> $GITHUB_OUTPUT
+              id: save
+  - language: yaml
+    label: 'Avoid 24h limit by parallelizing with matrix strategy'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              partition: [1, 2, 3, 4]
+              # Split 30h workload into 4 × 8h partitions
+            max-parallel: 4
+          runs-on: self-hosted
+          steps:
+            - uses: actions/checkout@v4
+            - name: Process partition ${{ matrix.partition }}
+              run: |
+                ./process.sh \
+                  --partition ${{ matrix.partition }} \
+                  --total-partitions 4
+prevention:
+  - 'Profile all self-hosted runner jobs and ensure no single job exceeds 20 hours (leave buffer)'
+  - 'Add timing logs at major workflow steps to detect when a job is approaching the 24h limit'
+  - 'Design long-running workloads as checkpoint-resume pipelines from the start'
+  - 'Use matrix partitioning to parallelize work that currently runs serially'
+  - 'Set timeout-minutes on jobs to fail fast at a controlled limit rather than waiting for the broker 404'
+docs:
+  - url: 'https://github.com/actions/runner/issues/3869'
+    label: 'actions/runner#3869: Self hosted runner jobs cancelled after 24 hours when request to broker fails'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners'
+    label: 'GitHub Docs: About self-hosted runners'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-jobs-in-a-workflow#setting-a-timeout-for-a-job'
+    label: 'GitHub Docs: Setting a timeout for a job (timeout-minutes)'
