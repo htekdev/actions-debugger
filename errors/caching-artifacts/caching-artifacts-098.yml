@@ -1,0 +1,111 @@
+id: caching-artifacts-098
+title: 'upload-artifact FinalizeArtifact Hangs Silently — Log Ends at "Finalizing artifact upload" With No Error, Step Fails'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - upload-artifact
+  - finalize-artifact
+  - grpc
+  - blob-storage
+  - silent-failure
+  - artifact-missing
+  - v6
+  - v7
+patterns:
+  - regex: 'Finalizing artifact upload\s*$'
+    flags: 'im'
+  - regex: 'SHA256 digest of uploaded artifact zip is [0-9a-f]+'
+    flags: 'i'
+error_messages:
+  - "Finalizing artifact upload"
+  - "Finished uploading artifact content to blob storage!"
+  - "SHA256 digest of uploaded artifact zip is <hash>"
+root_cause: |
+  The `actions/upload-artifact` v6/v7 upload pipeline has two distinct phases:
+
+  1. **Blob upload** — file content is uploaded to Azure Blob Storage. On success
+     the log shows: "Uploading artifact: <name>.zip", "Beginning upload of artifact
+     content to blob storage", "Uploaded bytes N", "Finished uploading artifact
+     content to blob storage!", "SHA256 digest of uploaded artifact zip is <hash>".
+
+  2. **Finalization** — a `FinalizeArtifact` gRPC call to the GitHub Artifact Service
+     registers the artifact and returns the artifact ID. On success: "Artifact <name>
+     successfully finalized. Artifact ID <N>" + download URL.
+
+  When the `FinalizeArtifact` gRPC call hangs (transient connectivity issue between
+  the runner and GitHub's Artifact Service backend), the action waits until a client-
+  side timeout. The log stops at "Finalizing artifact upload" — no "Artifact ID" line,
+  no error message. The step then exits with code 1 but **emits no `::error::` annotation**.
+
+  The artifact blob was successfully uploaded to Azure Blob Storage but is **never
+  registered** in GitHub's artifact catalog. It is invisible in the Actions UI and any
+  downstream `download-artifact` step reports "no artifact named <name> found". The
+  silent exit-1 with no error line causes confusion — the step appears to have run but
+  the artifact simply does not exist.
+
+  Observed on both GitHub-hosted and self-hosted runners with `upload-artifact` v6 and v7.
+  Not consistently reproducible — appears to be a transient GitHub-side service issue.
+fix: |
+  **Immediate:** Re-run the failed workflow. Use `overwrite: true` to prevent a
+  "409 Conflict" error on re-run in case the first upload left a partial artifact
+  record.
+
+  **Detection:** Distinguish this failure from other upload errors by looking for:
+  - Last log line is "Finalizing artifact upload" — no "Artifact ID N" line following
+  - Step exits non-zero with no `##[error]` line in the log
+  - Blob upload phase completed (SHA256 digest line is present)
+  - `download-artifact` in a downstream job reports "no artifact found"
+
+  **Proactive:** Add a post-upload verification step that confirms the artifact
+  is visible in the run's artifact catalog before dependent jobs proceed.
+fix_code:
+  - language: yaml
+    label: "Add overwrite: true and a verification step to catch silent finalization failures"
+    code: |
+      - name: Upload build artifact
+        id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-output
+          path: dist/
+          overwrite: true   # prevents 409 on re-run after partial registration
+
+      - name: Verify artifact was registered
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Confirm the artifact appears in the catalog (not just blob storage)
+          count=$(gh api \
+            /repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts \
+            --jq '[.artifacts[] | select(.name == "build-output")] | length')
+          if [ "$count" -eq 0 ]; then
+            echo "::error::Artifact 'build-output' not found after upload — FinalizeArtifact may have hung silently"
+            exit 1
+          fi
+          echo "Artifact confirmed in catalog (${count} record(s))"
+  - language: yaml
+    label: "Retry upload on FinalizeArtifact failure using a loop"
+    code: |
+      - name: Upload with retry
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          command: |
+            # Re-run the upload action by calling it explicitly
+            echo "Attempting artifact upload..."
+        # Alternative: wrap in a composite action that calls upload-artifact,
+        # then calls the gh API to verify, and retries on verification failure.
+prevention:
+  - "Add a post-upload verification step using the GitHub REST API to confirm the artifact is registered in the catalog before marking the job as successful."
+  - "Use `overwrite: true` on upload-artifact to safely handle re-runs after a partially registered blob."
+  - "Monitor for upload steps that exit non-zero but have no `##[error]` lines — the 'Finalizing artifact upload' last-line pattern is the signature of this failure."
+  - "Track actions/upload-artifact#806 for upstream retry and error logging improvements in the FinalizeArtifact call."
+docs:
+  - url: "https://github.com/actions/upload-artifact/issues/806"
+    label: "actions/upload-artifact#806 — Upload failed without any error output"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-workflow-data-as-artifacts"
+    label: "GitHub Docs: Storing workflow data as artifacts"
+  - url: "https://docs.github.com/en/rest/actions/artifacts"
+    label: "GitHub REST API: Actions artifacts"

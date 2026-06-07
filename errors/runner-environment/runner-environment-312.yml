@@ -1,0 +1,102 @@
+id: runner-environment-312
+title: 'ARC No-Permission ServiceAccount Name Exceeds Kubernetes 63-Character Label Limit — Runner Pods Cannot Start'
+category: runner-environment
+severity: error
+tags:
+  - arc
+  - actions-runner-controller
+  - kubernetes
+  - service-account
+  - name-length
+  - 63-char-limit
+  - cilium
+  - eks
+  - helm
+  - pod-sandbox
+patterns:
+  - regex: 'must be no more than 63 characters.*no-permission|no-permission.*must be no more than 63 characters'
+    flags: 'i'
+  - regex: 'gha-rs-controller-no-permission.*Invalid value|no-permission.*CiliumIdentity.*invalid'
+    flags: 'i'
+  - regex: 'metadata\.labels: Invalid value: ".*-gha-rs-controller-no-permission"'
+    flags: 'i'
+  - regex: 'Failed to create pod sandbox.*unable to create endpoint.*Cilium API client timeout exceeded'
+    flags: 'i'
+error_messages:
+  - "metadata.labels: Invalid value: \"<scale-set-name>-gha-rs-controller-no-permission\": must be no more than 63 characters"
+  - "CiliumIdentity is invalid: metadata.labels: Invalid value: \"<long-name>-gha-rs-controller-no-permission\": must be no more than 63 characters"
+  - "Failed to create pod sandbox: rpc error: code = Unknown desc = failed to setup network for sandbox: unable to create endpoint: Cilium API client timeout exceeded"
+  - "Warning FailedCreatePodSandBox"
+root_cause: |
+  ARC derives the no-permission ServiceAccount name by appending the fixed suffix
+  `-gha-rs-controller-no-permission` (29 characters) to the Helm **release name**.
+  Kubernetes enforces a **63-character maximum** on label values used in pod identity
+  metadata (e.g., `io.cilium.k8s.policy.serviceaccount` on Cilium-networked clusters).
+
+  **Threshold:** If the Helm release name exceeds **34 characters**, the combined
+  no-permission SA name (`{release-name}-gha-rs-controller-no-permission`) exceeds
+  63 characters. The CNI plugin (Cilium on EKS, or Kubernetes admission) rejects
+  the label value at pod sandbox creation time.
+
+  Result: every runner pod for the scale set fails at `FailedCreatePodSandBox` —
+  no pods are ever scheduled and no jobs are picked up. The ARC controller and
+  Kubernetes events log the label length violation, but the connection to the
+  Helm release name is not immediately obvious.
+
+  The ARC controller does not validate release name length or truncate/hash long
+  SA names. There is no pre-install warning.
+fix: |
+  **Rename the Helm release** to a value of 34 characters or fewer so the derived
+  no-permission SA name stays within 63 characters.
+
+  Calculation: `len(release-name) + 29 ≤ 63` → `release-name ≤ 34 characters`
+
+  After renaming: helm uninstall the old release, then helm install with the shorter
+  name. The scale set will re-register with GitHub under the new name; update any
+  workflow `runs-on:` labels accordingly.
+
+  Some ARC chart versions allow overriding the SA name prefix via Helm values —
+  consult the chart's `values.yaml` for a `controllerServiceAccount.name` or similar
+  field to apply a shorter prefix without renaming the release.
+fix_code:
+  - language: yaml
+    label: "Check derived SA name length before helm install/upgrade"
+    code: |
+      #!/bin/bash
+      RELEASE_NAME="my-scale-set-name"
+      SUFFIX="-gha-rs-controller-no-permission"  # 29 chars
+      SA_NAME="${RELEASE_NAME}${SUFFIX}"
+      echo "Release: ${RELEASE_NAME} (${#RELEASE_NAME} chars)"
+      echo "SA name: ${SA_NAME} (${#SA_NAME} chars)"
+      if [ ${#SA_NAME} -gt 63 ]; then
+        MAX_RELEASE_LEN=$(( 63 - ${#SUFFIX} ))
+        echo "ERROR: SA name exceeds 63 chars. Shorten release name to ≤ ${MAX_RELEASE_LEN} chars."
+        exit 1
+      fi
+      echo "OK — SA name within 63-char limit."
+  - language: yaml
+    label: "Rename a too-long release (uninstall + reinstall with shorter name)"
+    code: |
+      # 1. Uninstall the old release
+      helm uninstall shift-copy-sandbox-arc-runner-set -n arc-runners
+
+      # 2. Install with a shortened release name (≤ 34 chars)
+      helm install sc-sandbox-arc-rs \  # 15 chars → SA name 44 chars ✓
+        oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set \
+        --namespace arc-runners \
+        --values values.yaml
+
+      # 3. Update workflow runs-on label to match new runnerScaleSetName
+      # runs-on: sc-sandbox-arc-rs
+prevention:
+  - "Keep ARC Helm release names ≤ 34 characters to ensure the derived no-permission ServiceAccount name stays within the Kubernetes 63-character label limit."
+  - "Add a pre-flight check (shell script or CI step) that validates the derived SA name length before any helm install or upgrade."
+  - "Establish a naming convention for ARC scale sets that limits release names — e.g., `<env>-<team>-arc` pattern with an enforced maximum."
+  - "On CNI plugins that use pod identity labels (Cilium, Calico), test with a short release name in staging first."
+docs:
+  - url: "https://github.com/actions/actions-runner-controller/issues/4182"
+    label: "ARC #4182 — Cannot launch because no-permission SA name is over 63 chars"
+  - url: "https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#syntax-and-character-set"
+    label: "Kubernetes Docs: Label syntax and character set (63-char limit)"
+  - url: "https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners-with-actions-runner-controller/deploying-runner-scale-sets-with-actions-runner-controller"
+    label: "GitHub Docs: Deploying runner scale sets with ARC"

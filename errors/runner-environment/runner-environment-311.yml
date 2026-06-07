@@ -1,0 +1,92 @@
+id: runner-environment-311
+title: 'ARC AutoscalingRunnerSet Patch with minRunners > 0 Leaves Listener Deleted — Jobs Queue Indefinitely (v0.14.0)'
+category: runner-environment
+severity: error
+tags:
+  - arc
+  - actions-runner-controller
+  - autoscaling-runner-set
+  - listener
+  - min-runners
+  - helm
+  - kubernetes
+  - patch
+patterns:
+  - regex: 'RunnerScaleSetListener is out of date\. Deleting it so that it is recreated'
+    flags: 'i'
+  - regex: 'AutoscalingListener does not exist\. Creating a new AutoscalingListener is waiting for the running and pending runners to finish'
+    flags: 'i'
+  - regex: 'Deleted RunnerScaleSetListener since existing one is out of date'
+    flags: 'i'
+error_messages:
+  - "RunnerScaleSetListener is out of date. Deleting it so that it is recreated"
+  - "AutoscalingListener does not exist. Creating a new AutoscalingListener is waiting for the running and pending runners to finish"
+  - "Deleted RunnerScaleSetListener since existing one is out of date"
+root_cause: |
+  In ARC v0.14.0, when an `AutoscalingRunnerSet` spec is patched (e.g., changing
+  `minRunners`, `maxRunners`, labels, or other fields via `helm upgrade` or `kubectl
+  patch`), the controller identifies the existing `RunnerScaleSetListener` pod as
+  "out of date" and deletes it.
+
+  Before recreating the listener, the reconciler waits for all `EphemeralRunner`
+  instances to reach a terminal state ("running and pending runners to finish").
+  The bug: **idle warm runners kept alive by `minRunners > 0`** are counted as
+  "running" by the reconciler. They are not completing because they are
+  intentionally held alive for the next job.
+
+  Result: the scale set has no listener pod; the listener recreation prerequisite
+  is never met; queued workflow jobs targeting the scale set are never dispatched;
+  the deadlock persists indefinitely until an operator manually deletes the idle
+  EphemeralRunner pods.
+fix: |
+  **Immediate unblock:** Manually delete the idle EphemeralRunner pods in the
+  affected namespace. Once all EphemeralRunners are gone, the controller reconcile
+  loop recreates the listener immediately and queued jobs start dispatching.
+
+  **Safe patching procedure:** Scale `minRunners` to 0 first, wait for idle runners
+  to terminate, apply the spec change, then restore `minRunners`.
+
+  **Long-term:** Track https://github.com/actions/actions-runner-controller/issues/4432
+  for an upstream fix that correctly distinguishes idle warm runners from active
+  job runners when deciding whether listener recreation can proceed.
+fix_code:
+  - language: yaml
+    label: "Unblock immediately — delete idle EphemeralRunners so listener can be recreated"
+    code: |
+      # List EphemeralRunners in the affected namespace
+      kubectl get ephemeralrunners -n github-actions-runners
+
+      # Delete all idle EphemeralRunners for the stuck scale set
+      kubectl delete ephemeralrunner -n <namespace> \
+        -l actions.github.com/scale-set-name=<scale-set-name>
+
+      # Verify the listener pod is recreated (within ~30 seconds)
+      kubectl get pods -n <namespace> \
+        -l actions.github.com/scale-set-name=<scale-set-name>
+  - language: yaml
+    label: "Safe patch procedure — scale down to 0 before applying changes"
+    code: |
+      # 1. Scale down to 0 before patching
+      kubectl patch autoscalingrunnerset <name> -n <namespace> \
+        --type=merge -p '{"spec":{"minRunners":0}}'
+
+      # 2. Wait for all runners to terminate
+      kubectl wait --for=delete pod -n <namespace> \
+        -l actions.github.com/scale-set-name=<name> --timeout=120s
+
+      # 3. Apply the spec change safely
+      kubectl patch autoscalingrunnerset <name> -n <namespace> \
+        --type=merge -p '{"spec":{"minRunners":2,"maxRunners":8}}'
+
+      # 4. Confirm new listener pod comes up
+      kubectl rollout status deployment -n <namespace>
+prevention:
+  - "Scale `minRunners` to 0 before patching any AutoscalingRunnerSet spec to ensure no idle runners block listener recreation."
+  - "Monitor the listener pod after any ARS patch; if it disappears and does not return within 60 seconds, check for idle EphemeralRunners."
+  - "Use Helm upgrade with a pre-upgrade hook that scales down ARC runners before applying chart changes."
+  - "Pin ARC to a version that includes the fix for listener-recreation deadlock with minRunners > 0."
+docs:
+  - url: "https://github.com/actions/actions-runner-controller/issues/4432"
+    label: "ARC #4432 — listener can remain deleted after ARS patch when minRunners > 0"
+  - url: "https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners-with-actions-runner-controller/troubleshooting-actions-runner-controller-errors"
+    label: "GitHub Docs: Troubleshooting ARC errors"
