@@ -1,0 +1,129 @@
+id: permissions-auth-084
+title: 'GitHub App installation token expires after 1 hour, breaking long-running jobs mid-workflow'
+category: permissions-auth
+severity: error
+tags:
+  - github-app
+  - create-github-app-token
+  - token-expiry
+  - long-running
+  - authentication
+  - bad-credentials
+patterns:
+  - regex: 'Bad credentials'
+    flags: 'i'
+  - regex: 'HttpError: Bad credentials'
+    flags: 'i'
+  - regex: 'Failed to get.*status.*Bad credentials'
+    flags: 'i'
+  - regex: 'fatal: Authentication failed.*github\.com'
+    flags: 'i'
+  - regex: '401.*Unauthorized'
+    flags: 'i'
+error_messages:
+  - 'Warning: Failed to get workflow status: Bad credentials'
+  - 'HttpError: Bad credentials'
+  - 'Error: 401 Unauthorized'
+  - 'fatal: Authentication failed for https://github.com/'
+  - 'remote: Invalid username or password.'
+  - 'Error: Request failed due to following response errors: Bad Credentials'
+root_cause: |
+  GitHub App installation access tokens have a hard maximum lifetime of exactly 1 hour,
+  enforced by GitHub's API regardless of when or how the token was created. The token is
+  generated once at the point where actions/create-github-app-token runs and is stored
+  as a plain string (steps.app-token.outputs.token). There is no built-in refresh
+  mechanism — the token string does not auto-renew.
+
+  Long-running jobs (builds, integration test suites, jobs that poll or wait for
+  downstream workflows) begin failing after the 60-minute mark at the first step that
+  uses the stored token string for authentication. The failure manifests as
+  "Bad credentials" or "401 Unauthorized" and appears indistinguishable from a
+  misconfigured secret — because the token was valid earlier in the same job run.
+
+  Common long-running scenarios that hit this limit:
+  - Large test suites (end-to-end, browser, integration) exceeding 60 minutes
+  - Multi-stage compilation or build pipelines
+  - workflow-dispatch + wait-for-completion: true polling a downstream workflow
+    with a long timeout (e.g., wait-for-completion-timeout: 2h)
+  - Matrix jobs queued behind a concurrency group that delays actual start
+  - Terraform or Ansible provisioning against large infrastructure
+
+  The README for actions/create-github-app-token contains an IMPORTANT note about
+  this limitation with a reference to issue #121, but this warning is frequently
+  missed during initial setup.
+fix: |
+  Structure the workflow to avoid holding a single token across more than ~55 minutes
+  of work. The recommended approaches are:
+
+  1. Split long-running work into separate jobs: each job calls
+     actions/create-github-app-token independently and receives a fresh 1-hour token.
+     Jobs are cheap to split — they each run fresh steps after the token is issued.
+
+  2. Late binding — request the token immediately before authenticated use: move the
+     create-github-app-token step to just before the step that needs authentication.
+     Unauthenticated work (compilation, test execution) runs first, then the token
+     is requested only for the final push/release/deploy operation.
+
+  3. For polling scenarios: set wait-for-completion-timeout below 60 minutes, or
+     restructure to use a separate poller job that requests its own fresh token.
+fix_code:
+  - language: yaml
+    label: 'Split into separate jobs — each job gets a fresh 1-hour token'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Long build (no token needed)
+              run: make build  # May take 45+ minutes
+
+        release:
+          needs: build
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/create-github-app-token@v1  # Fresh token for this job
+              id: app-token
+              with:
+                app-id: ${{ vars.APP_ID }}
+                private-key: ${{ secrets.PRIVATE_KEY }}
+            - name: Create release
+              env:
+                GH_TOKEN: ${{ steps.app-token.outputs.token }}
+              run: gh release create ...
+  - language: yaml
+    label: 'Late binding — request token immediately before use'
+    code: |
+      jobs:
+        long-job:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Long computation (50+ minutes, no token needed)
+              run: make test
+
+            # Request token right before authenticated operation
+            - uses: actions/create-github-app-token@v1
+              id: app-token
+              with:
+                app-id: ${{ vars.APP_ID }}
+                private-key: ${{ secrets.PRIVATE_KEY }}
+
+            - name: Authenticated operation (within seconds of token creation)
+              env:
+                GH_TOKEN: ${{ steps.app-token.outputs.token }}
+              run: gh pr comment ${{ github.event.number }} --body "Tests passed"
+prevention:
+  - 'Never assume a GitHub App token stays valid for more than ~55 minutes after creation'
+  - 'Split workflows with >60 minute jobs into separate jobs — each requests its own fresh token'
+  - 'Request the token as late as possible: immediately before the authenticated operation'
+  - 'For wait-for-completion polling workflows, set timeout below 60 minutes or restructure into a poller job'
+  - 'Read the IMPORTANT note in the actions/create-github-app-token README before adopting App tokens in long workflows'
+docs:
+  - url: 'https://github.com/actions/create-github-app-token/issues/121'
+    label: 'actions/create-github-app-token#121 — Token seems to expire after 1h'
+  - url: 'https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-an-installation-access-token-for-a-github-app'
+    label: 'GitHub Docs — Generating an installation access token (1-hour lifetime)'
+  - url: 'https://github.com/actions/create-github-app-token'
+    label: 'actions/create-github-app-token README — token expiry IMPORTANT warning'

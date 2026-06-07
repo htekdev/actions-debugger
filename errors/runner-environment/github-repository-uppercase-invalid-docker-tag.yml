@@ -1,0 +1,104 @@
+id: runner-environment-272
+title: 'github.repository uppercase letters cause "repository name must be lowercase" Docker build failure'
+category: runner-environment
+severity: error
+tags:
+  - docker
+  - ghcr
+  - registry
+  - github-repository
+  - lowercase
+  - build-push-action
+  - metadata-action
+patterns:
+  - regex: 'invalid tag "[^"]*[A-Z][^"]*": repository name must be lowercase'
+    flags: 'i'
+  - regex: 'invalid reference format: repository name must be lowercase'
+    flags: 'i'
+  - regex: 'ERROR:.*repository name must be lowercase'
+    flags: 'i'
+error_messages:
+  - 'ERROR: invalid tag "ghcr.io/MyOrg/repo:latest": repository name must be lowercase'
+  - 'invalid reference format: repository name must be lowercase'
+  - 'error: failed to solve: invalid reference format: repository name must be lowercase'
+  - 'ERROR: invalid tag "ghcr.io/EvanCarroll/claudeai-bundle:latest": repository name must be lowercase'
+  - 'ERROR: invalid tag "WarpedPixel-issue200": repository name must be lowercase'
+root_cause: |
+  The OCI image naming specification requires that repository names (the owner/repo
+  portion of an image reference) be entirely lowercase. GitHub usernames and organization
+  names are case-insensitive at the GitHub account level, but github.repository preserves
+  the original mixed-case registration casing (e.g., "MyOrg/my-repo" or "EvanCarroll/repo").
+
+  When workflows interpolate ${{ github.repository }} directly into Docker image tags,
+  cache references, or image names (e.g., ghcr.io/${{ github.repository }}:latest), the
+  uppercase characters are passed verbatim to docker buildx / BuildKit. The OCI distribution
+  spec enforces lowercase-only registry paths, so the build fails immediately at the tag
+  validation stage before any layer is pushed.
+
+  docker/metadata-action sanitizes the images: input but does NOT automatically sanitize
+  branch-derived tags. Branches with mixed-case names (e.g., "Feature/my-fix") can also
+  produce invalid tags through type=ref,event=branch when the branch name contains
+  uppercase letters.
+
+  The issue affects any workflow using docker/build-push-action, docker/bake-action, or
+  raw docker build/push commands where github.repository or branch names are interpolated
+  directly into image references.
+fix: |
+  Convert the repository name (and any branch-derived tag values) to lowercase before
+  using them in Docker image references.
+
+  Option 1 — Shell inline lowercase conversion (simplest, no extra action):
+  Use a run step to produce a lowercase image name and export it as a step output.
+
+  Option 2 — docker/metadata-action (recommended for multi-tag workflows):
+  Pass ghcr.io/${{ github.repository }} to the images: input. metadata-action sanitizes
+  the images input automatically. For branch tags, ensure the bake target or tag template
+  does not bypass this sanitization.
+
+  Option 3 — actions/github-script:
+  Call .toLowerCase() on the repository string and expose the result as a step output.
+fix_code:
+  - language: yaml
+    label: 'Option 1: Shell lowercase conversion before docker/build-push-action'
+    code: |
+      - name: Set lowercase image name
+        id: image
+        run: echo "name=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: ${{ steps.image.outputs.name }}:latest
+  - language: yaml
+    label: 'Option 2: docker/metadata-action (handles images: input sanitization)'
+    code: |
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+prevention:
+  - 'Never interpolate ${{ github.repository }} directly into Docker image tags — always lowercase first'
+  - 'Use docker/metadata-action which sanitizes the images: input automatically'
+  - 'Add a single lowercase-conversion step at the top of the job and reuse that output for all image references'
+  - 'Test container workflows in repos or orgs whose names contain uppercase letters before release'
+  - 'Branch names with uppercase letters also cause this error through type=ref,event=branch — enforce lowercase branch naming conventions'
+docs:
+  - url: 'https://github.com/docker/build-push-action/blob/master/TROUBLESHOOTING.md#repository-name-must-be-lowercase'
+    label: 'docker/build-push-action TROUBLESHOOTING.md — repository name must be lowercase'
+  - url: 'https://github.com/actions/starter-workflows/issues/1293'
+    label: 'actions/starter-workflows#1293 — uppercase username breaks docker-publish starter workflow'
+  - url: 'https://github.com/docker/metadata-action/issues/405'
+    label: 'docker/metadata-action#405 — uppercase branch names slip through to buildx tags'

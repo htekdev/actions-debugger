@@ -1,0 +1,115 @@
+id: silent-failures-134
+title: 'Writing the same key to $GITHUB_OUTPUT multiple times in one step silently keeps only the last value'
+category: silent-failures
+severity: silent-failure
+tags:
+  - GITHUB_OUTPUT
+  - step-outputs
+  - loop
+  - duplicate-key
+  - outputs
+  - accumulate
+patterns:
+  - regex: 'echo.*>>.*GITHUB_OUTPUT'
+    flags: 'i'
+  - regex: '\$\{GITHUB_OUTPUT\}'
+    flags: 'i'
+error_messages:
+  - 'Step output contains only the last value written — earlier writes to same key in same step are silently discarded'
+  - 'Loop result accumulation via GITHUB_OUTPUT only preserves last iteration (each write overwrites previous)'
+root_cause: |
+  When a run step writes the same key to $GITHUB_OUTPUT more than once within a single
+  step — e.g., inside a for/while loop, or across multiple echo statements that all
+  target the same key name — only the last written value is available as
+  steps.<step-id>.outputs.<key> in subsequent steps. No warning, error annotation, or
+  debug message is produced by the runner.
+
+  The runner processes the $GITHUB_OUTPUT file after the step completes and resolves
+  duplicate keys by using the final occurrence of each key. All earlier values for that
+  key are silently discarded. This behavior affects:
+
+  - Loops that attempt to accumulate results (e.g., building a list):
+      for item in "${items[@]}"; do
+        echo "result=$item" >> "$GITHUB_OUTPUT"   # Only last value survives
+      done
+
+  - Steps where a default value is written early and a conditional override may or
+    may not execute — if both the default and override branches run, only the
+    override survives, but if the override branch does not run the default is still
+    the last write and is preserved correctly.
+
+  - Composite actions that call a uses: step which sets a key, and then the composite
+    also writes the same key — the composite's later write takes precedence.
+
+  A related documentation misconception: $GITHUB_OUTPUT is NOT shared between steps.
+  Each step has an isolated output file scoped to that step. Later steps cannot
+  override or read earlier steps' raw output files. Values are only accessible via
+  the steps.<id>.outputs context, which exposes the last-written value per key.
+fix: |
+  To accumulate multiple values across loop iterations, build the final string or
+  data structure in a shell variable first, then write to $GITHUB_OUTPUT exactly
+  once at the end of the step — never inside the loop.
+
+  For comma-separated lists:
+    result=""
+    for item in "${items[@]}"; do
+      result="${result:+$result,}${item}"
+    done
+    echo "items=$result" >> "$GITHUB_OUTPUT"
+
+  For JSON arrays (usable with fromJSON in a downstream matrix):
+    json="[]"
+    for item in "${items[@]}"; do
+      json=$(printf '%s' "$json" | jq --arg v "$item" '. + [$v]')
+    done
+    echo "matrix=$json" >> "$GITHUB_OUTPUT"
+
+  For multiline output, use the heredoc delimiter syntax — still one write per key:
+    {
+      echo "report<<EOF"
+      cat test-results.txt
+      echo "EOF"
+    } >> "$GITHUB_OUTPUT"
+fix_code:
+  - language: yaml
+    label: 'Correct — accumulate in shell variable, single write to GITHUB_OUTPUT'
+    code: |
+      - name: Collect changed services
+        id: changes
+        run: |
+          result=""
+          for svc in api worker scheduler; do
+            if git diff --quiet HEAD~1 -- "services/$svc/"; then
+              continue
+            fi
+            result="${result:+$result,}${svc}"
+          done
+          # Write once, after the loop — not inside it
+          echo "services=$result" >> "$GITHUB_OUTPUT"
+
+      - name: Use collected services
+        run: echo "Changed: ${{ steps.changes.outputs.services }}"
+  - language: yaml
+    label: 'Broken — each loop iteration silently overwrites the previous value'
+    code: |
+      - name: Collect changed services (broken)
+        id: broken
+        run: |
+          for svc in api worker scheduler; do
+            # BUG: Each iteration overwrites the previous value.
+            # Only the last service in the loop will be in the output.
+            echo "latest=$svc" >> "$GITHUB_OUTPUT"
+          done
+prevention:
+  - 'Treat $GITHUB_OUTPUT as write-once-per-key per step — never write the same key twice'
+  - 'Never write to $GITHUB_OUTPUT inside a loop body; accumulate in a shell variable and write once after the loop'
+  - 'When multiple conditional branches might execute, use a shell variable to determine the final value, then write it once'
+  - 'Enable ACTIONS_RUNNER_DEBUG=true (repository secret) to see all GITHUB_OUTPUT file writes in the debug log for tracing'
+  - 'Lint shell scripts in run: steps for multiple echo "key=..." >> $GITHUB_OUTPUT lines with the same key name'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/passing-information-between-jobs'
+    label: 'GitHub Docs — Passing information between jobs (step outputs)'
+  - url: 'https://github.com/actions/runner/issues/2981'
+    label: 'actions/runner#2981 — Duplicate output key behavior'
+  - url: 'https://github.com/github/docs/pull/33842'
+    label: 'github/docs#33842 — Correction: GITHUB_OUTPUT is NOT shared between steps'

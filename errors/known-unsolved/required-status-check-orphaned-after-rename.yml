@@ -1,0 +1,104 @@
+id: known-unsolved-085
+title: 'Required status checks become orphaned and permanently block PRs after workflow or job rename'
+category: known-unsolved
+severity: limitation
+tags:
+  - branch-protection
+  - required-status-check
+  - workflow-rename
+  - job-rename
+  - pull-request
+  - merge-blocked
+patterns:
+  - regex: 'Expected — Waiting for status to be reported'
+    flags: 'i'
+  - regex: 'Required status check ''.*'' hasn''t run yet'
+    flags: 'i'
+  - regex: 'blocked.*required status checks.*have not.*run'
+    flags: 'i'
+  - regex: 'Merging is blocked.*required status checks'
+    flags: 'i'
+error_messages:
+  - 'Expected — Waiting for status to be reported'
+  - "Required status check 'CI / test' hasn't run yet"
+  - 'Merging is blocked — Required status checks have not passed'
+  - '1 required status check has not run: CI / build'
+  - 'All required status checks must pass before merging'
+root_cause: |
+  GitHub branch protection rules store required status check names as exact immutable
+  strings. The check name is derived from two components:
+  - The workflow's name: field (or filename if name: is absent) — becomes the prefix
+  - The job's key/id in the YAML — becomes the suffix
+  Together they form the check name: "Workflow Name / job-id"
+
+  When you rename the workflow (by changing the name: field in the YAML or renaming the
+  .yml file) or rename a job ID (by changing the job's key in the YAML), GitHub begins
+  reporting a new check name for all subsequent runs. The old check name stored in the
+  branch protection rule is never auto-updated — GitHub has no mechanism to detect or
+  migrate renamed checks.
+
+  The renamed workflow runs successfully under its new name. The branch protection rule
+  still requires the old name, which never fires again. All open and future PRs are
+  permanently blocked from merging. There is no error in the workflow run logs — the
+  only symptom is that the PR's status checks panel shows the old check name as
+  "Expected — Waiting for status to be reported" indefinitely.
+
+  This is a known platform limitation. GitHub does not provide an API or UI mechanism
+  to auto-migrate required status check names when workflows are renamed. Feature
+  requests have been open on the GitHub Community forum since 2020 with no scheduled fix.
+fix: |
+  Update the branch protection rule manually after any workflow or job rename:
+
+  1. Navigate to Settings → Branches → Branch protection rules → Edit rule
+  2. Under "Require status checks to pass before merging", find the search box
+  3. Search for and select the NEW check name (the new "Workflow Name / job-id" string)
+  4. Remove the OLD check name that no longer runs
+  5. Save the rule
+
+  Important caveat: A check name is only discoverable in the search dropdown if it has
+  run at least once on any branch in the repository. Before updating the rule, trigger
+  the renamed workflow on a feature branch first so the new check name appears in the
+  GitHub search index.
+
+  To find current check names programmatically:
+  Use the GitHub REST API to list check runs for a recent commit, which returns the
+  exact check names currently being reported.
+fix_code:
+  - language: yaml
+    label: 'List current check run names via GitHub CLI (find new name after rename)'
+    code: |
+      # Run this locally or in a workflow step to discover current check names
+      gh api repos/{owner}/{repo}/commits/$(git rev-parse HEAD)/check-runs \
+        --jq '.check_runs[] | .name' | sort -u
+
+      # Then update branch protection via API (or via Settings UI):
+      gh api --method PUT \
+        repos/{owner}/{repo}/branches/main/protection \
+        --input protection-rules.json
+  - language: yaml
+    label: 'Stable job IDs that survive workflow-level renames'
+    code: |
+      # workflow filename: ci.yml (renamed from build.yml — this changes the check prefix)
+      # To avoid breaking required checks when renaming the FILE,
+      # keep the workflow name: stable and rename only the description/comments:
+      name: CI  # Keep this stable — it is part of the check name "CI / test"
+
+      jobs:
+        test:  # Keep job IDs stable — "CI / test" is the required check name
+          runs-on: ubuntu-latest
+          steps:
+            - run: npm test
+prevention:
+  - 'Treat workflow name: values and job key/ids as public API — avoid renaming them once branch protection rules reference them'
+  - 'Document required status check names in the repo wiki or README alongside the protection rule'
+  - 'When a rename is unavoidable, update branch protection rules before merging the rename commit'
+  - 'Trigger the renamed workflow on a test branch first — required so the new check name appears in the Settings search index'
+  - 'Use stable, semantic job IDs (test, build, lint) that are unlikely to need renaming as the project evolves'
+  - 'Consider using GitHub rulesets (newer alternative to branch protection rules) which have improved check name management'
+docs:
+  - url: 'https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/managing-a-branch-protection-rule'
+    label: 'GitHub Docs — Managing a branch protection rule'
+  - url: 'https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/troubleshooting-required-status-checks'
+    label: 'GitHub Docs — Troubleshooting required status checks'
+  - url: 'https://github.com/orgs/community/discussions/24290'
+    label: 'GitHub Community — Required status checks not updated after workflow rename'
