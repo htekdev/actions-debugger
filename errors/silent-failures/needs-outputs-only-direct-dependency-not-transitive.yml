@@ -1,0 +1,105 @@
+id: silent-failures-131
+title: 'needs outputs only available from direct job dependencies — transitive outputs not propagated'
+category: silent-failures
+severity: silent-failure
+tags:
+  - needs
+  - outputs
+  - transitive
+  - job-dependency
+  - empty-string
+  - context
+patterns:
+  - regex: 'needs\.\w+\.outputs\.\w+'
+    flags: 'i'
+root_cause: |
+  The `needs` context in GitHub Actions only contains outputs from jobs that are
+  listed as **direct** dependencies of the current job. If job C depends on job B,
+  and job B depends on job A, job C cannot access `needs.job_a.outputs.*` — only
+  `needs.job_b.outputs.*` is available.
+
+  When job C attempts `${{ needs.job_a.outputs.some_key }}`, the expression
+  evaluates to an empty string with no error, warning, or annotation. The workflow
+  continues silently with incorrect data.
+
+  This is by design. GitHub's documentation (github/docs#20701) explicitly clarifies:
+  "The `needs` context contains outputs from all jobs that are defined as a **direct**
+  dependency of the current job. Note that this doesn't include implicitly dependent
+  jobs (for example, dependent jobs of a dependent job)."
+
+  Common manifestation: a 3+ stage pipeline (build → test → deploy) where `deploy`
+  tries to access outputs set by `build` but only declares `needs: [test]`.
+fix: |
+  Two approaches:
+
+  1. Add the upstream job to the downstream job's `needs` list directly (recommended
+     when the dependency is intentional and the graph allows it):
+
+  2. Re-export the upstream output through each intermediate job's `outputs` block
+     (required when adding a direct dependency would create unwanted serial execution
+     or break the intended graph shape).
+fix_code:
+  - language: yaml
+    label: 'Wrong — job C tries to access job A outputs without listing job A in needs'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          outputs:
+            version: ${{ steps.set-version.outputs.version }}
+          steps:
+            - id: set-version
+              run: echo "version=1.2.3" >> $GITHUB_OUTPUT
+
+        test:
+          runs-on: ubuntu-latest
+          needs: [build]
+          steps:
+            - run: echo "Testing build ${{ needs.build.outputs.version }}"
+
+        deploy:
+          runs-on: ubuntu-latest
+          needs: [test]       # ← only depends on test, not build
+          steps:
+            # WRONG: needs.build.outputs.version is empty string here
+            - run: echo "Deploying version ${{ needs.build.outputs.version }}"
+  - language: yaml
+    label: 'Fix option 1 — add build to deploy needs directly'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          needs: [build, test]   # ← add build as direct dependency
+          steps:
+            - run: echo "Deploying version ${{ needs.build.outputs.version }}"
+  - language: yaml
+    label: 'Fix option 2 — re-export build output through test job'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          needs: [build]
+          outputs:
+            version: ${{ needs.build.outputs.version }}   # re-export
+          steps:
+            - run: echo "Testing ${{ needs.build.outputs.version }}"
+
+        deploy:
+          runs-on: ubuntu-latest
+          needs: [test]
+          steps:
+            - run: echo "Deploying version ${{ needs.test.outputs.version }}"
+error_messages:
+  - ''
+prevention:
+  - 'If a downstream job needs data from an upstream job, list the upstream job in needs: directly'
+  - 'Outputs are NOT automatically forwarded through intermediate jobs — re-export explicitly'
+  - 'When building multi-stage pipelines, map out which jobs need which outputs and wire needs: accordingly'
+  - 'Use `needs: [job_a, job_b]` (array syntax) to list multiple direct dependencies'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#needs-context'
+    label: 'GitHub Docs — needs context'
+  - url: 'https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/pass-job-outputs'
+    label: 'GitHub Docs — Passing information between jobs'
+  - url: 'https://github.com/github/docs/issues/20701'
+    label: 'github/docs#20701 — Clarify needs context only includes direct dependencies'

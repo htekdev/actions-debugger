@@ -1,0 +1,109 @@
+id: known-unsolved-084
+title: 'actions/stale secondary rate limit — bursting API calls triggers "exceeded a secondary rate limit"'
+category: known-unsolved
+severity: error
+tags:
+  - stale
+  - rate-limit
+  - secondary-rate-limit
+  - api-throttle
+  - content-creation
+  - github-api
+patterns:
+  - regex: 'You have exceeded a secondary rate limit'
+    flags: 'i'
+  - regex: 'temporarily blocked from content creation'
+    flags: 'i'
+  - regex: 'performed \d+ operations, exiting to avoid rate limit'
+    flags: 'i'
+error_messages:
+  - "Error when creating a comment: You have exceeded a secondary rate limit and have been temporarily blocked from content creation. Please retry your request again later."
+  - "##[warning]performed 30 operations, exiting to avoid rate limit"
+root_cause: |
+  The `actions/stale` action processes issues and pull requests in batches and
+  performs many GitHub API write operations in quick succession: adding labels,
+  posting comments, and closing items. On repositories with many stale items,
+  hundreds of write operations can fire within minutes, triggering GitHub's
+  **secondary rate limits** (undocumented burst thresholds for content creation).
+
+  Unlike the primary rate limit (5000 requests/hour for GitHub Apps, 5000 for
+  authenticated users), secondary rate limits govern concurrent requests and
+  burst rates. Their exact thresholds are not publicly documented by GitHub.
+
+  Symptoms:
+  - Stale workflow log shows "Error when creating a comment: You have exceeded a
+    secondary rate limit..."
+  - The stale run exits early and only processes a fraction of stale items
+  - The workflow completes with exit code 0 (non-fatal by default) but most stale
+    items are not processed
+  - On next run, the action re-processes items from where it left off — or restarts
+    from the beginning depending on sort order
+
+  There is no GitHub-provided mechanism to configure secondary rate limit backoff
+  or guaranteed burst allowance. `operations-per-run` defaults to 30 and is the
+  primary mitigation, but even lowering it does not guarantee avoidance if the
+  GitHub API temporarily tightens limits.
+fix: |
+  There is no complete fix because secondary rate limit thresholds are not
+  configurable. The following mitigations reduce frequency of triggering:
+
+  1. Lower `operations-per-run` (default: 30) — each "operation" is one API call
+     (comment, label, close). Reducing to 10-20 gives GitHub more breathing room.
+
+  2. Set a higher `days-before-stale` / `days-before-close` — fewer items become
+     stale per cycle, reducing total operations per run.
+
+  3. Avoid simultaneous `stale-issue-message` + `stale-pr-message` if both are
+     the default — commenting on hundreds of items in one run is the primary
+     trigger.
+
+  4. Run stale action more frequently (daily instead of weekly) so each run
+     processes fewer items.
+
+  5. Set `only-labels: stale` on `close` operations — separate stale-labeling
+     runs from close-comment runs.
+fix_code:
+  - language: yaml
+    label: 'Reduce operations-per-run to avoid bursting secondary rate limit'
+    code: |
+      - uses: actions/stale@v9
+        with:
+          # Lower operations-per-run (default: 30) to avoid secondary rate limit
+          operations-per-run: 15
+          days-before-stale: 60
+          days-before-close: 14
+          stale-issue-message: 'This issue is stale — please comment if still relevant.'
+          stale-pr-message: 'This PR is stale — please update or close.'
+          # Avoid closing and commenting in same run when possible
+          close-issue-message: ''   # omit comment on close to save operations
+          close-pr-message: ''
+  - language: yaml
+    label: 'Schedule stale action frequently to keep per-run item count low'
+    code: |
+      on:
+        schedule:
+          # Run daily at 2 AM UTC instead of weekly
+          - cron: '0 2 * * *'
+
+      jobs:
+        stale:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/stale@v9
+              with:
+                operations-per-run: 20
+                days-before-stale: 90
+                days-before-close: 7
+prevention:
+  - 'Monitor stale action logs for "performed N operations, exiting to avoid rate limit" warnings'
+  - 'Keep operations-per-run low (10-20) for repos with hundreds of issues/PRs'
+  - 'Run stale action daily rather than weekly to spread API calls across more cycles'
+  - 'Avoid setting both stale-issue-message and a close-issue-message if the repo has many stale items'
+  - 'The secondary rate limit is unrelated to the primary hourly rate limit — lowering GITHUB_TOKEN usage elsewhere does not help'
+docs:
+  - url: 'https://github.com/actions/stale?tab=readme-ov-file#operations-per-run'
+    label: 'actions/stale README — operations-per-run'
+  - url: 'https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api#about-secondary-rate-limits'
+    label: 'GitHub Docs — About secondary rate limits'
+  - url: 'https://github.com/apache/arrow/issues/48162'
+    label: 'apache/arrow#48162 — Stale issues bot hit secondary rate limit and did not complete'
