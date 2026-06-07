@@ -1,0 +1,125 @@
+id: permissions-auth-092
+title: 'OIDC custom property claim mismatch silently rejects token when repo property is missing or changed'
+category: permissions-auth
+severity: silent-failure
+tags:
+  - oidc
+  - custom-properties
+  - trust-policy
+  - aws
+  - azure
+  - gcp
+  - silent-failure
+patterns:
+  - regex: 'Not authorized to assume role|AccessDenied.*AssumeRoleWithWebIdentity'
+    flags: 'i'
+  - regex: 'Invalid identity token.*claim.*custom_property'
+    flags: 'i'
+  - regex: 'Error: credential provider not found|Unable to locate credentials'
+    flags: 'i'
+  - regex: 'google\.auth\.exceptions\.TransportError|WorkloadIdentityPool.*denied'
+    flags: 'i'
+error_messages:
+  - 'Not authorized to perform sts:AssumeRoleWithWebIdentity'
+  - 'Error: Received a PKIX path building failed error when requesting an OIDC token from the GitHub Actions service'
+  - 'google.auth.exceptions.MutualTLSChannelError: WorkloadIdentityPool token denied'
+  - 'AADSTS70021: No matching federated identity record found'
+  - 'Invalid identity token: claim "custom_property_environment_type" not found in token'
+root_cause: |
+  In April 2026, GitHub Actions OIDC tokens became generally available with support
+  for repository custom properties as OIDC claims. When a repository has custom
+  properties defined (e.g., environment_type: production), these appear as claims
+  in the form custom_property_<name>: <value> in the OIDC JWT.
+
+  Two categories of silent failure occur:
+
+  1. Trust policy references a property the repo does not have: If a cloud provider
+     (AWS, GCP, Azure) trust policy requires a specific custom_property_X claim and
+     the repository has not set that property, the claim is absent from the token.
+     The cloud provider silently rejects the OIDC exchange with a generic auth error
+     (AccessDenied, credential provider not found) — no mention of which claim is missing.
+
+  2. Custom property value changed: If an existing trust policy uses a custom property
+     value (e.g., custom_property_compliance_tier: "tier1") and the org admin changes
+     the property value on the repository, all workflows that use that OIDC trust policy
+     silently lose cloud access at next run, with no warning in the workflow logs.
+
+  Source: GitHub Changelog, April 2 2026 (Actions OIDC tokens now support repository
+  custom properties — generally available).
+fix: |
+  For missing claim errors:
+  1. Verify the repository has the required custom properties set under:
+     Repository Settings → Custom Properties
+  2. Add the missing property to the repository (or inherit from org-level defaults).
+  3. Re-run the workflow — the new claim will be present in the next OIDC token.
+
+  For trust policy debugging:
+  1. Decode the OIDC JWT issued to your workflow to inspect all claims:
+     Use jwt.io or the debug step below to log the token claims (do NOT log the full token).
+  2. Compare the actual claims in the token against your cloud trust policy conditions.
+
+  For change management:
+  1. Treat custom property values as trust policy configuration — use organization-wide
+     governance to prevent uncoordinated value changes.
+  2. Add a workflow step that validates required custom property claims are present
+     before attempting cloud OIDC auth.
+fix_code:
+  - language: yaml
+    label: 'Debug OIDC token claims without exposing the full token'
+    code: |
+      jobs:
+        debug-oidc-claims:
+          runs-on: ubuntu-latest
+          permissions:
+            id-token: write
+          steps:
+            - name: Fetch and decode OIDC token claims
+              run: |
+                TOKEN=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+                  "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://token.actions.githubusercontent.com" \
+                  | jq -r .value)
+                # Decode payload only (middle section of JWT) — safe to log
+                PAYLOAD=$(echo "$TOKEN" | cut -d'.' -f2 | base64 -d 2>/dev/null || \
+                           echo "$TOKEN" | cut -d'.' -f2 | python3 -c "import sys,base64; print(base64.b64decode(sys.stdin.read()+'==').decode())")
+                echo "$PAYLOAD" | jq 'to_entries | map(select(.key | startswith("custom_property")))'
+  - language: yaml
+    label: 'Validate required custom property claim is present before OIDC auth'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          permissions:
+            id-token: write
+            contents: read
+          steps:
+            - name: Verify custom property claim present
+              env:
+                EXPECTED_ENV_TYPE: 'production'
+              run: |
+                TOKEN=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+                  "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://token.actions.githubusercontent.com" \
+                  | jq -r .value)
+                PAYLOAD=$(echo "$TOKEN" | cut -d'.' -f2 | base64 -d 2>/dev/null)
+                ACTUAL=$(echo "$PAYLOAD" | jq -r '.custom_property_environment_type // "MISSING"')
+                if [ "$ACTUAL" != "$EXPECTED_ENV_TYPE" ]; then
+                  echo "::error::OIDC claim custom_property_environment_type='$ACTUAL' (expected '$EXPECTED_ENV_TYPE'). Check repo custom properties."
+                  exit 1
+                fi
+            - name: Authenticate to AWS
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-to-assume: arn:aws:iam::123456789012:role/production-deploy
+                aws-region: us-east-1
+prevention:
+  - 'Document which OIDC trust policies depend on which custom property claims before enabling the feature'
+  - 'Treat custom property values as privileged configuration — implement org-level governance before changing values'
+  - 'Add a pre-auth claim validation step that fails fast with a descriptive error before the cloud auth attempt'
+  - 'Alert when any repository custom property changes in repos with OIDC trust policies that reference that property'
+  - 'Use repo-level required custom properties (org policy) to ensure the claim always exists with a valid value'
+docs:
+  - url: 'https://github.blog/changelog/2026-04-02-github-actions-early-april-2026-updates/'
+    label: 'GitHub Changelog: Actions OIDC tokens now support repository custom properties (April 2, 2026)'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect'
+    label: 'GitHub Docs: About security hardening with OpenID Connect'
+  - url: 'https://docs.github.com/en/organizations/managing-organization-settings/managing-custom-properties-for-repositories-in-your-organization'
+    label: 'GitHub Docs: Managing custom properties for repositories'

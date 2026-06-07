@@ -1,0 +1,106 @@
+id: runner-environment-304
+title: 'Service container entrypoint: and command: silently ignored on GHES without April 2026+ update'
+category: runner-environment
+severity: silent-failure
+tags:
+  - service-container
+  - entrypoint
+  - command
+  - ghes
+  - compatibility
+  - silent-failure
+patterns:
+  - regex: 'service.*container.*not.*responding|healthcheck.*service.*timeout'
+    flags: 'i'
+  - regex: 'Connection refused.*127\.0\.0\.1.*service'
+    flags: 'i'
+  - regex: 'Error.*connect ECONNREFUSED.*service'
+    flags: 'i'
+  - regex: 'database.*initialization.*failed|service.*started.*wrong.*mode'
+    flags: 'i'
+error_messages:
+  - 'connect ECONNREFUSED 127.0.0.1:5432'
+  - 'ERROR: could not connect to server: Connection refused'
+  - 'Service container health check failed after 60 seconds'
+  - 'database system identifier differs between pg_control and pg_resetwal'
+root_cause: |
+  In April 2026, GitHub Actions added entrypoint: and command: keys to the service
+  container configuration block (jobs.<id>.services.<id>.entrypoint and
+  jobs.<id>.services.<id>.command). These keys override the container's default
+  ENTRYPOINT and CMD respectively, matching Docker Compose naming conventions.
+
+  GitHub Enterprise Server (GHES) versions that have not yet received the April 2026
+  Actions update silently ignore these keys. The workflow passes YAML validation
+  (unlike the actionlint false-positive error covered separately in yaml-syntax-090),
+  but the service container starts with its IMAGE DEFAULT entrypoint and command
+  instead of the workflow-specified overrides.
+
+  Silent failure scenarios:
+  - A PostgreSQL service container with entrypoint: overrides to set auth mode
+    starts with default settings (e.g., scram-sha-256 auth) instead of the
+    override (e.g., md5). Tests fail with authentication errors.
+  - A custom proxy or mock service specified via command: starts with its default
+    unhelpful behavior instead of the configured mode. Tests pass but produce
+    wrong results (e.g., wrong endpoint routed).
+  - Health check passes (container started) but tests fail because initialization
+    parameters were not applied.
+
+  Source: GitHub Changelog, April 2 2026 (Early April 2026 updates — service container
+  entrypoint and command overrides).
+fix: |
+  For GHES: Check your GHES version and confirm it includes the April 2026+ Actions
+  update that adds entrypoint: and command: support for service containers.
+
+  Workaround for older GHES: Build a custom Docker image with the desired entrypoint
+  and command baked in, and reference that image in your service container definition.
+  This approach is also more portable across all GHES and GHEC versions.
+fix_code:
+  - language: yaml
+    label: 'Using entrypoint: and command: (GHEC / GHES with April 2026+ update)'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          services:
+            postgres:
+              image: postgres:16
+              entrypoint: ["docker-entrypoint.sh"]
+              command: ["postgres", "-c", "password_encryption=md5"]
+              env:
+                POSTGRES_PASSWORD: testpass
+              options: >-
+                --health-cmd pg_isready
+                --health-interval 10s
+                --health-timeout 5s
+                --health-retries 5
+  - language: yaml
+    label: 'Portable workaround — custom image with entrypoint baked in'
+    code: |
+      # Dockerfile for custom postgres image:
+      # FROM postgres:16
+      # CMD ["postgres", "-c", "password_encryption=md5"]
+      #
+      # Then in workflow (works on all GHES versions):
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          services:
+            postgres:
+              image: ghcr.io/my-org/postgres-md5:16
+              env:
+                POSTGRES_PASSWORD: testpass
+              options: >-
+                --health-cmd pg_isready
+                --health-interval 10s
+                --health-timeout 5s
+                --health-retries 5
+prevention:
+  - 'Check your GHES version before using entrypoint: or command: on service containers — requires GHES with April 2026+ Actions update'
+  - 'Use custom Docker images with desired entrypoints baked in for maximum portability across GHES versions'
+  - 'Add a service container diagnostic step that verifies the expected configuration was applied before running tests'
+  - 'Note: yaml-syntax-090 covers actionlint false positives for these keys on GHEC — this is a distinct GHES runtime issue'
+docs:
+  - url: 'https://github.blog/changelog/2026-04-02-github-actions-early-april-2026-updates/'
+    label: 'GitHub Changelog: Early April 2026 updates — service container entrypoint/command (April 2, 2026)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idservicesservice_idoptions'
+    label: 'GitHub Docs: Workflow syntax — jobs.<id>.services.<id>.entrypoint and command'

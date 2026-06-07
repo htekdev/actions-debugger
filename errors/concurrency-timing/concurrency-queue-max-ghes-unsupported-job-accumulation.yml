@@ -1,0 +1,84 @@
+id: concurrency-timing-078
+title: 'concurrency queue: max unsupported on GHES and causes unexpected job pile-up'
+category: concurrency-timing
+severity: error
+tags:
+  - concurrency
+  - ghes
+  - queue
+  - pending-runs
+  - breaking-change
+patterns:
+  - regex: 'Unexpected value.*queue'
+    flags: 'i'
+  - regex: 'Invalid workflow file.*concurrency'
+    flags: 'i'
+  - regex: 'You have exceeded.*pending.*concurrency'
+    flags: 'i'
+error_messages:
+  - "Unexpected value 'queue'"
+  - 'Invalid workflow file: .github/workflows/deploy.yml'
+  - 'You have exceeded your workflow run queuing limit.'
+root_cause: |
+  GitHub added the queue property to the concurrency block in May 2026 (GitHub
+  Actions changelog, May 7, 2026). The queue: max field allows up to 100 pending
+  runs per concurrency group instead of the previous single-pending-run limit.
+  This property is only available on GitHub.com (GHEC). It is not supported on
+  GitHub Enterprise Server (GHES).
+
+  Two failure modes arise from this change:
+
+  1. GHES incompatibility: Adding queue: max (or queue: N) to a workflow on GHES
+     causes a YAML validation error at workflow dispatch time because GHES does not
+     support this key. The workflow shows as invalid and may be hidden from the
+     Actions UI entirely.
+
+  2. Unexpected queue accumulation on GHEC: Setting queue: max without understanding
+     the semantics can cause many runs to accumulate in pending state. On plans with
+     concurrency limits (e.g., 20 concurrent jobs on free plans), large queues from
+     one workflow can starve all other workflows. The previous implicit cap of one
+     pending run per concurrency group was an effective safety valve that queue: max
+     removes.
+fix: |
+  For GHES: Remove the queue property entirely. Use the classic single-pending
+  behavior (cancel-in-progress: false) or cancel-in-progress: true to discard
+  pending runs:
+
+    concurrency:
+      group: deploy-${{ github.ref }}
+      cancel-in-progress: false   # one pending, one in-progress max (GHES safe)
+
+  For GHEC queue accumulation: Replace queue: max with an explicit numeric limit
+  to cap pending runs:
+
+    concurrency:
+      group: deploy-${{ github.ref }}
+      cancel-in-progress: false
+      queue: 5   # max 5 pending; 6th run cancels oldest pending
+
+  To audit current pending runs:
+    gh run list --workflow=deploy.yml --status=waiting
+fix_code:
+  - language: yaml
+    label: 'GHES-compatible concurrency (no queue key)'
+    code: |
+      concurrency:
+        group: deploy-${{ github.ref }}
+        cancel-in-progress: false  # classic: one in-progress + one pending (GHES safe)
+  - language: yaml
+    label: 'GHEC with bounded queue to prevent starvation'
+    code: |
+      concurrency:
+        group: deploy-${{ github.ref }}
+        cancel-in-progress: false
+        queue: 5  # GHEC only: allow up to 5 queued pending runs; 6th cancels oldest
+prevention:
+  - 'Check your GitHub deployment type (GHEC vs GHES) before using queue: max or queue: N'
+  - 'Monitor pending run counts after adding queue: max — large matrices in busy repos can pile up quickly'
+  - 'Prefer queue: N with an explicit small limit over queue: max in high-traffic workflows'
+  - 'Use gh run list --status=waiting to audit current pending queue depth before deploying'
+docs:
+  - url: 'https://github.blog/changelog/2026-05-07-github-actions-concurrency-groups-now-allow-larger-queues/'
+    label: 'GitHub Changelog: Concurrency groups now allow larger queues (May 7, 2026)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs'
+    label: 'GitHub Docs: Control the concurrency of workflows and jobs'
