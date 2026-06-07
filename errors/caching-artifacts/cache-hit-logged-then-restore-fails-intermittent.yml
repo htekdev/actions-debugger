@@ -1,0 +1,86 @@
+id: caching-artifacts-090
+title: 'actions/cache logs "Cache hit" then immediately fails to restore (intermittent backend flake)'
+category: caching-artifacts
+severity: error
+tags:
+  - actions-cache
+  - v5
+  - intermittent
+  - backend-flake
+  - misleading-log
+  - service-reliability
+patterns:
+  - regex: 'Cache hit for:.+[\r\n][\s\S]{0,200}(?:Warning: Failed to restore|Cache not found for input keys)'
+    flags: 'is'
+  - regex: 'Cache hit for: .+\r?\n.*Failed to restore'
+    flags: 'i'
+error_messages:
+  - 'Cache hit for: my-cache-key'
+  - 'Warning: Failed to restore: '
+  - 'Cache not found for input keys: my-cache-key'
+root_cause: |
+  actions/cache (all versions, most visible on v5) intermittently logs "Cache hit for:
+  [key]" based on a successful metadata index lookup, but the subsequent artifact blob
+  download from GitHub's cache storage backend fails. The action reports the cache as
+  found, then immediately fails with "Warning: Failed to restore" or "Cache not found
+  for input keys" — typically with no HTTP status code or specific error detail in the
+  logs.
+
+  The root cause is in the cache backend's `GetCacheEntryDownloadURL` method: the index
+  lookup succeeds (metadata exists) but the returned download URL is temporarily
+  unavailable or stale, causing the blob fetch to fail silently. The action catches the
+  HTTP error and falls through to "Cache not found" rather than reporting the underlying
+  failure — making the failure indistinguishable in logs from a normal cache miss.
+
+  The failure is an infrastructure-side issue at GitHub, not a workflow configuration
+  error. It presents as an intermittent flake: the same cache key restores successfully
+  on retry, confirming the cache exists. Most severe during GitHub cache service
+  degradation events (not always reflected on githubstatus.com) but also appears as
+  low-rate background noise outside incidents. Tracked in actions/cache#1621 (231
+  reactions), community/discussions#163260. Recurrently reappears after individual
+  incidents are resolved.
+fix: |
+  There is no user-side fix that fully prevents this — it is a GitHub infrastructure
+  reliability issue. Mitigations:
+
+  1. Never use fail-on-cache-miss: true for caches that may be affected by backend
+     flakes. A missed restore should trigger a full install, not a hard failure.
+  2. Split into restore + save (actions/cache/restore + actions/cache/save) and check
+     the `outcome` output explicitly. Fall back to a full dependency install when
+     restore outcome is not "success".
+  3. Check https://githubstatus.com and the GitHub community forum when seeing a sudden
+     spike in "Cache hit" → "Failed to restore" failures across unrelated repos.
+fix_code:
+  - language: yaml
+    label: 'Resilient restore — fall back to full install when restore outcome is not success'
+    code: |
+      steps:
+        - name: Restore cache
+          id: cache-restore
+          uses: actions/cache/restore@v5
+          with:
+            path: ~/.npm
+            key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+            restore-keys: ${{ runner.os }}-node-
+          # Do NOT set fail-on-cache-miss: true — intermittent backend failures
+          # will cause a hard failure even when the cache exists.
+
+        - name: Install dependencies (full install if cache miss or flaky restore)
+          if: steps.cache-restore.outcome != 'success'
+          run: npm ci
+
+        - name: Install dependencies (fast path on confirmed cache hit)
+          if: steps.cache-restore.outcome == 'success'
+          run: npm ci --prefer-offline
+prevention:
+  - 'Never use fail-on-cache-miss: true for caches that are not guaranteed to exist on every run — intermittent backend issues will cause hard failures.'
+  - 'Always check steps.<id>.outcome == "success" before skipping installs — do not assume a "Cache hit" log line means the restore actually succeeded.'
+  - 'Use actions/cache/restore + actions/cache/save split form for finer outcome control; the combined actions/cache form gives less visibility into restore failure reasons.'
+  - 'Monitor githubstatus.com during sudden spikes of cache failures across repos; individual incidents may not be posted immediately.'
+docs:
+  - url: 'https://github.com/actions/cache/issues/1621'
+    label: 'actions/cache#1621 — Random issue with cache/restore (231 reactions)'
+  - url: 'https://github.com/orgs/community/discussions/163260'
+    label: 'Community discussion #163260 — cache service intermittent failures'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/caching-dependencies-to-speed-up-workflows'
+    label: 'GitHub docs: Caching dependencies to speed up workflows'

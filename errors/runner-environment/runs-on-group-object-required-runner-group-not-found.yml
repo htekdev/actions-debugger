@@ -1,0 +1,77 @@
+id: runner-environment-276
+title: 'runs-on group object form intermittently fails with "Required runner group not found"'
+category: runner-environment
+severity: error
+tags:
+  - self-hosted
+  - runner-group
+  - runs-on
+  - intermittent
+  - dispatch
+  - queued
+patterns:
+  - regex: 'Required runner group .+ not found'
+    flags: 'i'
+error_messages:
+  - "Required runner group 'my-runner-group' not found"
+root_cause: |
+  When `runs-on` uses the object form with a `group:` key to target a named runner
+  group, GitHub Actions' internal job dispatcher intermittently fails to resolve the
+  runner group during job routing. The job fails immediately with "Required runner
+  group 'x' not found" even though the runner group exists, has the correct repository
+  in scope, and the runner is online and idle.
+
+  The failure mode:
+  - The queued job's API representation shows `runnerId: null`, `runnerName: null`,
+    `runnerGroupId: null` throughout the queue duration — the group was never resolved.
+  - Re-running the failed job usually succeeds immediately, confirming the group exists.
+  - The equivalent label-based `runs-on` form (`runs-on: [self-hosted, my-label]`)
+    does not exhibit the same failure on the same runner.
+
+  The issue is most frequently reproduced on organization-level runner groups with
+  repository access lists, at high job concurrency, and intermittently with no
+  predictable pattern. Tracked in actions/runner#4252 (opened February 2026, open as
+  of June 2026). No official acknowledgement or fix timeline from GitHub.
+fix: |
+  Primary workaround: switch to the label-based `runs-on` form using a label that
+  uniquely identifies the runners in the target group. This avoids the affected
+  group-resolution code path entirely.
+
+  If the object form is required (e.g. multiple groups share the same label and the
+  `group:` key is needed to disambiguate), add a `strategy: max-parallel: 1` combined
+  with a retry action, or wrap workflows to automatically re-queue on failure.
+fix_code:
+  - language: yaml
+    label: 'Switch to label form to avoid intermittent group dispatch failure'
+    code: |
+      jobs:
+        build:
+          # Before — intermittently fails:
+          # runs-on:
+          #   group: my-runner-group
+          #   labels: [self-hosted, linux]
+
+          # After — stable (assign a unique label to runners in that group):
+          runs-on: [self-hosted, linux, my-runner-group-label]
+  - language: yaml
+    label: 'If group form is required — add a retry step for dispatch failures'
+    code: |
+      jobs:
+        build:
+          runs-on:
+            group: my-runner-group
+            labels: [self-hosted, linux]
+          steps:
+            - uses: actions/checkout@v4
+            # Note: GitHub Actions has no native job-level retry.
+            # Use a wrapping workflow with workflow_run + needs + re-dispatch,
+            # or monitor actions/runner#4252 for an upstream fix.
+prevention:
+  - 'Prefer the label-based runs-on form when runners in a group have a distinct label — it avoids the intermittent dispatch issue.'
+  - 'Monitor actions/runner#4252 for an upstream fix before adopting the group object form in critical workflows.'
+  - 'If using the group object form, set up alerting on sudden job failures (failed after 0 seconds) to detect dispatch failures quickly — they can be confused with runner offline errors.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4252'
+    label: 'actions/runner#4252 — Intermittent "Required runner group not found" with group object form'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idruns-on'
+    label: 'Workflow syntax: runs-on (group object form)'

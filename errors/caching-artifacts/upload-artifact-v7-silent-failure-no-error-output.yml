@@ -1,0 +1,92 @@
+id: caching-artifacts-091
+title: 'upload-artifact@v7 fails mid-upload with no error message in logs'
+category: caching-artifacts
+severity: error
+tags:
+  - upload-artifact
+  - v7
+  - silent-failure
+  - artifact-upload
+  - blob-storage
+  - no-error-message
+patterns:
+  - regex: 'Beginning upload of artifact content to blob storage[\s\S]{0,500}Uploaded bytes \d+'
+    flags: 'is'
+  - regex: 'Uploaded bytes \d+\s*$'
+    flags: 'im'
+error_messages:
+  - 'Beginning upload of artifact content to blob storage'
+  - 'Uploaded bytes 113997'
+root_cause: |
+  actions/upload-artifact@v7 (the current major version) has a regression where the
+  artifact upload terminates after partially uploading bytes without emitting any
+  "Error:" or failure message. The step is marked as failed and the job fails, but the
+  logs end abruptly after "Uploaded bytes XXXXX" — no error code, no exception, no
+  explanation. Users see only "Failure - Main actions/upload-artifact@v7" with no
+  actionable message.
+
+  The issue is tracked in actions/upload-artifact#806 (open since April 2026). The
+  failure affects all platforms (Linux, Windows, macOS) and all artifact types.
+  Symptoms:
+  - Step prints "Artifact name is valid!", "Root directory input is valid!", and
+    "Beginning upload of artifact content to blob storage"
+  - Step prints "Uploaded bytes XXXXX" for partial progress
+  - Step is then marked failed; no error message follows
+  - if-no-files-found: warn does not help because files are found — the upload itself
+    fails silently
+
+  The underlying cause is an unhandled rejection or blob storage response that v7's
+  upload client does not log before exiting. This regression is not present in
+  upload-artifact@v4 (Node 20) or upload-artifact@v6 (Node 24, pre-ESM). Users
+  affected have pinned to v4.6.2 or upgraded to v6.0.0 as a workaround.
+
+  Note: actions/upload-artifact v4 uses Node 20 and will require upgrade before
+  Node 20 toolcache removal (Sept 16, 2026).
+fix: |
+  Pin to upload-artifact@v6 (Node 24, pre-ESM, no known silent-failure regressions)
+  as the stable upgrade path. Avoid v7 until actions/upload-artifact#806 is resolved.
+
+  If you must use v7, add a post-upload verification step that checks for the artifact
+  via the GitHub API, and fail explicitly if not found.
+fix_code:
+  - language: yaml
+    label: 'Pin to v6 to avoid v7 silent failure regression'
+    code: |
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6   # v6: Node 24, no known silent-failure regressions
+        with:
+          name: my-artifact
+          path: ./dist/
+  - language: yaml
+    label: 'v4 pin (Node 20) as fallback — upgrade before Sept 16, 2026 Node 20 removal'
+    code: |
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4.6.2  # Node 20; upgrade to v6 before Sept 16 2026
+        with:
+          name: my-artifact
+          path: ./dist/
+  - language: yaml
+    label: 'Verify upload succeeded when stuck on v7 (workaround)'
+    code: |
+      - name: Upload artifact
+        id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: my-artifact
+          path: ./dist/
+
+      - name: Verify artifact uploaded (workaround for v7 silent failure)
+        if: always() && steps.upload.outcome != 'success'
+        run: |
+          echo "::error::upload-artifact@v7 failed silently. See actions/upload-artifact#806."
+          echo "Workaround: pin to actions/upload-artifact@v6"
+          exit 1
+prevention:
+  - 'Pin upload-artifact to a specific version (v6 recommended) rather than a major version tag — major version tags can point to regressions.'
+  - 'Test artifact uploads in a canary workflow before rolling out a new major version to all CI workflows.'
+  - 'Check actions/upload-artifact releases and open issues before upgrading to a new major version.'
+docs:
+  - url: 'https://github.com/actions/upload-artifact/issues/806'
+    label: 'upload-artifact#806 — Upload failed without an error output (open since April 2026)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-workflow-data-as-artifacts'
+    label: 'GitHub docs: Storing workflow data as artifacts'
