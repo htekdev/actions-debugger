@@ -1,0 +1,143 @@
+id: triggers-085
+title: "workflow_run Triggered Checkout with head_sha Produces Detached HEAD State — Git Push and Semantic Release Fail"
+category: triggers
+severity: silent-failure
+tags:
+  - workflow_run
+  - checkout
+  - head_sha
+  - detached-head
+  - semantic-release
+  - git-push
+  - trigger
+patterns:
+  - regex: 'HEAD is now at [0-9a-f]{7,40}.*detached'
+    flags: 'i'
+  - regex: 'Detached HEAD state cannot match any release groups'
+    flags: 'i'
+  - regex: 'You are in .detached HEAD. state.*workflow_run'
+    flags: 'im'
+  - regex: 'fatal: You are not currently on a branch.*workflow.run'
+    flags: 'im'
+error_messages:
+  - "HEAD is now at a1b2c3d (detached)"
+  - "Detached HEAD state cannot match any release groups; no release will be made"
+  - "fatal: You are not currently on a branch."
+  - "You are in 'detached HEAD' state. You can look around, make experimental changes and commit them, and you can discard any commits you make in this state without impacting any branches by performing another checkout."
+root_cause: |
+  In `workflow_run`-triggered workflows, the triggered workflow executes in the context of
+  the REPOSITORY DEFAULT BRANCH, not the branch that caused the upstream workflow to fire
+  (see triggers-019 for that issue). The standard fix is to explicitly set
+  `ref: ${{ github.event.workflow_run.head_sha }}` in the checkout step to target the
+  triggering commit.
+
+  However, checking out by a raw commit SHA (not a branch name or tag ref) puts Git into
+  DETACHED HEAD state. The runner is not on any named branch. Tools and steps that require
+  a named branch then fail:
+
+  - **semantic-release**: fails with "Detached HEAD state cannot match any release groups;
+    no release will be made" because its branch configuration (e.g., `main`, `develop`)
+    cannot be matched against a detached HEAD.
+  - **git push**: fails with "fatal: You are not currently on a branch."
+  - **version bump scripts**: many scripts use `git rev-parse --abbrev-ref HEAD` to get the
+    current branch name; they receive "HEAD" instead of a real branch name.
+  - **Conventional Commits tooling**: tools like `semantic-release`, `release-it`, and
+    `changesets` check out a named branch to determine release channels.
+
+  The confusion arises because:
+  1. triggers-019 says "you need `head_sha`" to target the right commit.
+  2. Using `head_sha` introduces a NEW problem: detached HEAD.
+  3. The two-step fix (use `head_sha` for correctness, then recover branch name) is not
+     documented in the checkout action README for `workflow_run` scenarios.
+fix: |
+  Instead of using only `ref: ${{ github.event.workflow_run.head_sha }}`, also set the
+  working branch by checking out using the BRANCH NAME from the workflow_run event
+  (`github.event.workflow_run.head_branch`) while including the SHA for validation:
+
+  **Option A** — checkout the branch by name (avoids detached HEAD entirely):
+  ```yaml
+  - uses: actions/checkout@v4
+    with:
+      ref: ${{ github.event.workflow_run.head_branch }}
+  ```
+  Limitation: this may miss force-push scenarios or check out a newer commit than expected.
+
+  **Option B** — checkout by SHA, then create a local tracking branch:
+  ```yaml
+  - uses: actions/checkout@v4
+    with:
+      ref: ${{ github.event.workflow_run.head_sha }}
+  - run: |
+      git checkout -b "${{ github.event.workflow_run.head_branch }}" || \
+      git checkout "${{ github.event.workflow_run.head_branch }}"
+  ```
+
+  **Option C** — checkout by SHA and set HEAD to branch (for semantic-release):
+  ```yaml
+  - uses: actions/checkout@v4
+    with:
+      ref: ${{ github.event.workflow_run.head_sha }}
+      fetch-depth: 0
+  - run: |
+      git checkout -B "${{ github.event.workflow_run.head_branch }}"
+  ```
+  The `-B` flag creates or resets the local branch to the current SHA, allowing
+  tools like semantic-release to see a named branch context.
+fix_code:
+  - language: yaml
+    label: "Recommended fix — checkout by branch name to avoid detached HEAD"
+    code: |
+      jobs:
+        release:
+          # workflow_run-triggered, runs on the default branch context
+          if: ${{ github.event.workflow_run.conclusion == 'success' }}
+          runs-on: ubuntu-latest
+          steps:
+            # Check out by BRANCH NAME, not SHA — avoids detached HEAD
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.workflow_run.head_branch }}
+                fetch-depth: 0
+                token: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Run semantic-release
+              run: npx semantic-release
+              env:
+                GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  - language: yaml
+    label: "SHA-first checkout with branch recovery — for exact commit targeting"
+    code: |
+      jobs:
+        release:
+          if: ${{ github.event.workflow_run.conclusion == 'success' }}
+          runs-on: ubuntu-latest
+          steps:
+            # Checkout by exact SHA for reproducibility
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.workflow_run.head_sha }}
+                fetch-depth: 0
+
+            # Recover named branch context for tools that require it
+            - name: Restore branch pointer
+              run: |
+                BRANCH="${{ github.event.workflow_run.head_branch }}"
+                git checkout -B "$BRANCH"
+                echo "Now on branch: $(git rev-parse --abbrev-ref HEAD)"
+
+            - name: Run semantic-release
+              run: npx semantic-release
+              env:
+                GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+prevention:
+  - "Whenever using `ref: ${{ github.event.workflow_run.head_sha }}` in a workflow_run context, immediately follow with a `git checkout -B <branch-name>` step to restore named branch context."
+  - "Check if your release tooling (semantic-release, changesets, release-it) is branch-aware; if so, always check out by branch name in workflow_run-triggered jobs."
+  - "Test workflow_run-triggered release pipelines on a non-default feature branch to surface detached-HEAD issues before they affect production releases."
+  - "Use `fetch-depth: 0` whenever checking out for release tools to ensure full commit and tag history is available."
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run"
+    label: "GitHub Docs — workflow_run trigger event payload"
+  - url: "https://github.com/actions/checkout/issues/2287"
+    label: "actions/checkout#2287 — Related: checkout@v5 workflow scope timeout on push"
+  - url: "https://github.com/semantic-release/semantic-release/blob/master/docs/usage/ci-configuration.md"
+    label: "semantic-release CI config — branch requirement documentation"
