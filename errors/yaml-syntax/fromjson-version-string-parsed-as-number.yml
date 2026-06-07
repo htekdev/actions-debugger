@@ -1,0 +1,129 @@
+id: yaml-syntax-085
+title: 'fromJson version strings parsed as numbers — "Input string is not a valid number" in dynamic matrix'
+category: yaml-syntax
+severity: error
+tags:
+  - fromJson
+  - matrix
+  - dynamic-matrix
+  - strategy
+  - version-string
+  - json
+  - expression
+patterns:
+  - regex: 'Input string .* is not a valid number\. Path .* line \d+, position \d+'
+    flags: 'i'
+  - regex: "Error when evaluating 'strategy' for job .* Error parsing fromJson"
+    flags: 'i'
+  - regex: 'fromJson.*not a valid number'
+    flags: 'i'
+error_messages:
+  - "Error when evaluating 'strategy' for job 'build'. .github/workflows/ci.yml (Line: 15, Col: 18): Error parsing fromJson, ... Input string '9.0.0' is not a valid number. Path '[0]', line 1, position 6."
+  - "Error when evaluating 'strategy' for job 'test'. Error parsing fromJson, ... Input string '11.0.0' is not a valid number."
+  - "Error: Error parsing fromJson, unexpected character encountered while parsing value: 9. Path '[0]', line 1, position 1."
+root_cause: |
+  When using a dynamic matrix with `fromJson()`, all string values in the JSON array
+  MUST be double-quoted in the JSON itself. Bare token values like `9.0.0` or `11.0.0`
+  are not valid JSON — JSON only recognises numbers, strings (double-quoted), booleans,
+  null, objects, and arrays as primitives.
+
+  The GitHub Actions runner uses .NET's Newtonsoft.Json library internally. When it
+  encounters `[9.0.0, 11.0.0]` in fromJson(), the parser starts reading `9.0.0` as a
+  number candidate, succeeds on `9`, then hits the `.0.0` suffix and throws
+  "Input string '9.0.0' is not a valid number".
+
+  The root cause is almost always how the JSON is emitted. Common mistakes:
+
+  1. Bash shell expansion removes quotes:
+     ```bash
+     echo "versions=["9.0.0", "11.0.0"]"
+     # Bash sees: echo "versions=[9.0.0, 11.0.0]"
+     ```
+
+  2. Single-quoted output loses inner quoting:
+     ```bash
+     echo 'versions=["9.0.0"]'   # correct
+     echo "versions=[\"9.0.0\"]" # also correct, but easy to get wrong
+     ```
+
+  3. Using `jq` without `-r` adds extra JSON escaping.
+
+  Version-style strings like `1.2.3`, `9.0`, `11.0.0` are especially prone because
+  they start with a digit — the parser tries to interpret them as numbers.
+
+  The error fires during strategy evaluation, before any job runs, making it look like
+  a YAML syntax error even though the YAML file is syntactically valid.
+fix: |
+  Always emit the matrix value as valid JSON with all string values double-quoted.
+  Use `jq` or carefully escaped bash to produce the JSON:
+
+  - Use single-quoted string in bash to preserve inner double-quotes
+  - Use `jq -c` to safely serialise arrays
+  - In the strategy block, consume with `fromJson(needs.JOB.outputs.KEY)`
+
+  When version strings are the matrix values, you must quote them in the JSON
+  even though they look like numbers.
+fix_code:
+  - language: yaml
+    label: 'WRONG — unquoted version strings in JSON (causes the error)'
+    code: |
+      - name: Set versions
+        id: versions
+        run: |
+          # BAD: bash strips the inner quotes
+          echo "matrix=[9.0.0, 11.0.0]" >> $GITHUB_OUTPUT
+          # BAD: inner quotes lost in double-quoted string
+          echo "matrix=["9.0.0", "11.0.0"]" >> $GITHUB_OUTPUT
+  - language: yaml
+    label: 'CORRECT — properly quoted JSON strings'
+    code: |
+      - name: Set versions
+        id: versions
+        run: |
+          # GOOD: single-quoted bash string preserves inner double-quotes
+          echo 'matrix=["9.0.0", "11.0.0"]' >> $GITHUB_OUTPUT
+
+          # GOOD: use jq to build the array safely
+          versions='["9.0.0", "11.0.0"]'
+          echo "matrix=$(echo "$versions" | jq -c .)" >> $GITHUB_OUTPUT
+
+          # GOOD: build dynamically with jq
+          echo "matrix=$(echo '9.0.0 11.0.0' | jq -Rc '[split(" ")][]' | jq -sc)" >> $GITHUB_OUTPUT
+  - language: yaml
+    label: 'Full example — dynamic matrix with quoted version strings'
+    code: |
+      jobs:
+        setup:
+          runs-on: ubuntu-latest
+          outputs:
+            matrix: ${{ steps.set-matrix.outputs.matrix }}
+          steps:
+            - name: Set matrix versions
+              id: set-matrix
+              run: |
+                # Single-quoted to preserve JSON double-quotes
+                echo 'matrix=["9.0.0", "11.0.0", "17.0.0"]' >> $GITHUB_OUTPUT
+
+        build:
+          needs: setup
+          strategy:
+            matrix:
+              version: ${{ fromJson(needs.setup.outputs.matrix) }}
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Building with version ${{ matrix.version }}"
+prevention:
+  - 'Always use single-quoted bash strings when emitting JSON arrays to GITHUB_OUTPUT to preserve inner double-quotes'
+  - 'Run `echo $OUTPUT | python3 -m json.tool` locally to verify your JSON is valid before committing'
+  - 'Use `jq -c` to build and compact JSON arrays — it handles quoting correctly'
+  - 'If version strings contain dots (e.g. 9.0.0), they MUST be quoted in JSON — they look numeric but are not valid JSON numbers'
+  - 'Validate the fromJson output in an earlier step: `echo "${{ toJson(needs.setup.outputs.matrix) }}"` to inspect the raw value'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#fromjson'
+    label: 'GitHub Docs — fromJSON expression'
+  - url: 'https://stackoverflow.com/questions/76039616/how-to-read-in-an-array-of-strings-to-matrix-in-github-actions'
+    label: 'Stack Overflow — How to read in an array of strings to matrix in GitHub Actions (#76039616)'
+  - url: 'https://github.com/actions/runner/issues/751'
+    label: 'actions/runner #751 — Dynamic strategy.matrix from job outputs'
+  - url: 'https://github.com/orgs/community/discussions/27096'
+    label: 'GitHub Community — Dynamic matrix / fromJson string array issues'
