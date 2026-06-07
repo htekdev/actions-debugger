@@ -1,0 +1,108 @@
+id: permissions-auth-083
+title: 'actions/labeler@v5 requires pull-requests: write permission — v4-to-v5 upgrade breaks with "Resource not accessible by integration"'
+category: permissions-auth
+severity: error
+tags:
+  - labeler
+  - pull-requests
+  - permissions
+  - v5-breaking-change
+  - github-token
+  - resource-not-accessible
+patterns:
+  - regex: 'HttpError: Resource not accessible by integration'
+    flags: 'i'
+  - regex: 'Error: HttpError: Resource not accessible by integration'
+    flags: 'i'
+  - regex: 'labeler.*Resource not accessible|Resource not accessible.*labeler'
+    flags: 'i'
+error_messages:
+  - 'HttpError: Resource not accessible by integration'
+  - 'Error: HttpError: Resource not accessible by integration'
+root_cause: |
+  `actions/labeler@v5` introduced a breaking change in how it handles labels compared
+  to v4: the action now WRITES labels to pull requests (via the REST API) rather than
+  only reading existing labels. This requires the `pull-requests: write` permission.
+
+  In `actions/labeler@v4` and earlier, the action only needed `contents: read` and
+  `pull-requests: read` permissions (the defaults). After upgrading to v5, if the
+  `permissions:` block is not updated, the GITHUB_TOKEN lacks the required `write`
+  scope for pull requests and the label assignment fails with:
+    "HttpError: Resource not accessible by integration"
+
+  This error is also triggered when:
+  1. The repository uses the default token permissions set to "read" at the org or repo
+     level (Settings → Actions → Workflow permissions → "Read repository contents and
+     packages permissions") — write operations require explicit `permissions:` override.
+  2. The workflow runs on a `pull_request` event from a fork — fork PRs receive a
+     read-only token and cannot write labels regardless of the `permissions:` block.
+     Use `pull_request_target` for fork label workflows (with appropriate security review).
+
+  Source: actions/labeler#1272, #1278 (v5 upgrade reports), GitHub Community
+fix: |
+  Add `pull-requests: write` to the job's (or workflow's) `permissions:` block.
+
+  For fork PRs: use `pull_request_target` trigger instead of `pull_request` to receive
+  a write-capable token (review security implications carefully before using
+  pull_request_target with untrusted fork code).
+fix_code:
+  - language: yaml
+    label: 'Wrong — v4 permissions block breaks after upgrading to labeler@v5'
+    code: |
+      on: [pull_request]
+
+      jobs:
+        label:
+          runs-on: ubuntu-latest
+          permissions:
+            contents: read       # was enough for v4
+          steps:
+            - uses: actions/labeler@v5   # v5 needs pull-requests: write
+              with:
+                repo-token: ${{ secrets.GITHUB_TOKEN }}
+                # Error: HttpError: Resource not accessible by integration
+  - language: yaml
+    label: 'Fixed — add pull-requests: write permission for labeler@v5'
+    code: |
+      on: [pull_request]
+
+      jobs:
+        label:
+          runs-on: ubuntu-latest
+          permissions:
+            contents: read
+            pull-requests: write   # required by labeler@v5 to apply labels
+          steps:
+            - uses: actions/labeler@v5
+              with:
+                repo-token: ${{ secrets.GITHUB_TOKEN }}
+  - language: yaml
+    label: 'Fixed — for fork PRs use pull_request_target with restricted checkout'
+    code: |
+      on:
+        pull_request_target:
+
+      jobs:
+        label:
+          runs-on: ubuntu-latest
+          permissions:
+            contents: read
+            pull-requests: write
+          steps:
+            # IMPORTANT: do not check out PR head for fork PRs with pull_request_target
+            # unless you have validated the code is safe — use base branch only
+            - uses: actions/labeler@v5
+              with:
+                repo-token: ${{ secrets.GITHUB_TOKEN }}
+prevention:
+  - 'When upgrading labeler from v4 to v5, always add pull-requests: write to the permissions block'
+  - 'Check the action changelog for permission requirement changes before upgrading major versions'
+  - 'Set repository default workflow permissions to read-only and use explicit permissions blocks to follow least-privilege'
+  - 'Test action upgrades on a feature branch before merging to default branch'
+docs:
+  - url: 'https://github.com/actions/labeler'
+    label: 'actions/labeler — repository and v5 changelog'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/controlling-permissions-for-github_token'
+    label: 'GitHub Docs — Controlling permissions for GITHUB_TOKEN'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions#considering-cross-repository-access'
+    label: 'GitHub Docs — Security hardening for GitHub Actions'

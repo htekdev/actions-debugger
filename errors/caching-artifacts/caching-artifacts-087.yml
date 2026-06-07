@@ -1,0 +1,106 @@
+id: caching-artifacts-087
+title: 'actions/cache@v4 requires GitHub Enterprise Server 3.10+ — older GHES fails with "Cache service url not found"'
+category: caching-artifacts
+severity: error
+tags:
+  - actions-cache
+  - v4
+  - ghes
+  - github-enterprise-server
+  - cache-service-url
+  - compatibility
+patterns:
+  - regex: 'Cache service url not found\. Unable to restore cache\.'
+    flags: 'i'
+  - regex: 'Cache service url not found\. Unable to save cache\.'
+    flags: 'i'
+  - regex: 'ACTIONS_RESULTS_URL.*not.*defined|ACTIONS_CACHE_URL.*not.*found'
+    flags: 'i'
+error_messages:
+  - 'Cache service url not found. Unable to restore cache.'
+  - 'Cache service url not found. Unable to save cache.'
+  - 'Warning: Cache service url not found, unable to restore cache.'
+root_cause: |
+  `actions/cache@v4` uses a new cache service API that relies on the
+  `ACTIONS_RESULTS_URL` environment variable (introduced in GitHub Actions runner
+  v2.311.0 / GHES 3.10). Older GHES instances (< 3.10) only provide the legacy
+  `ACTIONS_CACHE_URL` environment variable, which `cache@v4` no longer reads.
+
+  When `ACTIONS_RESULTS_URL` is absent (GHES < 3.10), the action cannot determine
+  the cache service endpoint and outputs:
+    "Cache service url not found. Unable to restore cache."
+    "Cache service url not found. Unable to save cache."
+
+  The workflow step itself exits with status 0 (not a workflow failure) — cache misses
+  are treated as warnings by default, so workflows continue to run but all caching is
+  silently skipped, causing slow rebuilds on every run.
+
+  Note: This is different from the `upload-artifact@v4` GHES incompatibility (which
+  required GHES 3.11+). The `cache@v4` requirement is GHES 3.10+.
+
+  Source: actions/cache CHANGELOG.md, GitHub Enterprise Server 3.10 release notes,
+  community reports from GHES administrators upgrading action pinning.
+fix: |
+  **Option 1 (recommended for GHES < 3.10): Stay on actions/cache@v3**
+  `cache@v3` uses the legacy `ACTIONS_CACHE_URL` endpoint supported by all GHES versions.
+  Upgrade to `cache@v4` only after your GHES instance is on 3.10+.
+
+  **Option 2: Upgrade GHES to 3.10+**
+  The cleanest long-term fix. After upgrading, switch to `cache@v4` for the new
+  cache service performance improvements.
+
+  **Option 3: Pin by commit SHA for stability**
+  If your org standardizes on a specific action version, pin by commit SHA to avoid
+  accidental major-version bumps via Dependabot or manual edits.
+fix_code:
+  - language: yaml
+    label: 'Wrong — cache@v4 on GHES < 3.10 produces "Cache service url not found"'
+    code: |
+      - name: Cache node_modules
+        uses: actions/cache@v4   # requires GHES 3.10+ — fails silently on older versions
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          # Warning: Cache service url not found. Unable to restore cache.
+          # Warning: Cache service url not found. Unable to save cache.
+  - language: yaml
+    label: 'Fixed — use cache@v3 for GHES < 3.10 compatibility'
+    code: |
+      - name: Cache node_modules
+        uses: actions/cache@v3   # supports all GHES versions via legacy ACTIONS_CACHE_URL
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+  - language: yaml
+    label: 'Fixed — conditional version selection based on GHES version (advanced)'
+    code: |
+      # Use the GHES version environment variable available in runner context
+      # to dynamically select the cache action version.
+      # Simpler alternative: maintain a separate workflow file per GHES version.
+      - name: Cache dependencies (GHES 3.10+ compatible)
+        if: ${{ env.GHES_VERSION >= '3.10' || github.server_url == 'https://github.com' }}
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+
+      - name: Cache dependencies (GHES < 3.10 fallback)
+        if: ${{ env.GHES_VERSION < '3.10' && github.server_url != 'https://github.com' }}
+        uses: actions/cache@v3
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+prevention:
+  - 'Check actions/cache CHANGELOG.md before upgrading major versions — v3→v4 has a GHES version requirement'
+  - 'Document your GHES version in your repository''s contributing guide so developers know which action versions are safe'
+  - 'Use Dependabot or Renovate with version constraints to avoid auto-upgrading to incompatible major versions'
+  - 'Monitor workflow run times after cache version upgrades — silent cache misses cause builds to slow dramatically'
+docs:
+  - url: 'https://github.com/actions/cache/blob/main/CHANGELOG.md'
+    label: 'actions/cache CHANGELOG — v4 release notes and GHES requirements'
+  - url: 'https://docs.github.com/en/enterprise-server@3.10/admin/release-notes'
+    label: 'GitHub Enterprise Server 3.10 release notes'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows'
+    label: 'GitHub Docs — Caching dependencies to speed up workflows'

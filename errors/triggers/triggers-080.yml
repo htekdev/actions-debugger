@@ -1,0 +1,123 @@
+id: triggers-080
+title: 'Label-gated workflow uses only types: [labeled] — subsequent pushes after label is applied are silently skipped'
+category: triggers
+severity: silent-failure
+tags:
+  - pull_request
+  - labeled
+  - types
+  - label-gate
+  - synchronize
+  - deployment-gate
+patterns:
+  - regex: 'types:\s*[\[\n]\s*labeled\s*[\]\n]'
+    flags: 'si'
+  - regex: 'on:\s*\n\s*pull_request:\s*\n\s*types:\s*\[?\s*labeled\s*\]?'
+    flags: 'si'
+error_messages:
+  - 'Workflow skipped — no trigger matched'
+root_cause: |
+  When a workflow uses `on: pull_request: types: [labeled]`, it fires ONLY when a label
+  is APPLIED to a pull request. It does NOT fire when a new commit is pushed to the PR
+  (`synchronize` event) while the label is already present.
+
+  Developers commonly use this pattern to create label-gated deployments or quality gates:
+  1. Apply the `deploy` label to trigger a deployment workflow
+  2. Iterate on the PR code and push more commits
+  3. Expect the deployment workflow to re-run on each push
+
+  Step 3 silently fails because the `labeled` event is one-time — it fires when the label
+  is added, never on subsequent pushes. The label remains on the PR, but no new workflow
+  runs are triggered for `synchronize` events.
+
+  The combined `contains(github.event.pull_request.labels.*.name, 'deploy')` check in the
+  `if:` condition doesn't help here — the problem is the workflow is NEVER TRIGGERED at
+  all on push, so the `if:` condition is never evaluated.
+
+  This is expected GitHub Actions behavior, but it is a frequent source of confusion for
+  teams building deployment gates or approval-required workflows triggered by PR labels.
+
+  Source: GitHub Community discussions, Stack Overflow #65475890, GitHub Actions docs
+  on pull_request activity types.
+fix: |
+  Add `synchronize` to the `types:` list AND use an `if:` condition to check for the
+  label's presence. Without the `if:` condition, every push will trigger the deployment
+  workflow (even without the label).
+
+  The `if:` condition uses `contains(github.event.pull_request.labels.*.name, 'label-name')`
+  to check whether the label is currently present on the PR at the time of each trigger.
+fix_code:
+  - language: yaml
+    label: 'Wrong — only types: [labeled] silently skips pushes after label is applied'
+    code: |
+      on:
+        pull_request:
+          types: [labeled]   # Only fires when label is applied, NOT on new commits
+
+      jobs:
+        deploy-preview:
+          runs-on: ubuntu-latest
+          # This job never re-runs when a new commit is pushed to a labeled PR
+          steps:
+            - name: Deploy to preview
+              run: echo "Deploying..."
+  - language: yaml
+    label: 'Fixed — add synchronize to types and check label presence in if: condition'
+    code: |
+      on:
+        pull_request:
+          types:
+            - labeled        # fires when label is applied
+            - synchronize    # fires when new commits are pushed
+
+      jobs:
+        deploy-preview:
+          runs-on: ubuntu-latest
+          # Only run when the 'deploy-preview' label is present (not just applied)
+          if: contains(github.event.pull_request.labels.*.name, 'deploy-preview')
+          steps:
+            - uses: actions/checkout@v4
+            - name: Deploy to preview
+              run: echo "Deploying PR ${{ github.event.pull_request.number }}..."
+  - language: yaml
+    label: 'Fixed — also handle label removal to cancel deployments'
+    code: |
+      on:
+        pull_request:
+          types:
+            - labeled
+            - unlabeled      # fires when label is removed (e.g., to cancel deployment)
+            - synchronize
+            - reopened
+
+      jobs:
+        deploy-preview:
+          runs-on: ubuntu-latest
+          if: contains(github.event.pull_request.labels.*.name, 'deploy-preview')
+          concurrency:
+            group: deploy-preview-${{ github.event.pull_request.number }}
+            cancel-in-progress: true
+          steps:
+            - uses: actions/checkout@v4
+            - name: Deploy PR preview
+              run: ./scripts/deploy-preview.sh
+
+        teardown-preview:
+          runs-on: ubuntu-latest
+          # Clean up when label is removed
+          if: |
+            github.event.action == 'unlabeled' &&
+            github.event.label.name == 'deploy-preview'
+          steps:
+            - name: Teardown preview environment
+              run: ./scripts/teardown-preview.sh
+prevention:
+  - 'Always add synchronize to types when using labeled to build label-gated workflows that must react to new commits'
+  - 'Pair types: [labeled, synchronize] with an if: contains(labels) condition to avoid running on all pushes'
+  - 'Consider also adding reopened and unlabeled types to handle PR lifecycle events that affect label-gated deployments'
+  - 'Document the label-gate behavior in PR templates so contributors know to re-apply the label after major changes if needed'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request'
+    label: 'GitHub Docs — pull_request event and activity types'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#running-your-workflow-when-a-pull-request-is-merged'
+    label: 'GitHub Docs — Controlling workflow runs based on labels'
