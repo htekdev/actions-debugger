@@ -1,0 +1,117 @@
+id: caching-artifacts-086
+title: 'deploy-pages ''Artifact could not be deployed'' — hard links or symlinks in build artifact'
+category: caching-artifacts
+severity: error
+tags:
+  - deploy-pages
+  - github-pages
+  - symlinks
+  - hard-links
+  - node_modules
+  - upload-pages-artifact
+patterns:
+  - regex: 'Artifact could not be deployed'
+    flags: 'i'
+  - regex: 'hard links.*symlinks|symlinks.*hard links'
+    flags: 'i'
+  - regex: 'Please ensure the content does not contain any hard links'
+    flags: 'i'
+error_messages:
+  - 'Error: Artifact could not be deployed. Please ensure the content does not contain any hard links, symlinks and total size is less than 10GB.'
+  - 'Artifact could not be deployed. Please ensure the content does not contain any hard links or symlinks and total size is less than 10GB.'
+root_cause: |
+  The GitHub Pages infrastructure rejects artifacts containing hard links or symbolic
+  links because these cannot be safely served from a static CDN. The error fires even
+  when the developer believes their build output contains no symlinks.
+
+  Common hidden sources of symlinks in uploaded artifacts:
+
+  1. **node_modules/.bin/** — every npm package binary is a symlink inside `.bin/`.
+     If you upload a directory that contains (or is a parent of) `node_modules`, the
+     `.bin/` symlinks are included.
+
+  2. **Python virtual environments** — `venv/bin/` contains symlinks to the Python
+     interpreter and installed tool wrappers.
+
+  3. **Monorepo workspace links** — pnpm, Yarn workspaces, and npm workspaces create
+     symlinked packages under `node_modules/<scope>/`.
+
+  4. **Build tool outputs with symlinks** — some Astro, Nuxt, or Gatsby builds write
+     a `_astro/` or `.nuxt/` directory that contains symlinked CSS/JS modules.
+
+  5. **Wrong upload path** — uploading the repo root or the source directory instead
+     of the final built `dist/` or `_site/` output directory accidentally includes
+     `node_modules` and other tooling artifacts.
+
+  The GitHub Pages server-side validation scanner reports any symlink or hard link as
+  a fatal error, even if the symlink target is benign and within the archive.
+fix: |
+  **Fix 1 (preferred):** Upload only the clean build output directory, not the source
+  or workspace root. Ensure the `path:` in `upload-pages-artifact` (or `upload-artifact`
+  with `name: github-pages`) points to `dist/`, `_site/`, `out/`, `public/`, or
+  whichever directory your build tool writes to.
+
+  **Fix 2:** Remove symlinks from the artifact before uploading:
+  ```bash
+  find ./dist -type l -delete
+  find ./dist -type f -links +1 -delete  # remove hard links
+  ```
+
+  **Fix 3:** Use `actions/upload-pages-artifact` instead of `actions/upload-artifact`
+  directly — the Pages artifact action applies stricter path scoping and is tested
+  against the Pages acceptance criteria.
+
+  **Fix 4:** For Astro sites, set `outDir: './dist'` in `astro.config.mjs` and upload
+  only `./dist` — never upload the project root.
+fix_code:
+  - language: yaml
+    label: 'Wrong — uploading project root or node_modules-containing directory'
+    code: |
+      - name: Upload Pages artifact (WRONG — uploads node_modules symlinks)
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: .  # entire repo root — includes node_modules/.bin/ symlinks!
+  - language: yaml
+    label: 'Correct — upload only the built output directory'
+    code: |
+      - name: Build
+        run: npm run build  # writes to ./dist
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./dist  # only the built output, no node_modules
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+  - language: yaml
+    label: 'Defensive — strip any remaining symlinks and hard links before upload'
+    code: |
+      - name: Build
+        run: npm run build
+
+      - name: Remove symlinks and hard links from dist
+        run: |
+          find ./dist -type l -delete        # remove symbolic links
+          find ./dist -links +1 -type f -delete  # remove hard links (link count > 1)
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./dist
+prevention:
+  - 'Always point upload-pages-artifact path to the built output directory (dist/, _site/, out/), never to . or the project root'
+  - 'Run `find ./dist -type l` locally before pushing to verify no symlinks exist in build output'
+  - 'Never include node_modules, venv, or .pnp directories in the Pages artifact path'
+  - 'If using monorepo workspaces, ensure the build step resolves all workspace symlinks before upload'
+  - 'Use actions/upload-pages-artifact (not actions/upload-artifact) for Pages deployments — it applies stricter validation'
+docs:
+  - url: 'https://github.com/actions/deploy-pages/issues/389'
+    label: 'deploy-pages#389 — Artifact could not be deployed... yet everything looks fine'
+  - url: 'https://github.com/actions/deploy-pages/issues/345'
+    label: 'deploy-pages#345 — Astro Site: hard links / symlinks error'
+  - url: 'https://docs.github.com/en/pages/getting-started-with-github-pages/using-custom-workflows-with-github-pages'
+    label: 'GitHub Docs — Custom workflows with GitHub Pages'
+  - url: 'https://github.com/actions/upload-pages-artifact'
+    label: 'actions/upload-pages-artifact — official Pages artifact uploader'

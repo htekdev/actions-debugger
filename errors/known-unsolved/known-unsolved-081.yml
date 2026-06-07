@@ -1,0 +1,111 @@
+id: known-unsolved-081
+title: 'matrix context not available in job-level if condition — Unrecognized named-value: ''matrix'''
+category: known-unsolved
+severity: error
+tags:
+  - matrix
+  - job-if
+  - context-availability
+  - strategy
+  - known-limitation
+patterns:
+  - regex: 'Unrecognized named-value: ''matrix'''
+    flags: 'i'
+  - regex: 'Located at position \d+ within expression:.*matrix\.'
+    flags: 'i'
+error_messages:
+  - "The workflow is not valid. .github/workflows/workflow.yml (Line: X, Col: Y): Unrecognized named-value: 'matrix'. Located at position Z within expression: matrix.os"
+  - "Unrecognized named-value: 'matrix'. Located at position 1 within expression: contains(inputs.SCHEMAS, matrix.customer.schema)"
+root_cause: |
+  The `matrix` context is NOT available in job-level `if:` conditions. Job-level `if:`
+  expressions are evaluated during workflow validation and job scheduling — before the
+  matrix strategy is expanded into individual jobs. At that evaluation point the
+  `matrix` context does not yet exist; only `github`, `needs`, `strategy`, `vars`,
+  `inputs`, and `secrets` contexts are available at the job level.
+
+  After the matrix is expanded, individual jobs each receive their own `matrix` context
+  values, but by that point the job-level `if:` has already been evaluated.
+
+  The `matrix` context IS available in:
+  - `jobs.<job_id>.steps[*].if` — step-level conditions (evaluated at runtime)
+  - `jobs.<job_id>.steps[*].with` — step inputs
+  - `jobs.<job_id>.steps[*].env` — step environment variables
+  - `jobs.<job_id>.steps[*].name` — step names
+  - `jobs.<job_id>.steps[*].run` — inline shell scripts
+
+  This is a known GitHub Actions platform limitation (actions/runner#1985, 64 reactions)
+  with no planned fix as of 2026.
+fix: |
+  Move the matrix-dependent logic from the job-level `if:` to a step-level `if:`.
+
+  If you need to skip the entire job based on a matrix value, use a guard step at
+  the top of the job that fails/cancels if the condition is not met, or filter the
+  matrix inputs before generating the matrix (e.g., via a generate-matrix job that
+  only emits valid combinations).
+
+  Alternative: use `jobs.<job_id>.steps[*].if: matrix.foo == 'value'` to
+  conditionally skip work inside the job rather than skipping the job entirely.
+fix_code:
+  - language: yaml
+    label: 'Wrong — matrix context in job-level if (throws validation error)'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          needs: get-customers
+          if: contains(inputs.SCHEMAS, matrix.customer.schema)  # ERROR: matrix not available here
+          strategy:
+            matrix:
+              customer: ${{ fromJson(needs.get-customers.outputs.customers) }}
+          steps:
+            - run: echo "Building for ${{ matrix.customer.schema }}"
+  - language: yaml
+    label: 'Correct — gate on matrix value inside a step instead'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          needs: get-customers
+          strategy:
+            matrix:
+              customer: ${{ fromJson(needs.get-customers.outputs.customers) }}
+          steps:
+            - name: Skip if schema not in allowed list
+              if: '!contains(inputs.SCHEMAS, matrix.customer.schema)'
+              run: |
+                echo "Schema ${{ matrix.customer.schema }} not in allowed list — skipping"
+                exit 0
+            - name: Actual build step
+              if: contains(inputs.SCHEMAS, matrix.customer.schema)
+              run: echo "Building for ${{ matrix.customer.schema }}"
+  - language: yaml
+    label: 'Alternative — pre-filter matrix in a prior job to avoid invalid combinations'
+    code: |
+      jobs:
+        generate-matrix:
+          runs-on: ubuntu-latest
+          outputs:
+            matrix: ${{ steps.filter.outputs.matrix }}
+          steps:
+            - id: filter
+              run: |
+                # Only emit matrix entries that match the allowed schemas
+                echo "matrix=$(echo '${{ toJson(inputs.customers) }}' | jq --argjson schemas '${{ toJson(inputs.SCHEMAS) }}' '[.[] | select(.schema as $s | $schemas | index($s))]' -c)" >> $GITHUB_OUTPUT
+        build:
+          needs: generate-matrix
+          strategy:
+            matrix:
+              customer: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Building for ${{ matrix.customer.schema }}"
+prevention:
+  - 'Never use matrix context in job-level if: conditions — it is not available at that evaluation stage'
+  - 'Use step-level if: matrix.foo == ''value'' to gate work within a job based on matrix values'
+  - 'Pre-filter matrix inputs in a generate-matrix job to avoid generating invalid combinations entirely'
+  - 'Remember: matrix is available in steps, step names, step with/env/run — but NOT in jobs.<id>.if'
+docs:
+  - url: 'https://docs.github.com/en/actions/learn-github-actions/contexts#context-availability'
+    label: 'GitHub Docs — Context availability (which contexts work at each level)'
+  - url: 'https://github.com/actions/runner/issues/1985'
+    label: 'actions/runner#1985 — Unrecognized named-value: ''matrix'' in job if conditional (64 reactions)'
