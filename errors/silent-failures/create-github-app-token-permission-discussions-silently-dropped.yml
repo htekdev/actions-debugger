@@ -1,0 +1,97 @@
+id: silent-failures-145
+title: "create-github-app-token permission-discussions input silently dropped when other permissions are specified"
+category: silent-failures
+severity: silent-failure
+tags:
+  - create-github-app-token
+  - github-app
+  - permissions
+  - discussions
+  - token-scope
+  - silent-failure
+patterns:
+  - regex: 'Warning: Unexpected input\(s\).*permission-discussions'
+    flags: 'i'
+  - regex: 'Unexpected input.*permission-discussions.*valid inputs are'
+    flags: 'i'
+  - regex: 'permission-discussions.*write.*not.*applied|permission-discussions.*ignored'
+    flags: 'i'
+error_messages:
+  - "Warning: Unexpected input(s) 'permission-discussions', valid inputs are ['app-id', 'private-key', 'owner', 'repositories', 'permission-actions', 'permission-administration', ...]"
+  - "Unexpected input(s) 'permission-discussions'"
+root_cause: |
+  `actions/create-github-app-token@v2.x` does not declare `permission-discussions` as a
+  formal input in its `action.yml`. When a workflow passes `permission-discussions: write`
+  (or `read`), GitHub Actions logs an "Unexpected input" warning.
+
+  The critical silent failure is in the permission-scoping logic: when **any** `permission-*`
+  input is present (e.g., `permission-contents: write`, `permission-issues: read`), the
+  action explicitly scopes the token to **only** the declared, known permissions. Because
+  `permission-discussions` is undeclared in v2.x, it is excluded from the explicit scope
+  list — the generated token does NOT have discussions read/write permissions, even though
+  the workflow specifies `permission-discussions: write`.
+
+  In contrast, if `permission-discussions` is the *only* `permission-*` input, the token
+  falls back to the app's full installation permissions (no explicit scoping), which may
+  accidentally include discussions access. This inconsistent behavior makes the bug
+  non-reproducible across configurations.
+
+  Result: downstream steps that call the GitHub Discussions API (create/update/delete
+  discussions, GraphQL `createDiscussion` mutation) fail with HTTP 403 or GraphQL
+  `INSUFFICIENT_SCOPES`, not at token creation time but at API call time — hours after
+  the pipeline starts.
+
+  Fixed in `actions/create-github-app-token@v3+`, which formally declares
+  `permission-discussions` as a valid input.
+fix: |
+  Upgrade `actions/create-github-app-token` to `v3.1.1` or later, which formally
+  declares `permission-discussions` in `action.yml`. The "Unexpected input" warning
+  disappears and the discussions scope is correctly applied to the token:
+
+  ```yaml
+  - uses: actions/create-github-app-token@v3
+    with:
+      app-id: ${{ secrets.APP_ID }}
+      private-key: ${{ secrets.APP_PRIVATE_KEY }}
+      permission-discussions: write
+      permission-contents: read
+  ```
+
+  If you are pinned to v2.x for compatibility reasons, add `permission-discussions`
+  as the *only* `permission-*` input to let the token inherit the app's full
+  installation permissions (workaround only — not recommended for least-privilege
+  token configurations).
+fix_code:
+  - language: yaml
+    label: "Upgrade to create-github-app-token v3+ (permanent fix)"
+    code: |
+      - name: Generate token with discussions scope
+        id: generate-token
+        uses: actions/create-github-app-token@v3  # v3+ declares permission-discussions
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-discussions: write
+          permission-contents: read
+          permission-issues: read
+  - language: yaml
+    label: "Debug step — verify token claims (diagnose missing scope)"
+    code: |
+      # Verify the token actually has the discussions scope before use
+      - name: Verify token scopes
+        run: |
+          gh api /installation/token \
+            --header "Authorization: token ${{ steps.generate-token.outputs.token }}" \
+            | jq '.permissions'
+prevention:
+  - "Always upgrade to actions/create-github-app-token@v3+ when working with GitHub Discussions APIs"
+  - "Watch for 'Unexpected input' warnings on create-github-app-token — they indicate scoping issues, not just noise"
+  - "Test token permissions by calling the /installation/token endpoint and inspecting the permissions object"
+  - "If a downstream Discussions API call returns 403 or INSUFFICIENT_SCOPES, trace back to the token-creation step and verify the declared permission-* inputs"
+docs:
+  - url: "https://github.com/actions/create-github-app-token/issues/359"
+    label: "actions/create-github-app-token#359 — Add missing permission-discussions input"
+  - url: "https://github.com/github/gh-aw/pull/25709"
+    label: "gh-aw#25709 — Root cause analysis: undeclared input env-var passthrough behavior"
+  - url: "https://docs.github.com/en/rest/apps/installations#create-an-installation-access-token-for-an-app"
+    label: "GitHub Docs — Create an installation access token (permissions object)"

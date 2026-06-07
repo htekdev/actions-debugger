@@ -1,0 +1,112 @@
+id: runner-environment-287
+title: "Custom runner image Packer build fails — install-git.sh add-apt-repository Launchpad API timeout"
+category: runner-environment
+severity: error
+tags:
+  - custom-runner-images
+  - packer
+  - ubuntu
+  - launchpad
+  - add-apt-repository
+  - image-build
+  - self-hosted-runner
+patterns:
+  - regex: 'TimeoutError.*Errno 110.*Connection timed out.*launchpad'
+    flags: 'i'
+  - regex: 'add-apt-repository.*--remove.*ppa:git-core.*TimeoutError'
+    flags: 'i'
+  - regex: 'launchpadlib.*Connection timed out|api\.launchpad\.net.*timed out'
+    flags: 'i'
+  - regex: 'install-git\.sh.*provisioning.*failed|install-git.*TimeoutError'
+    flags: 'i'
+error_messages:
+  - "TimeoutError: [Errno 110] Connection timed out"
+  - "TimeoutError: [Errno 110] Connection timed out  apt_pkg.Error: E:The repository 'http://ppa.launchpad.net/git-core/ppa/ubuntu noble Release' does not have a Release file."
+  - "==> ubuntu-24_04.azure-arm.image: TimeoutError: [Errno 110] Connection timed out"
+root_cause: |
+  When building a custom GitHub Actions runner image from the `actions/runner-images`
+  source code using Packer (common since GitHub's custom runner images went GA in March
+  2026), the `install-git.sh` provisioning script fails during the
+  `add-apt-repository --remove ppa:git-core/ppa` step.
+
+  `add-apt-repository --remove` uses Python's `launchpadlib` library to call the
+  Launchpad REST API (`https://api.launchpad.net/`) to look up PPA metadata before
+  performing the removal. This outbound HTTPS request frequently times out from within
+  Azure VM environments because:
+
+  1. Azure Firewall rules in VNet-isolated Packer build VMs may block or throttle
+     outbound connections to `api.launchpad.net`.
+  2. The Launchpad API is intermittently slow or unavailable (DDoS mitigation, rate
+     limiting, or just high load).
+  3. The `launchpadlib` timeout is not configurable from the `add-apt-repository` CLI.
+
+  Since `install-git.sh` runs under `bash -e`, a single non-zero exit code from
+  `add-apt-repository --remove` aborts the entire Packer provisioning step.
+
+  This issue surfaces on Ubuntu 24.04 custom image builds. Ubuntu 22.04 builds are
+  less affected because the `git-core/ppa` removal flow differs slightly.
+
+  **Note:** This does NOT affect standard GitHub-hosted runner workflows. It only
+  affects teams building their own runner images from the `actions/runner-images`
+  source using Packer in an Azure VM.
+fix: |
+  **Option 1 — Patch the provisioning script to skip the --remove step:**
+  Before running Packer, patch `images/ubuntu/scripts/build/install-git.sh` to
+  remove or skip the `add-apt-repository --remove ppa:git-core/ppa` line. The
+  PPA removal is not strictly necessary if the git toolchain is installed before
+  the PPA removal runs.
+
+  **Option 2 — Allow outbound access to api.launchpad.net in the build VM:**
+  Add an Azure Firewall application rule (FQDN: `api.launchpad.net`) to permit
+  HTTPS egress from the Packer build VM. Verify connectivity with
+  `curl -s https://api.launchpad.net/devel/` from inside the VM.
+
+  **Option 3 — Use the pre-built GitHub-managed images:**
+  Instead of building from source, reference the pre-built images published at
+  `ghcr.io/actions/runner-images` to avoid the provisioning step entirely.
+
+  **Option 4 — Use `apt-get remove --purge` directly:**
+  Replace the `add-apt-repository --remove` call with the lower-level
+  `apt-get remove --purge git-core-ppa` approach, which does not call the
+  Launchpad API.
+fix_code:
+  - language: yaml
+    label: "GitHub Actions workflow to patch install-git.sh before Packer build"
+    code: |
+      - name: Patch install-git.sh to skip Launchpad API call
+        run: |
+          # Remove the add-apt-repository --remove line that calls api.launchpad.net
+          sed -i '/add-apt-repository --remove ppa:git-core\/ppa/d' \
+            images/ubuntu/scripts/build/install-git.sh
+          echo "Patched install-git.sh"
+
+      - name: Build custom runner image with Packer
+        run: |
+          packer build \
+            -var "client_id=${{ secrets.AZURE_CLIENT_ID }}" \
+            -var "client_secret=${{ secrets.AZURE_CLIENT_SECRET }}" \
+            -var "subscription_id=${{ secrets.AZURE_SUBSCRIPTION_ID }}" \
+            -var "tenant_id=${{ secrets.AZURE_TENANT_ID }}" \
+            images/ubuntu/templates/ubuntu-24.04.pkr.hcl
+  - language: yaml
+    label: "Azure Firewall rule to allow api.launchpad.net egress"
+    code: |
+      # Azure Firewall Application Rule (ARM/Bicep snippet)
+      # Add this FQDN allow rule to your Packer build VM's network policy
+      # target_fqdns: ["api.launchpad.net", "launchpad.net"]
+      # protocol: HTTPS (port 443)
+      # action: Allow
+prevention:
+  - "When building custom runner images from actions/runner-images source, test Packer builds in a network environment with unrestricted egress to launchpad.net"
+  - "Pin to a tested runner-images tag (e.g., ubuntu24/20260525.161) and re-validate after tag bumps"
+  - "Consider using the pre-built ghcr.io/actions/runner-images images instead of building from source to avoid Packer provisioning failures"
+  - "Add api.launchpad.net to your Azure Firewall FQDN allowlist if running Packer builds behind a corporate firewall"
+docs:
+  - url: "https://github.com/actions/runner-images/issues/14185"
+    label: "actions/runner-images#14185 — install-git.sh fails due to Launchpad API timeout (Ubuntu 24.04)"
+  - url: "https://github.com/actions/runner-images/issues/14111"
+    label: "actions/runner-images#14111 — Build failing while installing git (Ubuntu 22.04)"
+  - url: "https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners/about-github-hosted-runners#creating-custom-images-for-github-hosted-runners"
+    label: "GitHub Docs — Creating custom images for GitHub-hosted runners"
+  - url: "https://help.launchpad.net/Packaging/PPA/InstallingSoftware"
+    label: "Launchpad PPA Installation Guide"
