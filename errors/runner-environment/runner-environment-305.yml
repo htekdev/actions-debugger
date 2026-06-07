@@ -1,0 +1,96 @@
+id: runner-environment-305
+title: macOS 26 Homebrew libheif postinstall step fails — brew install imagemagick exits code 1
+category: runner-environment
+severity: error
+tags:
+  - macos-26
+  - homebrew
+  - imagemagick
+  - libheif
+  - postinstall
+  - brew
+patterns:
+  - regex: 'Warning: The post-install step did not complete successfully'
+    flags: i
+  - regex: 'brew postinstall libheif'
+    flags: i
+  - regex: 'update-mime-database.*libheif'
+    flags: i
+  - regex: 'Installing imagemagick dependency: libheif'
+    flags: i
+error_messages:
+  - "Warning: The post-install step did not complete successfully"
+  - "You can try again using:\n  brew postinstall libheif"
+  - "Error: Process completed with exit code 1."
+  - "==> /opt/homebrew/opt/shared-mime-info/bin/update-mime-database /opt/homebrew/share/mime"
+  - "==> Installing imagemagick dependency: libheif"
+root_cause: |
+  On macOS 26 runners starting around April 10, 2026, installing `imagemagick` or
+  `graphicsmagick` via Homebrew triggers a transitive install of `libheif`. The
+  libheif formula contains a post-install step that calls `update-mime-database`
+  from the `shared-mime-info` package to register MIME types for HEIF/HEIC media.
+
+  On affected macOS 26 runner image builds, the `update-mime-database` binary
+  from `shared-mime-info` crashes or fails silently during the postinstall step.
+  Homebrew detects the non-zero exit and marks the formula install as failed,
+  exiting the brew install command with code 1.
+
+  The failure occurs even though `magick` and `gs` binaries are actually installed
+  and functional. The MIME database registration step is irrelevant for most CI use
+  cases, but Homebrew has no mechanism to distinguish "postinstall failure is OK"
+  from "build failure".
+
+  The root cause is a regression in the macOS 26 runner image's bundled Homebrew
+  environment (present in image versions ~20260408–20260422). GitHub fixed the issue
+  in image version 20260422.0012.1.
+
+  Source: actions/runner-images#13902 (Apr 11, 2026).
+fix: |
+  Option 1 — Skip libheif postinstall (recommended):
+  Install libheif with --skip-post-install first. Homebrew skips the MIME database
+  registration, then the subsequent imagemagick install sees libheif already satisfied
+  and skips it entirely.
+
+  Option 2 — Pre-install shared-mime-info:
+  Installing shared-mime-info before imagemagick provides a working update-mime-database
+  binary so the postinstall step succeeds.
+
+  Option 3 — Tolerate the postinstall warning:
+  Check whether magick is actually present after the failed brew install and continue
+  if it is. This avoids the fix but introduces fragility.
+fix_code:
+  - language: yaml
+    label: Skip libheif postinstall then install imagemagick (recommended)
+    code: |
+      - name: Install ImageMagick
+        run: |
+          # Skip libheif postinstall to avoid update-mime-database crash on macOS 26.
+          # imagemagick then finds libheif already installed and skips it entirely.
+          brew install --skip-post-install libheif
+          brew install imagemagick
+
+  - language: yaml
+    label: Pre-install shared-mime-info to fix postinstall step
+    code: |
+      - name: Install ImageMagick
+        run: |
+          brew install shared-mime-info
+          brew install imagemagick
+
+  - language: yaml
+    label: Install both imagemagick and ghostscript
+    code: |
+      - name: Install ImageMagick and Ghostscript
+        run: |
+          brew install --skip-post-install libheif
+          brew install imagemagick ghostscript
+prevention:
+  - "When brew install fails with a post-install warning on macOS 26, check if the installed binaries are present before assuming full failure"
+  - "Use brew install --skip-post-install for packages with known postinstall regressions on macOS 26 runner images"
+  - "Check the runner-images issue tracker for open Homebrew postinstall regressions before adding new brew install steps"
+  - "Pin the macOS runner image version via the Image Version tag if a known-good build is required"
+docs:
+  - url: https://github.com/actions/runner-images/issues/13902
+    label: "runner-images#13902: macOS 26 installing imagemagick using homebrew fails"
+  - url: https://docs.brew.sh/Manpage#install-options-formulacask-
+    label: "Homebrew install options: --skip-post-install"
