@@ -1,0 +1,85 @@
+id: triggers-081
+title: "Scheduled workflow silently auto-disabled after 60 days of repository inactivity"
+category: triggers
+severity: silent-failure
+tags:
+  - schedule
+  - cron
+  - inactivity
+  - auto-disabled
+  - repository-activity
+patterns:
+  - regex: 'This scheduled workflow is disabled because there has been no repository activity'
+    flags: i
+  - regex: 'workflow.*disabled.*inactiv|inactiv.*disabled.*workflow'
+    flags: i
+error_messages:
+  - "This scheduled workflow is disabled because there has been no repository activity for the past 60 days."
+root_cause: |
+  GitHub automatically disables `on: schedule` workflows in repositories that have had
+  no activity (pushes, pull requests, issue events, etc.) for 60 consecutive days.
+  There is no email notification, no GitHub Actions UI badge failure, and no workflow
+  run failure — the scheduled jobs simply stop appearing in the run history.
+
+  A banner reading "This scheduled workflow is disabled because there has been no
+  repository activity for the past 60 days." appears in the GitHub Actions UI only if
+  someone actively navigates to the affected workflow's page. Automated monitoring that
+  checks only for failed or absent runs may not detect the stoppage, especially for
+  infrequently-visited repos.
+
+  This most commonly affects:
+  - Maintenance bots and automated dependency update workflows in stable/mature repos
+  - Archival or compliance report workflows in low-commit repositories
+  - Internal tooling repos that receive infrequent pushes
+  - Monitoring workflows in repos whose activity has shifted to another repo
+fix: |
+  Re-enable the workflow by clicking "Enable workflow" in the GitHub Actions tab for
+  the affected workflow, or push any commit to reset the activity clock.
+
+  To prevent future auto-disabling, use one of these strategies:
+  1. Add a monthly "keep-alive" workflow that pushes a trivial commit or triggers
+     a workflow_dispatch event to signal repository activity.
+  2. Use the `gh` CLI or REST API to re-enable the workflow programmatically from
+     an external scheduler that is not subject to the inactivity rule.
+  3. Configure repository-level activity via GitHub Issues, Discussions, or other
+     lightweight touchpoints if the repo genuinely has no code changes.
+fix_code:
+  - language: yaml
+    label: "Keep-alive workflow — runs monthly to prevent 60-day inactivity disable"
+    code: |
+      name: Keep workflows alive
+      on:
+        schedule:
+          - cron: '0 0 1 * *'   # first day of every month
+        workflow_dispatch:       # allow manual trigger as well
+
+      jobs:
+        keepalive:
+          runs-on: ubuntu-latest
+          permissions:
+            actions: write
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Re-enable scheduled workflows
+              run: |
+                # List and re-enable any disabled workflows
+                gh workflow list --all --json name,state \
+                  | jq -r '.[] | select(.state == "disabled_inactivity") | .name' \
+                  | while read -r wf; do
+                      echo "Re-enabling: $wf"
+                      gh workflow enable "$wf"
+                    done
+              env:
+                GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+prevention:
+  - "Push at least one commit or open one PR every 60 days in repos with scheduled workflows."
+  - "Use a monthly keep-alive workflow with `permissions: actions: write` to re-enable disabled workflows."
+  - "Monitor the GitHub Actions UI for banners on scheduled workflow pages, or alert on gaps in run history."
+  - "Set up an external cron job (AWS EventBridge, GitHub Apps webhook) to trigger `workflow_dispatch` if the repo is intentionally commit-free."
+  - "Consider migrating low-traffic scheduled tasks to a dedicated always-active scheduler repo."
+docs:
+  - url: https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/disabling-and-enabling-a-workflow
+    label: "GitHub Docs — Disabling and enabling a workflow"
+  - url: https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#schedule
+    label: "GitHub Docs — Schedule event"

@@ -1,0 +1,81 @@
+id: silent-failures-129
+title: "Composite action outputs from inner uses: steps silently lost unless explicitly re-exported"
+category: silent-failures
+severity: silent-failure
+tags:
+  - composite-action
+  - outputs
+  - steps-context
+  - action-outputs
+  - silent-failure
+patterns:
+  - regex: 'steps\.[a-zA-Z0-9_-]+\.outputs\.[a-zA-Z0-9_-]+'
+    flags: ''
+error_messages: []
+root_cause: |
+  In a composite action, steps that use `uses:` (calling another action) do expose
+  their outputs via `steps.<step-id>.outputs.<name>` — but only INSIDE the composite
+  action's own step definitions. These inner outputs are NOT automatically forwarded
+  to the workflow that calls the composite action.
+
+  To surface an inner step's output to the caller, the composite action must explicitly
+  declare each value in its top-level `outputs:` block and map it to the appropriate
+  `steps.<id>.outputs.<key>` expression. If this re-export is omitted, the caller
+  silently receives an empty string for any output it tries to read. No warning, no
+  error, and no annotation is emitted — the expression simply evaluates to ''.
+
+  This is a very common silent failure when:
+  - Wrapping a third-party action (e.g., actions/checkout, google-github-actions/auth)
+    in a composite action and expecting its outputs to be automatically available
+  - Migrating a workflow job to a composite action without auditing the outputs: section
+  - Calling a composite action from another composite action (multi-level nesting)
+fix: |
+  Declare all outputs you want to expose in the composite action's top-level `outputs:`
+  block, explicitly mapping each one to `${{ steps.<step-id>.outputs.<key> }}`.
+
+  The `id:` field on the inner step is required for its outputs to be referenceable.
+fix_code:
+  - language: yaml
+    label: "Composite action action.yml — correctly re-exporting inner action outputs"
+    code: |
+      # action.yml — composite action
+      name: My Composite Action
+      description: Wraps get-version-action and exposes its output
+
+      outputs:
+        version:
+          description: "Version string discovered by the inner action"
+          value: ${{ steps.get-version.outputs.version }}   # explicit re-export required
+
+      runs:
+        using: composite
+        steps:
+          - name: Get version
+            id: get-version          # id: required to reference outputs below
+            uses: some-org/get-version-action@v1
+            # outputs are accessible as steps.get-version.outputs.version HERE
+            # but NOT to the caller unless declared in outputs: above
+
+  - language: yaml
+    label: "Calling workflow — consuming the composite action output"
+    code: |
+      - name: Use composite action
+        id: my-composite
+        uses: ./.github/actions/my-composite-action
+
+      - name: Print version
+        shell: bash
+        run: echo "Version is ${{ steps.my-composite.outputs.version }}"
+        # Empty string if composite action omits the outputs: re-export above
+
+prevention:
+  - "Always audit the `outputs:` block in `action.yml` whenever an inner `uses:` step produces values you need."
+  - "Add `id:` to every inner step whose outputs you intend to re-export — it is required for the reference."
+  - "Add a debug `run: echo` step inside the composite action to print `steps.<id>.outputs.<key>` and verify the value before re-exporting."
+  - "Use `actionlint` — it validates that `outputs.value` references resolve to real step output expressions."
+  - "Write a calling-workflow integration test that asserts the composite action's outputs are non-empty strings."
+docs:
+  - url: https://docs.github.com/en/actions/sharing-automations/creating-actions/metadata-syntax-for-github-actions#outputs-for-composite-actions
+    label: "GitHub Docs — outputs for composite actions"
+  - url: https://docs.github.com/en/actions/sharing-automations/creating-actions/creating-a-composite-action
+    label: "GitHub Docs — Creating a composite action"
