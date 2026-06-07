@@ -1,0 +1,129 @@
+id: caching-artifacts-102
+title: 'actions/deploy-pages Reports Misleading Hard-Links/Symlinks Error When upload-artifact Is Used Instead of upload-pages-artifact'
+category: caching-artifacts
+severity: error
+tags:
+  - deploy-pages
+  - upload-artifact
+  - upload-pages-artifact
+  - pages
+  - zip
+  - tgz
+  - format-mismatch
+  - misleading-error
+patterns:
+  - regex: 'Artifact could not be deployed\. Please ensure the content does not contain any hard links, symlinks'
+    flags: 'i'
+  - regex: 'could not be deployed.*hard links.*symlinks.*10GB'
+    flags: 'i'
+error_messages:
+  - 'Error: Artifact could not be deployed. Please ensure the content does not contain any hard links, symlinks and total size is less than 10GB.'
+root_cause: |
+  `actions/deploy-pages` expects a Pages artifact in `.tgz` (gzip-compressed tarball)
+  format. This format is produced by `actions/upload-pages-artifact`, which wraps the
+  site directory in a tarball before uploading.
+
+  `actions/upload-artifact` (the generic artifact action) produces a `.zip` file instead.
+  When `actions/deploy-pages` receives a `.zip` artifact, it attempts to extract and
+  validate the archive as a tarball; the extraction logic fails when it encounters the
+  zip format and reports the misleading error about "hard links, symlinks and total size".
+
+  The error message is completely unrelated to the actual problem — there are no
+  hard links or symlinks. The real issue is a file format mismatch between the
+  archiving tools:
+  - `upload-pages-artifact` → creates `.tgz` → deploy-pages can process it ✅
+  - `upload-artifact` (generic) → creates `.zip` → deploy-pages cannot process it ❌
+
+  This commonly happens when developers:
+  1. Migrate from the old deploy workflow pattern but swap the wrong action
+  2. Follow blog posts or third-party templates that use `upload-artifact` for everything
+  3. Have Dependabot bump `deploy-pages` but their upload step was already using
+     the generic `upload-artifact`
+
+  Source: actions/deploy-pages#389 (open since Feb 2025, multiple reporters,
+  workaround confirmed: switch to upload-pages-artifact).
+fix: |
+  Replace `actions/upload-artifact` with `actions/upload-pages-artifact@v3` (or later)
+  in the build job. The upload-pages-artifact action creates the required `.tgz` format
+  that deploy-pages can process.
+
+  Do NOT use the generic `actions/upload-artifact` for GitHub Pages deployments. Use
+  `actions/upload-pages-artifact` instead — it wraps the directory in a tarball that
+  deploy-pages expects.
+fix_code:
+  - language: yaml
+    label: 'BROKEN — using generic upload-artifact (produces .zip, rejected by deploy-pages)'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build site
+              run: npm run build
+            # ❌ WRONG: generic artifact produces .zip — deploy-pages cannot use it
+            - name: Upload artifact
+              uses: actions/upload-artifact@v4
+              with:
+                name: github-pages
+                path: ./dist
+
+        deploy:
+          needs: build
+          runs-on: ubuntu-latest
+          permissions:
+            pages: write
+            id-token: write
+          environment:
+            name: github-pages
+            url: ${{ steps.deployment.outputs.page_url }}
+          steps:
+            - name: Deploy to GitHub Pages
+              id: deployment
+              uses: actions/deploy-pages@v4
+              # ❌ Fails: "Artifact could not be deployed. Please ensure the content
+              #           does not contain any hard links, symlinks and total size is
+              #           less than 10GB." — misleading; real issue is .zip vs .tgz format
+  - language: yaml
+    label: 'FIXED — using upload-pages-artifact (produces .tgz required by deploy-pages)'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build site
+              run: npm run build
+            # ✅ CORRECT: upload-pages-artifact creates .tgz that deploy-pages expects
+            - name: Upload Pages artifact
+              uses: actions/upload-pages-artifact@v3
+              with:
+                path: ./dist
+
+        deploy:
+          needs: build
+          runs-on: ubuntu-latest
+          permissions:
+            pages: write
+            id-token: write
+          environment:
+            name: github-pages
+            url: ${{ steps.deployment.outputs.page_url }}
+          steps:
+            - name: Deploy to GitHub Pages
+              id: deployment
+              uses: actions/deploy-pages@v4
+prevention:
+  - 'Always use `actions/upload-pages-artifact` (not `actions/upload-artifact`) for GitHub Pages deployments.'
+  - 'If you see a "hard links/symlinks" error from deploy-pages, check which upload action you are using — it is almost certainly a format mismatch.'
+  - 'Use the GitHub-provided Pages starter workflows which always pair the correct upload and deploy actions.'
+  - 'When Dependabot bumps `actions/deploy-pages`, also verify your upload step uses `upload-pages-artifact`, not the generic `upload-artifact`.'
+docs:
+  - url: 'https://github.com/actions/deploy-pages/issues/389'
+    label: 'actions/deploy-pages#389: Misleading hard links/symlinks error when using upload-artifact (open Feb 2025)'
+  - url: 'https://github.com/actions/upload-pages-artifact'
+    label: 'actions/upload-pages-artifact — correct action for GitHub Pages deployments'
+  - url: 'https://docs.github.com/en/actions/use-cases-and-examples/deploying/deploying-to-github-pages'
+    label: 'GitHub Docs: Deploying to GitHub Pages'
+  - url: 'https://github.com/actions/starter-workflows/tree/main/pages'
+    label: 'GitHub Starter Workflows for Pages — reference correct action combinations'

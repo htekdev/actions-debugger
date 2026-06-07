@@ -1,0 +1,117 @@
+id: silent-failures-151
+title: 'ARC 0.14.0 Silently Fails to Dispatch Jobs on GitHub Enterprise Server 3.19'
+category: silent-failures
+severity: silent-failure
+tags:
+  - arc
+  - actions-runner-controller
+  - ghes
+  - github-enterprise-server
+  - dispatch
+  - scaleset-library
+  - version-mismatch
+  - silent-failure
+patterns:
+  - regex: '"assigned job":0'
+    flags: 'i'
+  - regex: 'assigned job.*0.*decision.*0'
+    flags: 'i'
+  - regex: 'Getting next message.*lastMessageID.*\b[0-9]+\b.*Getting next message.*lastMessageID.*\b[0-9]+\b'
+    flags: 'i'
+error_messages:
+  - '{"assigned job":0,"decision":0,"min":0,"max":100,"currentRunnerCount":0}'
+  - '"assigned job": 0 — repeated in every poll cycle, jobs never dispatched'
+  - 'Jobs remain in queued state indefinitely with runner_group_id: null'
+root_cause: |
+  ARC (Actions Runner Controller) 0.14.0 rewrote the client library used by both the
+  controller and listener to communicate with the GitHub Enterprise Server Actions
+  pipeline service. Two key PRs replaced the old `actions` client:
+    - ARC#4383 — "Switch client to scaleset library for the listener"
+    - ARC#4390 — "Moving to scaleset client for the controller"
+    - ARC#4405 — "Remove actions client"
+
+  The new `scaleset` client library uses a protocol or message format that GHES 3.19's
+  Actions pipeline service does NOT fully support. The result is a completely silent
+  failure:
+  - Listener pods start and run normally — no crashes, no errors
+  - Session creation with the GHES Actions pipeline service **succeeds**
+  - Long-polling via `GET /_apis/runtime/runnerscalesets/{id}/messages` returns HTTP 200
+  - Listener logs show `"assigned job": 0` on every poll cycle
+  - Jobs queued on GHES show `runner_group_name: null` via the API
+  - GHES never dispatches jobs to the ARC 0.14.0 listeners
+
+  Rolling back to ARC 0.13.1 on the same cluster, same GHES instance, and same
+  configuration immediately restores job dispatch.
+
+  Affected GHES versions: 3.19 (bundled runner v2.328.0) — confirmed broken.
+  GHES 3.20 (bundled runner v2.330.0) was not confirmed fixed at time of reporting.
+  ARC 0.14.0 ships runner v2.332.0, newer than what either GHES version bundles.
+
+  Source: actions/actions-runner-controller#4443 (open Apr 2026, confirmed across
+  multiple clusters, 11 scale sets, multiple orgs).
+fix: |
+  Option 1 — Roll back to ARC 0.13.1 (immediate workaround):
+  Downgrade the Helm chart to ARC 0.13.1. Job dispatch restores immediately.
+
+  Option 2 — Upgrade GHES to 3.20 or later:
+  GHES 3.20 ships a newer bundled runner version and may support the scaleset
+  client protocol used by ARC 0.14.0. Upgrade GHES first, then upgrade ARC.
+
+  Option 3 — Pin ARC to a pre-0.14.0 version and upgrade GHES separately:
+  If upgrading GHES is not immediately possible, pin ARC to 0.13.1 in your
+  Helm values until GHES is on a version confirmed compatible with ARC 0.14.0.
+
+  How to detect silently broken dispatch:
+  Monitor listener logs for repeated `"assigned job": 0` across all poll cycles.
+  A healthy listener should show `"assigned job": 1` and `"Job assigned message received"`
+  when a workflow queues a job. If you never see job assignments, dispatch is broken.
+fix_code:
+  - language: yaml
+    label: 'Helm rollback to ARC 0.13.1 (immediate fix)'
+    code: |
+      # Roll back the controller chart
+      helm rollback gha-runner-scale-set-controller --namespace arc-system
+
+      # Or re-install at a known good version
+      helm upgrade --install gha-runner-scale-set-controller \
+        oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller \
+        --version 0.13.1 \
+        --namespace arc-system \
+        --create-namespace
+
+      # Also roll back runner scale sets
+      helm upgrade --install my-scale-set \
+        oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set \
+        --version 0.13.1 \
+        --namespace arc-runners
+  - language: yaml
+    label: 'Detect broken dispatch via listener log monitoring'
+    code: |
+      # Healthy listener log (job dispatched):
+      # {"msg":"Processing message","messageType":"RunnerScaleSetJobMessages"}
+      # {"msg":"New runner scale set statistics.","statistics":{"totalAssignedJobs":1}}
+      # {"msg":"Job assigned message received","jobId":"..."}
+
+      # Broken listener log (ARC 0.14.0 on GHES 3.19 — repeated, no jobs):
+      # {"msg":"Getting next message","lastMessageID":1}
+      # {"msg":"Calculated target runner count","assigned job":0,"decision":0}
+      # {"msg":"Getting next message","lastMessageID":1}
+      # {"msg":"Calculated target runner count","assigned job":0,"decision":0}
+      # (repeated indefinitely)
+
+      # Check via kubectl:
+      kubectl logs -n arc-system -l app.kubernetes.io/name=gha-runner-scale-set \
+        --container listener --follow | grep -E '"assigned job"|"Job assigned"'
+prevention:
+  - 'Before upgrading ARC to a new major/minor release, check its CHANGELOG for client library changes and verify GHES compatibility.'
+  - 'When upgrading ARC on GHES, first confirm GHES is on a version compatible with the new ARC client protocol.'
+  - 'Monitor listener logs for `"assigned job": 0` across multiple poll cycles as a dispatch health check.'
+  - 'After any ARC upgrade, trigger a test workflow and confirm it is dispatched within 60 seconds before declaring the upgrade successful.'
+  - 'Pin ARC chart versions in GitOps manifests and use a separate staging cluster to test compatibility before production upgrades.'
+docs:
+  - url: 'https://github.com/actions/actions-runner-controller/issues/4443'
+    label: 'ARC#4443: ARC 0.14.0 silently fails to dispatch jobs on GHES 3.19 (open Apr 2026)'
+  - url: 'https://github.com/actions/actions-runner-controller/blob/master/CHANGELOG.md'
+    label: 'ARC CHANGELOG — track client library changes between versions'
+  - url: 'https://docs.github.com/en/enterprise-server@latest/admin/github-actions/getting-started-with-github-actions-for-your-enterprise/getting-started-with-github-actions-for-github-enterprise-server'
+    label: 'GitHub Docs: Getting started with GitHub Actions for GHES'
