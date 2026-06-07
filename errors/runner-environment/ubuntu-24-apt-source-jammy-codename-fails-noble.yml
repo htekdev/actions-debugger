@@ -1,0 +1,106 @@
+id: runner-environment-271
+title: "ubuntu-24.04 apt sources using 'jammy' codename fail — lsb_release -cs returns 'noble'"
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-24.04
+  - apt
+  - package-manager
+  - noble
+  - jammy
+  - lsb-release
+  - third-party-repo
+patterns:
+  - regex: 'E: The repository.*noble.*does not have a Release file'
+    flags: 'i'
+  - regex: 'N: Skipping acquire.*noble.*no such codename|404.*noble.*Release'
+    flags: 'i'
+  - regex: 'Unable to locate package.*after apt-add-repository.*ppa'
+    flags: 'i'
+error_messages:
+  - "E: The repository 'https://ppa.launchpadcontent.net/.../ubuntu noble Release' does not have a Release file."
+  - "E: Failed to fetch https://.../<repo>/dists/noble/Release 404 Not Found"
+  - "N: Skipping acquire of configured file '...noble/binary-amd64/Packages' as repository '...' does not support architecture 'amd64'"
+  - "E: Unable to locate package <package>"
+root_cause: |
+  Many CI workflows install third-party software by adding an external apt repository, using
+  `$(lsb_release -cs)` to embed the Ubuntu codename into the repository URL. On ubuntu-22.04,
+  `lsb_release -cs` returned `jammy`. On ubuntu-24.04, it returns `noble`.
+
+  Third-party repositories that have not yet published a `noble`-compatible channel produce a
+  404 or "does not have a Release file" error when `noble` is substituted. Common examples:
+
+  - Docker's official apt repo: lagged behind ubuntu releases; initially only had `jammy`
+  - HashiCorp/HashiCorp-legacy repos (Terraform, Vault, Consul)
+  - Google Cloud SDK older installation scripts
+  - Some language-specific PPAs (e.g., older Ruby via brightbox PPA)
+  - MongoDB community edition (lagged noble support by ~6 months)
+
+  The failure manifests either as an apt update error (when the repo is added) or a silent
+  "Unable to locate package" after apt update succeeds but the package index is empty for noble.
+  The latter is a silent failure: `apt-get update` exits 0 but subsequent `apt-get install` fails.
+fix: |
+  **Option 1 (recommended): Hardcode the codename to `jammy` for repos without noble support.**
+  Jammy packages are generally compatible with ubuntu-24.04 for non-system libraries. This is
+  explicitly supported by many third-party repos as a transitional compatibility measure.
+
+  **Option 2: Use the vendor's official ubuntu-24.04 installation script.**
+  Most major vendors (Docker, HashiCorp, Google) updated their quick-install scripts to auto-
+  detect noble. Use the official install script instead of manually adding apt repos.
+
+  **Option 3: Check whether a `noble` channel now exists** and update the codename accordingly.
+fix_code:
+  - language: yaml
+    label: "Hardcode 'jammy' for repos without noble support (transitional)"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-24.04
+          steps:
+            - name: Add third-party repo with explicit codename
+              run: |
+                # Hardcode jammy instead of $(lsb_release -cs) for repos without noble channel
+                echo "deb [arch=amd64 signed-by=/usr/share/keyrings/vendor.gpg] \
+                  https://vendor.example.com/apt jammy main" \
+                  | sudo tee /etc/apt/sources.list.d/vendor.list
+                sudo apt-get update
+                sudo apt-get install -y some-package
+  - language: yaml
+    label: "Use Docker's official install script (handles noble automatically)"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-24.04
+          steps:
+            - name: Install Docker Engine via official script
+              run: |
+                curl -fsSL https://get.docker.com | sudo sh
+  - language: yaml
+    label: "Detect codename and fall back to jammy if noble not supported"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-24.04
+          steps:
+            - name: Add repo with noble→jammy fallback
+              run: |
+                CODENAME=$(lsb_release -cs)
+                # Fallback to jammy for repos that haven't published noble yet
+                if ! curl -sf "https://vendor.example.com/apt/dists/${CODENAME}/Release" > /dev/null; then
+                  echo "No ${CODENAME} channel, falling back to jammy"
+                  CODENAME=jammy
+                fi
+                echo "deb https://vendor.example.com/apt ${CODENAME} main" \
+                  | sudo tee /etc/apt/sources.list.d/vendor.list
+prevention:
+  - "Replace dynamic `$(lsb_release -cs)` codename substitution with explicit version pins when adding third-party apt repositories in CI."
+  - "Test apt repository availability by checking the repo's dists/ index before migrating to ubuntu-24.04: `curl -sf https://repo/dists/noble/Release`"
+  - "Prefer package managers with stable cross-distribution support (e.g., snap, flatpak, GitHub Releases binaries) over distro-specific apt repos for third-party tools in CI."
+  - "Check the vendor's documentation for ubuntu-24.04 support before migrating from ubuntu-22.04."
+docs:
+  - url: "https://docs.docker.com/engine/install/ubuntu/"
+    label: "Docker Engine installation for Ubuntu (official, supports noble)"
+  - url: "https://developer.hashicorp.com/terraform/install"
+    label: "HashiCorp Terraform installation (official, supports noble)"
+  - url: "https://github.com/actions/runner-images/issues"
+    label: "runner-images GitHub Issues — search for noble apt issues"
