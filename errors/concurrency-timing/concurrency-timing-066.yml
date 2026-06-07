@@ -1,0 +1,153 @@
+id: concurrency-timing-066
+title: 'Terraform state lock not released when GitHub Actions workflow is cancelled — setup-terraform wrapper does not forward SIGTERM'
+category: concurrency-timing
+severity: error
+tags:
+  - terraform
+  - setup-terraform
+  - state-lock
+  - cancellation
+  - signal
+  - hashicorp
+patterns:
+  - regex: 'Error acquiring the state lock'
+    flags: 'i'
+  - regex: 'Error locking state: Error acquiring the state lock'
+    flags: 'i'
+  - regex: 'state is already locked by another operation'
+    flags: 'i'
+  - regex: 'Lock Info:\s*\n\s*ID:'
+    flags: 'im'
+error_messages:
+  - "Error acquiring the state lock"
+  - "Error locking state: Error acquiring the state lock"
+  - "state is already locked by another operation"
+  - "Lock Info:\n    ID:        xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+root_cause: |
+  When a `terraform plan` or `terraform apply` runs inside a GitHub Actions workflow,
+  Terraform acquires a state lock (in S3, Azure Blob Storage, GCS, Terraform Cloud, etc.)
+  to prevent concurrent state modifications.
+
+  If the workflow is cancelled from the GitHub Actions UI while Terraform is running, the
+  runner sends SIGTERM to the shell process executing the `run:` step. The
+  `hashicorp/setup-terraform` action installs a wrapper script that intercepts all
+  `terraform` invocations to capture stdout/stderr outputs for use in subsequent steps.
+  This wrapper shell does NOT properly forward SIGTERM to the actual `terraform` binary.
+
+  Signal propagation failure sequence:
+  1. User cancels workflow from GitHub Actions UI (or timeout fires)
+  2. Runner sends SIGTERM to the bash shell running `run: terraform plan`
+  3. The wrapper shell terminates immediately without forwarding the signal
+  4. The terraform binary process either receives an orphaned signal or none at all
+  5. Terraform never performs a graceful shutdown — state lock is NOT released
+  6. The state lock persists indefinitely in the backend
+
+  When the next workflow run starts:
+  - `terraform init` succeeds
+  - `terraform plan` or `apply` fails immediately: "Error acquiring the state lock"
+  - The Lock Info block shows the orphaned lock ID from the cancelled run
+
+  This requires MANUAL intervention: the lock ID from the error must be used with
+  `terraform force-unlock <LOCK_ID>` to release the dangling lock.
+fix: |
+  Immediate fix — force-unlock the state from your local machine:
+
+  ```bash
+  terraform init   # required to configure the backend
+  terraform force-unlock <LOCK_ID>
+  ```
+
+  The LOCK_ID is shown in the failing workflow's error output:
+  ```
+  Lock Info:
+    ID:        1a2b3c4d-5e6f-7890-abcd-ef1234567890
+    Path:      terraform.tfstate
+    Operation: OperationTypePlan
+    ...
+  ```
+
+  Mitigation — add a cleanup step that always runs to detect and release the lock:
+
+  Use `if: cancelled() || failure()` with `continue-on-error: true` and
+  `terraform force-unlock` to attempt cleanup automatically.
+
+  Long-term — use `-lock=false` for read-only plan jobs:
+  `terraform plan -lock=false` skips acquiring the state lock entirely and is safe
+  for plan-only (non-mutating) runs.
+fix_code:
+  - language: yaml
+    label: 'Add always() cleanup step to attempt force-unlock on cancellation'
+    code: |
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -out=tfplan
+        continue-on-error: true
+
+      # Force-unlock if the workflow was cancelled (prevents lock buildup)
+      - name: Release state lock if cancelled
+        if: cancelled()
+        continue-on-error: true
+        run: |
+          # Attempt to parse lock ID from a recently-written error file
+          # Note: this only works if terraform wrote lock info before shutdown
+          echo "Workflow was cancelled — attempting to identify and release any state lock"
+          echo "Check workflow logs for 'Lock Info' block to get the lock ID, then run:"
+          echo "  terraform force-unlock <LOCK_ID>"
+        env:
+          TF_TOKEN_app_terraform_io: ${{ secrets.TF_TOKEN }}
+  - language: yaml
+    label: 'Use -lock=false for plan-only jobs to avoid acquiring unnecessary locks'
+    code: |
+      jobs:
+        plan:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: hashicorp/setup-terraform@v3
+
+            - name: Terraform Init
+              run: terraform init
+
+            # -lock=false is safe for read-only plans — no state mutation
+            - name: Terraform Plan (no lock)
+              run: terraform plan -lock=false -out=tfplan
+
+            - uses: actions/upload-artifact@v4
+              with:
+                name: tfplan
+                path: tfplan
+
+        apply:
+          needs: plan
+          runs-on: ubuntu-latest
+          environment: production   # Require manual approval — reduces mid-apply cancellation risk
+          if: github.ref == 'refs/heads/main'
+          steps:
+            - uses: actions/checkout@v4
+            - uses: hashicorp/setup-terraform@v3
+            - name: Terraform Init
+              run: terraform init
+            - uses: actions/download-artifact@v4
+              with:
+                name: tfplan
+            # Apply DOES acquire the lock — shorter window and gated by approval
+            - name: Terraform Apply
+              run: terraform apply tfplan
+prevention:
+  - 'Use terraform plan -lock=false for read-only plan jobs to avoid acquiring state locks that can be orphaned on cancellation'
+  - 'Use environment protection rules with manual approval gates on apply jobs to reduce mid-apply cancellation risk'
+  - 'Add a cancelled() cleanup step with continue-on-error: true to log instructions for manual force-unlock'
+  - 'Consider Terraform Cloud / HCP Terraform for managed run cancellation that handles state lock cleanup automatically'
+  - 'Track hashicorp/setup-terraform#441 for a fix that properly forwards SIGTERM to the terraform binary'
+docs:
+  - url: 'https://github.com/hashicorp/setup-terraform/issues/441'
+    label: 'Terraform state does not unlock if workflow running terraform plan is cancelled (setup-terraform#441)'
+  - url: 'https://github.com/orgs/community/discussions/26311'
+    label: 'GitHub Community discussion — Terraform state lock not released on workflow cancellation'
+  - url: 'https://developer.hashicorp.com/terraform/language/state/locking'
+    label: 'Terraform State Locking documentation'
+  - url: 'https://developer.hashicorp.com/terraform/cli/commands/force-unlock'
+    label: 'terraform force-unlock command reference'

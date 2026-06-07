@@ -1,0 +1,111 @@
+id: runner-environment-259
+title: 'setup-dotnet wildcard version resolves to unreleased patch — CDN binary not yet available'
+category: runner-environment
+severity: error
+tags:
+  - dotnet
+  - setup-dotnet
+  - version-resolution
+  - cdn-lag
+  - wildcard
+  - version-manifest
+patterns:
+  - regex: 'dotnet-install: Error: Could not find \.NET Core Runtime with version = \d+\.\d+\.\d+'
+    flags: 'i'
+  - regex: 'dotnet-install: The resource at aka\.ms link .* is not available\.'
+    flags: 'i'
+  - regex: 'curl: \(22\) The requested URL returned error: 404 Not Found'
+    flags: 'i'
+error_messages:
+  - "dotnet-install: Error: Could not find `.NET Core Runtime` with version = 10.0.5"
+  - "dotnet-install: Error: Could not find `.NET Core SDK` with version = 10.0.201"
+  - "dotnet-install: The resource at aka.ms link 'https://builds.dotnet.microsoft.com/dotnet/Runtime/10.0.5/dotnet-runtime-10.0.5-linux-x64.tar.gz' is not available."
+  - "curl: (22) The requested URL returned error: 404 Not Found"
+root_cause: |
+  When `dotnet-version: '10.0.x'` (or any `MAJOR.MINOR.x` wildcard) is used, setup-dotnet
+  resolves the latest patch by querying Microsoft's version manifest file. Microsoft's release
+  process updates the manifest file (announcing the new version number) BEFORE the actual
+  binary tarballs and zip files are uploaded to the CDN at
+  `https://builds.dotnet.microsoft.com/dotnet/`.
+
+  There is typically a 12–48 hour window after a new patch release is announced when:
+  1. The manifest lists e.g. `10.0.5` as the latest `10.0.x` version
+  2. But `https://builds.dotnet.microsoft.com/dotnet/Runtime/10.0.5/*.tar.gz` returns HTTP 404
+
+  During this window, every workflow using `dotnet-version: '10.0.x'` fails with
+  "Could not find .NET Core Runtime with version = X" even though X is a valid, announced
+  version. This pattern repeats for every new .NET patch release cycle (typically 3–4
+  per year).
+
+  This is distinct from the EOL version removal issue (where old versions are permanently
+  deleted from the CDN). The CDN propagation lag is transient — the same workflow succeeds
+  12–48 hours later without any changes.
+
+  Affected version specifiers include any wildcard that resolves to a newly-released patch:
+  - `10.0.x` → resolves to `10.0.5` when `10.0.5` is in the manifest but not yet on CDN
+  - `9.0.x`, `8.0.x` → same issue on their respective patch release days
+fix: |
+  Short-term (unblock immediately): pin to the last known-good patch version:
+
+  ```yaml
+  dotnet-version: '10.0.4'   # last confirmed available patch
+  ```
+
+  Check available versions at: https://github.com/dotnet/core/discussions
+
+  After 12–48 hours, the CDN will have the new binary and you can switch back to the
+  wildcard or upgrade to the new patch.
+
+  If you cannot tolerate even transient failures, add a fallback step:
+
+  ```yaml
+  - name: Setup .NET (latest)
+    id: setup-dotnet
+    uses: actions/setup-dotnet@v4
+    continue-on-error: true
+    with:
+      dotnet-version: '10.0.x'
+  - name: Setup .NET (fallback to pinned)
+    if: steps.setup-dotnet.outcome == 'failure'
+    uses: actions/setup-dotnet@v4
+    with:
+      dotnet-version: '10.0.4'   # last confirmed available
+  ```
+fix_code:
+  - language: yaml
+    label: 'Pin to specific patch version during new release window'
+    code: |
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          # Pin to a specific patch version during the 12-48h window after
+          # a new patch is announced but before CDN binaries are available.
+          # Check https://github.com/dotnet/core/discussions for latest confirmed version.
+          dotnet-version: '10.0.4'   # last confirmed available patch
+  - language: yaml
+    label: 'Wildcard with continue-on-error fallback'
+    code: |
+      - name: Setup .NET (latest)
+        id: setup-dotnet
+        uses: actions/setup-dotnet@v4
+        continue-on-error: true
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Setup .NET (fallback if CDN lag)
+        if: steps.setup-dotnet.outcome == 'failure'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.4'   # last known-good patch
+prevention:
+  - 'Avoid wildcard dotnet-version specifiers during the week of a new .NET patch release; prefer pinning to a specific patch'
+  - 'Monitor https://github.com/dotnet/core/discussions for new release announcements before relying on wildcards'
+  - 'Add continue-on-error with a pinned fallback step when using wildcard .NET version specifiers in critical CI workflows'
+  - 'If builds start failing after a .NET release day, check CDN availability before debugging workflow logic'
+docs:
+  - url: 'https://github.com/actions/setup-dotnet/issues/711'
+    label: 'dotnet-version: 10.0.x trying to download non-existent version 10.0.5 (setup-dotnet#711)'
+  - url: 'https://github.com/actions/setup-dotnet/issues/712'
+    label: 'Failure to setup 10.0.x on linux runner — action tries to find binary that does not exist (setup-dotnet#712)'
+  - url: 'https://github.com/dotnet/core/discussions'
+    label: '.NET release announcements — check here for latest confirmed version availability'
