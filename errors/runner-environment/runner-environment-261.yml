@@ -1,0 +1,147 @@
+id: runner-environment-261
+title: 'SSH host key verification failed — GitHub RSA key rotation or missing known_hosts'
+category: runner-environment
+severity: error
+tags:
+  - ssh
+  - ssh-key
+  - host-key-verification
+  - known-hosts
+  - rsa-key-rotation
+  - actions-checkout
+patterns:
+  - regex: 'Host key verification failed'
+    flags: 'i'
+  - regex: 'No RSA host key is known for.*and you have requested strict checking'
+    flags: 'i'
+  - regex: 'WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED'
+    flags: 'i'
+  - regex: 'ECDSA host key for github\.com has changed'
+    flags: 'i'
+error_messages:
+  - 'Host key verification failed.'
+  - 'Warning: Permanently added the RSA host key for IP address'
+  - 'No RSA host key is known for github.com and you have requested strict checking.'
+  - 'WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!'
+  - 'ECDSA host key for github.com has changed and you have requested strict checking.'
+  - 'IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!'
+  - 'Offending ECDSA key in /home/runner/.ssh/known_hosts'
+  - 'fatal: Could not read from remote repository.'
+root_cause: |
+  SSH host key verification fails in GitHub Actions for two main reasons:
+
+  **1. GitHub's RSA SSH host key rotation (March 24, 2023)**
+  GitHub replaced its RSA SSH host key on March 24, 2023. Any `known_hosts` file that
+  was hardcoded or cached before this date contains the OLD RSA fingerprint
+  (`SHA256:nThbg6kXUpJWGl7E1IGOCspRomTxdCARLviKw6E5SY8`). When the runner attempts to
+  connect to github.com via SSH, the ECDSA/RSA key in `known_hosts` no longer matches,
+  triggering the MITM warning and aborting the connection.
+
+  GitHub's current RSA key fingerprint (as of 2023+):
+  `SHA256:uNiVztksCsDhcc0u9e8BujQXVUpKZIDTMczCvj3tD2s`
+
+  GitHub's ED25519 fingerprint (recommended — unchanged):
+  `SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU`
+
+  **2. Custom SSH keys without known_hosts configuration**
+  When using `actions/checkout` with `ssh-key:` to clone private repos (or submodules),
+  the target host's key must be trusted. If `known_hosts` is not set, the checkout action
+  uses a hardcoded known_hosts entry; if the action version is outdated, that entry may
+  contain the old (pre-2023) RSA key.
+
+  **3. Self-hosted runners with stale known_hosts**
+  Self-hosted runners may have a user-level `~/.ssh/known_hosts` with an old or incorrect
+  github.com entry that persists across runs.
+
+  Sources:
+  - GitHub blog — "We updated our RSA SSH host key" (March 23, 2023)
+  - actions/checkout issue #1240 (host key verification failed)
+  - actions/checkout issue #454 (Could not read from remote repository)
+  - Stack Overflow #63012327 — SSH host key verification failed in GitHub Actions
+  - Stack Overflow #75830783 — GitHub SSH errors after March 2023 key rotation
+fix: |
+  **Fix 1 (recommended): Use HTTPS instead of SSH for public repos**
+  Unless you specifically need SSH (e.g., private repos), use HTTPS checkout which is
+  the default and avoids SSH host key issues entirely.
+
+  **Fix 2: Update known_hosts before SSH operations**
+  Add a step to fetch the current GitHub SSH host keys using `ssh-keyscan`:
+  ```bash
+  mkdir -p ~/.ssh
+  ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts
+  ```
+  ED25519 is recommended (more stable, less likely to rotate than RSA).
+
+  **Fix 3: Use actions/checkout ssh-strict: false (not recommended)**
+  Only for trusted private networks where MITM is not a concern. `ssh-strict: false`
+  disables host key verification entirely.
+
+  **Fix 4: Hardcode known_hosts in checkout action**
+  Pass the current GitHub host key fingerprints explicitly via `known_hosts:` in the
+  `actions/checkout` action inputs. Use `ssh-keyscan -t ed25519 github.com` to get
+  the current key.
+
+  **Fix 5: Remove stale entry from self-hosted runner known_hosts**
+  On self-hosted runners, clear the old github.com entry:
+  ```bash
+  ssh-keygen -R github.com  # removes all github.com entries from known_hosts
+  ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts  # add current key
+  ```
+fix_code:
+  - language: yaml
+    label: 'Fix — update known_hosts before SSH-based checkout operations'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Update GitHub SSH host key in known_hosts
+              run: |
+                mkdir -p ~/.ssh
+                # Remove any old/stale github.com entries
+                ssh-keygen -R github.com 2>/dev/null || true
+                # Add current github.com ED25519 host key (stable since 2021)
+                ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts
+
+            - uses: actions/checkout@v4
+              with:
+                ssh-key: ${{ secrets.DEPLOY_KEY }}
+  - language: yaml
+    label: 'Fix — use known_hosts input in actions/checkout (hardcoded current key)'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ssh-key: ${{ secrets.DEPLOY_KEY }}
+                # Get current key via: ssh-keyscan -t ed25519 github.com
+                # Update this if GitHub rotates their key again
+                known_hosts: |
+                  github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+  - language: yaml
+    label: 'Fix — ssh-keyscan in self-hosted runner pre-job setup script'
+    code: |
+      # In your self-hosted runner setup or pre-job hook:
+      # /etc/github-runner/pre-job.sh (or equivalent)
+      #!/bin/bash
+      mkdir -p /home/runner/.ssh
+      ssh-keygen -R github.com 2>/dev/null || true
+      ssh-keyscan -t ed25519 github.com >> /home/runner/.ssh/known_hosts
+      chmod 600 /home/runner/.ssh/known_hosts
+prevention:
+  - 'Use HTTPS (not SSH) for actions/checkout unless SSH is specifically required for private repos'
+  - 'If using SSH keys, prefer ED25519 known_hosts entries over RSA (ED25519 has not been rotated)'
+  - 'For self-hosted runners, add ssh-keyscan to your runner pre-job hook to always use current host keys'
+  - 'If hardcoding known_hosts, include a comment with the date — check it when GitHub announces key changes'
+  - 'Monitor the GitHub blog and status page for SSH host key rotation announcements'
+docs:
+  - url: 'https://github.blog/2023-03-23-we-updated-our-rsa-ssh-host-key/'
+    label: 'GitHub Blog — We updated our RSA SSH host key (March 2023)'
+  - url: 'https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints'
+    label: "GitHub Docs — GitHub's SSH key fingerprints"
+  - url: 'https://github.com/actions/checkout/issues/1240'
+    label: 'actions/checkout#1240 — Host key verification failed'
+  - url: 'https://stackoverflow.com/questions/63012327/ssh-host-key-verification-failed-in-github-actions-but-key-exists-in-known-h'
+    label: 'Stack Overflow #63012327 — SSH host key verification failed in GitHub Actions'

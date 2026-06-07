@@ -1,0 +1,189 @@
+id: permissions-auth-082
+title: 'GITHUB_TOKEN missing packages: write — cannot push to GitHub Container Registry (ghcr.io)'
+category: permissions-auth
+severity: error
+tags:
+  - ghcr
+  - packages
+  - docker
+  - container-registry
+  - packages-write
+  - github-token
+patterns:
+  - regex: 'denied: permission_denied: write_package'
+    flags: 'i'
+  - regex: 'denied: installation not allowed to (Write|Create) (organization |user )?package'
+    flags: 'i'
+  - regex: 'unauthorized: authentication required.*ghcr\.io'
+    flags: 'i'
+  - regex: 'ERROR \[auth\] Requested access to the resource is denied'
+    flags: 'i'
+  - regex: 'Error: buildx failed with: ERROR \[auth\]'
+    flags: 'i'
+error_messages:
+  - 'denied: permission_denied: write_package'
+  - 'denied: installation not allowed to Write organization package'
+  - 'denied: installation not allowed to Create organization package'
+  - 'unauthorized: authentication required'
+  - 'Error: buildx failed with: ERROR [auth] Requested access to the resource is denied'
+  - 'error parsing HTTP 403 response body'
+root_cause: |
+  Pushing container images to GitHub Container Registry (`ghcr.io`) from a GitHub Actions
+  workflow requires the `packages: write` permission in the GITHUB_TOKEN. This permission
+  is NOT included in the default token permissions.
+
+  Without `packages: write`, the `docker login ghcr.io -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}`
+  step appears to succeed (login returns 200), but the subsequent `docker push` or
+  `docker/build-push-action` push step fails with a 403/permission_denied error.
+
+  **Additional causes:**
+  1. **Package not linked to the repository**: If the container image was previously
+     published manually (outside a workflow), it may not be linked to the repository. In
+     this case, GITHUB_TOKEN won't have access even with `packages: write`. Fix: link the
+     package to the repository in the package's Settings page, or add the
+     `org.opencontainers.image.source` label to the Dockerfile.
+
+  2. **Organization-level "Actions permissions" restrictions**: Some organizations disable
+     GitHub Actions from writing packages by default. An org admin must grant permissions
+     at the package level.
+
+  3. **Inheriting package access across repositories**: Cross-repo package access requires
+     explicit configuration in the package's Access settings.
+
+  Sources:
+  - GitHub Docs — Working with the Container registry
+  - GitHub Docs — Publishing and installing a package with GitHub Actions
+  - Community reports and SO questions about ghcr.io 403 errors
+fix: |
+  Add `packages: write` to the workflow-level or job-level `permissions:` block. Also
+  include `contents: read` (required for `actions/checkout`).
+
+  **Job-level permissions** (preferred — principle of least privilege):
+  ```yaml
+  jobs:
+    build-and-push:
+      permissions:
+        contents: read
+        packages: write
+  ```
+
+  **Workflow-level permissions** (applies to all jobs):
+  ```yaml
+  permissions:
+    contents: read
+    packages: write
+  ```
+
+  **If the package is not linked to the repo**: Add a `LABEL` to your Dockerfile or
+  publish the package from the workflow once to establish the automatic link.
+fix_code:
+  - language: yaml
+    label: 'Wrong — no packages: write permission (403 on push to ghcr.io)'
+    code: |
+      on: [push]
+
+      jobs:
+        build-push:
+          runs-on: ubuntu-latest
+          # No permissions: block — GITHUB_TOKEN lacks packages: write by default
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Log in to GHCR
+              run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+              # Login succeeds (200 OK)
+
+            - name: Build and push
+              uses: docker/build-push-action@v6
+              with:
+                push: true
+                tags: ghcr.io/${{ github.repository_owner }}/myapp:latest
+                # ↑ FAILS: denied: permission_denied: write_package
+  - language: yaml
+    label: 'Correct — add packages: write at the job level (least privilege)'
+    code: |
+      on: [push]
+
+      jobs:
+        build-push:
+          runs-on: ubuntu-latest
+          permissions:
+            contents: read    # for actions/checkout
+            packages: write   # for pushing to ghcr.io
+
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Log in to GHCR
+              uses: docker/login-action@v3
+              with:
+                registry: ghcr.io
+                username: ${{ github.actor }}
+                password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Build and push
+              uses: docker/build-push-action@v6
+              with:
+                context: .
+                push: true
+                tags: ghcr.io/${{ github.repository_owner }}/myapp:latest
+                labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+  - language: yaml
+    label: 'Correct — full workflow using docker/metadata-action for canonical tags'
+    code: |
+      on:
+        push:
+          branches: [main]
+        pull_request:
+          branches: [main]
+
+      env:
+        REGISTRY: ghcr.io
+        IMAGE_NAME: ${{ github.repository }}
+
+      jobs:
+        build-push:
+          runs-on: ubuntu-latest
+          permissions:
+            contents: read
+            packages: write
+
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Log in to GHCR
+              if: github.event_name != 'pull_request'
+              uses: docker/login-action@v3
+              with:
+                registry: ${{ env.REGISTRY }}
+                username: ${{ github.actor }}
+                password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Extract metadata
+              id: meta
+              uses: docker/metadata-action@v5
+              with:
+                images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+            - name: Build and push
+              uses: docker/build-push-action@v6
+              with:
+                context: .
+                push: ${{ github.event_name != 'pull_request' }}
+                tags: ${{ steps.meta.outputs.tags }}
+                labels: ${{ steps.meta.outputs.labels }}
+prevention:
+  - 'Always add permissions: packages: write to any job that pushes to ghcr.io'
+  - 'Keep permissions: contents: read alongside packages: write — explicit permissions blocks remove all defaults'
+  - 'Add org.opencontainers.image.source label to Dockerfile to auto-link the package to the repository'
+  - 'Use docker/login-action (not raw docker login) — it handles credential renewal and multi-platform auth properly'
+  - 'If pushing only on push events (not PRs), use if: github.event_name != ''pull_request'' to skip push on PR runs'
+docs:
+  - url: 'https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry'
+    label: 'GitHub Docs — Working with the Container Registry'
+  - url: 'https://docs.github.com/en/actions/publishing-packages/publishing-docker-images'
+    label: 'GitHub Docs — Publishing Docker images with GitHub Actions'
+  - url: 'https://docs.github.com/en/packages/managing-github-packages-using-github-actions-workflows/publishing-and-installing-a-package-with-github-actions'
+    label: 'GitHub Docs — Publishing and installing a package with GitHub Actions'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/controlling-permissions-for-github_token'
+    label: 'GitHub Docs — Controlling permissions for GITHUB_TOKEN'
