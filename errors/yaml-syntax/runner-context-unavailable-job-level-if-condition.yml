@@ -1,0 +1,107 @@
+id: yaml-syntax-089
+title: 'runner context (runner.os, runner.arch, etc.) not available in job-level if: conditions — evaluates to empty'
+category: yaml-syntax
+severity: error
+tags:
+  - runner-context
+  - runner.os
+  - runner.arch
+  - job-level-if
+  - context-availability
+  - matrix
+patterns:
+  - regex: 'if:\s+\$\{\{\s*runner\.(os|arch|name|tool_cache|temp)\b'
+    flags: 'im'
+  - regex: 'if:\s+runner\.(os|arch|name|tool_cache|temp)\b'
+    flags: 'im'
+error_messages:
+  - "runner.os in job-level if condition always evaluates to empty string"
+  - "Unrecognized named-value: 'runner'. Located at position 1 within expression"
+  - "if: ${{ runner.os == 'Linux' }}  # at job level — always false (empty != 'Linux')"
+root_cause: |
+  The runner context is only populated after a runner has been allocated and the job
+  has actually started executing. Job-level if: conditions are evaluated server-side
+  at queue time — BEFORE a runner is selected. Because no runner is running yet, the
+  runner context is unavailable at the job-level if: evaluation point.
+
+  According to the GitHub Actions context availability table, the runner context is
+  only available inside individual step expressions. It is NOT available in:
+    - Job-level if: conditions
+    - Job-level env: blocks
+    - Job-level needs: expressions
+    - concurrency: group expressions
+
+  Using runner.os or runner.arch in a job-level if: produces one of:
+  1. An empty string (falsy) — silently skips the job regardless of intent
+  2. In some configurations: "Unrecognized named-value: 'runner'" validation error
+
+  This is the same limitation as the env context at job level
+  (env-context-unavailable-job-level.yml). Both runner and env contexts are step-only.
+
+  Real-world example (aquasecurity/trivy PR #9233 fixed exactly this — moved runner.os
+  from job-level env: to step-level because the job-level reference always returns empty).
+fix: |
+  Use the matrix value directly in job conditions instead of runner.os:
+
+    # Wrong — runner context not available at job-level if:
+    jobs:
+      linux-only:
+        runs-on: ${{ matrix.os }}
+        if: ${{ runner.os == 'Linux' }}   # always empty at evaluation time
+
+    # Correct — reference the matrix value directly:
+    jobs:
+      linux-only:
+        runs-on: ${{ matrix.os }}
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+
+  For runner.os inside steps (where it IS available), no change needed.
+
+  For platform-specific jobs without a matrix, use the explicit runs-on value:
+    # Correct — separate jobs per OS:
+    linux-job:
+      runs-on: ubuntu-latest
+      steps:
+        - run: echo "Linux-only step"
+
+    windows-job:
+      runs-on: windows-latest
+      steps:
+        - run: echo "Windows-only step"
+fix_code:
+  - language: yaml
+    label: 'Correct: use matrix.os in job condition instead of runner.os'
+    code: |
+      jobs:
+        test:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest, macos-latest]
+          runs-on: ${{ matrix.os }}
+
+          # Wrong: if: ${{ runner.os == 'Linux' }}  — runner unavailable at job level
+          # Correct: reference the matrix variable directly:
+          if: ${{ matrix.os != 'windows-latest' }}
+
+          steps:
+            - name: Non-Windows step
+              run: echo "Running on ${{ runner.os }}"  # runner.os IS available here
+
+            - name: OS check in step (correct)
+              # runner context IS available in step-level if:
+              if: ${{ runner.os == 'Linux' }}
+              run: echo "Linux-specific step"
+prevention:
+  - 'Use matrix.os or matrix.platform values in job-level conditions, not runner.os'
+  - 'Only reference runner context inside steps — not in job-level if:, env:, or needs:'
+  - 'Check the GitHub Actions context availability table when adding a new context reference'
+  - 'Use actionlint to catch context availability violations before they reach CI'
+docs:
+  - url: https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#context-availability
+    label: GitHub Actions — Context availability table
+  - url: https://github.com/actions/runner/issues/1996
+    label: 'actions/runner#1996: Job-level if condition not evaluated correctly'
+  - url: https://github.com/github/docs/issues/21927
+    label: 'github/docs#21927: env context not available in job if conditional (same limitation)'
+  - url: https://github.com/aquasecurity/trivy/pull/9233
+    label: 'Real-world fix: moving runner.os from job-level env to step-level (aquasecurity/trivy PR #9233)'
