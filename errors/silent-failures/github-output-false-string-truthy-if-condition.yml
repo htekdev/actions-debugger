@@ -1,0 +1,104 @@
+id: silent-failures-137
+title: "GITHUB_OUTPUT values are always strings — 'false' output is truthy in if: steps.X.outputs.flag conditions"
+category: silent-failures
+severity: silent-failure
+tags:
+  - GITHUB_OUTPUT
+  - step-outputs
+  - string-coercion
+  - truthy
+  - if-condition
+  - boolean
+  - false-string
+patterns:
+  - regex: 'if:\s+steps\.\w[\w-]*\.outputs\.\w[\w-]*\s*$'
+    flags: 'mi'
+  - regex: 'echo\s+[''"]?\w[\w-]*=false[''"]?\s*>>\s*\$GITHUB_OUTPUT'
+    flags: 'i'
+error_messages:
+  - 'step runs even though output flag is ''false'''
+  - 'if: steps.check.outputs.should-deploy  (always truthy)'
+  - 'if: steps.setup.outputs.enabled  (runs even when enabled=false)'
+root_cause: |
+  All values written to $GITHUB_OUTPUT are stored and transmitted as plain strings.
+  Even if a shell script writes `echo "flag=false" >> $GITHUB_OUTPUT`, the value in
+  the steps context is the string 'false', not the boolean false.
+
+  In GitHub Actions expression evaluation, any non-empty string is truthy. This means:
+
+    if: steps.my_step.outputs.flag
+
+  ...always evaluates to true as long as the step ran and output any non-empty string —
+  including 'false', '0', 'no', 'disabled', or any other "falsy-looking" string.
+
+  Common manifestation:
+    1. Composite action or shell script sets: echo "should-deploy=false" >> $GITHUB_OUTPUT
+    2. Caller uses: if: steps.setup.outputs.should-deploy
+    3. Step runs unexpectedly — no error emitted, no warning, wrong behavior silently
+
+  This is distinct from two related issues already documented:
+  - actions/cache cache-hit: on cache miss, cache-hit is EMPTY STRING (not 'false') —
+    covered by silent-failures-063
+  - workflow_call boolean inputs: coerced to strings when passed via with: —
+    covered by workflow-call-boolean-input-string-coercion.yml
+
+  The pattern affects any step output that a script sets to 'false' as a sentinel value.
+fix: |
+  Always use explicit string comparison when checking step outputs in if conditions.
+  Never rely on a bare output reference being falsy:
+
+    # Wrong — truthy even when flag is 'false' (non-empty string):
+    if: steps.my_step.outputs.flag
+
+    # Wrong — type mismatch: 'false' == true is false, but 'true' == true is ALSO false:
+    if: steps.my_step.outputs.flag == true
+
+    # Correct — explicit string comparison:
+    if: steps.my_step.outputs.flag == 'true'
+
+    # Correct — negation:
+    if: steps.my_step.outputs.flag != 'false'
+
+  Convention: always output 'true' or 'false' as the sentinel strings, never empty
+  string for false — and always compare explicitly at the call site.
+fix_code:
+  - language: yaml
+    label: Explicit string comparison for step outputs
+    code: |
+      jobs:
+        example:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Check condition
+              id: check
+              run: |
+                if some_condition; then
+                  echo "should-deploy=true" >> $GITHUB_OUTPUT
+                else
+                  echo "should-deploy=false" >> $GITHUB_OUTPUT
+                fi
+
+            - name: Deploy
+              # Wrong: if: steps.check.outputs.should-deploy
+              # (truthy for BOTH 'true' AND 'false' — non-empty string)
+              # Correct:
+              if: steps.check.outputs.should-deploy == 'true'
+              run: ./deploy.sh
+
+            - name: Skip notification
+              # Correct negation:
+              if: steps.check.outputs.should-deploy != 'true'
+              run: echo "Deployment skipped"
+prevention:
+  - "Always compare step outputs to string literals: == 'true' not just if: outputs.flag"
+  - 'All $GITHUB_OUTPUT values are strings — there is no boolean output type'
+  - 'Document composite action outputs as strings in README to prevent caller confusion'
+  - "Prefer explicit 'true'/'false' strings over empty/non-empty as sentinel convention"
+  - 'Use actionlint to warn on bare step output references in if conditions'
+docs:
+  - url: https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/passing-information-between-steps
+    label: Passing information between steps (GITHUB_OUTPUT)
+  - url: https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#literals
+    label: GitHub Actions expression literals — type coercion and truthiness
+  - url: https://stackoverflow.com/questions/77141188/what-is-considered-truthy-or-falsy-in-expressions-contexts-in-github-actions
+    label: 'Stack Overflow: Truthy and falsy values in GitHub Actions expressions'

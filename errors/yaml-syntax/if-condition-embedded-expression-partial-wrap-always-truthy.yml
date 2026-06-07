@@ -1,0 +1,98 @@
+id: yaml-syntax-088
+title: 'if: condition with embedded ${{ }} expression not fully wrapped — becomes non-empty string literal, always truthy'
+category: yaml-syntax
+severity: silent-failure
+tags:
+  - if-condition
+  - expression-syntax
+  - string-coercion
+  - double-braces
+  - silent-failure
+  - always-runs
+patterns:
+  - regex: 'if:\s+(?!\s*\$\{\{)[^\n]*\$\{\{[^\n]*\}\}[^\n]*$'
+    flags: 'im'
+error_messages:
+  - 'step runs even when if condition should be false'
+  - "if: github.ref == 'refs/heads/${{ env.MAIN_BRANCH }}'"
+  - "if: startsWith(github.ref, '${{ env.TAG_PREFIX }}')"
+  - "if: false && '${{ env.EMPTY_VALUE }}'"
+root_cause: |
+  When an `if:` condition contains `${{ }}` expression syntax as part of a larger
+  non-expression string (not wrapping the ENTIRE condition), GitHub Actions evaluates
+  the `${{ }}` fragment first (substituting its value inline), then treats the ENTIRE
+  `if:` value as a raw string literal. Any non-empty string is truthy in GitHub Actions
+  expression context, so the condition always evaluates to true regardless of what the
+  embedded expression returns.
+
+  Example:
+    if: github.ref == 'refs/heads/${{ env.MAIN_BRANCH }}'
+
+  Step 1 — `${{ env.MAIN_BRANCH }}` is substituted first, producing (e.g.):
+    if: "github.ref == 'refs/heads/main'"
+
+  Step 2 — This is now a literal string, not an expression. The runner evaluates the
+  entire if: value as a truthy non-empty string. The step ALWAYS runs.
+
+  A subtler variant: `if: false && '${{ env.EMPTY_VALUE }}'` — the `${{ }}` is
+  substituted first, leaving the string "false && ''" which is truthy as a literal.
+
+  The pattern was reported in actions/runner#1173 (69 reactions, Jun 2021–Jan 2026).
+  actionlint and sisakulint both flag this via their ConditionalRule.
+fix: |
+  Wrap the ENTIRE if condition in ${{ }} so it is evaluated as a single expression.
+  Never embed ${{ }} inside a larger literal condition.
+
+    # Wrong — embedded ${{ }} makes condition a literal string (always truthy):
+    if: github.ref == 'refs/heads/${{ env.MAIN_BRANCH }}'
+    if: startsWith(github.ref, '${{ env.TAG_PREFIX }}')
+    if: false && '${{ env.EMPTY_VALUE }}'
+
+    # Correct — wrap the entire condition in ${{ }}:
+    if: ${{ github.ref == format('refs/heads/{0}', env.MAIN_BRANCH) }}
+    if: ${{ startsWith(github.ref, env.TAG_PREFIX) }}
+    if: ${{ false }}
+
+  Use format() to build dynamic string comparisons within a single expression.
+  Or set a step-level env var and reference it without ${{ }} in the condition:
+
+    env:
+      TARGET_REF: 'refs/heads/main'
+    steps:
+      - if: github.ref == env.TARGET_REF   # env context available in step-level if
+fix_code:
+  - language: yaml
+    label: 'Correct: wrap entire condition in ${{ }}'
+    code: |
+      env:
+        MAIN_BRANCH: main
+        TAG_PREFIX: v
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Deploy to main
+              # Wrong: if: github.ref == 'refs/heads/${{ env.MAIN_BRANCH }}'
+              if: ${{ github.ref == format('refs/heads/{0}', env.MAIN_BRANCH) }}
+              run: ./deploy.sh
+
+            - name: Tag build
+              # Wrong: if: startsWith(github.ref, '${{ env.TAG_PREFIX }}')
+              if: ${{ startsWith(github.ref, env.TAG_PREFIX) }}
+              run: ./build-release.sh
+prevention:
+  - 'Never embed ${{ }} inside an if: condition — wrap the ENTIRE condition in ${{ }} instead'
+  - 'Use format() to build dynamic string comparisons inside a single ${{ }} wrapper'
+  - 'Use actionlint to catch this pattern statically before runtime'
+  - 'Prefer env: at step level to pre-resolve values, then reference in if: without ${{ }}'
+  - 'Remember: non-empty string literals are always truthy in GitHub Actions expressions'
+docs:
+  - url: https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions
+    label: GitHub Actions — Evaluate expressions in workflows
+  - url: https://github.com/actions/runner/issues/1173
+    label: 'actions/runner#1173: if condition with expression syntax always truthy (69 reactions, closed Jan 2026)'
+  - url: https://rhysd.github.io/actionlint/
+    label: actionlint — static checker that catches this pattern via ConditionalRule
+  - url: https://sisaku-security.github.io/lint/docs/rules/conditionalrule/
+    label: sisakulint ConditionalRule — documents the non-empty string truthy behavior

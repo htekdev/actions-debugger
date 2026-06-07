@@ -1,0 +1,124 @@
+id: known-unsolved-087
+title: 'Workflow re-run uses original event payload — labels, commits, and PR changes after trigger not reflected'
+category: known-unsolved
+severity: limitation
+tags:
+  - workflow-rerun
+  - event-payload
+  - stale-data
+  - labels
+  - pull-request
+  - limitation
+  - reproducibility
+patterns:
+  - regex: 'github\.event\.label\.name'
+    flags: 'i'
+  - regex: 'github\.event\.pull_request\.(?:body|title|labels)'
+    flags: 'im'
+error_messages:
+  - 're-run does not pick up label added after original trigger'
+  - 'github.event.pull_request.body shows stale content after PR edit'
+  - 're-run checks out old commit after force push to branch'
+  - 'github.event.label.name returns previous label on re-run'
+root_cause: |
+  GitHub Actions workflow re-runs (triggered via the "Re-run jobs" UI button, the
+  GitHub REST API re-run endpoint, or `gh run rerun`) always use the EXACT event
+  payload from the original trigger. No updated state is fetched — the re-run is a
+  replay with identical github.event data, github.sha, github.ref, and all
+  event-specific fields.
+
+  Specific common surprises:
+
+  1. Label added AFTER push trigger: re-running a push-triggered workflow does not
+     see any label — the push event payload never contained label data, and re-run
+     cannot add it retroactively.
+
+  2. Label added AFTER pull_request trigger: github.event.pull_request.labels shows
+     the labels at the TIME OF THE ORIGINAL TRIGGER, not current PR labels.
+
+  3. PR body or title edited: github.event.pull_request.body still shows the text
+     from when the PR event was originally fired.
+
+  4. New commit pushed to branch: re-run checks out the SAME commit SHA as the
+     original run — not the latest commit on the branch.
+
+  5. on: pull_request: types: [labeled] re-run: github.event.label.name shows the
+     label from the ORIGINAL labeled event, not any subsequently added label.
+
+  This behavior is by design for reproducibility: GitHub preserves original event
+  payloads so re-runs can exactly reproduce the conditions of the original build.
+  However, teams expecting re-run to reflect current state are surprised by stale data.
+
+  Reported in actions/runner#3149 and multiple GitHub Community discussions.
+fix: |
+  Trigger a FRESH workflow run rather than re-running the existing run:
+
+  For push-triggered workflows:
+    - Push an empty commit:  git commit --allow-empty -m "retrigger" && git push
+
+  For pull_request-triggered workflows:
+    - Close and reopen the PR  
+    - Push a new commit to the PR branch
+
+  For label-gated logic:
+    - Remove and re-add the label (fires a new labeled event → new run)
+    - Use on: pull_request: types: [labeled] as the trigger (not re-run)
+
+  For workflow_dispatch workflows:
+    - Use the workflow_dispatch trigger with explicit inputs to pass current values,
+      bypassing the stale event payload issue entirely.
+
+  For jobs that MUST see current PR state (labels, body, etc.) during re-runs, fetch
+  the current state via the GitHub API inside a step rather than relying on github.event:
+
+    - name: Get current PR labels
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const { data: pr } = await github.rest.pulls.get({
+            ...context.repo,
+            pull_number: context.payload.pull_request.number
+          });
+          return pr.labels.map(l => l.name);
+fix_code:
+  - language: yaml
+    label: Fetch current PR state via API instead of relying on event payload
+    code: |
+      on:
+        pull_request:
+          types: [opened, synchronize, labeled]
+
+      jobs:
+        label-check:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Get CURRENT PR labels (not stale event payload)
+              id: labels
+              uses: actions/github-script@v7
+              with:
+                script: |
+                  // github.event.pull_request.labels is stale on re-runs
+                  // Fetch current state via API instead:
+                  const { data: pr } = await github.rest.pulls.get({
+                    ...context.repo,
+                    pull_number: context.payload.pull_request.number
+                  });
+                  const labelNames = pr.labels.map(l => l.name);
+                  core.setOutput('has-deploy-label', String(labelNames.includes('deploy')));
+
+            - name: Deploy
+              if: steps.labels.outputs.has-deploy-label == 'true'
+              run: ./deploy.sh
+prevention:
+  - 'Do not rely on workflow re-run to pick up state changes made after the original trigger'
+  - 'For label-gated workflows, configure on: pull_request: types: [labeled] — not re-run'
+  - 'To get current PR state, fetch via github-script/API rather than trusting github.event'
+  - 'Document in workflow comments that re-run preserves original event payload for reproducibility'
+  - 'For critical label checks, verify labels via API in a step regardless of trigger method'
+docs:
+  - url: https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-workflow-runs/re-running-workflows-and-jobs
+    label: Re-running workflows and jobs — GitHub Docs
+  - url: https://github.com/actions/runner/issues/3149
+    label: 'actions/runner#3149: Re-run does not pick up new PR label'
+  - url: https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request
+    label: pull_request event — available event payload fields
