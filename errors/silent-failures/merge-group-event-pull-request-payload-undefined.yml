@@ -1,0 +1,130 @@
+id: silent-failures-132
+title: 'github.event.pull_request is undefined in merge_group — JS actions crash or return wrong results'
+category: silent-failures
+severity: silent-failure
+tags:
+  - merge_group
+  - merge-queue
+  - pull_request
+  - event-payload
+  - javascript-action
+  - context
+  - undefined
+patterns:
+  - regex: 'cannot read propert\w* of undefined.*pull_request|pull_request.*undefined.*merge.group'
+    flags: 'i'
+  - regex: '"received": "undefined".*"message": "Required"'
+    flags: 'i'
+  - regex: 'TypeError.*context\.payload\.pull_request|TypeError.*github\.event\.pull_request'
+    flags: 'i'
+error_messages:
+  - 'Error: [{"code":"invalid_type","expected":"object","received":"undefined","path":[],"message":"Required"}]'
+  - "TypeError: Cannot read properties of undefined (reading 'number')"
+  - "TypeError: Cannot read properties of undefined (reading 'head')"
+  - 'Error: context.payload.pull_request is undefined'
+root_cause: |
+  The `merge_group` event has a completely different payload structure from `pull_request`.
+  When GitHub adds a PR to the merge queue, it fires a `merge_group` event whose payload
+  contains a `merge_group` object — NOT a `pull_request` object.
+
+  Many JavaScript actions and workflow scripts check `github.event.pull_request` or
+  `context.payload.pull_request` to retrieve PR metadata (number, head SHA, base branch,
+  labels, etc.). When these actions run for `merge_group`, those fields are `undefined`,
+  causing one of:
+
+  1. **Hard crash** — the action throws `TypeError: Cannot read properties of undefined`
+     when it immediately dereferences the field (e.g., `context.payload.pull_request.number`)
+
+  2. **Schema validation failure** — actions using zod or similar schema validation emit
+     `{"code":"invalid_type","expected":"object","received":"undefined","message":"Required"}`
+     (exact error seen in actions/dependency-review-action@v4 before the fix)
+
+  3. **Silent wrong result** — code defensively handles `undefined` but falls back to
+     incorrect logic (e.g., skipping the check entirely and reporting success)
+
+  The `merge_group` payload provides the merge group ref and SHA via:
+  - `context.payload.merge_group.head_ref`
+  - `context.payload.merge_group.head_sha`
+  - `context.payload.merge_group.base_ref`
+  - `context.payload.merge_group.base_sha`
+
+  There is no `pull_request` field in this payload. PR metadata must be looked up
+  separately via the REST API using the PR number embedded in `head_ref`
+  (format: `refs/heads/gh-readonly-queue/{base}/{pr-N}-{sha}`).
+fix: |
+  In JavaScript actions and workflow scripts, guard against merge_group before
+  accessing pull_request fields. Use `context.eventName` to branch logic:
+
+  For actions that MUST have PR data (e.g., dependency review), either:
+  1. Skip the check gracefully for merge_group — the PR check already passed
+  2. Extract the PR number from the merge_group ref and call the REST API
+  3. Add `merge_group` to the action's schema as a distinct payload type
+
+  For workflow jobs, add an `if:` condition to skip steps that need pull_request
+  data when running in merge_group context.
+fix_code:
+  - language: yaml
+    label: 'Skip PR-specific steps for merge_group events'
+    code: |
+      - name: Dependency review
+        if: github.event_name == 'pull_request'
+        uses: actions/dependency-review-action@v4
+
+      # Or: run the action for both but guard inside
+      - name: Check PR labels
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "Labels: ${{ toJson(github.event.pull_request.labels) }}"
+  - language: yaml
+    label: 'Trigger on both pull_request and merge_group with conditional logic'
+    code: |
+      on:
+        pull_request:
+          branches: [main]
+        merge_group:
+          branches: [main]
+
+      jobs:
+        check:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Get PR number
+              id: pr
+              run: |
+                if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+                  echo "number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+                else
+                  # merge_group: extract PR number from head_ref
+                  # refs/heads/gh-readonly-queue/main/pr-42-abc123
+                  PR=$(echo "${{ github.event.merge_group.head_ref }}" | grep -oP '(?<=pr-)\d+')
+                  echo "number=$PR" >> $GITHUB_OUTPUT
+                fi
+  - language: yaml
+    label: 'JavaScript action guard (index.js / action.ts pattern)'
+    code: |
+      // Before accessing pull_request fields, check the event
+      const eventName = context.eventName;
+
+      if (eventName === 'pull_request' || eventName === 'pull_request_target') {
+        const pr = context.payload.pull_request;
+        // safe to use pr.number, pr.head.sha, etc.
+      } else if (eventName === 'merge_group') {
+        const mg = context.payload.merge_group;
+        // use mg.head_sha, mg.base_sha, mg.head_ref
+        // to fetch PR data: parse PR number from mg.head_ref
+      }
+prevention:
+  - 'Never assume github.event.pull_request is populated — check github.event_name first'
+  - 'When adding merge_group as a trigger to an existing pull_request workflow, audit all steps for pull_request field access'
+  - 'Use context guards in JavaScript actions: check context.eventName before accessing event-specific payload fields'
+  - 'Test merge queue workflows by enabling a merge queue on a test branch and observing which checks run'
+  - 'Pin to action versions that explicitly document merge_group support in their README'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#merge_group'
+    label: 'GitHub Docs — merge_group event payload'
+  - url: 'https://github.com/actions/dependency-review-action/issues/841'
+    label: 'actions/dependency-review-action #841 — invalid_type error in merge_group context'
+  - url: 'https://github.com/actions/dependency-review-action/pull/846'
+    label: 'actions/dependency-review-action PR #846 — Add MergeGroupSchema to handle merge_group payload'
+  - url: 'https://stackoverflow.com/questions/76655935/when-does-a-github-workflow-trigger-for-merge-group-and-is-it-restricted-by-bran'
+    label: 'Stack Overflow — When does a GitHub workflow trigger for merge_group?'
