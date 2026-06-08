@@ -1,0 +1,108 @@
+id: runner-environment-337
+title: 'ARC kubernetes-novolume mode: container: jobs fail at Initialize Containers with "Executing the custom container implementation failed"'
+category: runner-environment
+severity: error
+tags:
+  - arc
+  - actions-runner-controller
+  - kubernetes-novolume
+  - container-job
+  - PrepareJob
+  - initialize-containers
+  - k8s-novolume
+patterns:
+  - regex: 'Executing the custom container implementation failed\. Please contact your self hosted runner administrator\.'
+    flags: 'i'
+  - regex: 'Response file could not be read at .*/k8s-novolume/index\.js.*PrepareJob'
+    flags: 'i'
+  - regex: 'ContainerHookManager\.PrepareJobAsync'
+    flags: 'i'
+error_messages:
+  - 'Executing the custom container implementation failed. Please contact your self hosted runner administrator.'
+  - "##[debug]System.Exception: Response file could not be read at '/home/runner/k8s-novolume/index.js' running command 'PrepareJob'"
+  - "##[debug] at GitHub.Runner.Worker.Container.ContainerHooks.ContainerHookManager.ExecuteHookScript"
+  - "##[debug] at GitHub.Runner.Worker.Container.ContainerHooks.ContainerHookManager.PrepareJobAsync"
+root_cause: |
+  When using Actions Runner Controller (ARC) with `kubernetes-novolume` mode
+  (the runner scale set is configured to use `ACTIONS_RUNNER_CONTAINER_HOOKS=kubernetes-novolume`),
+  jobs that specify a `container:` directive (i.e., `jobs.<id>.container`) require the
+  `k8s-novolume` hook to:
+  1. Create a separate Kubernetes pod running the specified container image
+  2. Copy the workspace contents into the pod
+  3. Return a response file at `/home/runner/k8s-novolume/index.js` confirming the pod is ready
+
+  In certain conditions — including workspace copy failures, pod scheduling errors,
+  or timing issues during pod initialization — the hook process exits without writing the
+  expected response file. The runner then reads the empty or missing response path, throws
+  `Response file could not be read`, and marks the entire job as failed with the generic
+  "custom container implementation failed" message.
+
+  This issue does NOT affect jobs without a `container:` specification; those run
+  directly in the runner pod and do not trigger the `PrepareJob` hook.
+
+  Root causes observed in practice:
+  - The `workspace` directory copy step (`Copying /home/runner/_work to pod at /__w`) hangs
+    or fails silently due to RBAC/permissions restrictions on the target namespace
+  - The runner pod's service account lacks permissions to create pods in the target namespace
+  - The kubernetes-novolume hook version is incompatible with the runner version (mismatch
+    between runner image tag and container-hooks version)
+
+  Tracked: actions/runner-container-hooks#299 (11 reactions, December 2025 – February 2026).
+fix: |
+  Option 1 — Switch to kubernetes mode (with volumes):
+  For jobs that use `container:` specs, switch the runner scale set from `kubernetes-novolume`
+  to `kubernetes` mode. The `kubernetes` mode mounts a shared persistent volume between the
+  runner pod and job container, making workspace sharing reliable. The `novolume` mode is
+  designed for environments where PVCs are unavailable or too slow, but it has reduced
+  compatibility with `container:` jobs.
+
+  Option 2 — Upgrade runner-container-hooks:
+  Update to `runner-container-hooks` v0.14.0 or later which includes fixes for the workspace
+  copy race condition in PR#300. Pin the hooks image in your scale set configuration.
+
+  Option 3 — Move container logic inside the step:
+  Refactor the job to use `docker run` commands in a `run:` step instead of `container:`.
+  This avoids the PrepareJob hook entirely:
+    ```yaml
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run in container
+        run: docker run --rm -v ${{ github.workspace }}:/work myimage:tag /work/script.sh
+    ```
+fix_code:
+  - language: yaml
+    label: 'Switch runner scale set from novolume to kubernetes mode'
+    code: |
+      # In your Helm values for the runner scale set:
+      # containerMode:
+      #   type: "kubernetes"   # was: "kubernetes-novolume"
+      # This requires PVC support in your cluster but supports container: jobs.
+  - language: yaml
+    label: 'Avoid container: directive — use docker run in run: step instead'
+    code: |
+      jobs:
+        build:
+          runs-on: arc-runner-set
+          # Remove: container:
+          #   image: myimage:tag
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build inside container
+              run: |
+                docker run --rm \
+                  -v ${{ github.workspace }}:/workspace \
+                  -w /workspace \
+                  myimage:tag \
+                  ./build.sh
+prevention:
+  - 'Prefer `kubernetes` mode over `kubernetes-novolume` when your jobs use `container:` directives.'
+  - 'Keep `runner-container-hooks` version in sync with the runner image version to avoid hook/runner compatibility mismatches.'
+  - 'Test workflows with `container:` jobs in a staging ARC environment before rolling out to production scale sets.'
+  - 'If `novolume` mode is required, avoid `container:` at the job level — use `docker run` commands inside `run:` steps instead.'
+docs:
+  - url: 'https://github.com/actions/runner-container-hooks/issues/299'
+    label: 'runner-container-hooks#299 — no-volume initialize containers fails (11 reactions, Dec 2025)'
+  - url: 'https://github.com/actions/runner-container-hooks/pull/300'
+    label: 'runner-container-hooks PR#300 — fix: always copy GitHub workspace directories regardless of userMountVolumes'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners-with-actions-runner-controller/deploying-runner-scale-sets-with-actions-runner-controller'
+    label: 'GitHub Docs — Deploying runner scale sets with ARC'

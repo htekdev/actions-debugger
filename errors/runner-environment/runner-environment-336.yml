@@ -1,0 +1,115 @@
+id: runner-environment-336
+title: 'GitHub-hosted runner randomly cancels jobs with "The operation was canceled." — broker race condition or OOM'
+category: runner-environment
+severity: error
+tags:
+  - hosted-runner
+  - operation-canceled
+  - intermittent
+  - random-failure
+  - broker
+  - oom
+  - ubuntu-24
+  - ubuntu-latest
+patterns:
+  - regex: 'Error: The operation was canceled\.'
+    flags: 'i'
+  - regex: 'Error: A task was cancell?ed\.'
+    flags: 'i'
+  - regex: 'System\.OperationCanceledException: The operation was canceled\.'
+    flags: 'i'
+  - regex: 'GitHub\.Runner\.Sdk\.ProcessInvoker\.ExecuteAsync.*OperationCanceledException'
+    flags: 'i'
+error_messages:
+  - 'Error: The operation was canceled.'
+  - 'Error: A task was cancelled.'
+  - '##[debug]System.OperationCanceledException: The operation was canceled.'
+  - '##[debug] at System.Threading.CancellationToken.ThrowOperationCanceledException()'
+  - '##[debug] at GitHub.Runner.Sdk.ProcessInvoker.ExecuteAsync'
+  - 'WARN GitHubActionsService] GET request to https://broker.actions.githubusercontent.com/message?sessionId=... has been cancelled.'
+root_cause: |
+  GitHub-hosted runners intermittently fail with "The operation was canceled." or "A task
+  was cancelled." with no application-level error before the cancellation. This is distinct
+  from the ARC Kubernetes pod-eviction case (runner-environment-083) because it occurs on
+  GitHub-managed hosted runners (ubuntu-latest, ubuntu-24.04, etc.) without any Kubernetes
+  infrastructure.
+
+  Known root causes on hosted runners:
+
+  1. **Broker API race condition**: The runner starts up a new job session and polls the
+     GitHub Actions broker API (`broker.actions.githubusercontent.com/message`). When the
+     broker returns a "RunnerNotFound" response — due to a race between the runner
+     registration and the message dispatch — the runner considers the session invalid and
+     shuts itself down with a cancellation. The job is then marked as failed. This race is
+     intermittent (<1% of runs) and has been observed more frequently during high-load periods
+     on GitHub's infrastructure.
+
+  2. **OOM kill on high-memory jobs**: Large matrix builds that each consume significant
+     RAM can exhaust available memory on the hosted runner VM, causing the Linux OOM killer
+     to terminate the runner process. This produces the same "The operation was canceled."
+     error because the process is killed during a wait/IO operation.
+
+  3. **Hosted infrastructure transient failures**: Occasionally, the hosted runner VM
+     loses its network connection to GitHub's backend during job execution. The runner's
+     internal HTTP client times out and raises a `TaskCanceledException`, which propagates
+     as the operation canceled error.
+
+  The cancellation can occur at any phase: during setup-job, mid-step, or between steps.
+  No application log output precedes it — the step simply stops and shows the cancellation
+  error.
+
+  Observed primarily on ubuntu-24.04 / ubuntu-latest from 2025 onward.
+  Tracked: actions/runner#3819 (48 reactions, open since April 2025).
+fix: |
+  There is no permanent fix since this is an intermittent platform-level issue.
+  Recommended mitigations:
+
+  1. **Re-run the failed job**: The race condition resolves itself on retry. Most jobs
+     succeed on the second attempt. Use "Re-run failed jobs" in the GitHub Actions UI.
+
+  2. **Reduce matrix parallelism**: Limit `strategy.max-parallel` to reduce concurrent
+     memory pressure on individual VMs. For large matrix builds, try max-parallel: 4 or 8.
+
+  3. **Pin to a specific runner image**: If failures are correlated with a specific image
+     update, temporarily pin with `runs-on: ubuntu-22.04` while the issue resolves.
+
+  4. **Check for OOM**: For memory-intensive steps, add memory profiling or reduce
+     heap sizes (e.g., `NODE_OPTIONS: --max-old-space-size=4096` for Node.js builds).
+
+  5. **Add retry at the step level**: For critical steps, add a retry loop:
+     `for i in 1 2 3; do my-command && break || sleep 5; done`
+fix_code:
+  - language: yaml
+    label: 'Limit matrix parallelism to reduce OOM risk'
+    code: |
+      jobs:
+        test:
+          strategy:
+            max-parallel: 4
+            matrix:
+              os: [ubuntu-latest, windows-latest, macos-latest]
+              node: [18, 20, 22]
+          runs-on: ${{ matrix.os }}
+  - language: yaml
+    label: 'Set NODE_OPTIONS to reduce heap memory pressure'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          env:
+            NODE_OPTIONS: '--max-old-space-size=4096'
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm run build
+prevention:
+  - 'Keep matrix parallelism under 8 concurrent jobs per workflow run to avoid memory spikes on shared hosted runners.'
+  - 'Monitor for correlated failure timing — if many jobs cancel within the same 1-hour window, it may be a GitHub infrastructure incident (check githubstatus.com).'
+  - 'Enable workflow re-run-on-failure patterns for release-critical workflows to automatically retry transient cancellations.'
+  - 'Use `if: always()` on critical cleanup/notify steps so they still run even if the job is cancelled.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/3819'
+    label: 'actions/runner#3819 — A lot of random "A task was cancelled" errors (48 reactions, 2025)'
+  - url: 'https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#jobsjob_idstrategymaxparallel'
+    label: 'GitHub Docs — jobs.job_id.strategy.max-parallel'
+  - url: 'https://www.githubstatus.com/'
+    label: 'GitHub Status — check for ongoing infrastructure incidents'
