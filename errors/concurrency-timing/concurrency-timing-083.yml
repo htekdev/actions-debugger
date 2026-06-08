@@ -1,0 +1,104 @@
+id: concurrency-timing-083
+title: 'github.actor in concurrency group key creates per-user slots — different actors bypass per-branch run serialization'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - github-actor
+  - per-user-slot
+  - parallel-runs
+  - branch-serialization
+  - silent-failure
+  - ci-duplication
+patterns:
+  - regex: 'concurrency:.*github\.actor|github\.actor.*concurrency'
+    flags: 'i'
+  - regex: '\$\{\{.*github\.actor.*\}\}.*concurren|\$\{\{.*workflow.*actor.*ref'
+    flags: 'i'
+error_messages:
+  - 'Concurrency group includes github.actor — each actor gets a separate slot'
+  - 'Multiple CI runs running simultaneously on the same branch from different actors'
+root_cause: |
+  When `github.actor` is included in the concurrency group expression (e.g.,
+  `${{ github.workflow }}-${{ github.ref }}-${{ github.actor }}`), GitHub Actions
+  creates a **separate concurrency slot for each unique actor value**. This means
+  that when two different developers push to the same branch at roughly the same
+  time, each push lands in its own isolated concurrency group and the two CI runs
+  proceed **in parallel** rather than the second queuing behind or canceling the first.
+
+  The consequence is silent:
+  - No error is raised — both runs start and complete normally.
+  - If `cancel-in-progress: true` is set, only runs from the **same** actor cancel
+    each other. Runs from different actors are never affected.
+  - Multiple concurrent CI runs consume runner capacity and may post conflicting
+    commit statuses to the same commit SHA (e.g., when two devs push while a
+    third's run is still in progress).
+  - In repositories with many contributors this silently defeats the entire purpose
+    of adding a concurrency group to prevent redundant CI runs.
+
+  This pattern is often introduced by copying examples intended for matrix jobs (where
+  per-actor isolation is intentional) into branch-level CI workflows where per-branch
+  serialization is the actual goal.
+fix: |
+  Remove `github.actor` from the concurrency group key for branch-level CI workflows.
+  Use `github.ref` (or `github.head_ref` for pull requests) as the unique dimension
+  that defines "the same piece of work".
+
+  The standard per-branch serialization pattern is:
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+
+  To further scope by event type (so push and pull_request CI don't share a slot):
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+      cancel-in-progress: true
+
+  Only include `github.actor` in the concurrency group when the explicit goal is to
+  give each developer their own independent CI lane (rare — e.g., personal dev branches
+  in a monorepo where each developer works on different subdirectory).
+fix_code:
+  - language: yaml
+    label: '❌ WRONG — github.actor creates per-user slots, defeating per-branch serialization'
+    code: |
+      on: [push, pull_request]
+
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}-${{ github.actor }}
+        cancel-in-progress: true
+      # Problem: pushes from alice and bob to main run in separate slots:
+      #   slot "ci-refs/heads/main-alice"  ← alice's push runs here
+      #   slot "ci-refs/heads/main-bob"    ← bob's push runs HERE, simultaneously
+  - language: yaml
+    label: '✅ CORRECT — use github.ref only for per-branch serialization'
+    code: |
+      on: [push, pull_request]
+
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: true
+      # Both pushes share slot "ci-refs/heads/main" → second run cancels first
+  - language: yaml
+    label: '✅ PR-aware pattern — github.head_ref for pull_request, github.ref as fallback'
+    code: |
+      on:
+        push:
+          branches: [main, 'release/**']
+        pull_request:
+
+      concurrency:
+        # head_ref is set for pull_request (PR branch name), empty for push
+        group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+        cancel-in-progress: true
+prevention:
+  - 'Never include `github.actor` in a branch-level CI concurrency group — each unique actor creates an independent slot.'
+  - 'Use `github.ref` as the per-branch dimension. Add `github.event_name` if push and pull_request CI must not share slots.'
+  - 'When reviewing shared concurrency templates, verify that the group expression does not contain `github.actor`, `github.triggering_actor`, or `inputs.actor`.'
+  - 'Run `grep -r "github.actor" .github/workflows/` periodically to audit concurrency group expressions.'
+docs:
+  - url: 'https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#concurrency'
+    label: 'GitHub Docs: concurrency — workflow syntax reference'
+  - url: 'https://docs.github.com/en/actions/learn-github-actions/contexts#github-context'
+    label: 'GitHub Docs: github context — github.actor, github.ref, github.head_ref definitions'
+  - url: 'https://github.com/orgs/community/discussions/12835'
+    label: 'GitHub Community: Concurrency groups and multiple developers pushing to same branch'

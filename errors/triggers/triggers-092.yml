@@ -1,0 +1,135 @@
+id: triggers-092
+title: 'on: push: paths: filter silently bypassed when push contains 1,000+ commits — workflow always runs regardless of changed files'
+category: triggers
+severity: silent-failure
+tags:
+  - push
+  - paths-filter
+  - 1000-commits
+  - bypass
+  - silent-failure
+  - large-push
+  - bulk-import
+  - squash
+patterns:
+  - regex: 'paths.*filter.*bypass|paths.*filter.*ignored.*commit|1000.*commit.*paths'
+    flags: 'i'
+  - regex: 'workflow.*trigger.*despite.*path.*filter|paths.*filter.*not.*applied'
+    flags: 'i'
+error_messages:
+  - 'Workflow triggered despite paths filter — push contained 1000+ commits so filter was not applied'
+  - 'paths: filter bypassed on bulk push'
+root_cause: |
+  GitHub Actions evaluates `on.push.paths` (and `on.push.paths-ignore`) filters by
+  comparing the changed files in the push against the glob patterns. This comparison
+  requires GitHub to generate a diff of all files changed across all commits in the
+  push.
+
+  When a push event contains **1,000 or more commits**, or when GitHub cannot generate
+  a diff due to a timeout, the paths filter is **silently skipped** and the workflow
+  runs unconditionally — as if no `paths:` filter were configured.
+
+  This means workflows that are intended to be scoped to specific files (e.g., only
+  run backend CI when `src/server/**` changes, only deploy docs when `docs/**`
+  changes) will fire for ALL pushes that meet the 1,000-commit threshold, even if zero
+  relevant files were changed.
+
+  Common scenarios that trigger this bypass:
+  - Initial bulk import of a large repository history (thousands of commits pushed at once).
+  - `git push --force` after a deep rebase that rewrites hundreds of commits.
+  - Squash merges or `git filter-repo` operations that produce a single synthetic
+    commit referencing thousands of prior commit SHAs.
+  - Branch synchronization scripts that replay a long commit history onto a new branch.
+
+  The bypass is documented in the official GitHub Actions workflow syntax reference.
+  There is no warning or annotation added to the workflow run — the job simply starts
+  as if triggered normally, making it indistinguishable from a legitimate paths-matched run.
+fix: |
+  **Add a runtime gate step** that checks the actual changed files and short-circuits
+  the job when no relevant files were modified. This compensates for the filter bypass
+  at the workflow level by applying the check inside the job itself.
+
+  Use `actions/checkout` with `fetch-depth: 0` (or the specific number of commits in
+  the push) then inspect `git diff --name-only` against the base SHA.
+
+  Alternatively, use the `dorny/paths-filter` action, which performs its own diff and
+  sets output variables that job steps can gate on.
+
+  For large repository migrations: accept that CI will run once on the bulk push and
+  use a concurrency group with `cancel-in-progress: true` so that any subsequent
+  normal push immediately supersedes it.
+fix_code:
+  - language: yaml
+    label: 'Runtime paths gate using dorny/paths-filter to compensate for the 1,000-commit bypass'
+    code: |
+      on:
+        push:
+          branches: [main]
+          paths:
+            - 'src/server/**'   # Note: this filter is bypassed for 1000+ commit pushes
+
+      jobs:
+        backend-ci:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                fetch-depth: 2   # Need at least 2 commits for diff
+
+            # Runtime gate: re-check paths even when the trigger-level filter was bypassed
+            - uses: dorny/paths-filter@v3
+              id: changed
+              with:
+                filters: |
+                  server:
+                    - 'src/server/**'
+
+            - name: Run backend tests
+              if: steps.changed.outputs.server == 'true'
+              run: npm run test:server
+  - language: yaml
+    label: 'Manual git diff gate for when the paths filter is bypassed on large pushes'
+    code: |
+      on:
+        push:
+          branches: [main]
+          paths: ['src/**']
+
+      jobs:
+        ci:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                fetch-depth: 0
+
+            - name: Check if src/ actually changed
+              id: src-check
+              run: |
+                # Compare against the commit before this push
+                BASE=${{ github.event.before }}
+                HEAD=${{ github.sha }}
+                if [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+                  echo "changed=true" >> $GITHUB_OUTPUT  # New branch — always run
+                else
+                  CHANGED=$(git diff --name-only "$BASE" "$HEAD" -- 'src/' | wc -l)
+                  echo "changed=$([ "$CHANGED" -gt 0 ] && echo true || echo false)" >> $GITHUB_OUTPUT
+                fi
+
+            - name: Run CI
+              if: steps.src-check.outputs.changed == 'true'
+              run: make ci
+prevention:
+  - 'Be aware that `on.push.paths:` is not evaluated for pushes with 1,000+ commits or when GitHub cannot compute a diff — the workflow will always run in those cases.'
+  - 'For CI workflows where skipping is correctness-critical (e.g., cost-sensitive deployments), add a dorny/paths-filter runtime step as a secondary gate inside the job.'
+  - 'During large repository migrations (bulk history imports), expect all path-filtered push workflows to fire once. Use concurrency groups to ensure subsequent normal pushes supersede the migration run.'
+  - 'Document this limitation in your workflow file with a comment near the `paths:` filter so future maintainers are not surprised when the workflow runs on a bulk push.'
+docs:
+  - url: 'https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#onpushpull_requestpull_request_targetpathspaths-ignore'
+    label: 'GitHub Docs: on.push.paths — note on 1,000+ commit bypass'
+  - url: 'https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#push'
+    label: 'GitHub Docs: push event — behavior with large pushes'
+  - url: 'https://github.com/dorny/paths-filter'
+    label: 'dorny/paths-filter — runtime file change detection inside workflow jobs'
+  - url: 'https://github.com/orgs/community/discussions/25702'
+    label: 'GitHub Community: paths filter not working for force-push with many commits'
