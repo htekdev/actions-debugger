@@ -1,0 +1,104 @@
+id: concurrency-timing-084
+title: 'Force-cancel REST API returns 500 on a workflow run stuck in a concurrency queue — run permanently blocks the group slot'
+category: concurrency-timing
+severity: error
+tags:
+  - force-cancel
+  - concurrency
+  - rest-api
+  - stuck-run
+  - 500-error
+  - queue-blocked
+  - workflow-run-api
+patterns:
+  - regex: 'Failed to cancel workflow run|force.cancel.*500|force_cancel.*500'
+    flags: 'i'
+  - regex: '"message":\s*"Failed to cancel workflow run"'
+    flags: 'i'
+  - regex: 'force-cancel.*workflow.*run.*error|workflow.*stuck.*concurren.*cannot.*cancel'
+    flags: 'i'
+error_messages:
+  - '{"message":"Failed to cancel workflow run","documentation_url":"https://docs.github.com/rest/actions/workflow-runs#force-cancel-a-workflow-run","status":"500"}'
+  - 'HTTP 500: Failed to cancel workflow run'
+root_cause: |
+  When a workflow run is stuck in a concurrency queue (status: `queued` or
+  `waiting` while holding a concurrency slot), the GitHub REST API endpoint
+  `POST /repos/{owner}/{repo}/actions/runs/{run_id}/force-cancel` can return
+  HTTP 500 with the body `{"message":"Failed to cancel workflow run","status":"500"}`.
+
+  This happens because the force-cancel endpoint attempts to transition the run
+  through internal broker state. When the run is in a partially-initialized state
+  (registered in the concurrency queue but not yet fully dispatched to a runner),
+  the backend state machine encounters an inconsistency and returns a server error
+  instead of cleanly canceling the run.
+
+  The result is that:
+  1. The workflow run remains in `queued` or `waiting` state indefinitely.
+  2. The concurrency slot remains occupied, blocking all subsequent runs in the
+     same concurrency group.
+  3. Retrying the force-cancel endpoint returns the same 500 error.
+  4. The normal Cancel (non-force) endpoint (`POST .../cancel`) also fails because
+     the run is not in a state it can cleanly exit.
+
+  This was documented in actions/runner#3329 (Jun 2024) and affects both hosted and
+  self-hosted runner workflows when the runner becomes unavailable while a run holds
+  a concurrency slot.
+fix: |
+  **Workaround — delete the workflow run directly:**
+  The `DELETE /repos/{owner}/{repo}/actions/runs/{run_id}` endpoint removes the run
+  record entirely, freeing the concurrency slot regardless of run state. This is more
+  aggressive than cancellation but is the only reliable way to unblock the queue when
+  force-cancel returns 500.
+
+  After deleting the stuck run, verify that subsequent queued runs proceed normally.
+
+  **If the run cannot be deleted** (e.g., it is required for branch protection), use
+  the GitHub UI: navigate to the workflow run, click "Cancel workflow" via the
+  three-dot menu. In some cases the UI path bypasses the state-machine check that
+  causes the API 500.
+
+  **Prevention:** Set `timeout-minutes` on jobs to guarantee runs are forcibly
+  terminated by the runner after a maximum duration, preventing runs from stalling
+  in a half-initialized state indefinitely.
+fix_code:
+  - language: yaml
+    label: 'Delete stuck run via REST API to free the concurrency slot'
+    code: |
+      # Step 1: Identify the stuck run ID from the concurrency group
+      gh api /repos/{owner}/{repo}/actions/runs \
+        --jq '.workflow_runs[] | select(.status == "queued" or .status == "waiting") | {id, status, created_at}'
+
+      # Step 2: Attempt force-cancel (may return 500 for stuck runs)
+      gh api --method POST \
+        /repos/{owner}/{repo}/actions/runs/{run_id}/force-cancel
+
+      # Step 3: If force-cancel returns 500, delete the run entirely to free the slot
+      gh api --method DELETE \
+        /repos/{owner}/{repo}/actions/runs/{run_id}
+  - language: yaml
+    label: 'Add timeout-minutes to prevent runs from stalling indefinitely in the queue'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          timeout-minutes: 30   # Force-kill after 30 minutes — prevents infinite queue blocks
+          concurrency:
+            group: ${{ github.workflow }}-${{ github.ref }}
+            cancel-in-progress: true
+          steps:
+            - uses: actions/checkout@v4
+            - run: make build
+prevention:
+  - 'Always set `timeout-minutes` on jobs that use concurrency groups — this ensures the runner forcibly terminates stalled runs before the concurrency slot is permanently held.'
+  - 'When force-cancel returns HTTP 500, use `DELETE /repos/{owner}/{repo}/actions/runs/{run_id}` to remove the stuck run and free the concurrency slot.'
+  - 'Monitor concurrency slot occupancy in long-running pipelines; add alerting when a run stays in `queued` or `waiting` state beyond your expected maximum job duration.'
+  - 'Upgrade self-hosted runners to the latest version — broker state-machine improvements in runner v2.316.0+ reduce the frequency of this 500 condition.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/3329'
+    label: 'actions/runner #3329: force-cancel returns 500 on hanging workflow with concurrency (5 reactions)'
+  - url: 'https://docs.github.com/en/rest/actions/workflow-runs#force-cancel-a-workflow-run'
+    label: 'GitHub REST API: Force-cancel a workflow run'
+  - url: 'https://docs.github.com/en/rest/actions/workflow-runs#delete-a-workflow-run'
+    label: 'GitHub REST API: Delete a workflow run — use to free a stuck concurrency slot'
+  - url: 'https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#jobjob_idtimeout-minutes'
+    label: 'GitHub Docs: jobs.<job_id>.timeout-minutes'
