@@ -1,0 +1,123 @@
+id: yaml-syntax-094
+title: '$GITHUB_OUTPUT / $GITHUB_ENV Multiline Heredoc Fails — Missing Trailing Newline Prevents EOF Delimiter Detection'
+category: yaml-syntax
+severity: error
+tags:
+  - GITHUB_OUTPUT
+  - GITHUB_ENV
+  - heredoc
+  - multiline
+  - EOF
+  - environment-files
+  - file-command
+patterns:
+  - regex: 'Unable to process file command .output. successfully'
+    flags: 'i'
+  - regex: 'Invalid value\. Matching delimiter not found'
+    flags: 'i'
+  - regex: 'echo\s+["\w]*<<EOF.*>>\s*\$GITHUB_OUTPUT'
+    flags: 'i'
+  - regex: 'cat\s+\S+\s*>>\s*\$GITHUB_OUTPUT'
+    flags: 'i'
+error_messages:
+  - "##[error]Unable to process file command 'output' successfully."
+  - "##[error]Invalid value. Matching delimiter not found 'EOF'."
+  - "##[error]Unable to process file command 'env' successfully."
+  - "##[error]Invalid value. Matching delimiter not found 'EOF'."
+root_cause: |
+  GitHub Actions environment-file commands ($GITHUB_OUTPUT, $GITHUB_ENV,
+  $GITHUB_STEP_SUMMARY) use a heredoc-style syntax for multiline values where the
+  closing delimiter must appear on its own line with no trailing content:
+
+    echo "name<<EOF" >> $GITHUB_OUTPUT
+    <content>
+    EOF
+
+  When the content is written with `cat` (or any tool that does not append a newline)
+  and the content does not end with a newline character, the closing `echo "EOF"` is
+  concatenated onto the same line as the last byte of content. The result in the file
+  is "last-content-lineEOF" — the parser scans each line for a line that equals exactly
+  "EOF" but finds none, so it raises:
+
+    ##[error]Unable to process file command 'output' successfully.
+    ##[error]Invalid value. Matching delimiter not found 'EOF'.
+
+  The step exits non-zero and all downstream steps that use the output receive empty
+  values.
+
+  This is distinct from the delimiter-collision silent failure (sf-049) where the
+  content contains the literal string "EOF" on its own line (which terminates the
+  heredoc early without an error). This issue always produces a hard step failure.
+
+  Common triggers:
+  - `cat file >> $GITHUB_OUTPUT` where the file lacks a trailing newline
+  - Commands like `git-cliff`, `jq -r`, or `awk` that may omit trailing newlines
+  - Secrets written to $GITHUB_ENV via `printf '%s'` which suppresses trailing newlines
+fix: |
+  Always guarantee a newline before the closing delimiter. The simplest fix is to
+  replace `echo "EOF"` with `printf '\nEOF\n'` — this ensures a blank line before the
+  delimiter even if the content already ended with a newline (a harmless extra blank
+  line is added in that case, but the delimiter is always found).
+
+  Alternatively, use `awk 1` instead of `cat` — it guarantees a trailing newline
+  by printing every line through awk's default print rule:
+
+    awk 1 output.txt >> $GITHUB_OUTPUT
+
+  For content from subshells or command substitution, append a newline explicitly:
+
+    echo "$output" >> $GITHUB_OUTPUT   # echo always appends \n — safe
+
+  For robust multiline output, use a unique delimiter that cannot appear in the content:
+
+    DELIMITER="__UNIQUE_$(uuidgen)__"
+    { echo "name<<${DELIMITER}"; cat output.txt; echo "${DELIMITER}"; } >> $GITHUB_OUTPUT
+fix_code:
+  - language: yaml
+    label: 'Broken: cat without trailing newline glues EOF to last content line'
+    code: |
+      - name: Write changelog (broken)
+        run: |
+          echo "content<<EOF" >> $GITHUB_OUTPUT
+          cat CHANGELOG.md >> $GITHUB_OUTPUT   # CHANGELOG.md may lack trailing \n
+          echo "EOF" >> $GITHUB_OUTPUT          # → becomes "last-lineEOF", not found
+  - language: yaml
+    label: 'Fixed: printf ensures newline before delimiter (recommended)'
+    code: |
+      - name: Write changelog (fixed with printf)
+        run: |
+          echo "content<<EOF" >> $GITHUB_OUTPUT
+          cat CHANGELOG.md >> $GITHUB_OUTPUT
+          printf '\nEOF\n' >> $GITHUB_OUTPUT    # ← guaranteed newline before EOF
+  - language: yaml
+    label: 'Fixed: awk 1 guarantees trailing newline on output'
+    code: |
+      - name: Write changelog (fixed with awk)
+        run: |
+          echo "content<<EOF" >> $GITHUB_OUTPUT
+          awk 1 CHANGELOG.md >> $GITHUB_OUTPUT  # awk always ends output with \n
+          echo "EOF" >> $GITHUB_OUTPUT
+  - language: yaml
+    label: 'Robust: unique UUID delimiter avoids both EOF collision and missing newline'
+    code: |
+      - name: Write output (unique delimiter)
+        run: |
+          DELIM="__OUTPUT_$(uuidgen)__"
+          {
+            echo "content<<${DELIM}"
+            cat CHANGELOG.md
+            echo "${DELIM}"
+          } >> $GITHUB_OUTPUT
+prevention:
+  - 'Never use bare `echo "EOF"` after `cat file >> $GITHUB_OUTPUT` without first guaranteeing the file ends with a newline.'
+  - 'Prefer `awk 1 file >> $GITHUB_OUTPUT` over `cat file >> $GITHUB_OUTPUT` for multiline step outputs.'
+  - 'Use `printf '\''\nEOF\n'\'' >> $GITHUB_OUTPUT` as the closing line instead of `echo "EOF"` for defensive coding.'
+  - 'For secrets or external content of unknown format, use a UUID-based delimiter to eliminate both trailing-newline and delimiter-collision risks.'
+  - 'Run workflows in both newline-terminated and non-newline-terminated content scenarios during action development.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions#multiline-strings'
+    label: 'GitHub Docs: Workflow commands — multiline strings'
+  - url: 'https://github.com/orhun/git-cliff-action/pull/81'
+    label: 'orhun/git-cliff-action#81 — fix: always terminate content output with a newline'
+  - url: 'https://github.com/google-github-actions/run-gemini-cli/issues/490'
+    label: 'google-github-actions/run-gemini-cli#490 — EOF heredoc delimiter issues in GITHUB_OUTPUT'
