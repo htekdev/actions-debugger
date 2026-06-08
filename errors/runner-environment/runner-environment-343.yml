@@ -1,0 +1,91 @@
+id: runner-environment-343
+title: 'ARC Kubernetes Mode: Service Containers Using Same Docker Image Create Duplicate Pod Container Names'
+category: runner-environment
+severity: error
+tags:
+  - arc
+  - kubernetes
+  - service-containers
+  - actions-runner-controller
+  - runner-container-hooks
+  - pod-spec
+  - duplicate-container-name
+patterns:
+  - regex: 'failed to create job pod.*Duplicate value'
+    flags: 'i'
+  - regex: 'spec\.containers\[\d+\]\.name: Duplicate value:'
+    flags: 'i'
+  - regex: 'Pod.*is invalid.*spec\.containers.*Duplicate value'
+    flags: 'i'
+error_messages:
+  - 'Error: failed to create job pod: Pod "arc-runner-xxxx-workflow" is invalid: spec.containers[2].name: Duplicate value: "redis"'
+  - 'Error: failed to create job pod: Pod "self-hosted-runner-workflow" is invalid: [spec.containers[3].name: Duplicate value: "redis-cluster", spec.containers[4].name: Duplicate value: "redis-cluster"]'
+root_cause: |
+  When using ARC (actions-runner-controller) in Kubernetes mode via `runner-container-hooks`,
+  the hooks layer derives Kubernetes container names from the service container image or
+  computed label values. When two or more `services:` entries share the same base Docker image
+  (e.g., two `redis` containers, or multiple services built on `ubuntu`), the derived container
+  names collide.
+
+  Kubernetes validates pod specs and rejects pods where `spec.containers[N].name` is a
+  duplicate — the API server returns a 422 validation error containing "Duplicate value: <name>".
+  The workflow job never starts; it fails immediately with the pod creation error.
+
+  This was tracked in `actions/actions-runner-controller#4294` (multiple users hitting this on
+  scale-set runners in 2025) and root-caused in `actions/runner-container-hooks#241`. The fix
+  was implemented in `runner-container-hooks` PR #308, which introduces an index-suffix strategy
+  (e.g., `redis-0`, `redis-1`) when naming conflicts are detected.
+fix: |
+  **Option 1 (recommended)**: Update `actions/runner-container-hooks` to v0.7.0 or later, which
+  includes the fix from PR #308 and automatically generates unique container names using index
+  suffixes.
+
+  **Option 2**: Ensure each service container uses a distinct image or a distinct image tag that
+  results in a different derived name. Using explicit container names via the `options:` field is
+  not sufficient — the hooks layer derives names from the image, not the service key.
+
+  **Option 3**: Restructure the workflow to avoid running multiple service containers that share
+  the same base image in the same job.
+fix_code:
+  - language: yaml
+    label: 'Upgrade runner-container-hooks in ARC HelmChart values to v0.7.0+'
+    code: |
+      # In your ARC scale-set HelmChart values.yaml, pin to a hooks version
+      # that includes the duplicate-name fix (PR #308):
+      githubConfigSecret: arc-controller-manager
+      containerMode:
+        type: "kubernetes"
+        kubernetesModeServiceAccountName: arc-runner-set
+        # The fix is bundled in the runner image — update your runner image:
+      template:
+        spec:
+          containers:
+            - name: runner
+              image: ghcr.io/actions/actions-runner:latest  # ensure v2.323.0+ for hooks v0.7.0+
+  - language: yaml
+    label: 'Workaround: use distinct images for service containers with same software'
+    code: |
+      jobs:
+        test:
+          runs-on: arc-runner-set
+          services:
+            redis-primary:
+              image: redis:7.2-alpine   # distinct tag → unique derived name
+            redis-replica:
+              image: redis:7.0-alpine   # different tag → different derived name
+          steps:
+            - run: echo "Services started"
+prevention:
+  - 'Avoid using the same Docker image for multiple service containers in the same job when running on ARC in Kubernetes mode.'
+  - 'Pin `runner-container-hooks` to v0.7.0+ to get automatic index-suffix deduplication.'
+  - 'When adding a second service container of the same type (e.g., two Redis instances), use different image tags or base images.'
+  - 'Monitor the `actions/runner-container-hooks` release notes for fixes relevant to Kubernetes pod spec validation.'
+docs:
+  - url: 'https://github.com/actions/actions-runner-controller/issues/4294'
+    label: 'actions/actions-runner-controller#4294 — Duplicate container names with same-image services'
+  - url: 'https://github.com/actions/runner-container-hooks/issues/241'
+    label: 'actions/runner-container-hooks#241 — Root cause tracking'
+  - url: 'https://github.com/actions/runner-container-hooks/pull/308'
+    label: 'actions/runner-container-hooks PR #308 — Fix: index-suffix naming strategy'
+  - url: 'https://docs.github.com/en/actions/using-containerized-services/about-service-containers'
+    label: 'GitHub Docs: About service containers'

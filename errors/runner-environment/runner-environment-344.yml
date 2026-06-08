@@ -1,0 +1,110 @@
+id: runner-environment-344
+title: 'sparse-checkout Cone Mode With Shallow Fetch Fails: "Server does not allow request for unadvertised object"'
+category: runner-environment
+severity: error
+tags:
+  - checkout
+  - sparse-checkout
+  - cone-mode
+  - git
+  - fetch-depth
+  - fetch-tags
+  - unadvertised-object
+  - partial-clone
+patterns:
+  - regex: 'Server does not allow request for unadvertised object'
+    flags: 'i'
+  - regex: 'error:.*unadvertised object'
+    flags: 'i'
+  - regex: 'fatal:.*unadvertised.*object|unadvertised.*fatal:'
+    flags: 'i'
+error_messages:
+  - "error: Server does not allow request for unadvertised object"
+  - "fatal: Server does not allow request for unadvertised object <sha>"
+  - "error: Server does not allow request for unadvertised object. Please make sure you have the correct access rights and the repository exists."
+root_cause: |
+  When `actions/checkout` uses `sparse-checkout` in cone mode combined with certain fetch
+  configurations, git may attempt to fetch a specific commit SHA or object that the Git server
+  has not advertised in its initial ref list.
+
+  The Git `upload-pack` protocol only allows clients to request objects that were explicitly
+  advertised by the server in the initial `ls-refs` handshake. When sparse-checkout uses
+  cone mode alongside `fetch-depth:` (shallow clone) or `fetch-tags: true`, git can request
+  additional refs or tag-dereferenced commits that fall outside the set of advertised objects.
+  The server rejects the request with "Server does not allow request for unadvertised object".
+
+  Common triggers:
+  1. `sparse-checkout` enabled with `fetch-tags: true` — tag peel operations request tag-commit
+     SHAs that may not be advertised when combined with shallow clones.
+  2. `sparse-checkout` cone mode with `fetch-depth: 1` on repos with complex tag structures
+     (annotated tags pointing to commits not reachable from the shallow fetch boundary).
+  3. Using `ref:` to check out a specific commit SHA that falls outside the shallow history
+     when sparse-checkout changes the default fetch refspec.
+
+  Tracked in actions/checkout#1611.
+fix: |
+  **Option 1 (most common fix)**: Disable `fetch-tags` when using sparse-checkout:
+  ```yaml
+  - uses: actions/checkout@v4
+    with:
+      sparse-checkout: |
+        src/
+        tests/
+      fetch-tags: false   # add this
+  ```
+
+  **Option 2**: Remove `fetch-depth` (use full history) when using sparse-checkout with tags:
+  ```yaml
+  - uses: actions/checkout@v4
+    with:
+      sparse-checkout: src/
+      fetch-depth: 0      # full history avoids shallow boundary issues
+      fetch-tags: false
+  ```
+
+  **Option 3**: If sparse-checkout is not strictly required, remove it and use post-checkout
+  path filtering instead.
+fix_code:
+  - language: yaml
+    label: 'Disable fetch-tags when using sparse-checkout (most common fix)'
+    code: |
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            src/
+            docs/
+          sparse-checkout-cone-mode: true
+          fetch-depth: 1
+          fetch-tags: false   # prevents tag-peel SHAs from being requested unadvertised
+  - language: yaml
+    label: 'Use full fetch depth to avoid shallow boundary conflicts with sparse-checkout'
+    code: |
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            src/
+          sparse-checkout-cone-mode: true
+          fetch-depth: 0      # full history; more data but avoids unadvertised-object errors
+          fetch-tags: false
+  - language: yaml
+    label: 'Remove sparse-checkout and filter post-checkout instead'
+    code: |
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      # Then limit subsequent steps to the relevant paths:
+      - name: Build (only src/)
+        run: |
+          cd src && make build
+prevention:
+  - 'Avoid combining `sparse-checkout` with `fetch-tags: true` — tag peel operations can request unadvertised object SHAs.'
+  - 'When using `sparse-checkout` with `fetch-depth: 1`, test on repos with annotated tags, which are the most common trigger.'
+  - 'If CI needs git tags for versioning, fetch them in a separate dedicated step using `git fetch --tags` after checkout rather than relying on `fetch-tags: true`.'
+  - 'Prefer `sparse-checkout-cone-mode: true` (default) and keep `fetch-tags: false` for best compatibility.'
+docs:
+  - url: 'https://github.com/actions/checkout/issues/1611'
+    label: 'actions/checkout#1611 — sparse-checkout and unadvertised object error'
+  - url: 'https://github.com/actions/checkout#usage'
+    label: 'actions/checkout README — sparse-checkout inputs'
+  - url: 'https://git-scm.com/docs/git-upload-pack'
+    label: 'git-upload-pack — server-side pack protocol'
