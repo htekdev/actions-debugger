@@ -1,0 +1,105 @@
+id: silent-failures-163
+title: 'actions/cache/save CreateCacheEntry Timeout Reports Warning but Exits Success, Soft-Locks Cache Key'
+category: silent-failures
+severity: silent-failure
+tags:
+  - actions/cache
+  - cache-save
+  - timeout
+  - silent-success
+  - soft-lock
+  - CreateCacheEntry
+patterns:
+  - regex: 'Attempt \d+ of \d+ failed with error: Request timeout.*CreateCacheEntry'
+    flags: 'i'
+  - regex: 'Warning: Cache save failed\.'
+    flags: 'i'
+  - regex: 'Failed to save: Unable to reserve cache with key.*another job may be creating'
+    flags: 'i'
+error_messages:
+  - 'Attempt 1 of 5 failed with error: Request timeout: /twirp/github.actions.results.api.v1.CacheService/CreateCacheEntry. Retrying request in 3000 ms...'
+  - 'Failed to save: Unable to reserve cache with key Linux-build-workspace-930, another job may be creating this cache.'
+  - 'Warning: Cache save failed.'
+root_cause: |
+  `actions/cache/save` (and the cache post-step in `actions/cache`) is deliberately designed to
+  NOT fail the job on cache save errors — it emits a warning and exits with code 0. This means
+  the step conclusion is always "success" even when the cache was not saved.
+
+  When the `CreateCacheEntry` RPC call times out (usually due to transient GitHub cache service
+  overload), the action retries 5 times. If all 5 attempts fail, it logs:
+
+    "Attempt N of 5 failed with error: Request timeout: /twirp/...CacheService/CreateCacheEntry"
+    "Failed to save: Unable to reserve cache with key <key>, another job may be creating this cache."
+    "Warning: Cache save failed."
+
+  and then exits with code 0. The workflow job succeeds. Developers do not see a red step.
+
+  A critical secondary effect: a timed-out `CreateCacheEntry` call may have created a partial
+  reservation on the server side before the timeout. This partial reservation SOFT-LOCKS the
+  cache key — subsequent runs see "another job may be creating this cache" and cannot write to
+  that key, even though no usable cache was ever saved. The lock can persist across many runs,
+  effectively preventing any caching under that key until the reservation expires or is manually
+  deleted.
+
+  This caused a production outage reported in July 2025 where a pipeline lost cache coverage
+  for hours after a single timeout event.
+
+  Source: actions/cache#1581 (Mar 2025, ongoing); actions/cache#1625 (Jul 2025).
+
+  Distinct from caching-artifacts-109 (ca-109), which covers "Unable to reserve cache" when
+  an exact key was SUCCESSFULLY saved in a PRIOR run (first-write-wins). This entry covers the
+  TIMEOUT path where the save FAILS but the step still exits 0, and the failed partial
+  reservation persists as a soft-lock.
+fix: |
+  There is no built-in option to make `actions/cache/save` fail the job on save errors.
+  Workarounds:
+
+  1. Append `${{ github.run_attempt }}` to the cache key. If a timeout soft-locks a key, the
+     next re-run uses a new unique key and bypasses the locked slot.
+
+  2. Manually delete the soft-locked cache key via the GitHub REST API or the repository
+     Settings → Actions → Caches UI, then re-run the workflow.
+
+  3. For pipelines where a missed cache save is critical, add a post-step that checks
+     whether the cache was populated by querying the cache API:
+       gh api /repos/{owner}/{repo}/actions/caches?key=<key>
+
+  4. Track actions/cache#1625 for an upstream `fail-on-cache-save-error` option.
+fix_code:
+  - language: yaml
+    label: 'Workaround — append run_attempt to bypass soft-locked key on retry'
+    code: |
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          # Append run_attempt: if a timeout soft-locks the exact key,
+          # the next retry uses a new key and bypasses the locked slot.
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}-attempt${{ github.run_attempt }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}-
+            ${{ runner.os }}-node-
+  - language: yaml
+    label: 'Manual cleanup — delete a soft-locked cache key via gh CLI'
+    code: |
+      # Run manually in a one-off workflow or debug step to clear a soft-locked key.
+      - name: Delete soft-locked cache key
+        run: |
+          gh api \
+            -X DELETE \
+            "/repos/${{ github.repository }}/actions/caches?key=Linux-node-abc123"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+prevention:
+  - 'Include content hashes and run_attempt in cache keys so that a soft-locked key from a failed save does not block the next run.'
+  - 'Never treat a green job conclusion as confirmation that the cache was saved — the cache save warning is visible only in step logs.'
+  - 'Monitor step logs for "Warning: Cache save failed." in cache-heavy pipelines; set up a Slack/webhook alert on this pattern.'
+  - 'If builds consistently show "another job may be creating this cache" with no parallel jobs running, check for a soft-locked key in the repository cache list.'
+  - 'Track actions/cache#1625 for an upstream option to fail the step on cache save error.'
+docs:
+  - url: 'https://github.com/actions/cache/issues/1581'
+    label: 'actions/cache#1581 — cache/save does not fail the step on timeout error (Mar 2025, open)'
+  - url: 'https://github.com/actions/cache/issues/1625'
+    label: 'actions/cache#1625 — Failing to save cache should not result in a successful step/job (Jul 2025)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows'
+    label: 'GitHub Docs — Caching dependencies to speed up workflows'

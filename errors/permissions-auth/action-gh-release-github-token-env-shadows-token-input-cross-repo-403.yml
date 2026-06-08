@@ -1,0 +1,86 @@
+id: permissions-auth-096
+title: 'softprops/action-gh-release v2.2.x Reads GITHUB_TOKEN Env Before Explicit token Input — Cross-Repo Release Fails 403'
+category: permissions-auth
+severity: error
+tags:
+  - softprops/action-gh-release
+  - GITHUB_TOKEN
+  - PAT
+  - cross-repo
+  - release
+  - 403
+patterns:
+  - regex: 'GitHub release failed with status: 403'
+    flags: 'i'
+  - regex: 'Resource not accessible by integration.*releases'
+    flags: 'i'
+  - regex: 'Skip retry.*your GitHub token/PAT does not have the required permission'
+    flags: 'i'
+error_messages:
+  - '⚠️ GitHub release failed with status: 403'
+  - '{"message":"Resource not accessible by integration","documentation_url":"https://docs.github.com/rest/releases/releases#create-a-release","status":"403"}'
+  - 'Skip retry — your GitHub token/PAT does not have the required permission to create a release'
+  - 'Error: Resource not accessible by integration - https://docs.github.com/rest/releases/releases#create-a-release'
+root_cause: |
+  In `softprops/action-gh-release` versions prior to v2.3.4, the action resolves the GitHub
+  token with the wrong precedence: it reads the `GITHUB_TOKEN` environment variable FIRST,
+  then falls back to the `token:` input field. This means that even when a caller explicitly
+  passes `token: ${{ secrets.MY_PAT }}` to create a release on a different repository, the
+  action silently ignores the PAT and uses the automatic `GITHUB_TOKEN` from the runner
+  environment instead.
+
+  `GITHUB_TOKEN` is scoped exclusively to the repository that triggered the workflow. It
+  cannot create releases (or any resources) in any other repository, even in the same
+  organization. The result is a 403 "Resource not accessible by integration" that confusingly
+  appears even when the PAT has full content:write permissions on the target repository.
+
+  The developer validates the PAT permissions, sees them as correct, yet the 403 persists —
+  because the action never used the PAT at all.
+
+  This affects any workflow that:
+  - Uses `with: { repository: <other-repo> }` to release to a different repo
+  - Passes `token: ${{ secrets.MY_ORG_PAT }}` expecting the action to use the PAT
+  - Is running action-gh-release v2.2.x or earlier (commit before PR#751)
+
+  Fixed in v2.3.4 via PR#751 "fix: prefer token input over GITHUB_TOKEN" (merged Mar 2026).
+  Source: softprops/action-gh-release#639 (Jul 2025).
+fix: |
+  Upgrade to `softprops/action-gh-release@v2.3.4` or later. In v2.3.4+ the action correctly
+  prefers the explicitly passed `token:` input over the `GITHUB_TOKEN` environment variable.
+
+  If upgrading is not immediately possible, a temporary workaround is to unset the GITHUB_TOKEN
+  environment variable at the step level so the action falls through to the `token:` input.
+  However, unsetting GITHUB_TOKEN may break other features of the action.
+fix_code:
+  - language: yaml
+    label: 'Fix — upgrade to v2.3.4+ which prefers the explicit token input'
+    code: |
+      - name: Create release on target repository
+        uses: softprops/action-gh-release@v2.3.4  # v2.3.4+ reads token: input first
+        with:
+          repository: my-org/my-other-repo
+          token: ${{ secrets.MY_ORG_PAT }}         # now correctly takes precedence
+          tag_name: ${{ github.ref_name }}
+          files: dist/**
+  - language: yaml
+    label: 'Workaround — unset GITHUB_TOKEN env to force fallback to token input (older versions)'
+    code: |
+      - name: Create release on target repository
+        uses: softprops/action-gh-release@v2.2.2
+        with:
+          repository: my-org/my-other-repo
+          token: ${{ secrets.MY_ORG_PAT }}
+        env:
+          GITHUB_TOKEN: ''  # unset so action falls through to token: input field
+prevention:
+  - 'Pin action-gh-release to v2.3.4 or later when creating cross-repo releases with an explicit PAT.'
+  - 'When a 403 "Resource not accessible by integration" appears despite a PAT with the correct permissions, verify which token the action actually used by checking whether GITHUB_TOKEN was also set in the environment.'
+  - 'Test cross-repo release workflows with a dry run (draft: true) before depending on them in production pipelines.'
+  - 'For cross-org releases, always use a fine-grained or classic PAT — GITHUB_TOKEN is permanently scoped to the triggering repository.'
+docs:
+  - url: 'https://github.com/softprops/action-gh-release/issues/639'
+    label: 'action-gh-release#639 — cross-repo release fails 403, action reads GITHUB_TOKEN before token input (Jul 2025)'
+  - url: 'https://github.com/softprops/action-gh-release/pull/751'
+    label: 'action-gh-release PR#751 — fix: prefer token input over GITHUB_TOKEN (merged Mar 2026)'
+  - url: 'https://docs.github.com/en/actions/security-guides/automatic-token-authentication'
+    label: 'GitHub Docs — Automatic token authentication (GITHUB_TOKEN scope limitations)'

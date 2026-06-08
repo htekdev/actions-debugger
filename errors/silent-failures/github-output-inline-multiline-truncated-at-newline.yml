@@ -1,0 +1,125 @@
+id: silent-failures-164
+title: 'GITHUB_OUTPUT Inline Multiline Value Silently Truncated at First Newline'
+category: silent-failures
+severity: silent-failure
+tags:
+  - GITHUB_OUTPUT
+  - multiline
+  - step-outputs
+  - truncation
+  - newline
+  - echo
+patterns:
+  - regex: 'echo\s+"[a-zA-Z_]+=\$\(.*\)"\s*>>\s*["\$]?\{?GITHUB_OUTPUT'
+    flags: 'i'
+  - regex: 'echo\s+[a-zA-Z_]+=\$\(.*\)\s*>>\s*["\$]?\{?GITHUB_OUTPUT'
+    flags: 'i'
+  - regex: 'printf.*>>\s*["\$]?\{?GITHUB_OUTPUT\b'
+    flags: 'i'
+error_messages:
+  - 'No such file or directory'
+  - 'cat: cannot open'
+root_cause: |
+  The `$GITHUB_OUTPUT` environment file uses a newline-delimited `key=value` format. Each
+  output entry must occupy exactly one line. When a step writes an output value that contains
+  embedded newlines using the simple inline syntax (without the `name<<EOF` heredoc form),
+  the GITHUB_OUTPUT parser reads only up to the first newline as the value. All subsequent
+  lines are treated as new `key=value` entries, not as continuation of the original value.
+
+  Common triggers:
+
+  1. Command substitution whose output spans multiple lines:
+       echo "log=$(git log --oneline -5)" >> $GITHUB_OUTPUT
+     Only the first git log line is captured; lines 2-5 are fed back as new entries.
+
+  2. printf without -n writing a trailing newline into the variable:
+       printf "msg=%s" "$(some_multiline_cmd)" >> $GITHUB_OUTPUT
+
+  3. Multi-line heredoc content piped inline into a single echo:
+       echo "content=$(cat README.md)" >> $GITHUB_OUTPUT
+
+  The result is silent truncation: the step exits 0, the output is "set", but its value
+  contains only the first line of the intended content. Downstream steps receive a partial,
+  incorrect value with no error or warning emitted. This is extremely hard to debug because
+  the step shows green and the output key exists — only its value is wrong.
+
+  If one of the extra lines happens to contain an `=` sign, it silently creates a spurious
+  output variable. If the truncated value is later used as a file path, the downstream step
+  may fail with "No such file or directory" far from the origin of the corruption.
+
+  This is distinct from yaml-syntax-094 (GITHUB_OUTPUT heredoc missing trailing newline),
+  which covers the `name<<EOF / content / EOF` heredoc path. This entry covers the simpler
+  inline case: not using heredoc at all when the value may contain newlines.
+
+  Source: github/docs#21529 (Oct 2022, ongoing); jstrieb.github.io blog "Reliable Multiline
+  String Outputs from GitHub Actions Steps" (May 2025).
+fix: |
+  Use the heredoc syntax for any output value that may contain newlines:
+
+    {
+      echo "message<<EOF"
+      git log --oneline -5
+      echo "EOF"
+    } >> $GITHUB_OUTPUT
+
+  Or serialize the multiline content to a single-line JSON string using jq, then deserialize
+  in the expression that uses it:
+
+    echo "message=$(git log --oneline -5 | jq --raw-input --slurp --compact-output .)" >> $GITHUB_OUTPUT
+
+  And in the consuming step:
+    run: |
+      jq --raw-output <<"EXPR"
+      ${{ steps.get-log.outputs.message }}
+      EXPR
+
+  If the multiline content is only needed within the same job, write it to a file instead
+  of a step output — the job's filesystem is shared across all steps.
+fix_code:
+  - language: yaml
+    label: 'Broken — inline command substitution silently truncates at first newline'
+    code: |
+      - id: get-log
+        run: |
+          # BROKEN: only the first line of git log is captured in "message"
+          echo "message=$(git log --oneline -5)" >> $GITHUB_OUTPUT
+      - run: |
+          echo "Log: ${{ steps.get-log.outputs.message }}"
+          # Only prints the first commit line; the rest are silently lost
+  - language: yaml
+    label: 'Fixed — heredoc syntax preserves all lines'
+    code: |
+      - id: get-log
+        run: |
+          {
+            echo "message<<EOF"
+            git log --oneline -5
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+      - run: |
+          echo "Log: ${{ steps.get-log.outputs.message }}"
+          # Prints all 5 commit lines
+  - language: yaml
+    label: 'Fixed — serialize to JSON for use in expressions and cross-job outputs'
+    code: |
+      - id: get-log
+        run: |
+          echo "message=$(git log --oneline -5 | jq --raw-input --slurp --compact-output .)" >> $GITHUB_OUTPUT
+      - run: |
+          # Deserialize with fromJSON in an expression, or with jq in a run step
+          jq --raw-output <<"EXPR"
+          ${{ steps.get-log.outputs.message }}
+          EXPR
+prevention:
+  - 'Never use the inline `echo "name=$(command)" >> $GITHUB_OUTPUT` form for commands that may produce multiline output — use the heredoc form instead.'
+  - 'Always use `name<<EOF / content / EOF` heredoc syntax for step outputs that may span multiple lines.'
+  - 'Validate step outputs by explicitly printing them in a debug step: `echo "output=${{ steps.id.outputs.name }}"`.'
+  - 'Serialize multiline values to compact JSON with `jq --raw-input --slurp --compact-output` when the output needs to be used in workflow expressions or passed to downstream jobs.'
+  - 'For multiline content needed only within the same job, write to a temp file rather than a step output to avoid the format limitation entirely.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions#multiline-strings'
+    label: 'GitHub Docs — Workflow commands: multiline strings (heredoc syntax required)'
+  - url: 'https://github.com/github/docs/issues/21529'
+    label: 'github/docs#21529 — Clarify how multiline output values can be set via GITHUB_OUTPUT (Oct 2022)'
+  - url: 'https://jstrieb.github.io/posts/github-actions-multiline-outputs/'
+    label: 'jstrieb.github.io — Reliable Multiline String Outputs from GitHub Actions Steps (May 2025)'
