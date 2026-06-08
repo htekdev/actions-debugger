@@ -1,0 +1,105 @@
+id: runner-environment-330
+title: 'upload-artifact Fails "Bad Request" on Self-Hosted Runner with HTTPS_PROXY — Azure BlobClient Ignores Proxy Env'
+category: runner-environment
+severity: error
+tags:
+  - upload-artifact
+  - self-hosted
+  - proxy
+  - HTTPS_PROXY
+  - azure-storage
+  - BlobClient
+  - NO_PROXY
+patterns:
+  - regex: 'Beginning upload of artifact content to blob storage'
+    flags: 'i'
+  - regex: '^Error: Bad Request$'
+    flags: 'im'
+  - regex: 'upload.*artifact.*Error: Bad Request|Error: Bad Request.*upload.*artifact'
+    flags: 'is'
+  - regex: 'Uploaded bytes \d+\s*$'
+    flags: 'im'
+error_messages:
+  - 'Beginning upload of artifact content to blob storage'
+  - 'Error: Bad Request'
+  - 'Uploading artifact: <name>.zip'
+root_cause: |
+  On self-hosted runners configured with `HTTPS_PROXY`, `actions/upload-artifact` (all
+  versions that use `@azure/storage-blob`) fails with `Error: Bad Request` immediately
+  after the blob upload phase begins. The `@actions/artifact` package creates an Azure
+  `BlobClient` using only the upload URL:
+
+    const blobClient = new BlobClient(authenticatedUploadURL)
+    const blockBlobClient = blobClient.getBlockBlobClient()
+
+  No `StoragePipelineOptions` with proxy configuration are passed. The `@azure/storage-blob`
+  SDK builds its own internal HTTP pipeline that does NOT inherit the system `HTTPS_PROXY`
+  environment variable for upload data traffic. When the runner proxy intercepts the CONNECT
+  tunnel for `*.blob.core.windows.net:443`, the tunnel establishment succeeds (HTTP 200)
+  but the subsequent PUT data stream is blocked or rejected by the proxy:
+
+  - Upload stalls for 60-75 seconds (proxy timeout)
+  - Proxy returns HTTP 400/Bad Request to the SDK
+  - Step fails with `Error: Bad Request` and no uploaded bytes (or partial bytes only)
+
+  Proxy logs confirm: CONNECT tunnel succeeds in <1 second, but the TLS data upload hangs
+  until the proxy kills the connection. Curl and Python uploads to the same blob endpoint
+  through the same proxy succeed in under 1 second — the issue is specific to the Azure
+  SDK pipeline instantiation without proxy transport.
+
+  This is distinct from runner-environment-208 (upload-artifact v6 CONNECT header leak
+  on strict proxies): that issue involves the CONNECT request itself being rejected by
+  the proxy; this issue involves the CONNECT tunnel succeeding but data transfer failing.
+
+  Root cause tracked in actions/toolkit#2377 (open Apr 2026) and actions/runner#4351
+  (step log/summary uploads stall under the same conditions).
+fix: |
+  Primary fix: Add `.blob.core.windows.net` to the `NO_PROXY` environment variable.
+  This bypasses the proxy for Azure Blob Storage traffic, allowing direct TLS connections.
+  Azure Blob Storage is already end-to-end TLS-encrypted; routing through an HTTPS proxy
+  adds no security benefit and breaks the Azure SDK's upload pipeline.
+
+  Set at the runner host level (persistent, applies to all jobs):
+    echo 'NO_PROXY=.blob.core.windows.net' >> /etc/environment
+    # or in the runner's .env file:
+    # NO_PROXY=.blob.core.windows.net
+
+  Or per-workflow step (job-scoped only):
+    env:
+      NO_PROXY: .blob.core.windows.net
+
+  Note: This fix also resolves the related step log/summary upload stall described in
+  actions/runner#4351, as both share the same BlobClient-without-proxy root cause.
+fix_code:
+  - language: yaml
+    label: 'Fix — set NO_PROXY for upload-artifact step'
+    code: |
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v8
+        env:
+          NO_PROXY: .blob.core.windows.net   # bypass proxy for Azure Blob; no inspection needed
+        with:
+          name: build-output
+          path: dist/
+  - language: yaml
+    label: 'Runner-level fix — set NO_PROXY in runner .env file'
+    code: |
+      # In the self-hosted runner directory, edit .env (create if missing):
+      #
+      #   HTTPS_PROXY=http://proxy.corp.example.com:8080
+      #   NO_PROXY=.blob.core.windows.net,.actions.githubusercontent.com
+      #
+      # Restart the runner service after editing.
+      # This applies to ALL jobs on the runner, not just upload-artifact.
+prevention:
+  - 'When configuring a self-hosted runner behind a corporate proxy, always set `NO_PROXY=.blob.core.windows.net` in the runner environment from the start.'
+  - 'If upload-artifact fails immediately after "Beginning upload of artifact content to blob storage" with no byte count, suspect proxy interference before investigating artifact content.'
+  - 'Audit HTTPS_PROXY and NO_PROXY settings on all self-hosted runners during initial setup and after any network policy changes.'
+  - 'Set `NO_PROXY` to include both `.blob.core.windows.net` and `.actions.githubusercontent.com` to cover all GitHub Actions artifact and log upload traffic.'
+docs:
+  - url: 'https://github.com/actions/toolkit/issues/2377'
+    label: 'actions/toolkit#2377 — BlobClient upload fails "Bad Request" through HTTPS proxy (open Apr 2026)'
+  - url: 'https://github.com/actions/runner/issues/4351'
+    label: 'actions/runner#4351 — Runner step log/summary uploads stall through HTTPS proxy (same root cause)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/using-a-proxy-server-with-self-hosted-runners'
+    label: 'GitHub Docs — Using a proxy server with self-hosted runners'
