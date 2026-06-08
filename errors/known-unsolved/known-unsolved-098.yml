@@ -1,0 +1,145 @@
+id: known-unsolved-098
+title: 'Clicking "Re-run" in the GitHub UI or via REST API does NOT fire `workflow_run.requested` — downstream re-trigger chains are silently broken'
+category: known-unsolved
+severity: limitation
+tags:
+  - workflow_run
+  - rerun
+  - re-run
+  - requested
+  - downstream
+  - limitation
+  - known-bug
+patterns:
+  - regex: 'workflow_run'
+    flags: 'i'
+  - regex: 'types.*requested'
+    flags: 'i'
+error_messages: []
+root_cause: |
+  When a developer clicks "Re-run all jobs" or "Re-run failed jobs" in the GitHub
+  Actions UI, or calls the REST API endpoint
+  `POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun`, GitHub creates a new
+  run attempt for that workflow. However, this rerun operation does NOT emit a
+  new `workflow_run.requested` event.
+
+  The event sequence for a normal first-run:
+    1. workflow_run:requested → downstream triggered
+    2. workflow_run:completed → downstream triggered (with conclusion)
+
+  The event sequence for a rerun:
+    1. (no workflow_run:requested event — MISSING)
+    2. workflow_run:completed → downstream triggered (with conclusion)
+
+  This means any downstream workflow configured with:
+    on:
+      workflow_run:
+        workflows: ["CI"]
+        types: [requested]
+  will never fire for reruns. Only `types: [completed]` subscribers receive
+  the rerun's conclusion.
+
+  Additionally, there is a subtler impact: if downstream workflows rely on
+  `github.event.workflow_run.run_attempt > 1` to detect reruns, they can
+  only detect this via the `completed` event — not `requested`. Logic that
+  starts work when a workflow is "requested" (e.g., posting a "pending" status
+  check, reserving a resource, sending a notification) is silently skipped
+  on reruns.
+
+  This behavior has been reported and confirmed since September 2020 in
+  actions/runner#726. As of June 2026 it remains unfixed. The GitHub team
+  has acknowledged the issue but it is not listed on any public roadmap.
+
+  This is distinct from the `workflow-rerun-uses-original-event-payload.yml`
+  entry (known-unsolved-087), which covers stale event payload data on reruns;
+  this entry covers the missing `workflow_run.requested` event entirely.
+fix: |
+  There is no workaround that fully restores `workflow_run.requested` semantics
+  for reruns. Partial mitigations:
+
+  1. **Use `types: [completed]` only** — downstream workflows respond to the
+     completed conclusion regardless of whether it was a first run or rerun.
+     Use `github.event.workflow_run.run_attempt` to detect reruns if needed.
+
+  2. **Use `repository_dispatch`** — have the upstream workflow explicitly fire
+     a `repository_dispatch` event with a custom `event_type` at workflow start.
+     This gives full control over what constitutes a "requested" trigger, and
+     works on reruns because the step runs again.
+
+  3. **Accept the limitation** — if downstream "requested" logic is idempotent
+     (e.g., creating/updating a pending status check), consider whether the
+     impact of a missing re-trigger is acceptable. Required status checks updated
+     by `types: [completed]` will still work.
+fix_code:
+  - language: yaml
+    label: 'Pattern that silently misses reruns — types: [requested]'
+    code: |
+      # ❌ LIMITATION: downstream workflow ONLY fires on first run, not reruns
+      on:
+        workflow_run:
+          workflows: ['CI']
+          types: [requested]   # Re-run clicks do NOT generate this event
+      jobs:
+        start-notification:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "CI started — post pending status"  # Skipped on reruns
+  - language: yaml
+    label: 'Workaround — use types: [completed] + run_attempt to handle reruns'
+    code: |
+      # ✅ WORKAROUND: respond to completed event; use run_attempt to detect reruns
+      on:
+        workflow_run:
+          workflows: ['CI']
+          types: [completed]   # Fires for first run AND reruns
+      jobs:
+        handle-result:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Check if this is a rerun
+              run: |
+                echo "Run attempt: ${{ github.event.workflow_run.run_attempt }}"
+                if [[ "${{ github.event.workflow_run.run_attempt }}" -gt 1 ]]; then
+                  echo "This is a rerun — adjust logic accordingly"
+                fi
+            - name: Handle conclusion
+              if: ${{ github.event.workflow_run.conclusion == 'success' }}
+              run: echo "CI passed — deploy"
+  - language: yaml
+    label: 'Workaround — use repository_dispatch instead of workflow_run requested'
+    code: |
+      # ✅ WORKAROUND: upstream workflow fires repository_dispatch at start
+      # In upstream CI workflow (.github/workflows/ci.yml):
+      jobs:
+        notify-start:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Fire start event (works on reruns too)
+              uses: peter-evans/repository-dispatch@v3
+              with:
+                token: ${{ secrets.PAT }}
+                event-type: ci-started
+                client-payload: '{"run_id": "${{ github.run_id }}", "run_attempt": "${{ github.run_attempt }}"}'
+
+      ---
+      # In downstream notification workflow:
+      on:
+        repository_dispatch:
+          types: [ci-started]
+      jobs:
+        start-notification:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "CI started (run ${{ github.event.client_payload.run_id }}, attempt ${{ github.event.client_payload.run_attempt }})"
+prevention:
+  - 'Avoid depending on `workflow_run` `types: [requested]` for workflows that are frequently re-run; use `types: [completed]` or `repository_dispatch` instead.'
+  - 'If you use `types: [requested]` to post a pending status check, test your workflow by triggering a re-run and verifying the status check updates as expected.'
+  - 'Use `github.event.workflow_run.run_attempt` (available on the `completed` event) to distinguish first runs from reruns when downstream logic differs.'
+  - 'Document this limitation in team runbooks: "Re-running CI does not re-trigger the deployment readiness check."'
+docs:
+  - url: 'https://github.com/actions/runner/issues/726'
+    label: 'actions/runner#726 — Re-run all jobs button does not generate workflow_run.requested event (open since 2020)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run'
+    label: 'GitHub Docs — workflow_run trigger event types'
+  - url: 'https://docs.github.com/en/rest/actions/workflow-runs?apiVersion=2022-11-28#re-run-a-workflow'
+    label: 'GitHub REST API — Re-run a workflow'

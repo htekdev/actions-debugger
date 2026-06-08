@@ -1,0 +1,134 @@
+id: yaml-syntax-098
+title: '`on.schedule.cron` requires exactly 5-field POSIX cron syntax — Quartz-style 6-field or 4-field expressions are rejected with "must have exactly 5 fields"'
+category: yaml-syntax
+severity: error
+tags:
+  - schedule
+  - cron
+  - quartz
+  - 5-field
+  - 6-field
+  - validation
+  - syntax-error
+patterns:
+  - regex: 'invalid cron expression.*must have exactly 5 fields'
+    flags: 'i'
+  - regex: 'invalid CRON format.*expected exactly 5 fields'
+    flags: 'i'
+  - regex: 'invalid.*cron.*attribute'
+    flags: 'i'
+error_messages:
+  - "invalid cron expression '0 0 * *': must have exactly 5 fields (minute hour day-of-month month day-of-week)"
+  - "invalid CRON format \"0 */3 * *\" in schedule event: expected exactly 5 fields, found 4: [0 */3 * *]"
+  - "invalid `cron` attribute `\"0/${{ env.UPDATE_FREQ }} * * * *\"`"
+root_cause: |
+  GitHub Actions `on.schedule.cron:` accepts only the POSIX/Unix cron format with
+  exactly 5 space-separated fields:
+
+    ┌─────── minute (0-59)
+    │ ┌───── hour (0-23)
+    │ │ ┌─── day of month (1-31)
+    │ │ │ ┌─ month (1-12 or JAN-DEC)
+    │ │ │ │ ┌ day of week (0-7 or SUN-SAT; 0 and 7 are both Sunday)
+    * * * * *
+
+  The two most common sources of wrong field counts:
+
+  1. **6-field Quartz/Spring cron** — Quartz Scheduler (used in Java Spring,
+     Spring Batch, AWS EventBridge cron expressions) prepends a SECONDS field:
+     `0 */5 * * * *` (seconds, minutes, hours, day, month, weekday).
+     GitHub Actions does not support a seconds field. This expression must be
+     shortened to `*/5 * * * *` (run every 5 minutes) — the finest granularity
+     GitHub Actions supports is 1 minute.
+
+  2. **4-field expressions** — Developers occasionally omit the day-of-week field
+     (a common mistake when copying from docs that abbreviate examples):
+     `0 */3 * *` (missing the 5th field) — rejected as 4 fields found.
+
+  A third variant is using `${{ }}` expressions inside a cron string:
+     `0/${{ env.UPDATE_FREQ }} * * * *`
+     GitHub Actions evaluates `on:` at workflow registration time, before any
+     expression context is available. Cron strings must be static literals.
+
+  GitHub's JSON schema for workflow files (json.schemastore.org/github-workflow.json)
+  validates cron expressions via a regex requiring exactly 5 fields. VS Code's
+  YAML extension and actionlint both surface this as a schema/lint error.
+  At runtime, GitHub's scheduler also rejects the expression with the "exactly 5
+  fields" error message and the schedule never fires.
+
+  The minimum schedule interval is 5 minutes (`*/5 * * * *`). Using `* * * * *`
+  (every minute) is rejected by GitHub Actions as "too frequent" for shared runners.
+fix: |
+  Convert to 5-field POSIX cron:
+  - **Quartz 6-field**: Drop the first (seconds) field.
+    `0 */15 * * * *`  →  `*/15 * * * *`   (every 15 minutes)
+    `0 0 12 * * ?`    →  `0 12 * * *`      (daily at noon UTC)
+    `0 0 0 1 * ?`     →  `0 0 1 * *`       (monthly, 1st at midnight UTC)
+  - **4-field**: Add the missing day-of-week field (use `*` for any day).
+    `0 */3 * *`       →  `0 */3 * * *`     (every 3 hours)
+  - **Expression in cron**: Replace with a static value or use multiple
+    schedule entries and branch on `github.event.schedule`.
+  - Use https://crontab.guru to validate 5-field expressions.
+fix_code:
+  - language: yaml
+    label: 'Broken — Quartz 6-field cron (Spring/Java style)'
+    code: |
+      # ❌ BROKEN: 6-field Quartz cron — first field is seconds (not supported)
+      on:
+        schedule:
+          - cron: '0 */15 * * * *'   # Quartz: "at second 0 of every 15th minute"
+          - cron: '0 0 12 * * ?'     # Quartz: "daily at 12:00:00"
+  - language: yaml
+    label: 'Fixed — 5-field POSIX cron equivalents'
+    code: |
+      # ✅ FIXED: 5-field POSIX cron (drop the seconds field)
+      on:
+        schedule:
+          - cron: '*/15 * * * *'    # Every 15 minutes
+          - cron: '0 12 * * *'      # Daily at 12:00 UTC
+  - language: yaml
+    label: 'Broken — dynamic cron value using expression (not allowed)'
+    code: |
+      # ❌ BROKEN: expressions are not evaluated in on.schedule.cron
+      env:
+        UPDATE_FREQ: '15'
+      on:
+        schedule:
+          - cron: '0/${{ env.UPDATE_FREQ }} * * * *'   # invalid cron attribute
+  - language: yaml
+    label: 'Fixed — multiple static schedules with runtime branch on github.event.schedule'
+    code: |
+      # ✅ FIXED: use multiple static cron entries and check which one fired
+      on:
+        schedule:
+          - cron: '0 */1 * * *'   # Hourly — high frequency
+          - cron: '0 0 * * *'     # Daily   — low frequency
+      jobs:
+        update:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Determine frequency
+              run: |
+                if [[ "${{ github.event.schedule }}" == "0 */1 * * *" ]]; then
+                  echo "Running hourly update"
+                else
+                  echo "Running daily update"
+                fi
+prevention:
+  - 'Always use 5-field POSIX cron — NOT Quartz (6-field) cron used in Spring/Java applications.'
+  - 'Validate cron expressions at https://crontab.guru before committing.'
+  - 'Install actionlint in CI to catch invalid cron expressions before they reach main.'
+  - 'Minimum schedule interval is 5 minutes (`*/5 * * * *`); `* * * * *` (every minute) is rejected.'
+  - 'Cron strings must be static — `${{ }}` expressions are not evaluated inside `on.schedule.cron:` values.'
+  - 'When migrating from Spring Boot / Quartz Scheduler, systematically strip the first (seconds) field from all cron strings.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#schedule'
+    label: 'GitHub Docs — schedule event (on.schedule.cron)'
+  - url: 'https://crontab.guru'
+    label: 'crontab.guru — 5-field POSIX cron validator and reference'
+  - url: 'https://github.com/rhysd/actionlint/blob/main/docs/checks.md'
+    label: 'actionlint — invalid CRON format check documentation'
+  - url: 'https://github.com/github/docs/issues/29634'
+    label: 'github/docs#29634 — GitHub workflow JSON schema cron regex validation'
+  - url: 'https://stackoverflow.com/questions/75707608/how-to-insert-a-repo-environment-variable-into-a-github-actions-cron-string'
+    label: 'Stack Overflow — expressions not allowed in on.schedule.cron'

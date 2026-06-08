@@ -1,0 +1,124 @@
+id: triggers-094
+title: '`workflow_run` `workflows:` filter silently fails when target workflow `name:` contains glob-special characters `[` `]` or `!`'
+category: triggers
+severity: silent-failure
+tags:
+  - workflow_run
+  - trigger
+  - glob-pattern
+  - square-brackets
+  - silent
+  - filter
+patterns:
+  - regex: 'workflow_run'
+    flags: 'i'
+error_messages: []
+root_cause: |
+  The `on.workflow_run.workflows:` array is matched against the upstream workflow's
+  `name:` field using GitHub's internal glob pattern engine, not as a plain string
+  equality check. This means any glob-special characters present in the workflow name
+  are interpreted as pattern meta-characters rather than literal text.
+
+  Specifically, square brackets `[` and `]` are interpreted as character class syntax:
+  - `[Deploy]` → matches a single character that is D, e, p, l, o, y
+  - `[CI]` → matches a single character that is C or I
+  - `!` at the start of a name is interpreted as a negation pattern
+
+  When a team names their workflow `[Deploy] Production` or `[CI] Node tests`, the
+  filter `workflows: ["[Deploy] Production"]` never matches the upstream workflow
+  because GitHub's pattern engine evaluates `[Deploy]` as a character class.
+
+  No error is emitted at parse time or runtime. The triggered workflow simply never
+  fires. This was confirmed by GitHub Engineering as a known bug in github/docs#12572:
+  "Hi @starizard, I've checked with the engineering team, and I can confirm that this
+  is a known bug."
+
+  The same mechanism affects `!` at the start of a workflow name, which is treated
+  as a negation — the filter matches everything EXCEPT workflows whose names follow.
+
+  This is distinct from the general name-mismatch issue (triggers-032) which covers
+  using the filename instead of the `name:` field. This entry is specifically about
+  a correctly-spelled name that fails due to glob interpretation of special characters.
+fix: |
+  Escape the special characters in the `workflows:` filter using backslash escaping:
+  - `[` → `\[`
+  - `]` → `\]`
+  - `!` (at start) → `\!`
+
+  Alternatively — and preferably — rename the upstream workflow to avoid glob-special
+  characters entirely. Bracket-prefixed names like `[Deploy]` are a common pattern
+  from other CI systems that doesn't translate well to GitHub Actions.
+
+  Use descriptive names without special characters: `Deploy Production` or
+  `CI - Node Tests` (hyphens and colons are safe).
+fix_code:
+  - language: yaml
+    label: 'Broken — square brackets in workflow name cause silent filter miss'
+    code: |
+      # ❌ BROKEN: upstream workflow has a bracketed name
+      # File: .github/workflows/deploy.yml
+      name: '[Deploy] Production'
+      on: [push]
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "deploying"
+
+      ---
+      # ❌ BROKEN: this filter never matches — [Deploy] is a glob character class
+      on:
+        workflow_run:
+          workflows: ['[Deploy] Production']
+          types: [completed]
+      jobs:
+        notify:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "notify"  # Never runs
+  - language: yaml
+    label: 'Fixed option 1 — escape the brackets in the filter'
+    code: |
+      # ✅ FIXED: escape square brackets with backslash
+      on:
+        workflow_run:
+          workflows: ['\[Deploy\] Production']
+          types: [completed]
+      jobs:
+        notify:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "notify"
+  - language: yaml
+    label: 'Fixed option 2 — rename the upstream workflow to remove special chars'
+    code: |
+      # ✅ BEST PRACTICE: rename upstream workflow to avoid special characters
+      # File: .github/workflows/deploy.yml
+      name: 'Deploy Production'   # No brackets — safe to use in workflow_run filter
+      on: [push]
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "deploying"
+
+      ---
+      on:
+        workflow_run:
+          workflows: ['Deploy Production']  # Matches exactly — no glob issues
+          types: [completed]
+prevention:
+  - 'Avoid `[`, `]`, and `!` characters in workflow `name:` fields referenced by `workflow_run` filters.'
+  - 'If brackets are required, escape them in the filter: `\[foo\]` not `[foo]`.'
+  - 'When a `workflow_run`-triggered workflow silently never fires, first verify the name match is exact (triggers-032), then check for special characters in the upstream name.'
+  - 'Use actionlint to catch mismatch issues at PR review time — though actionlint does not currently flag the glob interpretation issue specifically.'
+  - 'Prefer simple ASCII names without shell-glob meta-characters: alphanumeric, spaces, hyphens, and colons are all safe.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run'
+    label: 'GitHub Docs — workflow_run trigger reference'
+  - url: 'https://github.com/github/docs/issues/12572'
+    label: 'github/docs#12572 — Confirmed GitHub Engineering bug: square brackets in workflow name break workflow_run filter'
+  - url: 'https://stackoverflow.com/questions/72551643/workflow-run-not-triggered-as-expected-after-parent-workflow-completes'
+    label: 'Stack Overflow — workflow_run not triggered (apostrophe quoting variant)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/filter-pattern-cheat-sheet'
+    label: 'GitHub Docs — Filter pattern cheat sheet (glob special characters)'
