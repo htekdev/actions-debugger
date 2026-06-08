@@ -1,0 +1,159 @@
+id: caching-artifacts-112
+title: 'upload-artifact Fails "Unable to make request: ETIMEDOUT" at CreateArtifact
+  Step — Network Timeout to GitHub Artifact Service API'
+category: caching-artifacts
+severity: error
+tags:
+  - upload-artifact
+  - self-hosted
+  - etimedout
+  - network
+  - artifact-service
+  - create-artifact
+  - firewall
+patterns:
+  - regex: 'Failed to CreateArtifact.*ETIMEDOUT'
+    flags: 'i'
+  - regex: 'Unable to make request.*ETIMEDOUT'
+    flags: 'i'
+  - regex: 'CreateArtifact.*connect ETIMEDOUT'
+    flags: 'i'
+  - regex: 'Error: Failed to CreateArtifact'
+    flags: 'i'
+error_messages:
+  - 'Error: Failed to CreateArtifact: Unable to make request: ETIMEDOUT'
+  - 'Error: Failed to CreateArtifact: Unable to make request: connect ETIMEDOUT <ip>:443'
+root_cause: |
+  The `actions/upload-artifact` action must call the GitHub Artifact Service REST API
+  (CreateArtifact RPC) to register an artifact before uploading its contents to
+  Azure Blob Storage. This API call is made to the endpoint specified in the runner's
+  `ACTIONS_RESULTS_URL` environment variable (for v4+) or `ACTIONS_RUNTIME_URL` (for v3).
+
+  If the runner cannot reach this endpoint — due to firewall rules blocking outbound
+  HTTPS to the artifact service domain, DNS failure, or proxy misconfiguration that
+  blocks the specific API host — the TCP connection attempt times out and the action
+  fails with:
+
+    Error: Failed to CreateArtifact: Unable to make request: ETIMEDOUT
+
+  Common causes:
+  1. Firewall/security group rules on self-hosted runner networks that block outbound
+     HTTPS to `results-receiver.actions.githubusercontent.com` or the dynamic hostname
+     in `ACTIONS_RESULTS_URL`.
+  2. HTTPS_PROXY configured but not whitelisting the artifact service endpoint,
+     causing connection to be silently dropped.
+  3. DNS split-horizon setups where `actions.githubusercontent.com` does not resolve
+     on the internal runner network.
+  4. VPN or network segmentation changes that alter routing to GitHub infrastructure
+     after the runner was initially set up.
+  5. Transient GitHub infrastructure incidents (the artifact service endpoint becomes
+     temporarily unreachable).
+
+  This error occurs before any blob upload begins — it is a failure to register the
+  artifact with GitHub's API layer, distinct from upload-level timeouts or finalize
+  timeouts (which occur after the blob upload succeeds).
+fix: |
+  Step 1 — Verify runner connectivity to the artifact service:
+  From the runner machine, test direct HTTPS connectivity:
+    curl -v https://results-receiver.actions.githubusercontent.com/healthz
+  If this times out, the issue is network/firewall, not the action itself.
+
+  Step 2 — Check GitHub's required domain list and ensure all artifact service
+  domains are allowed outbound on port 443. GitHub's required domains include:
+  *.actions.githubusercontent.com and results-receiver.actions.githubusercontent.com.
+
+  Step 3 — If behind an HTTPS proxy, ensure the proxy allows CONNECT tunnels to
+  artifact service endpoints. Add the artifact service hostname to the proxy allowlist
+  or to NO_PROXY to route directly.
+
+  Step 4 — Check for transient GitHub service incidents at githubstatus.com. If the
+  incident is GitHub-side, add retry logic to the workflow or wait for resolution.
+
+  Step 5 — If the issue is intermittent, consider adding a retry wrapper around the
+  upload-artifact step using a conditional re-run pattern.
+fix_code:
+  - language: yaml
+    label: 'Diagnose — test artifact service connectivity from runner before assuming action bug'
+    code: |
+      steps:
+        - name: Check artifact service reachability
+          run: |
+            echo "Testing artifact service connectivity..."
+            curl -v --connect-timeout 10 \
+              https://results-receiver.actions.githubusercontent.com/healthz || true
+            # Also check the ACTIONS_RESULTS_URL endpoint used by upload-artifact:
+            echo "ACTIONS_RESULTS_URL: $ACTIONS_RESULTS_URL"
+            curl -v --connect-timeout 10 "${ACTIONS_RESULTS_URL}" || true
+
+        - name: Upload artifact
+          uses: actions/upload-artifact@v4
+          with:
+            name: build-output
+            path: dist/
+  - language: yaml
+    label: 'Workaround — retry upload-artifact on ETIMEDOUT failure'
+    code: |
+      steps:
+        - name: Build
+          run: make build
+
+        - name: Upload artifact (with retry on network failure)
+          id: upload
+          uses: nick-fields/retry@v3
+          with:
+            timeout_minutes: 5
+            max_attempts: 3
+            retry_on: error
+            command: |
+              # Use gh CLI or re-invoke action indirectly; for simple cases:
+              echo "Attempt to upload..."
+
+        # Alternative: separate step with continue-on-error + manual retry:
+        - name: Upload artifact
+          uses: actions/upload-artifact@v4
+          continue-on-error: true
+          id: upload-attempt
+          with:
+            name: build-output
+            path: dist/
+
+        - name: Retry upload on failure
+          if: steps.upload-attempt.outcome == 'failure'
+          uses: actions/upload-artifact@v4
+          with:
+            name: build-output
+            path: dist/
+  - language: yaml
+    label: 'Network fix — allow artifact service domain through firewall or proxy allowlist'
+    code: |
+      # Required GitHub Actions domains (allow outbound HTTPS port 443):
+      # *.actions.githubusercontent.com
+      # results-receiver.actions.githubusercontent.com
+      # uploads.github.com
+      # *.blob.core.windows.net  (Azure Blob Storage for artifact contents)
+      #
+      # If using squid proxy, add to whitelist:
+      # acl github_actions dstdomain .actions.githubusercontent.com
+      # acl github_actions dstdomain results-receiver.actions.githubusercontent.com
+      # acl github_actions dstdomain .blob.core.windows.net
+      # http_access allow github_actions
+prevention:
+  - 'Before deploying self-hosted runners, validate all required GitHub Actions domains
+    are reachable on port 443: *.actions.githubusercontent.com, results-receiver.actions.githubusercontent.com,
+    and *.blob.core.windows.net.'
+  - 'Add a connectivity smoke-test step at the start of pipelines that use artifact
+    upload, to detect network issues before the actual upload step runs.'
+  - 'Monitor githubstatus.com for Actions infrastructure incidents — ETIMEDOUT on
+    CreateArtifact is sometimes caused by transient GitHub-side outages, not runner
+    misconfiguration.'
+  - 'When making firewall or network changes on runner infrastructure, immediately
+    run a workflow with an artifact upload to verify connectivity is not disrupted.'
+docs:
+  - url: 'https://github.com/actions/upload-artifact/issues/786'
+    label: 'actions/upload-artifact#786 — Failed to CreateArtifact: Unable to make request: ETIMEDOUT (2026)'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect'
+    label: 'GitHub Docs — Self-hosted runner network requirements for GitHub Actions'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners#communication-between-self-hosted-runners-and-github'
+    label: 'GitHub Docs — Communication between self-hosted runners and GitHub (required domains)'
+  - url: 'https://githubstatus.com'
+    label: 'GitHub Status — Check for active Actions infrastructure incidents'

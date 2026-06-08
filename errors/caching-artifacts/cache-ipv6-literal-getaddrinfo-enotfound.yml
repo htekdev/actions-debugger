@@ -1,0 +1,112 @@
+id: caching-artifacts-111
+title: 'actions/cache Fails "getaddrinfo ENOTFOUND [IPv6-literal]" When Cache Service
+  URL Contains an IPv6 Address Literal'
+category: caching-artifacts
+severity: error
+tags:
+  - actions/cache
+  - self-hosted
+  - ipv6
+  - getaddrinfo
+  - enotfound
+  - ghes
+  - cache-service-url
+patterns:
+  - regex: 'getaddrinfo ENOTFOUND \[.*:.*:.*\]'
+    flags: 'i'
+  - regex: 'getCacheEntry failed: getaddrinfo ENOTFOUND'
+    flags: 'i'
+  - regex: 'reserveCache failed: getaddrinfo ENOTFOUND'
+    flags: 'i'
+  - regex: 'Failed to restore.*getaddrinfo ENOTFOUND \['
+    flags: 'i'
+error_messages:
+  - '::warning::Failed to restore: getCacheEntry failed: getaddrinfo ENOTFOUND [2001:bc8:1d90:1fc1:dc00:ff:fe2b:3f97]'
+  - '::warning::Failed to save: reserveCache failed: getaddrinfo ENOTFOUND [2001:bc8:1d90:1fc1:dc00:ff:fe2b:3f97]'
+root_cause: |
+  When the `ACTIONS_CACHE_URL` or `ACTIONS_RESULTS_URL` runner environment variable
+  contains an IPv6 literal address (e.g., `http://[2001:bc8:1d90::1]/`), the HTTP
+  client used by `actions/cache` and `@actions/cache` toolkit passes the bracketed IPv6
+  address as the DNS hostname to Node.js `dns.lookup()`. The DNS resolver does not
+  accept IPv6 literals wrapped in square brackets as a valid input, and immediately
+  returns `ENOTFOUND`, causing both cache restore and cache save to fail silently
+  with a warning.
+
+  This pattern occurs on:
+  - GitHub Enterprise Server (GHES) installations with IPv6-addressed cache services
+  - Self-hosted runners where the cache service URL (set via runner configuration or
+    environment variable) resolves to an IPv6 address
+  - ARC (Actions Runner Controller) deployments where the cache proxy exposes an IPv6
+    endpoint
+
+  The issue was tracked in actions/cache#1718. The fix was implemented in
+  actions/toolkit PR#2298, which strips square brackets from IPv6 literals before
+  passing the host to the HTTP client. This fix shipped in later versions of
+  `@actions/cache` and `@actions/artifact` toolkit packages.
+
+  The error is emitted as `::warning::` not `::error::`, so workflows do NOT fail —
+  they silently miss the cache on every run, causing hidden slowdowns. This makes it
+  a de-facto silent failure for cache restore operations.
+fix: |
+  Fix (preferred): Upgrade to the latest `actions/cache` version. The IPv6 literal
+  fix shipped via actions/toolkit PR#2298. actions/cache@v4+ includes this fix.
+  Pin to a specific patched release if needed.
+
+  Workaround: If upgrading is not immediately possible, configure the cache service
+  to expose a DNS hostname instead of a bare IPv6 literal in the cache service URL.
+  Replace `http://[2001:bc8::1]/` with a hostname like `http://cache.internal/`
+  that resolves to the IPv6 address, so Node.js HTTP never sees the bare literal.
+
+  Verification: After fixing, confirm cache hits are appearing in workflow logs.
+  A successful restore shows "Cache restored from key: ..." instead of a warning.
+fix_code:
+  - language: yaml
+    label: 'Fix — upgrade to latest actions/cache version (IPv6 literal fix included)'
+    code: |
+      # Before (may hit IPv6 ENOTFOUND on GHES/self-hosted with IPv6 cache URL):
+      # - uses: actions/cache@v3
+
+      # After — upgrade to v4 or latest which includes the toolkit IPv6 literal fix:
+      steps:
+        - name: Cache dependencies
+          uses: actions/cache@v4   # or @v4.x.y for a pinned patch
+          with:
+            path: ~/.npm
+            key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+            restore-keys: |
+              ${{ runner.os }}-node-
+  - language: yaml
+    label: 'Workaround — use DNS hostname instead of bare IPv6 literal in cache URL'
+    code: |
+      # Configure ACTIONS_CACHE_URL with a hostname instead of IPv6 literal.
+      # In runner .env or ARC configuration, replace:
+      #   ACTIONS_CACHE_URL=http://[2001:bc8:1d90::1]/
+      # with:
+      #   ACTIONS_CACHE_URL=http://cache.internal/
+      # where cache.internal has an AAAA record pointing to 2001:bc8:1d90::1.
+      #
+      # ARC RunnerDeployment example:
+      # spec:
+      #   template:
+      #     spec:
+      #       env:
+      #         - name: ACTIONS_CACHE_URL
+      #           value: "http://cache.internal/"   # hostname resolves to IPv6 addr
+prevention:
+  - 'Always use a DNS hostname in ACTIONS_CACHE_URL and ACTIONS_RESULTS_URL rather
+    than a bare IPv6 literal. Node.js HTTP clients historically mishandle bracket-
+    wrapped IPv6 literals as DNS inputs.'
+  - 'After configuring a new cache service on GHES or ARC, run a test workflow and
+    check for `::warning::Failed to restore` or `::warning::Failed to save` lines
+    in the logs — these indicate the cache is silently being skipped.'
+  - 'Keep `actions/cache` pinned to a recent major version. The toolkit IPv6 literal
+    fix (PR#2298) shipped in packages used by actions/cache@v4+.'
+docs:
+  - url: 'https://github.com/actions/cache/issues/1718'
+    label: 'actions/cache#1718 — getaddrinfo ENOTFOUND with IPv6 literal cache service URL'
+  - url: 'https://github.com/actions/toolkit/pull/2298'
+    label: 'actions/toolkit PR#2298 — fix: handle IPv6 literal addresses in HTTP client (merged fix)'
+  - url: 'https://docs.github.com/en/enterprise-server@latest/admin/github-actions/enabling-github-actions-for-github-enterprise-server/enabling-github-actions-with-azure-blob-storage'
+    label: 'GitHub Enterprise Server Docs — Actions cache service URL configuration'
+  - url: 'https://github.com/actions/actions-runner-controller'
+    label: 'Actions Runner Controller — ARC cache proxy configuration'
