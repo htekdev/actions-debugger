@@ -1,0 +1,112 @@
+id: known-unsolved-095
+title: 'ubuntu-slim runner does not support Docker-in-Docker — jobs.container and docker run fail at missing daemon socket'
+category: known-unsolved
+severity: limitation
+tags:
+  - ubuntu-slim
+  - docker
+  - dind
+  - container
+  - docker-socket
+  - jobs-container
+  - architectural-limitation
+patterns:
+  - regex: 'dial unix /var/run/docker\.sock: connect: no such file or directory'
+    flags: 'i'
+  - regex: 'Cannot connect to the Docker daemon at unix:///var/run/docker\.sock'
+    flags: 'i'
+  - regex: 'failed to connect to the docker API at unix:///var/run/docker\.sock'
+    flags: 'i'
+  - regex: 'docker\.sock.*no such file or directory'
+    flags: 'i'
+error_messages:
+  - "failed to connect to the docker API at unix:///var/run/docker.sock; check if the path is correct and if the daemon is running: dial unix /var/run/docker.sock: connect: no such file or directory"
+  - "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"
+  - "dial unix /var/run/docker.sock: connect: no such file or directory"
+root_cause: |
+  The `ubuntu-slim` GitHub Actions runner is a container-based image — the runner
+  agent itself executes inside a container. Running a Docker daemon inside a container
+  (Docker-in-Docker) requires privileged mode, which GitHub-hosted ubuntu-slim runners
+  do not support.
+
+  The Docker CLI (`docker`) IS pre-installed on ubuntu-slim, which misleads users into
+  expecting full Docker functionality. However, the Docker daemon never starts and
+  there is no `/var/run/docker.sock` present. Any workflow step or container feature
+  that contacts the daemon socket will fail:
+
+  - `docker run`, `docker build`, `docker compose up` — all fail immediately
+  - `jobs.<job>.container:` — the `jobs.container` syntax requires the runner to spin
+    up a container via the Docker daemon; ubuntu-slim cannot do this
+  - Actions like `docker/build-push-action` — fail at daemon connection
+
+  GitHub has explicitly confirmed this as an architectural limitation with no current
+  resolution. The Docker CLI components were present only for working with remote Docker
+  APIs or remote hosts; GitHub plans to remove Docker CLI from ubuntu-slim to avoid
+  false expectations. As of the June 2026 runner image releases, the Docker CLI is
+  still included but non-functional for local daemon operations.
+
+  Source: actions/runner-images#13583, actions/runner-images#13541
+fix: |
+  Switch to a VM-based runner image (`ubuntu-latest`, `ubuntu-24.04`, or `ubuntu-22.04`)
+  for any workflow job that requires Docker operations. VM-based runners start the Docker
+  daemon automatically at job startup.
+
+  If ubuntu-slim is required for performance/cost reasons, restructure the workflow to
+  avoid Docker:
+  - Use native tool installations instead of containerized builds
+  - Use Podman (pre-installed on standard Ubuntu runners) instead of Docker
+  - Push Docker operations to a separate job running on ubuntu-latest
+fix_code:
+  - language: yaml
+    label: 'Migrate Docker jobs from ubuntu-slim to ubuntu-latest'
+    code: |
+      jobs:
+        build:
+          # Before: runs-on: ubuntu-slim
+          runs-on: ubuntu-latest   # VM runner — Docker daemon available
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build Docker image
+              run: docker build -t myimage .   # Works on ubuntu-latest
+
+        lint:
+          runs-on: ubuntu-slim   # Keep slim for non-Docker jobs (cost/speed)
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run linter
+              run: npm run lint
+
+  - language: yaml
+    label: 'Split workflow — Docker on ubuntu-latest, other steps on ubuntu-slim'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-slim    # OK — no Docker needed
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+
+        docker-publish:
+          runs-on: ubuntu-latest  # Required for Docker
+          needs: test
+          steps:
+            - uses: actions/checkout@v4
+            - uses: docker/build-push-action@v6
+              with:
+                push: true
+                tags: user/myimage:latest
+
+prevention:
+  - 'Never use ubuntu-slim for jobs that include jobs.container:, docker run, docker build, docker compose, or Docker-based actions'
+  - 'Check the ubuntu-slim README (actions/runner-images) for the current list of supported tools before migrating from ubuntu-latest'
+  - 'Audit workflows for Docker CLI usage before switching to ubuntu-slim for cost optimisation'
+  - 'Use a linter or CI check that validates runner-tool compatibility before enabling ubuntu-slim'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/13583'
+    label: 'runner-images#13583: Docker in ubuntu-slim silently fails (GitHub team confirms limitation)'
+  - url: 'https://github.com/actions/runner-images/issues/13541'
+    label: 'runner-images#13541: Add Docker to ubuntu-slim — GitHub team response explaining architectural constraint'
+  - url: 'https://github.com/actions/runner-images/blob/main/images/ubuntu-slim/ubuntu-slim-Readme.md'
+    label: 'ubuntu-slim README — official supported tool list'
+  - url: 'https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners'
+    label: 'GitHub Docs: About GitHub-hosted runners'
