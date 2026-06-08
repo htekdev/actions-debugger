@@ -1,0 +1,159 @@
+id: concurrency-timing-081
+title: 'Reusable Workflow Concurrency Deadlock — github.workflow Resolves to Caller Name, Both Workflows Share Same Group'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - workflow_call
+  - concurrency
+  - reusable-workflow
+  - cancel-in-progress
+  - deadlock
+  - github-workflow-context
+patterns:
+  - regex: 'This run was cancelled'
+    flags: 'i'
+  - regex: 'The workflow run was cancelled'
+    flags: 'i'
+  - regex: 'Canceling since a higher priority waiting run was found'
+    flags: 'i'
+error_messages:
+  - "This run was cancelled."
+  - "The workflow run was cancelled."
+  - "Canceling since a higher priority waiting run was found."
+root_cause: |
+  When a reusable workflow is called via `workflow_call`, GitHub Actions evaluates
+  all expressions — including `${{ github.workflow }}` — in the context of the CALLER
+  workflow, not the reusable workflow itself.
+
+  This creates a deadlock when both the caller and the callee define a `concurrency`
+  block using `${{ github.workflow }}` as part of the group name:
+
+      # caller: ci-push.yml
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: true
+
+      # callee: ci.yml (called via workflow_call)
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}  # resolves to "CI Push" not "CI"
+        cancel-in-progress: true
+
+  Both `ci-push.yml` and `ci.yml` evaluate `${{ github.workflow }}` as "CI Push" (the
+  caller's name). Both workflows land in the same concurrency group. GitHub treats the
+  second run as a duplicate of the first and cancels it — which in turn cancels the
+  child, causing the parent to never complete.
+
+  This is a silent failure because:
+  - No YAML syntax error is reported
+  - The workflow appears to start normally
+  - The cancellation message ("Canceling since a higher priority waiting run was found")
+    gives no indication that a reusable workflow concurrency misconfiguration is the cause
+  - The root cause is invisible without knowing how GitHub resolves `github.workflow`
+    in `workflow_call` contexts
+
+  The same issue affects `${{ github.workflow_ref }}` partially — use `${{ github.job }}`
+  or a workflow-specific literal string in reusable workflows.
+
+  Sources: multiple community reports; actions/runner#4468; ShieldCI fix commit e01418c;
+  GitHub internal PR github/gh-aw#35173 (documents same root cause at scale)
+fix: |
+  Remove or scope the concurrency block in the reusable workflow. Reusable workflows
+  should either have no top-level concurrency group, or use a group name that is
+  guaranteed to be unique to the callee's identity (not derived from github.workflow
+  which will inherit the caller's name).
+
+  Option 1 — Remove concurrency from the reusable workflow entirely (let the caller
+  control concurrency):
+
+      # callee: ci.yml
+      on:
+        workflow_call:
+      # No top-level concurrency block here
+
+  Option 2 — Use a literal string that uniquely identifies the reusable workflow:
+
+      # callee: ci.yml
+      concurrency:
+        group: reusable-ci-${{ github.ref }}
+        cancel-in-progress: true
+
+  Option 3 — Use per-job concurrency instead of workflow-level concurrency:
+
+      # callee: ci.yml
+      jobs:
+        build:
+          concurrency:
+            group: reusable-ci-build-${{ github.ref }}
+            cancel-in-progress: true
+fix_code:
+  - language: yaml
+    label: 'Remove top-level concurrency from reusable workflow (preferred fix)'
+    code: |
+      # ci.yml — reusable workflow
+      name: CI
+      on:
+        workflow_call:
+          inputs:
+            environment:
+              type: string
+      # DO NOT add a top-level concurrency block here.
+      # github.workflow resolves to the CALLER's name, not "CI".
+      # Concurrency is controlled by the caller workflow.
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+
+  - language: yaml
+    label: 'Use workflow-specific literal string in reusable workflow concurrency group'
+    code: |
+      # ci.yml — reusable workflow with safe concurrency group
+      name: CI
+      on:
+        workflow_call:
+
+      concurrency:
+        # Use a literal prefix that identifies THIS reusable workflow,
+        # not ${{ github.workflow }} which resolves to the caller.
+        group: 'reusable-ci-${{ github.ref }}'
+        cancel-in-progress: true
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+
+  - language: yaml
+    label: 'Caller workflow — concurrency block is safe here (github.workflow is correct)'
+    code: |
+      # ci-push.yml — caller workflow
+      name: CI Push
+      on:
+        push:
+          branches: [main]
+
+      concurrency:
+        # This is fine: github.workflow here = "CI Push" (correct)
+        group: '${{ github.workflow }}-${{ github.ref }}'
+        cancel-in-progress: true
+
+      jobs:
+        run-ci:
+          uses: ./.github/workflows/ci.yml   # callee must NOT use github.workflow in concurrency
+prevention:
+  - 'Never use ${{ github.workflow }} in a concurrency group inside a reusable workflow — it always resolves to the caller name'
+  - 'Review all reusable workflows for top-level concurrency blocks before adding them to workflow_call chains'
+  - 'Use a literal string or a job-level concurrency group in reusable workflows rather than workflow-level context expressions'
+  - 'If unexplained cancellations occur in workflow_call chains, check both caller and callee concurrency groups for naming collisions'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency'
+    label: 'GitHub Docs: Using concurrency — workflow-level and job-level concurrency groups'
+  - url: 'https://docs.github.com/en/actions/sharing-automations/reusing-workflows'
+    label: 'GitHub Docs: Reusing workflows — context limitations in workflow_call'
+  - url: 'https://github.com/actions/runner/issues/4468'
+    label: 'actions/runner#4468: Scheduled workflow concurrency deadlock with reusable workflow_call'

@@ -1,0 +1,118 @@
+id: runner-environment-327
+title: 'Self-Hosted Runner Version Deprecated — "Runner version vX.Y.Z is deprecated and cannot receive messages"'
+category: runner-environment
+severity: error
+tags:
+  - self-hosted
+  - runner-version
+  - deprecated
+  - minimum-version-enforcement
+  - ARC
+  - self-hosted-upgrade
+patterns:
+  - regex: 'Runner version v[\d\.]+ is deprecated and cannot receive messages'
+    flags: 'i'
+  - regex: 'GitHub\.DistributedTask\.WebApi\.AccessDeniedException: Runner version'
+    flags: 'i'
+  - regex: 'runner.*deprecated.*cannot receive messages'
+    flags: 'i'
+error_messages:
+  - "An error occured: Runner version v2.330.0 is deprecated and cannot receive messages."
+  - "GitHub.DistributedTask.WebApi.AccessDeniedException: Runner version v2.330.0 is deprecated and cannot receive messages."
+  - "Runner listener exit with terminated error, stop the service, no retry needed."
+root_cause: |
+  GitHub enforces a minimum runner version policy for GitHub Actions self-hosted runners.
+  When a self-hosted runner version falls below the enforced minimum, the runner's broker
+  long-poll request is rejected with an `AccessDeniedException` and the error message
+  "Runner version vX.Y.Z is deprecated and cannot receive messages."
+
+  The runner exits immediately with code 1 — it does not queue jobs, does not retry, and
+  does not auto-update. The service log ends with:
+
+      Runner listener exit with terminated error, stop the service, no retry needed.
+
+  Timeline of the February 2026 enforcement:
+  - GitHub blog post (Feb 5, 2026) announced minimum version v2.329.0
+  - The actual enforcement also deprecated v2.330.0, which confused users because v2.330.0
+    is NEWER than the announced minimum (v2.329.0 was the last Ubuntu-22 runner; v2.330.0
+    was the first Ubuntu-24 runner and was also sunset quickly)
+  - Subsequent enforcement cycles have deprecated additional versions as newer releases ship
+
+  This commonly affects:
+  - Kubernetes-based ARC (actions-runner-controller) setups that pin a specific runner
+    image tag (e.g., `ghcr.io/actions/actions-runner:2.330.0`)
+  - Docker Compose or VM-based runners with pinned image versions
+  - Any self-hosted runner that has not auto-updated (auto-update disabled or blocked)
+
+  Sources: actions/runner#4305 (Mar 2026, open, 3 reactions); GitHub Changelog Feb 2026
+fix: |
+  Upgrade the self-hosted runner to a version at or above the current minimum enforced
+  version. Always use the latest stable release or at minimum the version explicitly
+  listed as the current minimum in the GitHub Changelog.
+
+  For ARC-managed runners: update the `spec.template.spec.containers[].image` tag in
+  the AutoscalingRunnerSet or RunnerDeployment manifest to the latest image version.
+
+  For manually managed runners: download and install the latest runner package from
+  https://github.com/actions/runner/releases
+
+  To check the current minimum version: see the GitHub Changelog entry for
+  "GitHub Actions: Self-hosted runner minimum version enforcement"
+fix_code:
+  - language: yaml
+    label: 'ARC AutoscalingRunnerSet — upgrade runner image to latest version'
+    code: |
+      # autoscalingrunnerset.yaml (Helm values or direct manifest)
+      spec:
+        template:
+          spec:
+            containers:
+              - name: runner
+                # Pin to latest stable, or use :latest for auto-updates
+                image: ghcr.io/actions/actions-runner:2.334.0
+                # Check https://github.com/actions/runner/releases for latest
+
+  - language: yaml
+    label: 'GitHub Actions workflow to check runner version before registering'
+    code: |
+      # Use in a diagnostic workflow to detect deprecated runner versions early
+      jobs:
+        check-runner-version:
+          runs-on: self-hosted
+          steps:
+            - name: Check runner version
+              run: |
+                echo "Runner version: $RUNNER_VERSION"
+                # Compare against minimum (update this as GitHub enforces new minimums)
+                MINIMUM="2.334.0"
+                if [ "$(printf '%s\n' "$MINIMUM" "$RUNNER_VERSION" | sort -V | head -n1)" != "$MINIMUM" ]; then
+                  echo "::error::Runner version $RUNNER_VERSION is below minimum $MINIMUM"
+                  exit 1
+                fi
+
+  - language: yaml
+    label: 'Docker Compose — pin to latest runner image tag'
+    code: |
+      services:
+        runner:
+          # Before: image: ghcr.io/actions/actions-runner:2.330.0  # DEPRECATED
+          image: ghcr.io/actions/actions-runner:2.334.0  # Update to latest
+          # Or: image: ghcr.io/actions/actions-runner:latest
+          environment:
+            - GITHUB_URL=https://github.com
+            - RUNNER_TOKEN=${RUNNER_TOKEN}
+prevention:
+  - 'Do not hard-pin self-hosted runner image tags in production — use a rolling tag or automated image update policy'
+  - 'Subscribe to the GitHub Changelog for Actions to get advance notice of minimum version enforcement changes'
+  - 'Enable runner auto-update in self-hosted runner settings when using non-containerized runners'
+  - 'For ARC-based setups, configure Renovate or Dependabot to keep runner image tags current'
+  - 'Monitor runner startup logs for the "deprecated and cannot receive messages" error — it appears at runner init, not job execution time'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4305'
+    label: 'actions/runner#4305: Runner version v2.330.0 is deprecated and cannot receive messages (Mar 2026)'
+  - url: 'https://github.blog/changelog/2026-02-05-github-actions-self-hosted-runner-minimum-version-enforcement-extended/'
+    label: 'GitHub Changelog: Self-hosted runner minimum version enforcement (Feb 2026)'
+  - url: 'https://github.com/actions/runner/releases'
+    label: 'actions/runner releases — always check for the latest stable version'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/autoscaling-with-self-hosted-runners'
+    label: 'GitHub Docs: Autoscaling with self-hosted runners'
