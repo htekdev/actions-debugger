@@ -1,0 +1,127 @@
+id: caching-artifacts-118
+title: 'Docker BuildKit type=gha Cache SAS Token Expires During Long Build — 403 AuthenticationFailed'
+category: caching-artifacts
+severity: error
+tags:
+  - docker
+  - buildkit
+  - buildx
+  - gha-cache
+  - type-gha
+  - sas-token
+  - long-build
+  - build-push-action
+patterns:
+  - regex: 'Signature not valid in the specified time frame'
+    flags: 'i'
+  - regex: 'AuthenticationFailed.*Signature not valid'
+    flags: 'i'
+  - regex: 'failed to copy.*AuthenticationFailed'
+    flags: 'i'
+  - regex: '403 Server failed to authenticate the request.*signature'
+    flags: 'i'
+error_messages:
+  - "403 Server failed to authenticate the request. Make sure the value of Authorization header is formed correctly including the signature."
+  - "AuthenticationFailed: Signature not valid in the specified time frame: Start [...] - Expiry [...] - Current [...]"
+  - "ERROR: failed to solve: failed to push ... failed to copy: GET https://productionresultssa*.blob.core.windows.net/actions-cache/..."
+  - "ERROR CODE: AuthenticationFailed"
+root_cause: |
+  When using `cache-from: type=gha` or `cache-to: type=gha` with docker/build-push-action,
+  BuildKit obtains SAS (Shared Access Signature) URLs from the GitHub Actions cache service
+  to read and write cache blobs stored in Azure Blob Storage.
+
+  These SAS tokens have a TTL of approximately 10 minutes. If a Docker build takes longer
+  than 10 minutes to complete, the SAS token used to upload or fetch cache layers is already
+  expired by the time BuildKit tries to use it. Azure Blob Storage then returns HTTP 403
+  with "AuthenticationFailed: Signature not valid in the specified time frame".
+
+  The error references `productionresultssa*.blob.core.windows.net/actions-cache/` — this is
+  the Azure Blob backend for the GitHub Actions cache service, not the Docker registry push
+  endpoint. The Docker image push itself is unaffected; only the BuildKit GHA cache
+  read/write fails.
+
+  This issue is distinct from the GHA cache capacity limit (ca-019) or the legacy v1 API
+  shutdown (ca-065). It is triggered specifically by long builds (>10 minutes) with GHA cache.
+
+  Source: docker/build-push-action#1371 (May 2025, ongoing as of June 2025).
+fix: |
+  Short-term workarounds:
+
+  1. **Disable GHA cache for this workflow** — if the build is consistently > 10 min, GHA
+     cache may not provide net value anyway:
+
+     Remove `cache-from: type=gha` and `cache-to: type=gha` from the build-push-action step.
+
+  2. **Split build and push into two separate steps**:
+     - First run with `push: false, load: true` to build without GHA cache push.
+     - Then run again with `push: true, cache-from: type=gha` — the second run is fast
+       because it hits the local Docker image cache; the SAS token hasn't expired yet.
+     Note: this workaround fails if intermediate steps also take > 10 minutes.
+
+  3. **Use registry cache instead of GHA cache** — `type=registry` stores cache as Docker
+     layers and avoids the SAS TTL issue entirely:
+
+     ```yaml
+     cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache
+     cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max
+     ```
+     Requires `packages: write` permission.
+
+  4. **Use BuildKit inline cache** — embeds cache metadata in the pushed image itself,
+     no separate cache blob required.
+fix_code:
+  - language: yaml
+    label: 'Option 1: disable GHA cache for long builds'
+    code: |
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          # Removed: cache-from: type=gha
+          # Removed: cache-to: type=gha,mode=max
+  - language: yaml
+    label: 'Option 2: split build and push to avoid SAS expiry on the push step'
+    code: |
+      - name: Build (no push, warm local cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: myimage:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Push (fast — uses local cache, SAS not yet expired)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+  - language: yaml
+    label: 'Option 3: use registry cache (no SAS TTL issue)'
+    code: |
+      - name: Build and push with registry cache
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max
+prevention:
+  - 'For builds expected to exceed 10 minutes, prefer registry cache (type=registry) or inline cache over type=gha.'
+  - 'Monitor build durations; if a build regularly takes > 8 minutes, switch away from type=gha cache.'
+  - 'Use multi-stage Dockerfiles to keep individual build stages short and maximize layer reuse.'
+  - 'When using multi-platform builds (linux/amd64,linux/arm64), note that QEMU emulation can significantly extend build time.'
+docs:
+  - url: 'https://github.com/docker/build-push-action/issues/1371'
+    label: 'docker/build-push-action#1371 — Fail to push to ghcr.io due to expired token (May 2025)'
+  - url: 'https://docs.docker.com/build/cache/backends/gha/'
+    label: 'Docker BuildKit GitHub Actions cache backend documentation'
+  - url: 'https://docs.docker.com/build/cache/backends/registry/'
+    label: 'Docker BuildKit registry cache backend — alternative without TTL issues'

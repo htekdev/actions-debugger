@@ -1,0 +1,104 @@
+id: runner-environment-352
+title: 'Pre-installed JAVA_HOME_XX_arm64 on macOS ARM64 Runners Uses Lowercase — RUNNER_ARCH Interpolation Fails'
+category: runner-environment
+severity: silent-failure
+tags:
+  - java
+  - java-home
+  - arm64
+  - macos
+  - runner-arch
+  - environment-variable
+  - cross-platform
+  - setup-java
+patterns:
+  - regex: 'JAVA_HOME_\d+_\$\{\{?\s*runner\.arch\s*\}?\}'
+    flags: 'i'
+  - regex: 'JAVA_HOME_\d+_\$\{RUNNER_ARCH\}'
+    flags: 'i'
+  - regex: 'JAVA_HOME_\d+_ARM64.*not.*set\|JAVA_HOME.*empty'
+    flags: 'i'
+error_messages:
+  - "JAVA_HOME is unset or empty"
+  - "/bin/bash: java: command not found"
+  - "JAVA_HOME_17_ARM64: unbound variable"
+root_cause: |
+  GitHub-hosted runners expose pre-installed Java via arch-suffixed environment variables
+  (e.g., JAVA_HOME_17_X64, JAVA_HOME_21_X64). Developers naturally try to build
+  cross-platform scripts using RUNNER_ARCH to form the variable name dynamically:
+
+    JAVA_HOME="${JAVA_HOME_17_${RUNNER_ARCH}}"
+
+  This fails silently or with an unbound variable error on macOS ARM64 runners (macos-14,
+  macos-15) because these runners use **lowercase** `arm64` as the suffix:
+
+    - macOS ARM64 (macos-14, macos-15): JAVA_HOME_17_arm64 (lowercase)
+    - ubuntu-latest (x64):              JAVA_HOME_17_X64   (uppercase)
+    - ubuntu-24.04-arm (ARM ubuntu):    JAVA_HOME_17_X64   (also uppercase X64, not ARM!)
+
+  RUNNER_ARCH returns uppercase "ARM64" or "X64". So:
+    - ubuntu x64:     JAVA_HOME_17_X64 → resolves correctly ✅
+    - ubuntu ARM64:   JAVA_HOME_17_ARM64 → variable does NOT exist (actual: JAVA_HOME_17_X64) ❌
+    - macOS ARM64:    JAVA_HOME_17_ARM64 → variable does NOT exist (actual: JAVA_HOME_17_arm64) ❌
+
+  The result is JAVA_HOME evaluating to an empty string, causing subsequent `java`,
+  `mvn`, or `gradle` invocations to fail with "command not found" or
+  "No such file or directory".
+
+  Note: ubuntu-24.04-arm and ubuntu-22.04-arm also use JAVA_HOME_17_X64 even though
+  they are ARM architecture. Only macOS ARM64 runners use the lowercase `arm64` suffix.
+
+  Source: GitHub Community Discussion #160592 (Jan 2024, ongoing).
+fix: |
+  Use a bash parameter expansion fallback to handle both naming conventions:
+
+    JAVA_HOME="${JAVA_HOME_17_X64:-$JAVA_HOME_17_arm64}"
+
+  This resolves to JAVA_HOME_17_X64 if set (ubuntu x64 and ubuntu ARM), and falls back
+  to JAVA_HOME_17_arm64 for macOS ARM64 runners.
+
+  Alternatively, use actions/setup-java which sets JAVA_HOME correctly regardless of
+  platform — this is the recommended approach for any workflow needing a specific Java version.
+fix_code:
+  - language: yaml
+    label: 'Recommended: use actions/setup-java for platform-independent JAVA_HOME'
+    code: |
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+      # After this step, $JAVA_HOME is set correctly on all platforms.
+      - name: Use Java
+        run: java -version
+  - language: yaml
+    label: 'Workaround: bash fallback for pre-installed Java without setup-java'
+    code: |
+      - name: Set JAVA_HOME cross-platform
+        run: |
+          # JAVA_HOME_17_X64 on ubuntu (both x64 and arm), JAVA_HOME_17_arm64 on macOS ARM64
+          JAVA_HOME="${JAVA_HOME_17_X64:-$JAVA_HOME_17_arm64}"
+          echo "JAVA_HOME=$JAVA_HOME" >> "$GITHUB_ENV"
+          echo "PATH=$JAVA_HOME/bin:$PATH" >> "$GITHUB_ENV"
+      - name: Verify Java
+        run: java -version
+  - language: yaml
+    label: 'Do NOT do this — RUNNER_ARCH casing mismatch'
+    code: |
+      # BAD: RUNNER_ARCH is uppercase (ARM64), but macOS arm64 runner uses lowercase suffix
+      - name: Set JAVA_HOME (broken on macOS ARM64)
+        run: |
+          # This evaluates to JAVA_HOME_17_ARM64 which is unset on macOS ARM64 runners
+          echo "JAVA_HOME=${JAVA_HOME_17_${RUNNER_ARCH}}" >> "$GITHUB_ENV"
+prevention:
+  - 'Always use actions/setup-java to configure Java in workflows instead of relying on pre-installed JAVA_HOME_XX_ARCH variables.'
+  - 'When reading pre-installed JAVA_HOME variables, use bash fallback: ${JAVA_HOME_17_X64:-$JAVA_HOME_17_arm64} to handle both naming conventions.'
+  - 'Do not use $RUNNER_ARCH to construct JAVA_HOME variable names — the runner image casing convention is inconsistent across OS and architecture combinations.'
+  - 'Test workflows explicitly on macos-latest (ARM64) and ubuntu-24.04-arm to catch arch-dependent JAVA_HOME issues.'
+docs:
+  - url: 'https://github.com/orgs/community/discussions/160592'
+    label: 'GitHub Community Discussion #160592 — JAVA_HOME env variable inconsistency (Jan 2024)'
+  - url: 'https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2404-Readme.md#java'
+    label: 'runner-images Ubuntu 24.04 README — Java pre-installed versions and JAVA_HOME variables'
+  - url: 'https://github.com/actions/setup-java'
+    label: 'actions/setup-java — recommended way to configure Java on any runner'
