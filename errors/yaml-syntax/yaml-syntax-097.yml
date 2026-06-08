@@ -1,0 +1,86 @@
+id: yaml-syntax-097
+title: '${{ toJSON(github) }} inline in bash run: step breaks with shell syntax error when commit message contains a single quote'
+category: yaml-syntax
+severity: error
+tags:
+  - toJSON
+  - expressions
+  - bash
+  - shell-quoting
+  - commit-message
+  - single-quote
+  - run-step
+patterns:
+  - regex: 'unexpected EOF while looking for matching'
+    flags: 'i'
+  - regex: 'echo\s+\047\$\{\{.*toJSON.*github.*\}\}\047'
+    flags: 'i'
+  - regex: 'syntax error near unexpected token'
+    flags: 'i'
+  - regex: 'unterminated quoted string'
+    flags: 'i'
+error_messages:
+  - "bash: line 1: unexpected EOF while looking for matching `\"'"
+  - "bash: line 1: syntax error: unexpected end of file"
+  - "/bin/sh: 1: Syntax error: Unterminated quoted string"
+  - "bash: line X: syntax error near unexpected token"
+root_cause: |
+  When `${{ toJSON(github) }}` (or any expression producing a JSON string) is placed
+  inline inside a single-quoted bash string in a `run:` step, GitHub Actions expands
+  the expression BEFORE bash parses the script. The resulting JSON value is literal
+  text injected into the workflow's `run:` block.
+
+  If the expanded JSON contains a single quote character (`'`) — which is common
+  whenever a commit message, branch name, or any git context field has an apostrophe
+  (e.g., `"fix user's bug"`, `"can't reproduce"`) — the single quote breaks the
+  bash quoting context, producing a syntax error such as
+  `unexpected EOF while looking for matching "'"`.
+
+  The most common trigger is copying the "Dump GitHub context" example from older
+  GitHub docs which used:
+    `run: echo '${{ toJSON(github) }}'`
+
+  When the injected JSON contains `'`, bash sees an unmatched opening `'` and
+  waits for the closing delimiter that never arrives.
+
+  This affects any shell that respects single-quote escaping rules (bash, sh, zsh).
+  It does NOT affect double-quoted strings (`"..."`) because toJSON produces a JSON
+  string whose inner double quotes are already escaped as `\"`.
+fix: |
+  Assign `${{ toJSON(github) }}` to an environment variable in the `env:` block and
+  use the variable reference inside the `run:` script. The GitHub Actions runner
+  resolves environment variables before launching the shell, and the shell receives
+  the value safely through the process environment rather than as inline text.
+
+  Do NOT wrap the expression in single quotes inside `run:`.
+  Do NOT use the expression directly in curl `-d` or similar single-quoted arguments.
+fix_code:
+  - language: yaml
+    label: 'Wrong — expression inline in single-quoted bash string (breaks on apostrophes)'
+    code: |
+      - name: Dump GitHub context
+        run: echo '${{ toJSON(github) }}'
+  - language: yaml
+    label: 'Correct — assign to env variable first, then use the variable'
+    code: |
+      - name: Dump GitHub context
+        env:
+          GITHUB_CONTEXT: ${{ toJSON(github) }}
+        run: echo "$GITHUB_CONTEXT"
+  - language: yaml
+    label: 'Correct — for curl POST body, use env variable via @- stdin'
+    code: |
+      - name: Post context to endpoint
+        env:
+          PAYLOAD: ${{ toJSON(github) }}
+        run: echo "$PAYLOAD" | curl -s -X POST -H "Content-Type: application/json" -d @- https://example.com/hook
+prevention:
+  - 'Never place `${{ expression }}` inside single-quoted strings in bash `run:` steps — use `env:` to pass the value instead.'
+  - 'When dumping any GitHub context via `toJSON()`, always assign to an env var first: `env: CTX: ${{ toJSON(github) }}`.'
+  - 'Run actionlint on your workflows locally — it flags direct expression usage in shell contexts that risk quoting issues.'
+  - 'Prefer double-quoted bash strings or heredocs when embedding dynamic content in `run:` scripts.'
+docs:
+  - url: 'https://docs.github.com/en/actions/learn-github-actions/contexts#example-printing-context-information-to-the-log'
+    label: 'GitHub Docs — Printing context information to the log (uses env variable pattern)'
+  - url: 'https://github.com/actions/runner/issues/1656'
+    label: 'actions/runner#1656 — Cannot use ${{ toJson(github) }} when a single quote appears in commit message'
