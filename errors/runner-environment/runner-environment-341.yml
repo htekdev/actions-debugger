@@ -1,0 +1,121 @@
+id: runner-environment-341
+title: 'QEMU arm64 Emulation — Node.js 20+ Triggers Illegal Instruction (SIGILL) exit 132 During npm install'
+category: runner-environment
+severity: error
+tags:
+  - qemu
+  - arm64
+  - docker
+  - multi-platform
+  - nodejs
+  - npm
+  - buildx
+  - sigill
+  - illegal-instruction
+patterns:
+  - regex: 'Illegal instruction \(core dumped\)|SIGILL|qemu.*killed.*signal 4'
+    flags: 'i'
+  - regex: 'Process exited with code 132|exit code: 132|exited with code 132'
+    flags: 'i'
+  - regex: 'npm (install|ci).*: exit code 132|Error.*npm.*132'
+    flags: 'i'
+  - regex: 'qemu.*userspace.*arm64.*node|node.*qemu.*arm64.*illegal'
+    flags: 'i'
+error_messages:
+  - "Illegal instruction (core dumped)"
+  - "Process completed with exit code 132."
+  - "ERROR: process \"/bin/sh -c npm install\" did not complete successfully: exit code: 132"
+  - "qemu: uncaught target signal 4 (Illegal instruction) - core dumped"
+  - "npm warn EBADENGINE"
+root_cause: |
+  When using `docker/setup-qemu-action` to build multi-platform Docker images on a
+  GitHub-hosted ubuntu-latest (amd64) runner, the arm64 leg runs under QEMU user-mode
+  emulation (qemu-aarch64-static). Node.js 20+ (and npm 10+) make use of modern ARM64
+  architectural instructions — specifically FEAT_LSE (Large System Extensions, e.g.,
+  LDADD/STADD atomics) and FEAT_LSE2 — that QEMU user-mode emulation does not fully
+  support.
+
+  When the Dockerfile RUN step executes `npm install` or `npm ci` inside a QEMU-
+  emulated arm64 container, Node.js or native addon compilation triggers one of these
+  unsupported instructions, causing QEMU to deliver SIGILL (signal 4) to the process.
+  The shell reports "Illegal instruction (core dumped)" and exits with code 132
+  (128 + signal 4).
+
+  This is NOT a problem with the packages being installed — the exact same `npm install`
+  command succeeds on:
+  - A native ubuntu-24.04-arm runner
+  - A macOS Apple Silicon runner
+  - A local arm64 machine
+
+  The regression typically surfaces when Node.js 20 or 22 is introduced into the Docker
+  image (replacing Node 18 or earlier), because newer Node.js binaries increasingly
+  rely on LSE atomics for performance.
+fix: |
+  Replace the QEMU-emulated multi-platform build with a native runner matrix. Build
+  amd64 on ubuntu-latest and arm64 on ubuntu-24.04-arm (or ubuntu-22.04-arm), then
+  merge the per-platform digests into a single multi-arch manifest.
+
+  This approach is 5-10x faster AND more reliable because each platform runs natively.
+fix_code:
+  - language: yaml
+    label: "Fix: use native runner matrix instead of QEMU for multi-arch Docker build"
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              include:
+                - platform: linux/amd64
+                  runs-on: ubuntu-latest
+                - platform: linux/arm64
+                  runs-on: ubuntu-24.04-arm
+          runs-on: ${{ matrix.runs-on }}
+          steps:
+            - uses: actions/checkout@v4
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@v3
+            - name: Build and push by digest
+              id: build
+              uses: docker/build-push-action@v6
+              with:
+                context: .
+                platforms: ${{ matrix.platform }}
+                outputs: type=image,push-by-digest=true,name=myimage
+                cache-from: type=gha,scope=${{ matrix.platform }}
+                cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+
+        merge:
+          needs: build
+          runs-on: ubuntu-latest
+          steps:
+            - name: Create multi-arch manifest
+              run: |
+                docker buildx imagetools create \
+                  --tag myimage:latest \
+                  $(echo '${{ toJSON(needs.build.outputs) }}' | jq -r '.[] | .')
+  - language: yaml
+    label: "Before (broken): single job with QEMU emulation"
+    code: |
+      # BROKEN for Node.js 20+ on arm64:
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: docker/setup-qemu-action@v3     # sets up QEMU
+            - uses: docker/setup-buildx-action@v3
+            - uses: docker/build-push-action@v6
+              with:
+                platforms: linux/amd64,linux/arm64  # arm64 runs under QEMU
+                # npm install inside arm64 layer hits SIGILL on Node.js 20+
+prevention:
+  - "Use native arm64 runners (ubuntu-24.04-arm) for the arm64 build leg instead of QEMU emulation"
+  - "Scope GHA layer cache per platform using cache-from/to scope parameter to prevent cross-arch cache pollution"
+  - "If QEMU is still required (e.g. linux/arm/v7), pin Node.js to <=18 inside the arm/v7 Dockerfile or use a pre-built node image"
+  - "Check if your base image provides a pre-built arm64 variant — if so, QEMU is not needed for RUN steps that only install packages"
+docs:
+  - url: 'https://github.com/netbootxyz/docker-netbootxyz/pull/130'
+    label: 'netbootxyz PR #130 — Use native arm64 runner to fix QEMU build crash'
+  - url: 'https://github.com/docker/build-push-action/blob/master/docs/advanced/multi-platform.md'
+    label: 'docker/build-push-action — Multi-platform builds documentation'
+  - url: 'https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners/about-github-hosted-runners#supported-runners-and-hardware-resources'
+    label: 'GitHub-hosted runners — ubuntu-24.04-arm specifications'
