@@ -1,0 +1,115 @@
+id: silent-failures-154
+title: 'setup-node v6 Silently Removes always-auth from .npmrc — Private Registry Auth Fails with 401/403'
+category: silent-failures
+severity: silent-failure
+tags:
+  - setup-node
+  - v6
+  - always-auth
+  - private-registry
+  - npmrc
+  - breaking-change
+  - npm-auth
+patterns:
+  - regex: 'Unexpected input\(s\).*always-auth'
+    flags: 'i'
+  - regex: 'npm ERR! code E401'
+    flags: 'i'
+  - regex: 'npm ERR! 401 Unauthorized.*registry'
+    flags: 'i'
+  - regex: 'npm warn.*always-auth.*deprecated|always.auth.*no longer supported'
+    flags: 'i'
+error_messages:
+  - 'Warning: Unexpected input(s) ''always-auth'', valid inputs are [''node-version'', ...'
+  - 'npm ERR! code E401'
+  - 'npm ERR! 401 Unauthorized - PUT https://registry.npmjs.org/...'
+  - 'npm ERR! 403 Forbidden - PUT https://registry.example.com/...'
+root_cause: |
+  In `actions/setup-node@v6`, the `always-auth` input was removed as a breaking change
+  (see PR #1436). In v5 and earlier, setting `always-auth: true` caused setup-node to write
+  `always-auth=true` into `.npmrc`, which instructs npm to send authentication credentials
+  on every registry request. This was commonly used for private npm registries hosted behind
+  proxies or on Artifactory / Nexus / GitHub Packages that required authentication even for
+  read operations.
+
+  When a workflow is upgraded to `actions/setup-node@v6` while still specifying
+  `always-auth: true`, GitHub Actions emits:
+    "Warning: Unexpected input(s) 'always-auth', valid inputs are [...]"
+
+  The workflow does NOT fail at this point — setup-node continues, but `always-auth=true` is
+  NEVER written to `.npmrc`. Downstream `npm install`, `npm ci`, or `npm publish` steps then
+  fail with 401/403 because the registry now receives unauthenticated requests.
+
+  The warning is easy to miss in noisy CI logs, and the failure happens in a later step with
+  a cryptic E401/E403 that points to the registry, not to the setup-node configuration change.
+
+  This affects anyone who:
+  - Upgraded `actions/setup-node` to v6 (or uses `@latest`) during the June 2026 Node 24
+    enforcement migration
+  - Uses a private npm registry that requires authentication for all requests
+  - Previously relied on `always-auth: true` to ensure credentials are always sent
+
+  Root cause summary: v6 drops `always-auth` support silently (warning only, no failure),
+  `.npmrc` is incomplete, private registry requests fail authentication.
+fix: |
+  Remove `always-auth: true` from your `actions/setup-node` step. Instead, configure
+  registry authentication using one of the recommended alternatives:
+
+  Option 1 (recommended for GitHub Packages): Use `NODE_AUTH_TOKEN` with the registry's
+  scoped token. `actions/setup-node` already writes `_authToken=${NODE_AUTH_TOKEN}` to
+  `.npmrc` when `registry-url` is set. You only need to pass the token via the env variable.
+
+  Option 2 (for Artifactory/Nexus or basic-auth registries): Write authentication directly
+  into `.npmrc` using a step that sets the `_auth` or `_authToken` fields for the specific
+  registry scope.
+
+  Option 3 (for npm registry with OIDC): Do NOT set `registry-url` and use npm Trusted
+  Publishing with `id-token: write` permission. See known entry silent-failures-155 for the
+  OIDC registry-url conflict.
+fix_code:
+  - language: yaml
+    label: 'Before (v5 — always-auth: true): private registry authentication'
+    code: |
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+          registry-url: 'https://npm.pkg.github.com'
+          always-auth: true          # <-- v5 only; writes always-auth=true to .npmrc
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  - language: yaml
+    label: 'After (v6 — remove always-auth, rely on NODE_AUTH_TOKEN env var)'
+    code: |
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://npm.pkg.github.com'
+          # always-auth removed in v6 — do NOT include it
+          # setup-node already writes _authToken=${NODE_AUTH_TOKEN} to .npmrc
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - run: npm ci
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # also pass to npm ci step
+  - language: yaml
+    label: 'For Artifactory/Nexus — write .npmrc auth manually instead'
+    code: |
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Configure private registry auth
+        run: |
+          echo "//registry.example.com/:_authToken=${{ secrets.NPM_TOKEN }}" >> ~/.npmrc
+          echo "//registry.example.com/:always-auth=true" >> ~/.npmrc
+prevention:
+  - 'When upgrading to actions/setup-node@v6, search your workflows for `always-auth: true` and replace with NODE_AUTH_TOKEN env var authentication.'
+  - 'Watch for "Unexpected input(s) ''always-auth''" warnings in workflow logs — they indicate the auth configuration is silently incomplete.'
+  - 'Test npm install/publish against your private registry in a dev workflow before upgrading setup-node to v6 in production.'
+  - 'Pin to `actions/setup-node@v5` if you cannot migrate away from always-auth immediately; it will continue to work until v5 is deprecated.'
+docs:
+  - url: 'https://github.com/actions/setup-node/pull/1436'
+    label: 'PR #1436: Remove always-auth configuration handling from action'
+  - url: 'https://github.com/actions/setup-node?tab=readme-ov-file#v6'
+    label: 'setup-node v6 Breaking Changes — always-auth removed'
+  - url: 'https://docs.github.com/en/actions/publishing-packages/publishing-nodejs-packages'
+    label: 'GitHub Docs: Publishing Node.js packages from GitHub Actions'
