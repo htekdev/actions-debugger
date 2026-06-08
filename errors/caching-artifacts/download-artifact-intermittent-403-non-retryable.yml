@@ -1,0 +1,68 @@
+id: caching-artifacts-104
+title: 'download-artifact Intermittent 403 Forbidden — Non-Retryable Error in Large Parallel Matrix'
+category: caching-artifacts
+severity: error
+tags:
+  - download-artifact
+  - 403
+  - parallel-jobs
+  - matrix
+  - non-retryable
+  - throttling
+patterns:
+  - regex: 'Unable to download artifact\(s\).*Failed to ListArtifacts.*non-retryable error.*403'
+    flags: 'i'
+  - regex: 'Received non-retryable error: Failed request: \(403\) Forbidden'
+    flags: 'i'
+error_messages:
+  - 'Unable to download artifact(s): Failed to ListArtifacts: Received non-retryable error: Failed request: (403) Forbidden: Error from intermediary with HTTP status code 403 "Forbidden"'
+root_cause: |
+  When many parallel jobs attempt to list or download the same artifact concurrently (e.g.,
+  large matrix builds with 50–100+ parallel jobs), the artifact storage intermediary
+  (Azure Blob Storage) returns HTTP 403 Forbidden due to transient throttling. The
+  @actions/artifact package incorrectly classifies 403 responses as "non-retryable" errors,
+  so no retry is attempted and the job fails immediately. This is not a real permissions
+  error — it is a rate-limiting signal mishandled by the artifact client. Typically 5–10% of
+  jobs fail in this pattern when the matrix is large enough to saturate the artifact API.
+fix: |
+  Add a retry wrapper around the download step. Use the nick-fields/retry or
+  Wandalen/wretry.action community actions for a shell-level retry. Alternatively, limit
+  concurrent downloads using max-parallel on the matrix strategy to reduce the number of
+  simultaneous ListArtifacts calls. The root fix was tracked in actions/download-artifact#464
+  (open Feb 2026) to add proper retry behavior for 403 responses in the artifact client.
+fix_code:
+  - language: yaml
+    label: 'Retry the download step for large parallel matrix (uses gh CLI)'
+    code: |
+      - name: Download artifact with retry
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 5
+          max_attempts: 3
+          command: >
+            gh run download ${{ github.run_id }}
+            --name my-artifact
+            --dir ./artifacts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  - language: yaml
+    label: 'Limit concurrent downloads with max-parallel'
+    code: |
+      strategy:
+        matrix:
+          shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        max-parallel: 10  # cap concurrent artifact downloads to avoid 403 throttle
+      steps:
+        - uses: actions/download-artifact@v4
+          with:
+            name: build-output
+prevention:
+  - 'Set max-parallel on matrix jobs that all download the same artifact to cap concurrent ListArtifacts calls'
+  - 'Wrap artifact download steps in a retry loop for builds with 50+ parallel matrix jobs'
+  - 'Consider uploading separate per-shard artifacts (e.g., artifact-shard-1, artifact-shard-2) so jobs do not all download the same artifact simultaneously'
+  - 'Monitor download-artifact step failures in large matrices; sporadic 403 non-retryable is the signature of this throttling issue'
+docs:
+  - url: 'https://github.com/actions/download-artifact/issues/464'
+    label: 'download-artifact #464: intermittent 403s with no retry (open Feb 2026, 5 reactions)'
+  - url: 'https://github.com/actions/toolkit/tree/main/packages/artifact'
+    label: '@actions/artifact package — artifact client used by download-artifact'
