@@ -1,0 +1,93 @@
+id: runner-environment-339
+title: 'pnpm/action-setup@v6 standalone fallback (@pnpm/exe 11.x) ships node-gyp shims without execute bit — native module builds fail with Permission denied'
+category: runner-environment
+severity: error
+tags:
+  - pnpm
+  - action-setup
+  - node-gyp
+  - native-modules
+  - permission-denied
+  - pnpm-exe
+patterns:
+  - regex: 'sh: \d+: node-gyp: Permission denied'
+    flags: 'i'
+  - regex: 'node-gyp: Permission denied'
+    flags: 'i'
+  - regex: '\[ELIFECYCLE\] Command failed.*node-gyp'
+    flags: 'i'
+  - regex: 'dist/node-gyp-bin/node-gyp.*Permission denied'
+    flags: ''
+error_messages:
+  - 'sh: 1: node-gyp: Permission denied'
+  - '[ELIFECYCLE] Command failed.'
+  - 'node-gyp: Permission denied'
+root_cause: |
+  `pnpm/action-setup@v6` inspects the Node.js version available at setup time.
+  When the system Node is below v22.13 (pnpm 11's minimum requirement), the action
+  falls back to the `@pnpm/exe` standalone binary path rather than installing pnpm
+  via the regular npm registry path.
+
+  In `@pnpm/exe@11.x`, the three node-gyp shim files packed at `dist/node-gyp-bin/`
+  were given mode `0644` (read/write, no execute bit) instead of `0755`. When a
+  package with a native module executes `node-gyp rebuild` as its `install` script,
+  pnpm prepends `dist/node-gyp-bin/` to the script PATH. The shell cannot execute the
+  non-executable shim and throws `Permission denied`, causing the build to fail with
+  `ELIFECYCLE`.
+
+  This only triggers on the standalone `@pnpm/exe` fallback path. Workflows where
+  Node.js >=22.13 is installed before `pnpm/action-setup@v6` use the regular npm
+  path with correctly-permissioned shims and are unaffected.
+
+  This is a v11 regression — `@pnpm/exe@10.x` did not include a `dist/` layout, so
+  this class of failure could not occur on pnpm 10.
+
+  Tracked: pnpm/pnpm#11483 (May 2026).
+fix: |
+  Install Node.js >=22.13 BEFORE `pnpm/action-setup@v6` so the action takes the
+  non-standalone path and installs pnpm from the npm registry (with correct shim
+  permissions). This is the recommended fix.
+
+  As a temporary workaround, `chmod +x` the three affected shim files after the
+  action runs. See the `fix_code` section for both approaches.
+
+  A permanent fix in `@pnpm/exe` was planned in pnpm/pnpm#11483 to pack shims
+  with `0755` mode. Check that issue for a fixed release and remove the workaround
+  once your installed `@pnpm/exe` version includes the fix.
+fix_code:
+  - language: yaml
+    label: 'Install Node >=22.13 before pnpm/action-setup to avoid @pnpm/exe standalone path'
+    code: |
+      steps:
+        - uses: actions/setup-node@v4
+          with:
+            node-version: '22'   # >=22.13 prevents @pnpm/exe standalone fallback
+        - uses: pnpm/action-setup@v6
+          with:
+            version: latest
+        - run: pnpm install      # node-gyp shims now have correct execute bit
+  - language: yaml
+    label: 'Workaround: chmod +x shims after action-setup (Node <22.13 unavoidable)'
+    code: |
+      - uses: pnpm/action-setup@v6
+        with:
+          version: latest
+      # Fix @pnpm/exe node-gyp shim permissions (bug: pnpm/pnpm#11483)
+      - name: Fix pnpm/exe node-gyp-bin shim permissions
+        run: |
+          find "$(pnpm root -g 2>/dev/null || echo node_modules)" \
+            -path "*/dist/node-gyp-bin/node-gyp" \
+            -not -perm /111 \
+            -exec chmod +x {} + 2>/dev/null || true
+        shell: bash
+prevention:
+  - 'Always install Node.js >=22.13 before `pnpm/action-setup@v6` when using pnpm 11.x.'
+  - 'If a native module rebuild step fails with Permission denied after a pnpm upgrade, check whether the runner Node.js version triggered the @pnpm/exe standalone path.'
+  - 'Monitor pnpm/pnpm#11483 for the shim permission fix release and remove any chmod workaround once your @pnpm/exe version is patched.'
+docs:
+  - url: 'https://github.com/pnpm/pnpm/issues/11483'
+    label: 'pnpm/pnpm#11483 — @pnpm/exe 11.x ships node-gyp shims without execute bit (May 2026)'
+  - url: 'https://github.com/pnpm/action-setup'
+    label: 'pnpm/action-setup — official pnpm setup action for GitHub Actions'
+  - url: 'https://github.com/nodejs/node-gyp'
+    label: 'node-gyp — native addon build tool for Node.js'

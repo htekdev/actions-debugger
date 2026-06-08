@@ -1,0 +1,91 @@
+id: caching-artifacts-115
+title: 'npm 11.14.x falsely reports lockfile out of sync in workspaces with overrides (EUSAGE regression)'
+category: caching-artifacts
+severity: error
+tags:
+  - npm
+  - npm-ci
+  - workspaces
+  - overrides
+  - lockfile
+  - regression
+  - npm-11
+patterns:
+  - regex: 'npm error code EUSAGE'
+    flags: 'i'
+  - regex: "npm ci.*can only install packages when.*lock file.*not in sync"
+    flags: 'i'
+  - regex: "Invalid: lock file's .+ does not satisfy .+@[0-9]"
+    flags: ''
+  - regex: 'silly placeDep ROOT.*REPLACE for:'
+    flags: 'i'
+error_messages:
+  - 'npm error code EUSAGE'
+  - 'npm error `npm ci` can only install packages when your package.json and package-lock.json or npm-shrinkwrap.json are in sync. Please update your lock file with `npm install` before continuing.'
+  - "npm error Invalid: lock file's @types/node@20.19.39 does not satisfy @types/node@20.19.41"
+root_cause: |
+  npm 11.14.0 and 11.14.1 introduced a regression where `npm ci` incorrectly
+  re-resolves workspace dependency versions from the registry, even when the
+  existing lockfile satisfies the declared `^` range.
+
+  The regression was introduced by npm/cli PR #9198
+  (`fix(arborist): propagate overrides through Link nodes to targets`, commit
+  e7805c3a4). The fix added `Link.recalculateOutEdgesOverrides` to forward
+  overrides from a Link node to its target node. This caused `edge.reload(true)`
+  to be called on workspace dependency edges, invalidating edges that were already
+  satisfied by the lockfile. The arborist then issued a registry `fetchManifest`
+  request, which returned the latest matching version (e.g. `20.19.41`) instead of
+  the lockfile-pinned version (e.g. `20.19.39`). `placeDep` called `REPLACE` for
+  the resolution, and `validateLockfile()` rejected the mismatch with EUSAGE.
+
+  The failure only affects monorepos where ALL of the following are true:
+  - The root `package.json` contains an `overrides` block (including self-reference
+    syntax like `"$react"`)
+  - A workspace's `package.json` has a dep with a `^`-prefixed range
+  - The registry has published a newer patch release since the lockfile was generated
+
+  npm 11.12.1 and 11.13.0 are unaffected. Fixed in npm 11.14.2 (PR #9359).
+
+  Source: npm/cli#9357 (May 2026). Widely observed in WordPress/Gutenberg CI, where
+  dozens of PRs broke until lockfiles were force-updated.
+fix: |
+  Upgrade npm to 11.14.2 or later using `npm install -g npm@latest` in your
+  workflow before the `npm ci` step. This gets the fix from PR #9359.
+
+  As a temporary workaround, pin npm to 11.13.0 (`npm install -g npm@11.13.0`)
+  until you can upgrade to 11.14.2+.
+
+  If regenerating the lockfile is acceptable, running `npm install` (not `npm ci`)
+  will regenerate a lockfile with the current registry state and unblock CI.
+fix_code:
+  - language: yaml
+    label: 'Upgrade npm to 11.14.2+ before npm ci'
+    code: |
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Upgrade npm to fix 11.14.x workspace regression
+        run: npm install -g npm@latest   # 11.14.2+ includes the fix
+      - name: Install dependencies
+        run: npm ci
+  - language: yaml
+    label: 'Pin npm to 11.13.0 as workaround'
+    code: |
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Pin npm to last known-good version
+        run: npm install -g npm@11.13.0  # pre-regression, avoid 11.14.0-11.14.1
+      - run: npm ci
+prevention:
+  - 'Avoid pinning specific npm patch versions in CI; use `npm@latest` and let the regression window close naturally.'
+  - 'For monorepos with workspaces + overrides, add a `npm ci --dry-run` smoke test step that fails early and clearly.'
+  - 'When `npm ci` suddenly reports lockfile sync errors on a lockfile that was previously valid, check whether npm was recently upgraded — especially across 11.x minor boundaries.'
+  - 'Track npm/cli releases when your project uses workspaces with overrides; `npm ci` behavior in these cases is sensitive to arborist internals.'
+docs:
+  - url: 'https://github.com/npm/cli/issues/9357'
+    label: 'npm/cli#9357 — npm ci re-resolves workspace deps from registry in v11.14.x (May 2026)'
+  - url: 'https://github.com/npm/cli/pull/9359'
+    label: 'npm/cli PR#9359 — fix: only forward Link overrides when a rule names a target dep'
+  - url: 'https://docs.npmjs.com/cli/v11/commands/npm-ci'
+    label: 'npm docs — npm ci'
