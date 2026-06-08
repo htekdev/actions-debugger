@@ -1,0 +1,129 @@
+id: caching-artifacts-113
+title: 'docker/build-push-action type=gha Cache Scope Contains Unique SHA — Cache
+  Never Restored Across Runs'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - docker
+  - build-push-action
+  - buildx
+  - type=gha
+  - cache-scope
+  - sha
+  - perpetual-miss
+  - silent-failure
+patterns:
+  - regex: 'importing cache manifest from gha:'
+    flags: 'i'
+  - regex: 'cache-to.*type=gha.*scope.*github\.sha'
+    flags: 'i'
+  - regex: 'cache-from.*type=gha.*scope.*github\.sha'
+    flags: 'i'
+error_messages:
+  - '#N importing cache manifest from gha:<hash>'
+  - 'cache hit: false (scope contains commit SHA, unique per run)'
+root_cause: |
+  When `docker/build-push-action` is configured with `type=gha` cache and the
+  `scope` parameter includes a value unique to each workflow run — such as
+  `${{ github.sha }}`, `${{ github.run_id }}`, or `${{ github.run_number }}` —
+  a new cache entry is written with a unique scope key every time the workflow
+  runs. The `cache-from` directive in the NEXT run specifies the NEXT run's
+  unique SHA as the scope, which does not match the entry written by the previous
+  run. As a result, the cache is never found and every Docker build runs from
+  scratch.
+
+  The GitHub Actions cache log will show `importing cache manifest from gha:<id>`
+  on the first (cache-write) run, which gives the appearance that the cache is
+  being populated correctly. However on every subsequent run the scope does not
+  match any existing cache entry, so all layers are rebuilt — a silent failure
+  that wastes CI time without any error message.
+
+  Common anti-patterns that cause this:
+  1. `scope=${{ github.sha }}` — unique per commit
+  2. `scope=${{ github.run_id }}` — unique per workflow run
+  3. `scope=${{ github.repository }}-${{ github.sha }}` — unique per commit
+  4. `scope=build-${{ github.run_number }}` — unique per run number
+
+  The scope is designed to be a STABLE, human-meaningful identifier shared
+  between `cache-to` and `cache-from` across multiple runs. Using any
+  run-specific unique value defeats the purpose entirely.
+fix: |
+  Replace the dynamic/unique value in the scope with a stable identifier such
+  as the repository name, target image name, or branch name. The scope must
+  be identical between `cache-to` (write) and `cache-from` (read) across runs.
+
+  If you build multiple images in the same workflow, use distinct stable scopes
+  per image to avoid cache collisions between builds.
+
+  Recommended stable scope values:
+  - The Docker image name or service name: `scope=my-service`
+  - Repository + image combination: `scope=${{ github.repository }}/my-image`
+  - Branch-scoped (allows per-branch warm caches): `scope=${{ github.ref_name }}`
+  - Matrix target: `scope=build-${{ matrix.platform }}`
+
+  Note: GitHub Actions cache is automatically scoped to branches — the current
+  branch, base branch, and default branch are accessible. You do NOT need to
+  include branch information in the scope parameter to get branch isolation.
+fix_code:
+  - language: yaml
+    label: 'Before — SHA in scope causes perpetual cache miss'
+    code: |
+      # BAD: scope includes github.sha — each run writes a unique key,
+      # next run looks for a different key, cache is NEVER restored.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: my-registry/my-image:latest
+          cache-from: type=gha,scope=${{ github.repository }}-${{ github.sha }}
+          cache-to: type=gha,mode=max,scope=${{ github.repository }}-${{ github.sha }}
+  - language: yaml
+    label: 'After — stable scope enables cache restoration across runs'
+    code: |
+      # GOOD: stable scope — same key used every run, cache is found and restored.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: my-registry/my-image:latest
+          cache-from: type=gha,scope=my-image
+          cache-to: type=gha,mode=max,scope=my-image
+  - language: yaml
+    label: 'Multi-image example — stable per-image scopes'
+    code: |
+      # When building multiple images, use distinct stable scopes per image.
+      # Branch isolation is automatic — no need to include branch in scope.
+      - name: Build frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+      - name: Build backend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+prevention:
+  - 'Never use run-unique values (github.sha, github.run_id, github.run_number)
+    in the type=gha cache scope — they create orphaned cache entries that are
+    written once and never read.'
+  - 'Use image name, service name, or build target as the scope value. Scope
+    should be a stable human-readable identifier that remains constant across
+    workflow runs for the same artifact.'
+  - 'Verify cache hits by checking that Docker build steps show CACHED in the
+    build log. If every layer shows a build step (not CACHED), the scope is
+    likely misconfigured.'
+  - 'Remember that GitHub automatically restricts cache access by branch — the
+    current branch, base branch, and default branch are accessible. You do NOT
+    need to encode branch info in the scope parameter.'
+docs:
+  - url: 'https://docs.docker.com/build/cache/backends/gha/'
+    label: 'Docker Docs — GitHub Actions cache backend (scope parameter)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows#restrictions-for-accessing-a-cache'
+    label: 'GitHub Docs — Cache access restrictions by branch'
+  - url: 'https://github.com/docker/build-push-action/blob/main/docs/advanced/cache.md'
+    label: 'docker/build-push-action — Advanced cache usage documentation'
