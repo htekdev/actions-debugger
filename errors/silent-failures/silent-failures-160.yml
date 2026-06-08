@@ -1,0 +1,107 @@
+id: silent-failures-160
+title: 'contains(needs.*.result, "failure") wildcard returns false when some needs jobs are independently skipped — downstream job runs unexpectedly'
+category: silent-failures
+severity: silent-failure
+tags:
+  - needs
+  - contains
+  - wildcard
+  - result
+  - skipped
+  - if-conditional
+  - fan-out
+patterns:
+  - regex: 'contains\s*\(\s*needs\.\*\.result'
+    flags: 'i'
+  - regex: 'if\s*:.*always\(\).*contains.*needs\.\*'
+    flags: 'im'
+  - regex: 'needs\.\*\.result.*failure'
+    flags: 'i'
+error_messages:
+  - "contains(needs.*.result, 'failure')"
+  - 'always() && contains(needs.*.result, ''failure'')'
+root_cause: |
+  When using `contains(needs.*.result, 'failure')` with the `*` wildcard to check
+  whether any upstream job failed, the expression evaluates incorrectly when one or
+  more `needs` jobs were skipped via their own `if: false` (or similar static condition
+  unrelated to dependency failure).
+
+  The runner evaluates `needs.*.result` as the set of results from jobs listed in
+  `needs:`. When some of those jobs have `if: false` (independently skipped, not
+  skipped-because-dependency-failed), they report `'skipped'` in the result set.
+  The wildcard expansion combined with the `contains` function does not always
+  correctly aggregate the result array — in certain combinations of `failure` +
+  `skipped` across multiple needs jobs, the `contains` check returns `false` even
+  though one of the jobs has result `'failure'`.
+
+  The downstream job then evaluates `if: always() && contains(needs.*.result, 'failure')`
+  as `true && false` = `false` and proceeds to run when it should be skipped, or
+  evaluates it as `true` and runs when the dependent job was actually skipped (not failed).
+
+  This is a known runner evaluation bug tracked in actions/runner#1540 (opened Dec 2021,
+  18 reactions, still open Sep 2024). The root cause is the interaction between
+  independently-skipped jobs and the wildcard `needs.*` context expansion.
+
+  Using an explicit list of job results (`needs.job_a.result == 'failure' ||
+  needs.job_b.result == 'failure'`) is evaluated correctly and does not exhibit this
+  behavior.
+fix: |
+  Replace the `contains(needs.*.result, 'failure')` wildcard pattern with explicit
+  per-job result comparisons using `||`. This is always evaluated correctly regardless
+  of how jobs in the `needs:` list are skipped.
+
+  Alternatively, use `fromJSON` with a hardcoded array to leverage `contains` while
+  still naming jobs explicitly.
+fix_code:
+  - language: yaml
+    label: 'Wrong — wildcard may evaluate incorrectly when some needs jobs are independently skipped'
+    code: |
+      jobs:
+        notify-failure:
+          runs-on: ubuntu-latest
+          needs: [build, test, lint]
+          if: always() && contains(needs.*.result, 'failure')
+          steps:
+            - run: echo "A job failed"
+  - language: yaml
+    label: 'Correct — explicit per-job result checks evaluate reliably'
+    code: |
+      jobs:
+        notify-failure:
+          runs-on: ubuntu-latest
+          needs: [build, test, lint]
+          if: |
+            always() && (
+              needs.build.result == 'failure' ||
+              needs.test.result == 'failure' ||
+              needs.lint.result == 'failure'
+            )
+          steps:
+            - run: echo "A job failed"
+  - language: yaml
+    label: 'Alternative — use contains with fromJSON to check multiple results explicitly'
+    code: |
+      jobs:
+        notify-failure:
+          runs-on: ubuntu-latest
+          needs: [build, test, lint]
+          if: |
+            always() && (
+              contains(fromJSON('["failure", "cancelled"]'), needs.build.result) ||
+              contains(fromJSON('["failure", "cancelled"]'), needs.test.result) ||
+              contains(fromJSON('["failure", "cancelled"]'), needs.lint.result)
+            )
+          steps:
+            - run: echo "A job failed or was cancelled"
+prevention:
+  - 'Avoid contains(needs.*.result, "failure") in if: conditions when any needs job may be independently skipped via its own if: condition.'
+  - 'Use explicit per-job result comparisons (needs.job_a.result == "failure") for reliable evaluation in fan-out workflows.'
+  - 'If you have many needs jobs, use a summary job that aggregates results and sets an output flag, then check that single flag.'
+  - 'Test your if: conditions by manually triggering with specific jobs skipped to verify the conditional fires as expected.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/1540'
+    label: 'actions/runner#1540 — if conditional evaluated wrong for contains(needs.*.result)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-conditions-to-control-job-execution'
+    label: 'GitHub Actions — using conditions to control job execution'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#needs-context'
+    label: 'GitHub Actions contexts — needs context'
