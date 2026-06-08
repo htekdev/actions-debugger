@@ -1,0 +1,111 @@
+id: runner-environment-342
+title: 'QEMU User-Mode Emulation Network Unreliability — apt-get update Intermittently Exits with Code 100 Inside Multi-Platform Docker Builds'
+category: runner-environment
+severity: error
+tags:
+  - qemu
+  - arm64
+  - docker
+  - multi-platform
+  - apt-get
+  - network
+  - buildx
+  - intermittent
+  - nondeterministic
+patterns:
+  - regex: 'apt-get (update|install).*exit code: 100|process.*apt-get.*exit code 100'
+    flags: 'i'
+  - regex: 'E: Failed to fetch.*Connection failed.*qemu|qemu.*apt.*fail'
+    flags: 'i'
+  - regex: 'did not complete successfully: exit code: 100'
+    flags: 'i'
+  - regex: 'apt-get update.*100.*unrelated to any code change'
+    flags: 'i'
+error_messages:
+  - "ERROR: process \"/bin/sh -c apt-get update\" did not complete successfully: exit code: 100"
+  - "E: Failed to fetch http://archive.ubuntu.com/ubuntu/..."
+  - "E: Some index files failed to download. They have been ignored, or old ones used instead."
+  - "W: Failed to fetch http://archive.ubuntu.com/ubuntu/dists/noble/InRelease  Something wicked happened resolving 'archive.ubuntu.com'"
+root_cause: |
+  QEMU user-mode emulation (`qemu-aarch64-static`, set up by `docker/setup-qemu-action`)
+  provides partial emulation of Linux syscalls for cross-architecture containers. The
+  network syscall emulation path (used for DNS resolution and TCP socket I/O) is
+  unreliable under QEMU user-mode — particularly for arm64 emulated on x86_64.
+
+  When a multi-platform Docker build runs `apt-get update` (or `apt-get install`) inside
+  a QEMU-emulated arm64 layer on an ubuntu-latest (amd64) runner, the apt HTTP client
+  may fail to resolve hostnames or complete TCP connections — even when the same host
+  machine has working internet access. The failure is nondeterministic: the same
+  Dockerfile on the same runner can pass on one run and fail on the next, with no code
+  changes.
+
+  Common manifestations:
+  - `Connection failed [IP: ...]` for Ubuntu archive mirrors
+  - DNS resolution failure ("Something wicked happened resolving 'archive.ubuntu.com'")
+  - apt-get exits with code 100 (fetch error) instead of 0
+
+  This is fundamentally a QEMU user-mode network emulation limitation, not a GitHub
+  runner issue or a temporary mirror outage. The same Dockerfile succeeds reliably on
+  a native ubuntu-24.04-arm runner.
+fix: |
+  Replace the QEMU-emulated multi-platform build with a native runner matrix build.
+  Use ubuntu-24.04-arm for the arm64 leg and ubuntu-latest for amd64. Each platform
+  builds natively, eliminating QEMU entirely for the arm64 step.
+
+  If you cannot use native arm64 runners, add retry logic around apt-get commands
+  inside the Dockerfile as a mitigation (not a fix — failures will still occur but
+  retries will eventually succeed).
+fix_code:
+  - language: yaml
+    label: "Fix: native runner matrix eliminates QEMU for apt-get"
+    code: |
+      jobs:
+        build:
+          strategy:
+            fail-fast: false
+            matrix:
+              include:
+                - platform: linux/amd64
+                  runner: ubuntu-latest
+                - platform: linux/arm64
+                  runner: ubuntu-24.04-arm   # native — no QEMU, no network issues
+          runs-on: ${{ matrix.runner }}
+          steps:
+            - uses: actions/checkout@v4
+            - uses: docker/setup-buildx-action@v3
+            - uses: docker/build-push-action@v6
+              with:
+                platforms: ${{ matrix.platform }}
+                cache-from: type=gha,scope=${{ matrix.platform }}
+                cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+                push: true
+                tags: myimage:${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+  - language: yaml
+    label: "Mitigation: retry wrapper in Dockerfile for QEMU network flakiness"
+    code: |
+      # In Dockerfile — adds retry logic as a last resort if native runners unavailable:
+      # RUN for attempt in 1 2 3; do
+      #   apt-get update && apt-get install -y --no-install-recommends curl && break
+      #   echo "apt-get attempt $attempt failed, retrying in 10s..."
+      #   sleep 10
+      # done
+
+      # In GitHub Actions workflow with QEMU (fallback only):
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
+prevention:
+  - "Use native ubuntu-24.04-arm runners for the arm64 build leg — eliminates QEMU and all its reliability issues"
+  - "Never rely on apt-get inside QEMU-emulated containers for release-critical builds — use pre-built base images that don't need package installation"
+  - "Scope per-platform GHA cache to prevent cache pollution between amd64 and arm64 layers when using the matrix pattern"
+  - "If you must use QEMU, consolidate all apt-get update/install into a single RUN layer with --no-install-recommends to minimize network round trips"
+docs:
+  - url: 'https://github.com/michelangelo-ai/michelangelo/commit/29854e42905e7b68c0ffb75b348ff13c6c941291'
+    label: 'michelangelo-ai CI fix — replace QEMU cross-arch with native runners'
+  - url: 'https://github.com/docker/setup-qemu-action'
+    label: 'docker/setup-qemu-action repository'
+  - url: 'https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners/about-github-hosted-runners'
+    label: 'GitHub-hosted runners documentation'
