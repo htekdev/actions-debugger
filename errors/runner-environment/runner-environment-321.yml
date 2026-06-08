@@ -1,0 +1,116 @@
+id: runner-environment-321
+title: 'macOS-15 Arm64 runner shows Apple Analytics setup dialog — steals focus from UI tests'
+category: runner-environment
+severity: error
+tags:
+  - macos-15
+  - macos-15-arm64
+  - analytics
+  - dialog
+  - focus
+  - ui-tests
+  - electron
+  - xcodebuild
+patterns:
+  - regex: 'NSAlert.*Analytics|Analytics.*dialog.*macos|analyticsOptIn|Set Up Analytics'
+    flags: 'i'
+  - regex: 'electron.*test.*focus|keyboardEvent.*not.*received.*macos-15'
+    flags: 'i'
+  - regex: 'System (dialog|prompt|alert).*steal.*focus|UI test.*failed.*unexpected.*dialog'
+    flags: 'i'
+error_messages:
+  - "Error: Could not tap - the dialog is blocking focus"
+  - "keyboardInput: Failed to type text because no application is in focus"
+  - "Test Suite 'Selected tests' started but no tests ran — a system dialog may have stolen focus"
+root_cause: |
+  Since approximately late May 2026, macOS-15 Arm64 hosted runners display an Apple
+  "Set Up Analytics" dialog at job startup. The dialog prompts whether to share
+  diagnostics and usage data with Apple. Because the runner operates in a headless
+  CI environment, the dialog is never dismissed and remains frontmost, blocking
+  keyboard and mouse input to the application under test.
+
+  Tests that:
+    - Require keyboard focus (Electron apps, Xcode UI tests, Playwright on macOS)
+    - Type text into form fields
+    - Click UI elements that need to be frontmost
+    - Assert window focus state
+
+  ...all fail non-deterministically because the analytics dialog is overlaid on top
+  of the application window and holds the input focus.
+
+  The dialog renders even when `defaults write com.apple.analyticsUI` settings are
+  applied, because the dialog is presented by a system process (SubmitDiagInfo or
+  analyticsOptIn) that runs independently of the runner process.
+
+  Source: actions/runner-images#14161 (open May 2026, assigned to GitHub team).
+fix: |
+  Option 1 (recommended — disable analytics before tests):
+  Add a step early in the job that writes macOS defaults to suppress the analytics
+  dialog. Run it before any UI-dependent steps.
+
+  Option 2 — use AppleScript/osascript to dismiss any modal dialog:
+  After starting the application under test but before driving UI, use osascript
+  to close any unexpected system dialog that may be frontmost.
+
+  Option 3 — force focus to the test application:
+  Use `open -a MyApp` or `activateIgnoringOtherApps` (in XCUITest) to explicitly
+  bring the app to the foreground after starting it, overriding any system dialog.
+
+  Option 4 — pin to macOS-15 x86 or macOS-14:
+  macOS-15 Arm64 is the affected image. macOS-14 and macOS-15 (Intel, if available)
+  do not exhibit this dialog in current image versions.
+
+  Note: GitHub has acknowledged the issue and assigned it for investigation
+  (runner-images#14161). An image update will likely resolve it without workflow changes.
+fix_code:
+  - language: yaml
+    label: 'Suppress Analytics dialog before UI tests on macOS-15 Arm64'
+    code: |
+      - name: Disable Apple Analytics setup dialog
+        if: runner.os == 'macOS'
+        run: |
+          # Opt out of all analytics/diagnostics prompts before starting UI tests
+          defaults write /Library/Application\ Support/CrashReporter/DiagnosticMessagesHistory.plist AutoSubmit -bool false
+          defaults write com.apple.SubmitDiagInfo AutoSubmit -bool false
+          defaults write com.apple.diagnostics_agent SeedID -string ""
+          # Dismiss any existing frontmost dialog via osascript
+          osascript -e 'tell application "System Events" to keystroke return' 2>/dev/null || true
+
+      - name: Run Electron UI tests
+        run: npm test
+  - language: yaml
+    label: 'Force focus to application under test before driving UI'
+    code: |
+      - name: Start app and force focus
+        run: |
+          open -a "MyApp.app"
+          sleep 2
+          # Force focus regardless of any dialog that may be in front
+          osascript -e 'tell application "MyApp" to activate'
+
+      - name: Run UI automation tests
+        run: npx playwright test
+  - language: yaml
+    label: 'Pin to macOS-14 to avoid macOS-15 Arm64 analytics dialog regression'
+    code: |
+      jobs:
+        ui-tests:
+          # Temporarily pin to macOS-14 to avoid runner-images#14161 analytics dialog
+          # on macOS-15-arm64. Revisit after the runner image is fixed.
+          runs-on: macos-14
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run UI tests
+              run: npm run test:ui
+prevention:
+  - 'Add a step to suppress analytics dialogs before any UI-dependent test on macOS runners.'
+  - 'Use `osascript` or `defaults write` to clear any pending system dialogs in CI job setup.'
+  - 'Follow actions/runner-images#14161 for the official fix — the image team is investigating.'
+  - 'Use `runner.arch == "arm64"` conditional to apply the workaround only on Arm64 macOS runners.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14161'
+    label: 'runner-images#14161 — macOS-15 Arm64 runner shows Analytics setup dialog (open May 2026)'
+  - url: 'https://github.com/electron/electron/actions/runs/26368726651'
+    label: 'Electron CI example — analytics dialog causing test failure on macOS-15-arm64'
+  - url: 'https://developer.apple.com/documentation/xcode/running-tests-and-interpreting-results'
+    label: 'Apple Docs — Running tests and interpreting results (XCUITest focus requirements)'
