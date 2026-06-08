@@ -1,0 +1,135 @@
+id: silent-failures-155
+title: 'setup-node registry-url Writes .npmrc Auth Token Placeholder That Blocks npm OIDC Trusted Publishing — E404'
+category: silent-failures
+severity: silent-failure
+tags:
+  - setup-node
+  - registry-url
+  - npm-trusted-publishing
+  - oidc
+  - npmrc
+  - NODE_AUTH_TOKEN
+  - npm-publish
+  - id-token
+patterns:
+  - regex: 'npm ERR! code E404.*publish'
+    flags: 'i'
+  - regex: 'npm ERR! 404 Not Found.*Publish each package separately'
+    flags: 'i'
+  - regex: '404 Unauthorized - PUT.*registry\.npmjs\.org'
+    flags: 'i'
+  - regex: 'npm warn.*OIDC.*token.*not.*used|oidc.*token.*ignored'
+    flags: 'i'
+error_messages:
+  - 'npm ERR! code E404'
+  - 'npm ERR! 404 Not Found - PUT https://registry.npmjs.org/@scope%2fpackage - Not found'
+  - 'npm ERR! 404 You must be logged in to publish packages.'
+root_cause: |
+  When `actions/setup-node` is used with the `registry-url` input pointing to the npm registry,
+  it writes a `.npmrc` file containing:
+
+    //registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}
+
+  It also exports `NODE_AUTH_TOKEN` as an environment variable (empty string if not set by the
+  workflow). This `.npmrc` entry tells the npm CLI that an authentication token is configured
+  for the registry.
+
+  When developers use npm Trusted Publishing (OIDC) — which requires `id-token: write`
+  permission and does NOT use a personal access token — they intentionally do NOT set
+  `NODE_AUTH_TOKEN`. The expectation is that npm will perform an OIDC token exchange with
+  the npm registry to obtain a short-lived publish token automatically.
+
+  However, npm's OIDC exchange is SKIPPED when the `.npmrc` already contains an `_authToken`
+  entry for the registry, even if the token value is an unresolved environment variable
+  placeholder (`${NODE_AUTH_TOKEN}`). npm sees a configured auth entry and assumes the
+  token-based flow is intended, bypassing the OIDC exchange entirely.
+
+  Since NODE_AUTH_TOKEN is empty/unset, npm sends an unauthenticated (or malformed) request.
+  The npm registry returns 404 for scoped packages (to avoid leaking existence of private
+  packages) rather than a clear 401, making this extremely confusing to diagnose.
+
+  This is compounded because:
+  - The npm official Trusted Publishing documentation recommends using `registry-url` in
+    the setup-node step, directly causing this conflict
+  - The 404 response looks like a missing package rather than an auth failure
+  - The workflow has `id-token: write` set and appears correctly configured for OIDC
+fix: |
+  Do NOT set `registry-url` on `actions/setup-node` when using npm OIDC Trusted Publishing.
+  The `registry-url` input is only needed when you want setup-node to configure token-based
+  authentication via `.npmrc`. For OIDC flows, npm handles the token exchange natively without
+  needing a pre-configured registry entry.
+
+  If you need both npm installation cache AND trusted publishing:
+  - Remove `registry-url`
+  - Set `node-version` only (and optionally `cache: npm`)
+  - Ensure `id-token: write` and `contents: read` are in your permissions
+
+  If you must use `registry-url` (e.g., to configure a private mirror for downloads), clear
+  `NODE_AUTH_TOKEN` before running `npm publish` so that npm falls back to OIDC:
+    `unset NODE_AUTH_TOKEN`
+fix_code:
+  - language: yaml
+    label: 'Broken pattern — registry-url blocks OIDC exchange'
+    code: |
+      permissions:
+        id-token: write
+        contents: read
+
+      steps:
+        - uses: actions/checkout@v6
+        - uses: actions/setup-node@v6
+          with:
+            node-version: '24'
+            registry-url: 'https://registry.npmjs.org'   # <-- THIS writes _authToken placeholder
+        - run: npm ci
+        - run: npm publish --provenance
+          # Fails with E404 because .npmrc has _authToken=${NODE_AUTH_TOKEN}
+          # which blocks the OIDC exchange
+  - language: yaml
+    label: 'Fixed pattern — remove registry-url for OIDC trusted publishing'
+    code: |
+      permissions:
+        id-token: write
+        contents: read
+
+      steps:
+        - uses: actions/checkout@v6
+        - uses: actions/setup-node@v6
+          with:
+            node-version: '24'
+            # No registry-url — do not configure token auth; let npm use OIDC natively
+        - run: npm ci
+        - run: npm publish --provenance
+          # npm detects id-token: write permission and performs OIDC exchange automatically
+  - language: yaml
+    label: 'Alternative — unset NODE_AUTH_TOKEN before publish if registry-url is needed'
+    code: |
+      permissions:
+        id-token: write
+        contents: read
+
+      steps:
+        - uses: actions/checkout@v6
+        - uses: actions/setup-node@v6
+          with:
+            node-version: '24'
+            registry-url: 'https://registry.npmjs.org'  # needed for install steps
+        - run: npm ci
+        - name: Publish with OIDC
+          run: |
+            unset NODE_AUTH_TOKEN
+            npm publish --provenance
+prevention:
+  - 'For npm OIDC Trusted Publishing, do NOT set `registry-url` on actions/setup-node — it writes an auth token placeholder that prevents OIDC token exchange.'
+  - 'If you see E404 during `npm publish` with OIDC configured, check whether `.npmrc` has a `_authToken` entry for the registry — this is the most common root cause.'
+  - 'Verify your setup by running `npm config list` in a step before publishing to inspect the active `.npmrc` configuration.'
+  - 'Keep `registry-url` only for workflows that use token-based authentication (NODE_AUTH_TOKEN / NPM_TOKEN). Separate OIDC publish jobs from install jobs if needed.'
+docs:
+  - url: 'https://github.com/npm/cli/issues/8730'
+    label: 'npm/cli #8730: OIDC Trusted Publishing fails when .npmrc has _authToken entry'
+  - url: 'https://github.com/npm/cli/issues/8976'
+    label: 'npm/cli #8976: E404 on scoped package publish with OIDC + registry-url'
+  - url: 'https://github.com/actions/setup-node/issues/1445'
+    label: 'setup-node #1445: NODE_AUTH_TOKEN placeholder blocks OIDC exchange'
+  - url: 'https://docs.npmjs.com/trusted-publishers'
+    label: 'npm Docs: Trusted Publishers (OIDC) — official setup guide'
