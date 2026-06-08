@@ -1,0 +1,98 @@
+id: caching-artifacts-117
+title: "upload-artifact CreateArtifact fails after 5 retries — 'Request timeout' at ArtifactService Twirp endpoint"
+category: caching-artifacts
+severity: error
+tags:
+  - upload-artifact
+  - create-artifact
+  - request-timeout
+  - twirp
+  - retry
+  - artifact-service
+  - transient
+  - infrastructure
+patterns:
+  - regex: 'Failed to CreateArtifact: Failed to make request after \d+ attempts: Request timeout'
+    flags: 'i'
+  - regex: 'Request timeout:.*ArtifactService/CreateArtifact'
+    flags: 'i'
+  - regex: 'Attempt \d+ of \d+ failed with error: Request timeout:.*CreateArtifact'
+    flags: 'i'
+error_messages:
+  - "Failed to CreateArtifact: Failed to make request after 5 attempts: Request timeout: /twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact"
+  - "Attempt 1 of 5 failed with error: Request timeout: /twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact. Retrying request in 3000 ms..."
+  - "Attempt 2 of 5 failed with error: Request timeout: /twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact. Retrying request in 4541 ms..."
+root_cause: |
+  `upload-artifact` registers an artifact with the GitHub Actions backend by sending
+  a CreateArtifact RPC to the ArtifactService Twirp endpoint
+  (`/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact`) on
+  `results-receiver.actions.githubusercontent.com` before any blob data is
+  transferred. This HTTP request times out (~10 seconds per attempt) when the
+  service is under load or experiencing a transient degradation.
+
+  The action retries with exponential backoff up to 5 attempts (with ~3s / ~4.5s /
+  ~7.9s / ~11.7s delays between attempts), then emits
+  "Failed to make request after 5 attempts: Request timeout" and fails the step.
+
+  This error is distinct from `ETIMEDOUT` (caching-artifacts-112), which is a TCP
+  connection timeout at the network layer. "Request timeout" indicates the TCP
+  connection was established but the RPC did not return a response within the HTTP
+  timeout window — this is a GitHub infrastructure overload scenario, not a network
+  configuration problem on the runner side.
+
+  Observed most frequently during:
+  - Concurrent artifact uploads across many parallel matrix jobs
+  - Busy hours when GitHub Actions infrastructure is under elevated load
+  - During or shortly after GitHub Actions incidents
+fix: |
+  1. **Re-run the job** — This error is almost always transient. Retrying the
+     workflow or just the failed job resolves it in the vast majority of cases.
+
+  2. **Check GitHub status** — Visit https://www.githubstatus.com to see if there
+     is an active GitHub Actions incident.
+
+  3. **Add continue-on-error and retry** — For non-blocking artifacts, add
+     `continue-on-error: true` to the upload step and retry manually:
+
+  4. **Stagger concurrent uploads** — If many matrix jobs upload simultaneously,
+     add a small randomized sleep before the upload step to reduce ArtifactService
+     burst pressure.
+fix_code:
+  - language: yaml
+    label: 'Add continue-on-error and explicit retry for transient timeouts'
+    code: |
+      - name: Upload artifact (with retry)
+        id: upload
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: my-artifact
+          path: ./dist/
+      - name: Retry upload if first attempt timed out
+        if: steps.upload.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: my-artifact
+          path: ./dist/
+  - language: yaml
+    label: 'Stagger uploads in matrix jobs to reduce ArtifactService burst'
+    code: |
+      - name: Stagger artifact upload in matrix
+        run: sleep $((RANDOM % 30))  # random 0-30s delay
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifact-${{ matrix.os }}
+          path: ./dist/
+prevention:
+  - 'Add `continue-on-error: true` and a retry step for critical artifact uploads so transient ArtifactService timeouts do not fail the entire build.'
+  - 'Check https://www.githubstatus.com before spending time investigating CreateArtifact timeout failures.'
+  - 'Stagger artifact uploads in large matrix jobs with a random sleep to reduce simultaneous pressure on the ArtifactService.'
+  - 'If CreateArtifact timeouts occur frequently in your organization, reduce the number of concurrent workflows uploading artifacts at the same time.'
+docs:
+  - url: 'https://github.com/actions/upload-artifact/issues/569'
+    label: 'actions/upload-artifact#569 — Failed to CreateArtifact: Request timeout (24 reactions, 2024-2026)'
+  - url: 'https://www.githubstatus.com'
+    label: 'GitHub Status — Check for active GitHub Actions incidents'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-and-sharing-data-from-a-workflow'
+    label: 'GitHub Docs — Storing and sharing data from a workflow'
