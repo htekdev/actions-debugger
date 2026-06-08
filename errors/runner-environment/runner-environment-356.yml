@@ -1,0 +1,108 @@
+id: runner-environment-356
+title: 'macOS Self-Hosted Concurrent Checkout Hangs — gitconfig.lock Race on shared Runner'
+category: runner-environment
+severity: silent-failure
+tags:
+  - macos
+  - self-hosted-runner
+  - checkout
+  - concurrent-jobs
+  - gitconfig
+  - lock-file
+  - hang
+patterns:
+  - regex: 'git config --global --add safe\.directory'
+    flags: 'i'
+  - regex: 'actions/checkout.*\bv[4-9]\b.*macos'
+    flags: 'i'
+error_messages:
+  - 'Actions checkout gets stuck forever randomly'
+  - 'This issue occurs on macOS when two or more jobs run actions/checkout at the same time, causing one of the jobs to hang indefinitely during checkout.'
+root_cause: |
+  When two or more concurrent jobs on a macOS self-hosted runner both execute
+  actions/checkout, the action runs `git config --global --add safe.directory ...`
+  to register the workspace path as a safe directory. This write requires an exclusive
+  lock on `~/.gitconfig.lock`. Because both jobs share the same macOS user home
+  directory, they race to acquire this lock.
+
+  The `git config` command's built-in retry loop (approximately 3 attempts over 6-9
+  seconds) is too short to outlast the contention when both jobs reach the checkout
+  step simultaneously. One job fails to acquire the lock and either exits with code 1
+  or, more commonly, hangs indefinitely waiting for the lock to be released.
+
+  The hung job produces no error output — it simply stalls at the git config command
+  with no timeout. GitHub Actions will eventually cancel it after the job-level
+  `timeout-minutes` (default 6 hours) expires, but until then the runner slot is held
+  occupied and the job shows as "In progress".
+
+  This affects matrix builds where multiple matrix entries share a single self-hosted
+  macOS host (for example, `x86_64-apple-darwin` and `aarch64-apple-darwin` cross-compile
+  jobs running in parallel on the same machine). The problem is present in checkout@v4
+  through checkout@v6 and was confirmed active in February 2026.
+fix: |
+  Option 1 — Pre-clear the workspace before checkout (most reliable workaround):
+  Add a step before `actions/checkout` that removes the workspace contents. This
+  eliminates any stale lock files and reduces git config contention.
+
+  Option 2 — Use a per-job git config file via GIT_CONFIG_GLOBAL:
+  Set the `GIT_CONFIG_GLOBAL` environment variable to a job-unique path so each
+  concurrent job writes to its own gitconfig file instead of the shared `~/.gitconfig`.
+
+  Option 3 — Serialize concurrent checkouts with a concurrency group:
+  Use `concurrency: { group: checkout-${{ runner.name }}, cancel-in-progress: false }`
+  to queue checkouts on the same runner host rather than running them in parallel.
+
+  Option 4 — Set an explicit `timeout-minutes` on the checkout step:
+  Add `timeout-minutes: 5` to the checkout step so hanging jobs fail fast instead of
+  consuming the runner for hours.
+fix_code:
+  - language: yaml
+    label: 'Option 1 — clear workspace before checkout'
+    code: |
+      - name: Clear workspace to avoid gitconfig.lock contention
+        run: |
+          find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} + \
+            || echo "::warning::Workspace cleanup partial — non-fatal"
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+  - language: yaml
+    label: 'Option 2 — per-job GIT_CONFIG_GLOBAL (prevents shared lock)'
+    code: |
+      jobs:
+        build:
+          runs-on: [self-hosted, macos]
+          env:
+            # Each parallel job gets its own gitconfig file — avoids ~/.gitconfig.lock race
+            GIT_CONFIG_GLOBAL: ${{ runner.temp }}/.gitconfig-${{ github.run_id }}-${{ github.job }}
+          steps:
+            - uses: actions/checkout@v6
+
+  - language: yaml
+    label: 'Option 3 — concurrency group to serialize checkouts on shared runner'
+    code: |
+      jobs:
+        build:
+          runs-on: [self-hosted, macos]
+          concurrency:
+            group: checkout-${{ runner.name }}
+            cancel-in-progress: false
+          steps:
+            - uses: actions/checkout@v6
+prevention:
+  - 'Avoid running multiple concurrent jobs on the same macOS self-hosted runner host when any job uses actions/checkout.'
+  - 'Set GIT_CONFIG_GLOBAL to a job-unique path in all macOS self-hosted workflows that may run in parallel.'
+  - 'Add timeout-minutes on checkout steps to fail fast (default 6-hour timeout turns silent hangs into long waits).'
+  - 'Use hosted runners (macos-latest, macos-26) for matrix builds to avoid shared-state lock contention.'
+docs:
+  - url: 'https://github.com/actions/checkout/issues/550'
+    label: 'actions/checkout#550 — checkout gets stuck forever on self-hosted macOS (2021–2026)'
+  - url: 'https://stackoverflow.com/questions/79881327/github-actions-self-hosted-runner-on-macos-tries-to-checkout-repository-forever'
+    label: 'Stack Overflow — macOS self-hosted checkout hangs with concurrent jobs (Feb 2026)'
+  - url: 'https://github.com/Zondax/_workflows/commit/d8a68b298cad9c86643852e48f1b268448e53a7f'
+    label: 'Zondax fix — per-job GIT_CONFIG_GLOBAL to avoid macOS runner lock race (May 2026)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners'
+    label: 'GitHub Docs — self-hosted runners'
