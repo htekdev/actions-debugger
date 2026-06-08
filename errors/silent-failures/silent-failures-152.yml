@@ -1,0 +1,132 @@
+id: silent-failures-152
+title: '@actions/exec getExecOutput() corrupts I/O context — all logging and filesystem writes silently lost after call'
+category: silent-failures
+severity: silent-failure
+tags:
+  - actions-toolkit
+  - exec
+  - getExecOutput
+  - node-action
+  - io-context
+  - logging
+  - core-info
+  - silent
+patterns:
+  - regex: 'getExecOutput.*silent|I\/O.*fail.*exec.*action|logging.*lost.*exec'
+    flags: 'i'
+  - regex: 'core\.info.*not.*appear|core\.setOutput.*lost.*exec'
+    flags: 'i'
+  - regex: 'CHECKPOINT.*before.*exec.*works.*after.*silent'
+    flags: 'i'
+error_messages:
+  - "# No error thrown — core.info(), console.log(), and fs.writeFileSync() all silently fail after getExecOutput() returns"
+  - "# Step exits 0 despite all post-exec logging being dropped"
+root_cause: |
+  In @actions/exec versions affected by this issue, calling `getExecOutput()` in a
+  Node.js GitHub Action corrupts the I/O context of the calling process. After
+  `getExecOutput()` awaits and returns, ALL subsequent I/O operations in the same
+  Node.js process fail silently:
+
+    - `core.info()` / `core.debug()` / `core.warning()` — nothing appears in logs
+    - `console.log()` / `console.error()` — nothing appears
+    - `fs.writeFileSync()` — file is never created, no error thrown
+    - `core.setOutput()` — output not set (downstream steps see empty string)
+
+  The subprocess called by getExecOutput() runs correctly and result.stdout /
+  result.stderr are populated. The failure is exclusively in the calling context
+  after the exec returns.
+
+  Root cause: getExecOutput() redirects stdout/stderr to in-memory buffers for
+  capture. Under certain conditions (subprocess writes large volumes of output, or
+  the runtime's stream teardown races with the parent process), the stdout/stderr
+  streams for the Node.js process are left in a closed or ended state. Subsequent
+  writes to process.stdout / process.stderr (which core and console use internally)
+  are silently swallowed because Node.js treats writes to a closed stream as a no-op
+  when no 'error' listener is registered.
+
+  The issue is specific to the GitHub Actions runtime environment — the same code
+  running locally in Node.js does not exhibit the problem because local stdout is
+  a TTY (which is not buffered in the same way).
+
+  Source: actions/toolkit#2303 (open Feb 2026). Reproduced across 16 @actions/exec
+  versions. The issue affects actions using `runs.using: 'node20'`.
+fix: |
+  Workaround (pre-capture pattern):
+  Separate subprocess execution from result processing into two workflow steps.
+  In step 1, run the subprocess with a shell step (stdout/stderr are always fine in
+  shell steps); capture output to a file. In step 2, the action reads the file — no
+  subprocess spawning needed, so the I/O context remains intact.
+
+  This completely avoids getExecOutput() in the critical path.
+
+  Alternative (direct exec.exec with listeners):
+  Instead of getExecOutput(), use exec.exec() with output listeners manually
+  attached. This avoids the internal stream redirect that corrupts the context.
+fix_code:
+  - language: yaml
+    label: 'Broken pattern — getExecOutput() silently corrupts post-exec logging'
+    code: |
+      # ❌ BROKEN: all core.info() / fs.writeFileSync() calls after getExecOutput() are silent
+      # action.ts (simplified):
+      #
+      #   const result = await exec.getExecOutput('npm', ['test'], { ignoreReturnCode: true });
+      #   core.info(`Exit code: ${result.exitCode}`);   // ← silently lost
+      #   core.setOutput('test-result', result.stdout); // ← empty, never set
+      #   fs.writeFileSync('report.txt', result.stdout);// ← file never created
+
+      - uses: my-org/my-action@v1   # action internally uses getExecOutput()
+      - run: echo "Result was ${{ steps.my-action.outputs.test-result }}"
+        # Prints: "Result was " (empty — setOutput was silently lost)
+  - language: yaml
+    label: 'Fixed — pre-capture pattern: shell step captures output, action reads file'
+    code: |
+      # ✅ FIXED: run subprocess in shell step, then have action process results from file
+
+      # Step 1: run test in shell (I/O works perfectly in shell steps)
+      - name: Run tests and capture output
+        run: npm test 2>&1 | tee test-output.txt
+        continue-on-error: true
+
+      # Step 2: action reads file — no subprocess, no I/O context corruption
+      - name: Process test results
+        uses: my-org/my-action@v2
+        with:
+          test-output-file: test-output.txt
+          # v2 reads the file instead of calling getExecOutput() internally
+  - language: yaml
+    label: 'Alternative — use exec.exec() with manual listeners instead of getExecOutput()'
+    code: |
+      # In action source (TypeScript):
+      #
+      # import * as exec from '@actions/exec';
+      #
+      # let stdout = '';
+      # let stderr = '';
+      # await exec.exec('npm', ['test'], {
+      #   ignoreReturnCode: true,
+      #   listeners: {
+      #     stdout: (data: Buffer) => { stdout += data.toString(); },
+      #     stderr: (data: Buffer) => { stderr += data.toString(); },
+      #   }
+      # });
+      # // I/O context is NOT corrupted — core.info() works fine here
+      # core.info(`Test stdout: ${stdout}`);
+      # core.setOutput('test-result', stdout);
+      #
+      # Using exec.exec() with listeners avoids the stream redirect in getExecOutput()
+      # that triggers the corruption.
+      - name: Use action with exec.exec listeners pattern
+        uses: my-org/my-action@v3   # v3 uses exec.exec() + listeners, not getExecOutput()
+prevention:
+  - 'Avoid calling getExecOutput() in a Node.js action when you need to log or set outputs after the call — use the pre-capture pattern instead.'
+  - 'If you must use getExecOutput(), flush all outputs BEFORE the exec call and avoid any logging after it returns.'
+  - 'Consider exec.exec() with manual stdout/stderr listener buffers as a drop-in replacement for getExecOutput() that avoids the stream corruption.'
+  - 'Test action I/O by adding a CHECKPOINT log after getExecOutput() — if it is silent, your action is affected.'
+  - 'Track actions/toolkit#2303 for an upstream fix; subscribe to the issue for notification when a patched version is released.'
+docs:
+  - url: 'https://github.com/actions/toolkit/issues/2303'
+    label: 'actions/toolkit#2303 — Silent I/O failure after getExecOutput() (open Feb 2026)'
+  - url: 'https://github.com/actions/toolkit/tree/main/packages/exec'
+    label: '@actions/exec package — exec and getExecOutput documentation'
+  - url: 'https://docs.github.com/en/actions/sharing-automations/creating-actions/creating-a-javascript-action'
+    label: 'GitHub Docs — Creating a JavaScript action'

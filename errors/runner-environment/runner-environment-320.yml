@@ -1,0 +1,115 @@
+id: runner-environment-320
+title: 'macOS 15 Local Network Privacy blocks loopback and multicast socket connections in CI'
+category: runner-environment
+severity: error
+tags:
+  - macos-15
+  - macos-26
+  - local-network-privacy
+  - LNP
+  - socket
+  - multicast
+  - loopback
+  - sequoia
+patterns:
+  - regex: 'No route to host.*127\.|no route to host.*loopback|EHOSTUNREACH.*localhost'
+    flags: 'i'
+  - regex: 'Connection refused.*192\.168\.|ECONNREFUSED.*local.*network'
+    flags: 'i'
+  - regex: 'multicast.*permission|local.*network.*access.*denied|LNP.*blocked'
+    flags: 'i'
+error_messages:
+  - "error sending to socket: No route to host (os error 65)"
+  - "Connection refused (os error 61)"
+  - "ECONNREFUSED 127.0.0.1"
+  - "Error: connect EHOSTUNREACH"
+root_cause: |
+  macOS 15 Sequoia introduced Local Network Privacy (LNP) — a new system-level
+  permission layer that requires explicit user approval before an app can access
+  the local network (loopback, link-local, multicast, and same-subnet addresses).
+
+  On GitHub Actions hosted runners (macos-15, macos-15-arm64, macos-26), the runner
+  process runs in a headless environment with no GUI session. When test code attempts
+  to:
+    - Bind or send on multicast sockets (e.g., 224.0.0.0/4)
+    - Connect to another process on the same machine via TCP/UDP
+    - Use loopback (127.0.0.1 / ::1) for inter-process communication
+    - Spawn a subprocess that listens on a local port and then connect to it
+
+  macOS silently denies the connection (or returns "No route to host" for multicast)
+  because no LNP approval has been granted for the runner process. No dialog appears
+  in CI — the permission is simply absent.
+
+  This is a regression from macOS 14 (Sonoma) where local network access was
+  unrestricted. The same code passes on ubuntu-latest and windows-latest but fails
+  exclusively on macos-15 and macos-26.
+
+  Source: actions/runner-images#10924 (open since Nov 2024, updated Mar 2026, 4 reactions).
+fix: |
+  Option 1 (recommended — use loopback explicitly):
+  Force all spawned processes to bind on 127.0.0.1 instead of 0.0.0.0 or the
+  machine's primary IP. LNP restrictions apply primarily to real network interfaces;
+  pure loopback (127.0.0.1 ↔ 127.0.0.1) is typically not restricted. Where the
+  test framework or library chooses the bind address, override it.
+
+  Option 2 — disable LNP via tccutil / defaults (workaround, may stop working):
+  Add a pre-test step that disables LNP enforcement for the runner's own process.
+  This approach is fragile because Apple has progressively tightened enforcement
+  in minor macOS updates.
+
+  Option 3 — pin to macOS 14:
+  If the test suite requires multicast or cross-process local networking and cannot
+  be changed, continue running on macOS-14 runners which are still supported.
+  macos-14 does not enforce Local Network Privacy.
+
+  Option 4 — inject TCC permission:
+  In advanced CI setups, inject a TCC.db entry granting the runner executable
+  permission class kTCCServiceLocalNetwork before the tests run. Requires sudo
+  and is image-version fragile.
+fix_code:
+  - language: yaml
+    label: 'Force loopback binding for inter-process tests — use 127.0.0.1 explicitly'
+    code: |
+      - name: Run inter-process tests (LNP-safe)
+        run: |
+          # Pass --host 127.0.0.1 (or equivalent) to force pure loopback
+          # LNP does not block 127.0.0.1 ↔ 127.0.0.1 on macOS 15
+          ./my-server --host 127.0.0.1 --port 9001 &
+          sleep 1
+          ./my-client --host 127.0.0.1 --port 9001
+        env:
+          SERVER_HOST: '127.0.0.1'   # Override any default 0.0.0.0 binding
+  - language: yaml
+    label: 'Pin to macOS 14 until macOS 15 LNP is resolved for local network tests'
+    code: |
+      jobs:
+        test:
+          # ✅ macOS 14 (Sonoma) does not enforce Local Network Privacy
+          runs-on: macos-14
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run local network tests
+              run: make test-network
+  - language: yaml
+    label: 'Matrix — run network-dependent tests on macOS-14 only'
+    code: |
+      jobs:
+        test:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest, macos-14]
+              # Avoid macos-15 / macos-26 for local network socket tests
+              # See: actions/runner-images#10924 (LNP blocks loopback in macOS 15+)
+          runs-on: ${{ matrix.os }}
+prevention:
+  - 'Always force bind addresses to 127.0.0.1 in test server spawning code — never rely on 0.0.0.0 for local-only tests.'
+  - 'Avoid multicast socket tests on macOS-15 or macOS-26 runners until runner-images adds LNP permission.'
+  - 'When migrating from macos-14 to macos-15/macos-26, test any workflow that opens TCP/UDP connections locally before fully switching.'
+  - 'Follow actions/runner-images#10924 for updates on whether GitHub adds LNP permission to runner images.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/10924'
+    label: 'runner-images#10924 — macOS 15 Local Network Privacy blocks multicast/loopback (open)'
+  - url: 'https://developer.apple.com/documentation/bundleresources/information-property-list/nslocal-network-usage-description'
+    label: 'Apple Docs — NSLocalNetworkUsageDescription (LNP entitlement)'
+  - url: 'https://github.com/actions/runner-images/issues/11901'
+    label: 'runner-images#11901 — Cannot open TCP connection to same machine on macos-15 (duplicate)'
