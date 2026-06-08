@@ -1,0 +1,110 @@
+id: runner-environment-325
+title: 'Podman container builds fail with SSL certificate errors on ubuntu-24.04 — runner image networking config change broke container HTTPS'
+category: runner-environment
+severity: error
+tags:
+  - podman
+  - ssl
+  - tls
+  - container
+  - networking
+  - ubuntu-24.04
+  - image-regression
+  - certificate
+patterns:
+  - regex: 'UNKNOWN_CERTIFICATE_VERIFICATION_ERROR'
+    flags: 'i'
+  - regex: 'certificate verify failed.*podman|podman.*certificate verify failed'
+    flags: 'i'
+  - regex: 'SSL.*error.*podman build|podman build.*SSL.*error'
+    flags: 'i'
+  - regex: 'Error: building at STEP.*while running runtime: exit status 1'
+    flags: 'i'
+error_messages:
+  - "error: UNKNOWN_CERTIFICATE_VERIFICATION_ERROR downloading package manifest zod"
+  - "Error: building at STEP \"RUN bun install --frozen-lockfile\": while running runtime: exit status 1"
+  - "error: UNKNOWN_CERTIFICATE_VERIFICATION_ERROR"
+root_cause: |
+  The ubuntu-24.04 runner image update from version 20251126.144.1 to 20251208.163.1
+  (released December 8, 2025) modified container networking configuration. The change
+  affected iptables rules, bridge networking, or systemd-resolved DNS settings in a way
+  that breaks HTTPS connectivity for processes running inside Podman containers during
+  builds.
+
+  When `podman build` executes a Containerfile step that makes HTTPS requests — such as
+  package installs (`npm install`, `bun install`, `pip install`, `cargo build`) or any
+  API calls — the container cannot reach external HTTPS endpoints. SSL certificate
+  verification fails because the container's DNS resolution or TLS handshake path to
+  certificate authorities or package registries is broken.
+
+  Key observations:
+  - The host runner is unaffected; only operations inside `podman build` containers fail
+  - The same Containerfile works correctly with `--network=host`
+  - The issue began exactly with runner image 20251208.163.1 and was absent on 20251126.144.1
+  - The change was undocumented in the image release notes (only a binutils update was listed)
+
+  This pattern can recur whenever an ubuntu-24.04 image update changes container network
+  configuration without explicitly documenting the impact on Podman container networking.
+
+  Source: actions/runner-images#13422
+fix: |
+  Add the `--network=host` flag to `podman build` commands. This bypasses container
+  network isolation and routes container network traffic through the host network stack,
+  restoring HTTPS connectivity for processes inside the build container.
+
+  Trade-off: `--network=host` reduces network isolation during the build, which is
+  generally acceptable in CI/CD environments where full isolation is not required.
+
+  As an alternative, pin the ubuntu-24.04 runner image to a specific known-good version
+  or switch to using `docker build` instead of `podman build`.
+fix_code:
+  - language: yaml
+    label: 'Add --network=host to podman build to restore SSL connectivity'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-24.04
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Install podman-static
+              run: |
+                curl -fsSL -o /tmp/podman.tar.gz \
+                  https://github.com/mgoltzsche/podman-static/releases/latest/download/podman-linux-amd64.tar.gz
+                cd /tmp && tar -xzf podman.tar.gz
+                sudo cp -f podman-linux-amd64/usr/local/bin/* /usr/bin/
+                podman system migrate
+
+            - name: Build image
+              run: |
+                podman build \
+                  --network=host \        # Fixes SSL certificate errors inside container
+                  --format docker \
+                  -f Containerfile \
+                  .
+
+  - language: yaml
+    label: 'Alternative: use docker build instead of podman build'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-24.04
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build image
+              # docker build uses the host network bridge by default,
+              # which is not affected by this Podman networking regression
+              run: docker build -t myimage .
+
+prevention:
+  - 'When using podman build with external network dependencies inside the Containerfile, always pass --network=host to ensure container networking mirrors the host'
+  - 'Pin ubuntu-24.04 to a specific image version in critical workflows to avoid unexpected regressions from image updates'
+  - 'Test Podman-based workflows with a canary run after each major ubuntu-24.04 image release'
+  - 'Watch the actions/runner-images releases for networking or iptables changes that may impact container builds'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/13422'
+    label: 'runner-images#13422: ubuntu-24.04 runner 20251208.163.1 — Container networking breaks SSL in Podman builds'
+  - url: 'https://github.com/actions/runner-images/releases'
+    label: 'GitHub Actions runner-images releases — check for networking changes in image changelogs'
+  - url: 'https://docs.podman.io/en/latest/markdown/podman-build.1.html'
+    label: 'Podman build man page — --network flag documentation'

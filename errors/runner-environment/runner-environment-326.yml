@@ -1,0 +1,100 @@
+id: runner-environment-326
+title: 'ubuntu-slim missing "column" command (bsdextrautils not installed) — workflows break when assuming standard Ubuntu toolset'
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-slim
+  - column
+  - bsdextrautils
+  - missing-tool
+  - cli-tool
+  - text-formatting
+patterns:
+  - regex: 'column: command not found'
+    flags: 'i'
+  - regex: '/usr/bin/column: No such file or directory'
+    flags: 'i'
+  - regex: 'column:.*not found'
+    flags: 'i'
+error_messages:
+  - "column: command not found"
+  - "/usr/bin/column: No such file or directory"
+  - "bash: column: command not found"
+root_cause: |
+  The `ubuntu-slim` runner image is a lightweight image that intentionally omits many
+  packages installed by default on standard `ubuntu-24.04` and `ubuntu-22.04` images in
+  order to reduce image size and startup time.
+
+  The `column` command — provided by the `bsdextrautils` package on Ubuntu — is present
+  by default on standard Ubuntu runner images but is NOT installed on ubuntu-slim.
+  Workflows commonly use `column` to format tabular output in shell scripts:
+
+    df -h | column -t
+    cat data.tsv | column -t -s $'\t'
+    mount | column -t
+
+  When these scripts run on ubuntu-slim, they fail with "command not found". This
+  frequently occurs when developers migrate existing workflows from `ubuntu-latest` to
+  `ubuntu-slim` for cost or performance reasons without auditing for missing utilities.
+
+  Other commonly-missing tools on ubuntu-slim include: `lsb-release`, `file`, `man`,
+  `less`, `bc`, and various `bsd*` utilities. The ubuntu-slim image documentation
+  explicitly states it is not intended to be a drop-in replacement for standard Ubuntu
+  runner images.
+
+  Source: actions/runner-images#13759
+fix: |
+  Option 1 — Install bsdextrautils at the start of the job:
+    sudo apt-get update && sudo apt-get install -y bsdextrautils
+
+  Option 2 — Replace `column` with a Python or awk equivalent that is available on
+  ubuntu-slim:
+    # Python equivalent of "column -t"
+    python3 -c "import sys; rows=[l.split() for l in sys.stdin]; w=[max(len(r[i]) if i<len(r) else 0 for r in rows) for i in range(max(len(r) for r in rows))]; [print('  '.join(f.ljust(w[j]) for j,f in enumerate(r))) for r in rows]"
+
+  Option 3 — Switch to `ubuntu-latest` or `ubuntu-24.04` if the workflow relies on many
+  standard Unix utilities.
+fix_code:
+  - language: yaml
+    label: 'Install bsdextrautils to get the column command on ubuntu-slim'
+    code: |
+      jobs:
+        report:
+          runs-on: ubuntu-slim
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Install bsdextrautils
+              run: |
+                sudo apt-get update
+                sudo apt-get install -y bsdextrautils   # provides the column command
+
+            - name: Format disk usage report
+              run: df -h | column -t
+
+  - language: yaml
+    label: 'Replace column with awk — works on ubuntu-slim without installing extra packages'
+    code: |
+      jobs:
+        report:
+          runs-on: ubuntu-slim
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Format disk usage (awk-based, no bsdextrautils needed)
+              run: |
+                # awk column-t equivalent — available on ubuntu-slim
+                df -h | awk '{ for(i=1; i<=NF; i++) printf "%-15s", $i; print "" }'
+
+prevention:
+  - 'Before migrating workflows from ubuntu-latest to ubuntu-slim, run a dry-run job to identify missing tools'
+  - 'Check the ubuntu-slim README (actions/runner-images) for the complete list of pre-installed packages before assuming a utility is available'
+  - 'Use which <tool> || sudo apt-get install -y <package> patterns for optional tool dependencies to make workflows portable across runner images'
+  - 'Prefer POSIX-portable shell constructs (printf, awk, sed) over distribution-specific utilities when writing scripts that must run on multiple runner images'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/13759'
+    label: 'runner-images#13759: ubuntu-slim missing "column" tool from bsdextrautils'
+  - url: 'https://github.com/actions/runner-images/blob/main/images/ubuntu-slim/ubuntu-slim-Readme.md'
+    label: 'ubuntu-slim README — complete list of installed packages and tools'
+  - url: 'https://manpages.ubuntu.com/manpages/noble/man1/column.1.html'
+    label: 'Ubuntu column(1) man page — bsdextrautils package'

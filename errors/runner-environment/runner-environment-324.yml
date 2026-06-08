@@ -1,0 +1,93 @@
+id: runner-environment-324
+title: 'ubuntu-slim apt-get install fails with "E: Unable to locate package" — APT package lists not pre-populated'
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-slim
+  - apt
+  - apt-get
+  - package-manager
+  - package-lists
+  - missing-tool
+patterns:
+  - regex: 'E: Unable to locate package'
+    flags: 'i'
+  - regex: 'E: Package .* has no installation candidate'
+    flags: 'i'
+error_messages:
+  - "E: Unable to locate package curl"
+  - "E: Unable to locate package build-essential"
+  - "E: Unable to locate package git"
+  - "E: Package 'libssl-dev' has no installation candidate"
+root_cause: |
+  The `ubuntu-slim` runner image intentionally omits pre-populated APT package lists to
+  reduce image size. Unlike standard `ubuntu-24.04` and `ubuntu-22.04` runner images
+  (where APT package lists are refreshed during image build), ubuntu-slim ships with an
+  empty or stale `/var/lib/apt/lists/` directory.
+
+  When a workflow step calls `apt-get install <package>` without first running
+  `apt-get update`, APT has no index to search and reports "E: Unable to locate package".
+  This surprises developers migrating jobs from standard Ubuntu runners, where `apt-get
+  install` frequently works without an explicit update step because the lists are already
+  populated.
+
+  Additionally, ubuntu-slim's default APT mirror is `archive.ubuntu.com` (the global CDN)
+  rather than `azure.archive.ubuntu.com` (Azure-local mirror). Running `apt-get update`
+  on ubuntu-slim downloads approximately 43 MB of package list data from the global CDN,
+  which is slower than the Azure-local path used by standard Ubuntu runners.
+
+  Source: actions/runner-images#13426
+fix: |
+  Always run `sudo apt-get update` before `sudo apt-get install` on ubuntu-slim.
+  Combine both into a single step and use the `-y` flag for non-interactive installs.
+
+  For workflows that need to install many packages, consider caching the apt lists using
+  actions/cache to avoid repeating the 43 MB download on every run.
+fix_code:
+  - language: yaml
+    label: 'Always run apt-get update before apt-get install on ubuntu-slim'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-slim
+          steps:
+            - uses: actions/checkout@v4
+
+            # Required on ubuntu-slim — package lists are not pre-populated
+            - name: Install dependencies
+              run: |
+                sudo apt-get update
+                sudo apt-get install -y curl build-essential libssl-dev
+
+  - language: yaml
+    label: 'Cache APT package lists to speed up ubuntu-slim installs'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-slim
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Cache APT lists
+              uses: actions/cache@v4
+              with:
+                path: /var/lib/apt/lists
+                key: apt-lists-${{ runner.os }}-${{ hashFiles('.github/apt-packages.txt') }}
+
+            - name: Update and install
+              run: |
+                sudo apt-get update
+                sudo apt-get install -y $(cat .github/apt-packages.txt)
+
+prevention:
+  - 'Never skip apt-get update on ubuntu-slim — the package index is empty by default'
+  - 'If migrating a workflow from ubuntu-latest to ubuntu-slim, audit all apt-get install steps and add apt-get update before each one'
+  - 'Use apt-get install -y --no-install-recommends to keep install size minimal on ubuntu-slim'
+  - 'Consider caching /var/lib/apt/lists with actions/cache when many packages are installed to reduce per-run download time'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/13426'
+    label: 'runner-images#13426: ubuntu-slim APT configuration not consistent with normal runners'
+  - url: 'https://github.com/actions/runner-images/blob/main/images/ubuntu-slim/ubuntu-slim-Readme.md'
+    label: 'ubuntu-slim README — supported tools and packages'
+  - url: 'https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners'
+    label: 'GitHub Docs: GitHub-hosted runner specifications'
