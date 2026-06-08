@@ -1,0 +1,132 @@
+id: known-unsolved-093
+title: 'Skipped required check job passes branch protection auto-merge when dependency fails'
+category: known-unsolved
+severity: limitation
+tags:
+  - branch-protection
+  - required-status-checks
+  - auto-merge
+  - skipped
+  - needs
+  - job-result
+  - merge-queue
+patterns:
+  - regex: 'result.*skipped.*auto.*merge|auto.*merge.*skipped.*success'
+    flags: 'i'
+  - regex: 'needs\.\w+\.result.*==.*skipped.*required.*check'
+    flags: 'i'
+  - regex: 'branch.*protection.*auto.*merge.*skipped.*job'
+    flags: 'i'
+error_messages:
+  - "Auto-merge was triggered but required check job was skipped"
+  - "Required status check passed with 'skipped' status"
+  - "Check suite concluded as skipped — auto-merge may have proceeded"
+root_cause: |
+  GitHub's documented behavior states: "A job that is skipped will report its status as
+  'Success'." This means when a required status check job is SKIPPED (not failed), it is
+  treated as passed for branch protection purposes, including auto-merge.
+
+  The common scenario where this causes unexpected merges:
+
+  1. Workflow has a "gatekeeper" job (e.g., `all-tests-passed`) that runs only when all
+     upstream test jobs succeed:
+     ```yaml
+     all-tests-passed:
+       needs: [unit-tests, integration-tests, e2e-tests]
+       runs-on: ubuntu-latest
+       steps:
+         - run: echo "All tests passed"
+     ```
+  2. One upstream job (e.g., `e2e-tests`) FAILS.
+  3. The `all-tests-passed` job is SKIPPED because its dependency failed.
+  4. Branch protection checks `all-tests-passed` → skipped = success → auto-merge proceeds.
+  5. The PR merges despite a failing test suite.
+
+  This is fundamentally different from the known-unsolved case where a skipped job
+  BLOCKS a PR (known-unsolved-037). Here, the skipped status actively allows unsafe merges
+  to proceed because GitHub treats skipped as implicitly successful.
+
+  Note: GitHub has confirmed this is documented/intentional behavior and has no plans to
+  change the fundamental skip=success rule, as it would break many workflows that
+  intentionally use conditional jobs (e.g., skipping deploy jobs on forks).
+fix: |
+  The workaround is to make the required check job ACTIVELY FAIL when any dependency
+  fails, rather than being SKIPPED. Use `if: always()` plus explicit failure detection:
+
+  Replace the passive gatekeeper pattern with an active status check:
+  ```yaml
+  all-tests-passed:
+    needs: [unit-tests, integration-tests, e2e-tests]
+    runs-on: ubuntu-latest
+    if: always()  # Always run this job
+    steps:
+      - name: Check all test results
+        run: |
+          if [[ "${{ needs.unit-tests.result }}" != "success" ]]; then
+            echo "unit-tests failed or was skipped"
+            exit 1
+          fi
+          if [[ "${{ needs.integration-tests.result }}" != "success" ]]; then
+            echo "integration-tests failed or was skipped"
+            exit 1
+          fi
+          if [[ "${{ needs.e2e-tests.result }}" != "success" ]]; then
+            echo "e2e-tests failed or was skipped"
+            exit 1
+          fi
+          echo "All tests passed"
+  ```
+
+  This pattern ensures the required check job runs even when dependencies fail, and
+  explicitly fails when any dependency is not successful.
+fix_code:
+  - language: yaml
+    label: 'Active gatekeeper job that fails when dependencies fail'
+    code: |
+      all-tests-passed:
+        needs: [unit-tests, integration-tests, e2e-tests]
+        runs-on: ubuntu-latest
+        if: always()
+        steps:
+          - name: Verify all jobs passed
+            env:
+              UNIT: ${{ needs.unit-tests.result }}
+              INTEGRATION: ${{ needs.integration-tests.result }}
+              E2E: ${{ needs.e2e-tests.result }}
+            run: |
+              results="$UNIT $INTEGRATION $E2E"
+              for result in $results; do
+                if [[ "$result" != "success" ]]; then
+                  echo "One or more required jobs did not succeed (got: $results)"
+                  exit 1
+                fi
+              done
+              echo "All required jobs passed"
+
+  - language: yaml
+    label: 'Single-expression approach using contains()'
+    code: |
+      all-tests-passed:
+        needs: [unit-tests, integration-tests, e2e-tests]
+        runs-on: ubuntu-latest
+        if: always()
+        steps:
+          - name: Check for any non-success
+            run: |
+              if ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'skipped') || contains(needs.*.result, 'cancelled') }}; then
+                echo "One or more required jobs did not succeed"
+                exit 1
+              fi
+prevention:
+  - "Never use a passive gatekeeper job (one that only runs echo) as your required status check"
+  - "Always add if: always() to the required check job and explicitly fail when dependencies are not 'success'"
+  - "Test your CI pipeline with a deliberately failing test — verify auto-merge does NOT trigger"
+  - "Avoid relying on 'skipped = blocked' behavior for branch protection — it's the opposite"
+  - "Consider using merge queues with required job checks that actively validate all upstream results"
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-conditions-to-control-job-execution'
+    label: 'GitHub Docs: Using conditions to control job execution'
+  - url: 'https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-status-checks-before-merging'
+    label: 'GitHub Docs: Require status checks before merging'
+  - url: 'https://github.com/actions/runner/issues/3649'
+    label: 'GitHub Issue: Skipped checks on automerge are falsely considered successful (#3649)'

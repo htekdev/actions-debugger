@@ -1,0 +1,106 @@
+id: caching-artifacts-103
+title: 'setup-python cache: pip post step fails when pip cache directory never created'
+category: caching-artifacts
+severity: error
+tags:
+  - setup-python
+  - pip
+  - cache
+  - post-step
+  - uv
+  - virtualenv
+  - self-hosted
+patterns:
+  - regex: 'Cache folder path is retrieved for pip but doesn''t exist on disk'
+    flags: 'i'
+  - regex: '~\/\.cache\/pip.*doesn''t exist|\/home\/runner\/\.cache\/pip.*does not exist'
+    flags: 'i'
+  - regex: 'cache: pip.*no dependencies to cache|no pip cache directory.*cache step'
+    flags: 'i'
+error_messages:
+  - "Cache folder path is retrieved for pip but doesn't exist on disk: /home/runner/.cache/pip. This likely indicates that there are no dependencies to cache. Consider removing the cache step if it is not needed."
+  - "Warning: Cache folder path is retrieved for pip but doesn't exist on disk"
+root_cause: |
+  When `cache: pip` is set in `actions/setup-python`, the action registers a post step
+  to save the pip cache directory (`~/.cache/pip`) at the end of the job. This post step
+  fails if `~/.cache/pip` was never created during the job.
+
+  Common causes:
+  1. **Using uv or poetry instead of pip**: `uv install` or `poetry install` does not
+     create the pip cache directory. The `cache: pip` option is irrelevant and its post
+     step fails.
+  2. **Conditional pip install**: If the `pip install` step only runs for certain events
+     (e.g., not for pull requests), the post step runs regardless and fails on events
+     where no install occurred.
+  3. **Cache key mismatch + no warm cache**: When a Python patch version bump (e.g.,
+     3.13.5 → 3.13.6) causes a pip cache key mismatch AND no fallback cache exists, the
+     restore phase creates an empty placeholder. If `pip install` is then skipped
+     (conditional step), the post step tries to save an empty directory.
+  4. **Virtual environment isolation**: Installing into a venv does not populate
+     `~/.cache/pip` the same way as a system-wide install in some configurations.
+fix: |
+  Remove `cache: pip` from the setup-python step when using uv, poetry, or pixi as the
+  package installer. These tools maintain their own caches separate from pip.
+
+  For conditional pip installs, either make the cache setting conditional or remove it
+  and use `actions/cache` directly with a conditional save step.
+
+  If pip install runs inside a virtual environment, ensure the venv is activated before
+  `pip install` so the pip cache directory is properly populated.
+fix_code:
+  - language: yaml
+    label: 'Remove cache: pip when using uv or poetry'
+    code: |
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          # Remove cache: pip — uv/poetry use their own cache
+
+      - name: Install dependencies with uv
+        run: |
+          pip install uv
+          uv sync
+
+  - language: yaml
+    label: 'Conditional cache based on install step'
+    code: |
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          # Only cache pip when pip install will actually run
+          cache: ${{ (github.event_name != 'pull_request') && 'pip' || '' }}
+
+  - language: yaml
+    label: 'Use actions/cache directly with existence check'
+    code: |
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          # No built-in cache
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        if: hashFiles('requirements.txt') != ''
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+prevention:
+  - "Don't set cache: pip when using uv, poetry, pipenv, or pixi as the package manager"
+  - "If pip install is conditional on event type, make cache: pip conditional too or remove it"
+  - "When migrating from pip to uv/poetry, remember to remove the cache: pip line"
+  - "Test post-step behavior on PRs from forks — these often skip install steps"
+docs:
+  - url: 'https://github.com/actions/setup-python/blob/main/docs/advanced-usage.md#caching-packages'
+    label: 'actions/setup-python — Caching packages'
+  - url: 'https://github.com/actions/setup-python/issues/1169'
+    label: 'GitHub Issue: Cache folder path doesn''t exist on disk (#1169)'
+  - url: 'https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows'
+    label: 'GitHub Docs: Caching dependencies to speed up workflows'
