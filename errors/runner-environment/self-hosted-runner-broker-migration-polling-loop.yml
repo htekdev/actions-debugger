@@ -1,0 +1,135 @@
+id: runner-environment-334
+title: 'Self-hosted Runner Stuck in BrokerMigration Polling Loop — Online/Idle but
+  Never Picks Up Jobs'
+category: runner-environment
+severity: error
+tags:
+  - self-hosted
+  - broker
+  - broker-migration
+  - jobs-not-picked-up
+  - online-idle
+  - runner-polling
+patterns:
+  - regex: 'BrokerMigration message received\. Polling Broker for messages'
+    flags: 'i'
+  - regex: 'No message retrieved from session.*within last \d+ minutes'
+    flags: 'i'
+  - regex: 'Waiting for a runner to pick up this job'
+    flags: 'i'
+error_messages:
+  - '[INFO MessageListener] BrokerMigration message received. Polling Broker for messages...'
+  - '[INFO MessageListener] No message retrieved from session ''xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'' within last 30 minutes.'
+  - 'Waiting for a runner to pick up this job...'
+root_cause: |
+  GitHub Actions runners communicate with GitHub's backend via a long-polling
+  message broker. When GitHub migrates its backend messaging infrastructure (a
+  "broker migration"), runners using an older protocol version receive a
+  `BrokerMigration` message instructing them to poll the new broker endpoint.
+
+  If the runner is on an outdated version that does not fully implement the
+  migrated broker protocol, it enters a polling loop: it receives the
+  BrokerMigration notification, polls for messages, receives the notification
+  again, and repeats indefinitely. During this loop the runner registers as
+  Online/Idle on the GitHub dashboard, but GitHub's backend does not dispatch
+  jobs to it because the runner has not successfully established a session with
+  the new broker.
+
+  From the workflow side, jobs show "Waiting for a runner to pick up this
+  job..." and eventually time out. The runner logs repeat the same pair of
+  lines every few minutes:
+
+    [INFO MessageListener] BrokerMigration message received. Polling Broker for messages...
+    [INFO MessageListener] No message retrieved from session '...' within last 30 minutes.
+
+  This behavior is triggered by GitHub-side infrastructure changes and can
+  affect runners that have not been updated in a long time. The issue may
+  resolve on its own if GitHub rolls back the migration for the affected pool,
+  but re-occurs on the next migration attempt until the runner is updated.
+
+  This is distinct from:
+  - `TaskAgentSessionConflictException` (duplicate session, covered separately)
+  - The 24-hour broker session hard limit (known-unsolved — session cancelled
+    after 24 hours on long-running jobs)
+  - ARC runner stuck in Running state (OOM kill, covered separately)
+fix: |
+  Step 1 — Update the self-hosted runner to the latest version. The
+  BrokerMigration loop is caused by outdated runner software that does not
+  support the migrated broker protocol. Most broker migration issues are fixed
+  by running the runner at the latest version.
+
+  To update the runner manually:
+    ./config.sh --version  # check current version
+    # Download the latest runner package from:
+    # https://github.com/actions/runner/releases/latest
+    # Then: ./svc.sh stop && ./svc.sh install && ./svc.sh start
+
+  GitHub-hosted runners update automatically — this only affects self-hosted
+  runners that have not auto-updated.
+
+  Step 2 — If the runner is configured with auto-update disabled
+  (--disableupdate), enable updates or update manually.
+
+  Step 3 — As a quick diagnostic, restart the runner service. Restarting
+  clears the existing broker session and forces a fresh connection attempt.
+  If the new broker protocol is supported, the runner will pick up jobs after
+  reconnection.
+
+  Step 4 — Check githubstatus.com. If GitHub's Actions service is undergoing
+  a broker migration, waiting may resolve the issue without runner changes.
+
+  Step 5 — If none of the above works, remove the runner registration and
+  re-add it:
+    cd <runner-dir>
+    ./config.sh remove --token <REMOVAL_TOKEN>
+    ./config.sh --url <REPO_URL> --token <REGISTRATION_TOKEN>
+fix_code:
+  - language: yaml
+    label: 'Workflow-level timeout to fail fast instead of waiting hours'
+    code: |
+      # Add a timeout so stuck-runner jobs fail quickly and can be re-queued
+      # instead of occupying the workflow queue for hours.
+      jobs:
+        build:
+          runs-on: self-hosted
+          timeout-minutes: 10   # fail fast if runner never picks up the job
+          steps:
+            - uses: actions/checkout@v4
+            - run: make build
+  - language: yaml
+    label: 'Runner auto-update config snippet (config.sh)'
+    code: |
+      # When registering a self-hosted runner, DO NOT use --disableupdate.
+      # Allowing auto-update ensures the runner stays current with broker
+      # protocol changes.
+      #
+      # Registration:
+      #   ./config.sh --url https://github.com/<org>/<repo> \
+      #               --token <TOKEN>
+      #               # omit --disableupdate
+      #
+      # If already registered with auto-update disabled, remove and re-register:
+      #   ./config.sh remove --token <REMOVAL_TOKEN>
+      #   ./config.sh --url https://github.com/<org>/<repo> --token <TOKEN>
+prevention:
+  - 'Keep self-hosted runners on the latest stable version. GitHub periodically
+    migrates its broker infrastructure, and outdated runners may not support
+    the new protocol, causing them to poll indefinitely without picking up jobs.'
+  - 'Do not use `--disableupdate` when configuring self-hosted runners unless
+    absolutely required. Auto-update ensures compatibility with broker protocol
+    changes.'
+  - 'Add `timeout-minutes` to jobs that run on self-hosted runners. This
+    ensures stuck-runner scenarios fail fast and alert the team, rather than
+    silently waiting for hours.'
+  - 'Monitor self-hosted runner logs for the `BrokerMigration message received`
+    pattern. If it repeats more than a few times without any job activity, the
+    runner is likely in the polling loop and needs to be restarted or updated.'
+docs:
+  - url: 'https://github.com/actions/runner/releases/latest'
+    label: 'GitHub Actions Runner — Latest releases'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners#self-hosted-runner-updates'
+    label: 'GitHub Docs — Self-hosted runner automatic updates'
+  - url: 'https://github.com/actions/runner/issues/3526'
+    label: 'actions/runner#3526 — Runner Online/Idle but not picking up jobs (BrokerMigration)'
+  - url: 'https://githubstatus.com'
+    label: 'GitHub Status — Check for ongoing Actions infrastructure incidents'

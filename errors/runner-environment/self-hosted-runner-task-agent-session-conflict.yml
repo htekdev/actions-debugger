@@ -1,0 +1,144 @@
+id: runner-environment-335
+title: 'Self-hosted Runner Fails With TaskAgentSessionConflictException — Already
+  Has an Active Session'
+category: runner-environment
+severity: error
+tags:
+  - self-hosted
+  - session-conflict
+  - TaskAgentSessionConflictException
+  - re-register
+  - stale-session
+  - runner-restart
+patterns:
+  - regex: 'TaskAgentSessionConflictException'
+    flags: 'i'
+  - regex: 'already has an active session'
+    flags: 'i'
+  - regex: 'Registration was not found or is not medium trust'
+    flags: 'i'
+  - regex: 'HTTP Status: Conflict'
+    flags: 'i'
+error_messages:
+  - 'GitHub.DistributedTask.WebApi.TaskAgentSessionConflictException: The actions runner <NAME> already has an active session.'
+  - '[ERR GitHubActionsService] POST request to https://pipelinesghubeus*.actions.githubusercontent.com/.../_apis/distributedtask/pools/1/sessions failed. HTTP Status: Conflict'
+  - 'GitHub.Services.OAuth.VssOAuthTokenRequestException: Registration was not found or is not medium trust.'
+root_cause: |
+  A self-hosted runner maintains a persistent session with GitHub's Actions
+  backend to receive job assignments. When the runner process terminates
+  unexpectedly — for example due to a crash, SIGKILL, host reboot, or OOM
+  kill — the session record on GitHub's backend is NOT immediately cleared.
+  GitHub considers the runner to have an active session until it expires
+  (typically after several hours).
+
+  When the runner process restarts and attempts to create a NEW session, the
+  backend rejects it with HTTP 409 Conflict:
+
+    TaskAgentSessionConflictException: The actions runner <NAME> already has
+    an active session.
+
+  The runner loops retrying every 30 seconds but cannot establish a valid
+  session. Jobs queued for this runner stay in "Waiting for a runner to pick
+  up this job..." indefinitely.
+
+  A secondary symptom occurs if the runner's OAuth token has also expired or
+  been invalidated during the downtime. In this case the session creation
+  returns:
+
+    VssOAuthTokenRequestException: Registration was not found or is not
+    medium trust.
+
+  This error means the runner's `.credentials` registration has been revoked
+  on GitHub's side (for example, a runner re-registration removed the old
+  credential), and the runner process is still holding the old (now invalid)
+  credentials file.
+
+  This scenario is distinct from:
+  - ARC ephemeral runner OOM kill session conflict (ARC-specific, k8s pod
+    lifecycle; covered separately)
+  - BrokerMigration polling loop (protocol mismatch, covered separately)
+  - 24-hour broker session hard limit (session expiry for long jobs)
+fix: |
+  **If getting "already has an active session":**
+
+  Option A (preferred if runner version is outdated): Update the runner to the
+  latest version and restart. Newer runner versions handle session re-registration
+  more gracefully.
+
+  Option B (fastest fix): Wait for the stale session to expire on GitHub's
+  backend (typically 1-2 hours). After expiry the runner will reconnect
+  automatically on the next retry cycle.
+
+  Option C (immediate fix): Remove and re-register the runner:
+    cd <runner-directory>
+    ./svc.sh stop          # stop the service
+    rm -f .runner          # remove stale session state
+    ./config.sh remove --token <REMOVAL_TOKEN>    # deregister from GitHub
+    ./config.sh --url <REPO_URL> --token <NEW_REGISTRATION_TOKEN>
+    ./svc.sh start
+
+  **If getting "Registration was not found or is not medium trust":**
+
+  This means the runner's credentials have been revoked (e.g., the runner was
+  re-registered from another machine or the PAT used for registration was
+  deleted). Remove ALL credential files and re-register:
+    ./svc.sh stop
+    rm -f .runner .credentials .credentials_rsaparams
+    ./config.sh --url <REPO_URL> --token <NEW_REGISTRATION_TOKEN>
+    ./svc.sh start
+
+  After re-registration, confirm the runner appears in GitHub Settings →
+  Actions → Runners as Online.
+fix_code:
+  - language: yaml
+    label: 'Systemd runner service — restart and verify session reconnect'
+    code: |
+      # When using a systemd-managed runner service:
+      # 1. Stop the service
+      sudo systemctl stop actions.runner.<org>.<name>.service
+      # 2. Clear stale session file (keeps registration; only clears session)
+      # Note: .runner file contains registration, .credentials contains OAuth
+      # Removing only .runner + reconfig is the safest approach
+      # 3. Restart the service — it will create a fresh session on startup
+      sudo systemctl start actions.runner.<org>.<name>.service
+      sudo systemctl status actions.runner.<org>.<name>.service
+  - language: yaml
+    label: 'Re-registration script — for "Registration was not found" error'
+    code: |
+      # Full re-registration (use when credentials are revoked):
+      # First, get a new removal token and registration token from:
+      # GitHub repo/org Settings → Actions → Runners → (runner) → Remove
+      # and then "New self-hosted runner"
+      cd /home/runner/actions-runner
+      sudo ./svc.sh stop
+      sudo ./svc.sh uninstall
+      rm -f .runner .credentials .credentials_rsaparams
+      ./config.sh \
+        --url https://github.com/<org>/<repo> \
+        --token <NEW_REGISTRATION_TOKEN> \
+        --name <RUNNER_NAME> \
+        --labels <LABELS> \
+        --unattended
+      sudo ./svc.sh install
+      sudo ./svc.sh start
+prevention:
+  - 'Run self-hosted runners as a proper system service (systemd, svc.sh) rather
+    than a foreground process. Services restart gracefully and handle session
+    re-establishment on startup.'
+  - 'Use ephemeral runners (`--ephemeral` flag or ARC ephemeral mode) for
+    stateless CI workloads. Ephemeral runners exit after a single job and are
+    re-registered fresh each time, eliminating session staleness.'
+  - 'Set a graceful shutdown timeout in the runner service configuration so the
+    runner can properly deregister its session before the process exits, rather
+    than leaving a stale session.'
+  - 'Monitor runner logs for `HTTP Status: Conflict` or `TaskAgentSession
+    ConflictException`. If seen, check whether a duplicate runner process is
+    running on the same machine — two instances sharing the same `.runner` file
+    both try to create sessions and one will always fail.'
+docs:
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners'
+    label: 'GitHub Docs — About self-hosted runners'
+  - url: 'https://github.com/actions/runner/issues/3526'
+    label: 'actions/runner#3526 — Runner Online/Idle not picking up jobs (session conflict pattern)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/configuring-the-self-hosted-runner-application-as-a-service'
+    label: 'GitHub Docs — Configuring self-hosted runner as a service'
