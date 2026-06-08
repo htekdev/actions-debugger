@@ -1,0 +1,83 @@
+id: runner-environment-346
+title: 'VS2026 MSVC v14.51 removes stdext::checked_array_iterator — C++ projects fail to compile'
+category: runner-environment
+severity: error
+tags:
+  - windows
+  - visual-studio
+  - msvc
+  - cpp
+  - runner-image
+  - breaking-change
+patterns:
+  - regex: 'C3861.*make_checked_array_iterator|C3861.*checked_array_iterator'
+    flags: 'i'
+  - regex: "C2039: 'checked_array_iterator': is not a member of 'stdext'"
+    flags: 'i'
+  - regex: 'make_checked_array_iterator.*identifier not found'
+    flags: 'i'
+error_messages:
+  - "error C3861: 'make_checked_array_iterator': identifier not found"
+  - "error C2039: 'checked_array_iterator': is not a member of 'stdext'"
+  - "error C2065: 'checked_array_iterator': undeclared identifier"
+root_cause: |
+  MSVC v14.51 (Visual Studio 2026) removes the long-deprecated `stdext` extensions originally
+  added for checked iterators in debug builds. The removed symbols include:
+  - `stdext::make_checked_array_iterator(ptr, size)` — wraps raw pointer for bounds checking
+  - `stdext::checked_array_iterator<T>` — the iterator type itself
+
+  These were deprecated since VS2015 and appeared in Qt 5.15.x (qlist.h:915), O3DE, rpclib,
+  and other C++ libraries that hadn't removed them. With `windows-latest` and `windows-2025`
+  migrating to VS2026 starting June 8, 2026, any build that touches these symbols now fails
+  to compile. The error surfaces in `cmake --build`, `msbuild`, or `npm install` steps that
+  compile native addons against affected libraries.
+fix: |
+  Option 1 — Pin to windows-2022 (immediate rollback, VS2022/MSVC v143 unaffected):
+
+    runs-on: windows-2022
+
+  Option 2 — Use the MSVC v143 toolset shim bundled inside VS2026 via cmake -T v143.
+  The stdext extensions still exist in the v143 compatibility toolset.
+
+  Option 3 — Patch the source: replace stdext::make_checked_array_iterator(ptr, n) with
+  ptr directly (compilers treat raw pointers as valid output iterators in release mode),
+  or use stdext-free equivalents from the C++17/20 standard library.
+  For Qt 5.15.x: upgrade to Qt 6 (stdext calls removed) or apply the vcpkg patch from
+  microsoft/vcpkg PR #51802.
+fix_code:
+  - language: yaml
+    label: 'Pin to windows-2022 for immediate rollback (VS 2022 / MSVC v143)'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-2022   # VS2022 still available; stdext not yet removed
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build
+              run: |
+                cmake -B build -A x64
+                cmake --build build --config Release
+  - language: yaml
+    label: 'Use MSVC v143 compatibility toolset within VS2026 via -T v143'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-latest   # VS2026 after June 2026
+          steps:
+            - uses: actions/checkout@v4
+            - name: Configure with legacy toolset
+              run: |
+                cmake -B build -G "Visual Studio 18 2026" -A x64 -T v143
+                cmake --build build --config Release
+prevention:
+  - 'Audit C++ source and all transitive dependencies for stdext::make_checked_array_iterator or stdext::checked_array_iterator usage before targeting VS2026 runners.'
+  - 'Test against windows-2025-vs2026 before the windows-latest migration completes (June 15, 2026).'
+  - 'If using Qt 5.15.x, plan an upgrade to Qt 6.x or apply the vcpkg compatibility patch.'
+  - 'Track upstream fixes in heavily-used C++ packages (rpclib, O3DE, etc.) that have already landed patches for MSVC v14.51.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14017'
+    label: 'GitHub Announcement: windows-latest migrates to Visual Studio 2026 (June 2026)'
+  - url: 'https://github.com/microsoft/vcpkg/commit/20e8f918446d9d864add8f17c82e7344c471f098'
+    label: 'vcpkg PR #51802: Avoid stdext::checked_array_iterator in rpclib'
+  - url: 'https://learn.microsoft.com/en-us/cpp/standard-library/checked-iterators'
+    label: 'MSVC Checked Iterators (deprecated stdext extensions)'

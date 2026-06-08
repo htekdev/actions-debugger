@@ -1,0 +1,88 @@
+id: runner-environment-348
+title: 'Az 15.x Get-AzAccessToken returns SecureString — workflows passing .Token to sqlcmd or SqlPackage fail authentication'
+category: runner-environment
+severity: error
+tags:
+  - windows
+  - azure-powershell
+  - az-module
+  - securestring
+  - database
+  - runner-image
+  - breaking-change
+patterns:
+  - regex: "Cannot convert the 'System.Security.SecureString' value of type 'System.Security.SecureString' to type 'System.String'"
+    flags: 'i'
+  - regex: 'Get-AzAccessToken.*Token.*System\.Security\.SecureString'
+    flags: 'i'
+  - regex: 'Login failed.*token-identified principal|Unrecognized access token format'
+    flags: 'i'
+error_messages:
+  - "Cannot convert the 'System.Security.SecureString' value of type 'System.Security.SecureString' to type 'System.String'."
+  - "Login failed for user '<token-identified principal>'."
+  - "Error: Unrecognized access token format"
+  - "Error: Authentication failed, please try login again. error msg is: Logon failed with error 18456"
+root_cause: |
+  In Az.Accounts 2.x (bundled with Az >=13.0), the `Token` property returned by
+  `Get-AzAccessToken` was changed from `System.String` to `System.Security.SecureString`
+  to reduce accidental token logging. With Az 15.6.1 deployed to all GitHub Actions
+  runner images (June 1–7, 2026), workflows that interpolate `$token.Token` directly
+  into command arguments now pass the literal string "System.Security.SecureString"
+  instead of the bearer token value.
+
+  Common failure patterns:
+  - `sqlcmd -P $($token.Token)` — password becomes "System.Security.SecureString"
+  - `SqlPackage /at:$($token.Token)` — access token is the SecureString object name
+  - `curl -H "Authorization: Bearer $($token.Token)"` — invalid bearer token header
+  - `Connect-MgGraph -AccessToken $($token.Token)` — authentication method mismatch
+
+  These workflows succeed locally on pinned Az 12.x–13.x images but fail on runners
+  that now have Az 15.6.1.
+fix: |
+  Use ConvertFrom-SecureString -AsPlainText (PowerShell 7+) to extract the plain-text
+  token from the SecureString before passing it to external tools.
+
+  Alternatively, use -AsPlainText directly on the Get-AzAccessToken call if supported
+  by your Az.Accounts version.
+fix_code:
+  - language: yaml
+    label: 'Extract plain-text token from SecureString (Az 15.x compatible)'
+    code: |
+      - name: Deploy to Azure SQL with token auth
+        shell: pwsh
+        run: |
+          $tokenObj = Get-AzAccessToken -ResourceUrl 'https://database.windows.net'
+          # Az 15.x: Token is SecureString — convert to plain text before use
+          $token = $tokenObj.Token | ConvertFrom-SecureString -AsPlainText
+          sqlcmd -S myserver.database.windows.net -d mydb -G -P "$token" -Q 'SELECT 1'
+  - language: yaml
+    label: 'SqlPackage with SecureString-safe token extraction'
+    code: |
+      - name: Deploy dacpac
+        shell: pwsh
+        run: |
+          $tokenObj = Get-AzAccessToken -ResourceUrl 'https://database.windows.net'
+          $token = $tokenObj.Token | ConvertFrom-SecureString -AsPlainText
+          SqlPackage /Action:Publish /SourceFile:app.dacpac `
+            /TargetServerName:'myserver.database.windows.net' `
+            /TargetDatabaseName:'mydb' `
+            /at:"$token"
+  - language: yaml
+    label: 'Pin Az module to 14.x to avoid SecureString change temporarily'
+    code: |
+      - name: Pin Az module version
+        shell: pwsh
+        run: |
+          Install-Module -Name Az -RequiredVersion 14.6.0 -Force -AllowClobber -Scope CurrentUser
+prevention:
+  - 'Never pass $token.Token directly to external tools after Az 13.x — always pipe through ConvertFrom-SecureString -AsPlainText first.'
+  - 'Use Managed Identity or OIDC federated credentials with Azure SQL to avoid token-based auth patterns entirely.'
+  - 'Test Az module upgrades in a separate job matrix against current and pinned versions before merging.'
+  - 'Add CI smoke tests that verify the actual authentication succeeds, not just that Get-AzAccessToken returns an object.'
+docs:
+  - url: 'https://github.com/Azure/azure-powershell/issues/29098'
+    label: 'azure-powershell#29098: Get-AzAccessToken returns SecureString, sqlcmd/SqlPackage examples assume string'
+  - url: 'https://learn.microsoft.com/en-us/powershell/azure/migrate-az-15.0.0'
+    label: 'Az 15.x migration guide'
+  - url: 'https://github.com/actions/runner-images/issues/14104'
+    label: 'GitHub Announcement: Az module updated to 15.6.1 (June 2026)'
