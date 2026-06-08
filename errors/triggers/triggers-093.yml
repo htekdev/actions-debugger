@@ -1,0 +1,148 @@
+id: triggers-093
+title: '`on: push: branches:` and `tags:` use OR logic — tag pushes bypass the branches filter and trigger unconditionally'
+category: triggers
+severity: silent-failure
+tags:
+  - push
+  - tags
+  - branches
+  - or-logic
+  - tag-push
+  - filter
+  - silent-failure
+  - unexpected-trigger
+patterns:
+  - regex: 'on:\s+push:\s*\n\s+branches:\s*\n.*\n\s+tags:'
+    flags: 'si'
+  - regex: 'on:\s+push:\s*\n\s+tags:\s*\n.*\n\s+branches:'
+    flags: 'si'
+  - regex: 'Triggered by refs/tags/.+ \(unexpected — branches filter was set\)'
+    flags: 'i'
+error_messages:
+  - 'Workflow triggered for tag push from feature branch — expected only tags from main'
+  - 'Release job fired for a pre-release tag pushed from a development branch'
+root_cause: |
+  When both `branches:` and `tags:` filters are specified under the same `on: push:`
+  event, GitHub Actions evaluates them with **OR logic**: the workflow triggers if the
+  push matches **either** the `branches:` filter OR the `tags:` filter. It does NOT
+  apply AND logic (i.e., the branches filter does not restrict which branch a tag
+  push must originate from).
+
+  A common and misleading pattern:
+
+  ```yaml
+  on:
+    push:
+      branches: [main]
+      tags:
+        - 'v*'
+  ```
+
+  Developers expect this to mean: "run only when pushing a `v*` tag **to the main
+  branch**." In reality it means: "run when pushing to `main` OR when pushing any
+  `v*` tag (from any branch, including `feature/*`, `release/*`, etc.)."
+
+  This behavior is documented in the official GitHub Actions syntax reference but is
+  widely misunderstood because:
+  - `branches:` + `paths:` under the same `push:` event uses AND logic (both must
+    match), creating an inconsistent mental model.
+  - There is no error or warning when both filters are present — the workflow simply
+    fires more often than intended.
+  - Tag-push runs look identical to branch-push runs in the Actions tab.
+
+  Affected common use-cases:
+  - Release pipelines that should only publish when a tag is pushed from the main
+    branch get triggered for pre-release tags pushed from release branches.
+  - Deployment workflows fire for tags on hotfix branches before code is merged to main.
+  - Build matrices run for tag pushes from WIP feature branches, producing
+    unintended artifacts.
+
+  Sources: actions/runner#1007 (GitHub Actions Not Respecting Trigger "On Create Tags");
+  GitHub Community discussion #25244 (How to create filter on both tag and branch);
+  official GitHub Actions workflow syntax documentation.
+fix: |
+  The `on: push:` event does not support AND logic between `branches:` and `tags:`.
+  To restrict tag-triggered runs to tags originating from a specific branch, add a
+  job-level `if:` condition that checks both the ref type and the branch context.
+
+  Note that for tag pushes, `github.ref` is `refs/tags/<tagname>` and
+  `github.event.base_ref` (if available) contains the branch the tag was pushed
+  from. Alternatively, use `github.ref_type` (value: `tag` or `branch`) and query
+  the tag's commit to determine its originating branch.
+
+  For most release pipelines, the practical fix is to drop the `branches:` filter
+  entirely and rely solely on the `tags:` pattern, controlling release scope via
+  tag naming conventions and release tooling rather than branch origin.
+fix_code:
+  - language: yaml
+    label: 'Add job-level if condition to restrict tag-triggered run to tags from main'
+    code: |
+      on:
+        push:
+          tags:
+            - 'v*'
+          # Removing branches: here — see if: condition on the job instead
+
+      jobs:
+        release:
+          runs-on: ubuntu-latest
+          # Only publish releases for tags that were pushed from the main branch.
+          # github.event.base_ref is set to 'refs/heads/main' when the tag was
+          # pushed from main; it may be empty for tags pushed without a branch context.
+          if: |
+            startsWith(github.ref, 'refs/tags/v') &&
+            (github.event.base_ref == 'refs/heads/main' || github.event.base_ref == '')
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./release.sh
+  - language: yaml
+    label: 'Separate push event entries for branch CI and tag releases (explicit, no ambiguity)'
+    code: |
+      on:
+        push:
+          branches:
+            - main              # Branch CI: runs only on pushes to main
+        push:
+          tags:
+            - 'v[0-9]+.[0-9]+.[0-9]+'   # Release: runs only on semver tags
+
+      # NOTE: two separate push: entries are NOT valid YAML (duplicate key).
+      # Use a single on: push: with both and add job-level if conditions instead,
+      # or split into separate workflow files for branch CI and releases.
+  - language: yaml
+    label: 'Single workflow with per-job if conditions to separate branch CI from tag release'
+    code: |
+      on:
+        push:
+          branches: [main]
+          tags:
+            - 'v*'
+
+      jobs:
+        ci:
+          # Run CI only for branch pushes (not tag pushes)
+          if: github.ref_type == 'branch'
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: make test
+
+        release:
+          # Run release only for tag pushes
+          if: github.ref_type == 'tag'
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: make release
+prevention:
+  - '`branches:` and `tags:` under `on: push:` are evaluated with OR logic — specifying both does NOT restrict tags to the listed branches.'
+  - 'Use `github.ref_type == ''tag''` or `github.ref_type == ''branch''` in job-level `if:` conditions to differentiate between branch and tag pushes when both are in the same workflow.'
+  - 'Prefer separate workflow files for branch CI and release pipelines to avoid trigger logic confusion.'
+  - 'Note the asymmetry: `branches:` + `paths:` uses AND logic, but `branches:` + `tags:` uses OR logic — this inconsistency is a frequent source of incorrect trigger assumptions.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#onpushpull_requestbranchestags'
+    label: 'GitHub Docs: on.push branches and tags filters — OR semantics'
+  - url: 'https://github.com/actions/runner/issues/1007'
+    label: 'actions/runner #1007: GitHub Actions Not Respecting Trigger "On Create Tags" — branches + tags OR logic'
+  - url: 'https://github.com/orgs/community/discussions/25244'
+    label: 'GitHub Community #25244: How to create filter on both tag and branch'

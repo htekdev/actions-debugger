@@ -1,0 +1,154 @@
+id: permissions-auth-095
+title: '`create-github-app-token` fails with "Integration not found" (HTTP 404) when the GitHub App has no installation on the target repository'
+category: permissions-auth
+severity: error
+tags:
+  - github-app
+  - create-github-app-token
+  - installation
+  - integration-not-found
+  - 404
+  - dependabot
+  - token-creation
+patterns:
+  - regex: 'Failed to create token for .+?: Integration not found'
+    flags: 'i'
+  - regex: 'HttpError: Not Found.*create-github-app-token|create-github-app-token.*HttpError.*404'
+    flags: 'i'
+  - regex: 'Integration not found.*attempt \d|Error creating token.*Integration not found'
+    flags: 'i'
+error_messages:
+  - 'Failed to create token for "ORGNAME" (attempt 1): Integration not found'
+  - 'Failed to create token for "ORGNAME" (attempt 2): Integration not found'
+  - 'Failed to create token for "ORGNAME" (attempt 3): Integration not found'
+  - 'HttpError: Not Found — GitHub App has no installation for this repository'
+root_cause: |
+  The `actions/create-github-app-token` action generates an installation access token
+  by calling the GitHub Apps REST API (`POST /app/installations/{installation_id}/access_tokens`).
+  Before it can request the token, it must look up the GitHub App's installation ID for
+  the target organization or repository.
+
+  When the GitHub App is **not installed** on the target organization or repository,
+  the API returns HTTP 404 with the body `{"message":"Integration not found"}`. The
+  action surfaces this as:
+
+  ```
+  Failed to create token for "ORGNAME" (attempt 1): Integration not found
+  ```
+
+  The action retries (default: 3 attempts) before failing the step, producing the
+  same 404 error on each attempt.
+
+  **Common scenarios where this occurs:**
+
+  1. **Dependabot PRs**: Dependabot runs workflows in a sandboxed context. If the
+     GitHub App is only installed on the repository owner's account but not on the
+     Dependabot bot's virtual organization context, the installation lookup returns 404.
+     This is documented in `actions/create-github-app-token#235` — Dependabot PRs
+     can trigger workflows that attempt GitHub App token creation before the App is
+     accessible.
+
+  2. **Fork PRs**: Workflows triggered by PRs from forks run in the fork's repository
+     context. If the GitHub App is installed only on the upstream repository/org and
+     not on the fork's owner account, the installation is not found.
+
+  3. **New repositories**: A repository was added to the organization but the GitHub
+     App's installation was not updated to include the new repo (Apps scoped to
+     "selected repositories" only).
+
+  4. **Cross-org workflows**: A reusable workflow running in Organization B attempts
+     to create a token for an App installed only in Organization A.
+
+  5. **App uninstalled or suspended**: The GitHub App installation was suspended or
+     uninstalled by an organization admin without updating the workflows that depend
+     on it.
+fix: |
+  **Option 1 — Install the GitHub App on the target repository/org:**
+  The straightforward fix is to ensure the GitHub App is installed on the
+  organization or repository where the workflow runs. Navigate to the GitHub App
+  settings → "Install App" → select the target organization or specific repositories.
+
+  **Option 2 — Skip token creation for Dependabot/fork contexts:**
+  Add an `if:` condition to skip the token creation step when running in contexts
+  where the App installation is not available. Use `github.actor != 'dependabot[bot]'`
+  or check `github.event_name` and `github.event.pull_request.head.repo.fork`.
+
+  **Option 3 — Use `continue-on-error: true` with a fallback:**
+  If the App token is optional (e.g., for enhanced permissions but the workflow can
+  proceed with the default GITHUB_TOKEN), set `continue-on-error: true` on the
+  token-creation step and check `steps.<id>.outcome` in subsequent steps.
+
+  **Option 4 — Use `owner:` input to scope to the correct installation:**
+  If the App is installed at the organization level but the workflow runs in a
+  repository context, pass `owner: ${{ github.repository_owner }}` explicitly so
+  the action looks up the org-level installation, not the repo-level installation.
+fix_code:
+  - language: yaml
+    label: 'Skip token creation for Dependabot PRs and fork contexts where App is not installed'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Generate GitHub App token
+              id: app-token
+              # Skip for Dependabot PRs and fork PRs — App may not be installed there
+              if: |
+                github.actor != 'dependabot[bot]' &&
+                !github.event.pull_request.head.repo.fork
+              uses: actions/create-github-app-token@v2
+              with:
+                app-id: ${{ vars.APP_ID }}
+                private-key: ${{ secrets.APP_PRIVATE_KEY }}
+                owner: ${{ github.repository_owner }}
+
+            - name: Use token (falls back to GITHUB_TOKEN if App token skipped)
+              env:
+                GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+              run: gh api /repos/${{ github.repository }}
+  - language: yaml
+    label: 'Use continue-on-error with outcome check for optional App token'
+    code: |
+      jobs:
+        ci:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Generate GitHub App token (optional)
+              id: app-token
+              continue-on-error: true
+              uses: actions/create-github-app-token@v2
+              with:
+                app-id: ${{ vars.APP_ID }}
+                private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+            - name: Run with best-available token
+              env:
+                # Use App token if created successfully, otherwise fall back to GITHUB_TOKEN
+                GH_TOKEN: ${{ steps.app-token.outcome == 'success' && steps.app-token.outputs.token || github.token }}
+              run: echo "Using token for API calls"
+  - language: yaml
+    label: 'Ensure owner: input is set to look up org-level installation when running in a repo context'
+    code: |
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          # Explicitly scope to the org-level installation (not repo-level)
+          # Fixes "Integration not found" when App is installed at org scope only
+          owner: ${{ github.repository_owner }}
+prevention:
+  - 'Ensure the GitHub App is installed on every organization and repository where workflows using `create-github-app-token` run — including forks and newly-created repos if the App uses "Selected repositories" scope.'
+  - 'Add `if: github.actor != ''dependabot[bot]''` to skip App token creation on Dependabot PRs, which run in a context where the App installation is typically not accessible.'
+  - 'Use `owner: ${{ github.repository_owner }}` in the action inputs to look up the organization-level installation rather than the repository-level installation when the App is installed at the org scope.'
+  - 'When the App token is optional (workflow can proceed with GITHUB_TOKEN as fallback), use `continue-on-error: true` and check `steps.<id>.outcome` to avoid hard failures in contexts where the App is not installed.'
+  - 'After uninstalling or suspending a GitHub App, search for all workflows using `create-github-app-token` and update or remove them to prevent broken runs.'
+docs:
+  - url: 'https://github.com/actions/create-github-app-token/issues/235'
+    label: 'actions/create-github-app-token #235: Integration not found for Dependabot PRs — App not installed in that context'
+  - url: 'https://github.com/actions/create-github-app-token'
+    label: 'actions/create-github-app-token — action README, inputs reference including owner:'
+  - url: 'https://docs.github.com/en/apps/creating-github-apps/about-creating-github-apps/about-creating-github-apps'
+    label: 'GitHub Docs: About GitHub Apps — installation scoping and repository access'
+  - url: 'https://docs.github.com/en/code-security/dependabot/working-with-dependabot/automating-dependabot-with-github-actions#accessing-secrets'
+    label: 'GitHub Docs: Automating Dependabot with GitHub Actions — secrets and token limitations for Dependabot workflows'
