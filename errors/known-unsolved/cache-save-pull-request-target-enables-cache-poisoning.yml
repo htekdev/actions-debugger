@@ -1,0 +1,118 @@
+id: known-unsolved-099
+title: 'actions/cache silently saves cache from pull_request_target — enables cache poisoning by external contributors'
+category: known-unsolved
+severity: warning
+tags:
+  - cache
+  - pull_request_target
+  - security
+  - cache-poisoning
+  - silent-failure
+patterns:
+  - regex: 'on:\s+pull_request_target'
+    flags: 'i'
+  - regex: 'uses:\s+actions/cache@'
+    flags: 'i'
+error_messages:
+  - 'on: pull_request_target (workflow trigger)'
+  - 'Cache saved successfully. (step conclusion: success)'
+root_cause: |
+  actions/cache@v4 always runs both a restore step and a post-job save step by default.
+  When a workflow is triggered by pull_request_target, the job runs in the context of
+  the BASE repository with write access — but the workflow code (and actions) are
+  sourced from the HEAD of the PULL REQUEST (the external contributor fork).
+
+  This means:
+    1. A malicious PR can modify workflow files or action inputs to inject arbitrary
+       content into the cache save path.
+    2. The cache save succeeds silently — no error, no warning.
+    3. Subsequent runs in other workflows (e.g., push, schedule) restore the poisoned
+       cache and execute the malicious content.
+
+  This vector was confirmed in a real-world npm supply-chain attack in May 2026
+  (TanStack/router#7383) where a pull_request_target workflow was used to poison
+  the package registry cache. GitHub has not yet made cache writes from
+  pull_request_target opt-in or restricted — actions/cache PR#1757 proposes
+  disabling automatic save for this trigger but has not merged as of June 2026.
+
+  Distinct from the more general pull_request_target code execution risk (which is
+  well-documented). This entry covers the CACHE-SPECIFIC vector: silent cache
+  poisoning via the automatic post-job save step.
+fix: |
+  Split actions/cache into explicit restore + conditional save steps. Skip the
+  save step when triggered by pull_request_target:
+
+  Option 1 — Use actions/cache/restore only for pull_request_target:
+    Replace actions/cache with actions/cache/restore (restore-only, no save step).
+    Use actions/cache/save explicitly in a separate step/job that only runs on
+    trusted triggers (push, schedule, etc.).
+
+  Option 2 — Condition the cache step on the trigger:
+    Wrap the full actions/cache step with an if: condition that excludes
+    pull_request_target events.
+
+  Neither GitHub nor actions/cache currently provides an automatic guard —
+  this is a manual mitigation until the platform addresses the gap.
+fix_code:
+  - language: yaml
+    label: 'Use restore-only cache for pull_request_target (no write-back)'
+    code: |
+      # Replace actions/cache with the restore-only variant to prevent write-back
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            # Restore-only — no automatic save step, safe for pull_request_target
+            - name: Restore dependencies cache
+              uses: actions/cache/restore@v4
+              with:
+                path: ~/.npm
+                key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+                restore-keys: |
+                  ${{ runner.os }}-node-
+
+            - name: Install dependencies
+              run: npm ci
+
+            # Explicit save only on trusted triggers (never on pull_request_target)
+            - name: Save dependencies cache
+              if: github.event_name != 'pull_request_target'
+              uses: actions/cache/save@v4
+              with:
+                path: ~/.npm
+                key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+  - language: yaml
+    label: 'Skip entire cache step when triggered by pull_request_target'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            # Skip cache entirely on pull_request_target to prevent poisoning
+            - name: Cache dependencies
+              if: github.event_name != 'pull_request_target'
+              uses: actions/cache@v4
+              with:
+                path: ~/.npm
+                key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+
+            - name: Install dependencies
+              run: npm ci
+prevention:
+  - 'Audit all pull_request_target workflows for actions/cache usage — replace with actions/cache/restore and add explicit save steps gated on trusted triggers.'
+  - 'Prefer pull_request (not pull_request_target) for workflows that do not need write access to the base repository.'
+  - 'When pull_request_target is required (e.g., to post PR comments), isolate the write-access job from any build/test jobs that use cache.'
+  - 'Track actions/cache PR#1757 for an upstream fix that would disable automatic save on pull_request_target.'
+docs:
+  - url: 'https://github.com/actions/cache/issues/1756'
+    label: 'actions/cache#1756 — Cache/save should not run automatically from pull_request_target (May 2026)'
+  - url: 'https://github.com/actions/cache/pull/1757'
+    label: 'actions/cache PR#1757 — Disable default save action for pull_request_target (proposed fix)'
+  - url: 'https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/'
+    label: 'GitHub Security Lab: Preventing pwn requests (pull_request_target security)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request_target'
+    label: 'GitHub Docs: pull_request_target event — security considerations'

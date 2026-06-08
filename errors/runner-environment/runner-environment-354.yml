@@ -1,0 +1,89 @@
+id: runner-environment-354
+title: 'Self-hosted runner auto-update writes 0-byte runsvc.sh — systemd exits 203/EXEC on next restart'
+category: runner-environment
+severity: error
+tags:
+  - self-hosted-runner
+  - auto-update
+  - systemd
+  - linux
+  - runsvc
+patterns:
+  - regex: 'Status=203/EXEC'
+    flags: 'i'
+  - regex: 'Main process exited.*status=203'
+    flags: 'i'
+  - regex: 'bin\.\d+\.\d+\.\d+/runsvc\.sh.*0 B'
+    flags: 'i'
+error_messages:
+  - 'Main process exited, code=exited, status=203/EXEC'
+  - 'bin.2.334.0/runsvc.sh  0 B (0 bytes on disk)'
+  - 'Failed to start actions.runner.<name>.service — see systemctl status for details'
+root_cause: |
+  When a self-hosted runner auto-updates (e.g., from v2.328.0 → v2.334.0), the update
+  unpacker intermittently writes an empty (0-byte) runsvc.sh into the new version's
+  bin.<version>/ directory. The currently-running listener process continues operating
+  from in-memory state, so the runner appears healthy and keeps accepting jobs.
+  However, the bin/runsvc.sh symlink now resolves to the 0-byte file.
+
+  On the next service restart (host reboot, systemctl restart, OOM kill), systemd
+  attempts to execute the symlink target and fails immediately with Status=203/EXEC
+  because the file is empty. GitHub's registration GC marks the runner offline after
+  a few hours and removes the registration, requiring a fresh re-register with a new
+  token. Observed on Ubuntu 24.04 and Linux Mint 22 (ext4), multiple independent
+  hosts hitting the bug within ~24h of the same auto-update window.
+
+  Reported in actions/runner#4421 (May 2026). Root cause suspected to be a cp/mv
+  race during in-place upgrade — the symlink is updated before runsvc.sh is
+  fully written.
+fix: |
+  Immediate diagnosis:
+    ls -la $(readlink -f /opt/actions-runner/bin/runsvc.sh)
+
+  If the file is 0 bytes, copy a non-empty runsvc.sh from a sibling bin.* directory:
+    GOOD=$(find /opt/actions-runner -mindepth 2 -maxdepth 2 \
+           -path '/opt/actions-runner/bin.*/runsvc.sh' \
+           -type f -size +0c | head -1)
+    cp "$GOOD" /opt/actions-runner/bin/runsvc.sh
+    chmod +x /opt/actions-runner/bin/runsvc.sh
+
+  Long-term: Add an ExecStartPre= health-check script to the systemd unit that
+  detects and repairs a 0-byte runsvc.sh before starting the service (see fix_code).
+fix_code:
+  - language: yaml
+    label: 'systemd override — auto-repair 0-byte runsvc.sh before service start'
+    code: |
+      # /etc/systemd/system/actions.runner.<name>.service.d/repair-runsvc.conf
+      [Service]
+      ExecStartPre=/usr/local/bin/gha-runner-repair-runsvc.sh /opt/actions-runner
+
+      # /usr/local/bin/gha-runner-repair-runsvc.sh (chmod 755, root-owned)
+      #!/bin/bash
+      set -e
+      ROOT="${1:?usage: $0 <runner-root>}"
+      TARGET=$(readlink -f "$ROOT/bin/runsvc.sh" 2>/dev/null || echo "$ROOT/bin/runsvc.sh")
+      [ -s "$TARGET" ] && exit 0
+      GOOD=$(find "$ROOT" -mindepth 2 -maxdepth 2 \
+             -path "$ROOT/bin.*/runsvc.sh" -type f -size +0c \
+             -printf "%T@ %p\n" 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)
+      [ -n "$GOOD" ] && cp "$GOOD" "$TARGET" && chmod +x "$TARGET"
+  - language: yaml
+    label: 'Post-update verification — check symlink target is non-empty'
+    code: |
+      # Run after each runner auto-update completes:
+      RUNNER_ROOT=/opt/actions-runner
+      TARGET=$(readlink -f "$RUNNER_ROOT/bin/runsvc.sh")
+      if [ ! -s "$TARGET" ]; then
+        echo "ERROR: runsvc.sh is empty at $TARGET — runner will fail on next restart"
+        exit 1
+      fi
+prevention:
+  - 'After each runner auto-update, verify the symlink target is non-empty: test -s $(readlink -f /opt/actions-runner/bin/runsvc.sh)'
+  - 'Add an ExecStartPre= systemd health check to detect and repair 0-byte runsvc.sh before each service start.'
+  - 'Consider pinning the runner version and updating manually (with post-update verification) rather than relying on auto-update.'
+  - 'Monitor for systemd exit status 203/EXEC in runner service logs after any auto-update window; alert immediately rather than waiting for GC removal.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4421'
+    label: 'actions/runner#4421 — runsvc.sh sometimes 0 bytes after auto-update from v2.328.0 to v2.334.0 (May 2026)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners'
+    label: 'GitHub Docs: About self-hosted runners'
