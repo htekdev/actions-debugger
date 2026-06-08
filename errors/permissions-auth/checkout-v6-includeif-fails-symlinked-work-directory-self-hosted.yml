@@ -1,0 +1,120 @@
+id: permissions-auth-095
+title: 'checkout@v6 includeIf Credential Matching Fails on Self-Hosted Runners With Symlinked _work Directory'
+category: permissions-auth
+severity: error
+tags:
+  - checkout
+  - v6
+  - self-hosted
+  - symlink
+  - includeIf
+  - credentials
+  - git-auth
+patterns:
+  - regex: 'fatal: could not read Username for .https://github\.com.: terminal prompts disabled'
+    flags: 'i'
+  - regex: 'fatal: Authentication failed for .https://github\.com'
+    flags: 'i'
+  - regex: 'remote: Repository not found\.'
+    flags: 'i'
+error_messages:
+  - "fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+  - "fatal: Authentication failed for 'https://github.com/repo'"
+  - "Error: fatal: repository 'https://github.com/org/repo/' not found"
+root_cause: |
+  `actions/checkout@v6` stores Git credentials using `includeIf "gitdir:..."` directives
+  in `.git/config`. The condition matches when the Git directory path starts with the
+  configured path prefix.
+
+  On self-hosted runners where the `_work` directory is a **symlink** to a different
+  path (e.g., an external drive or NFS volume), Git resolves symlinks when evaluating
+  `gitdir:` conditions. As a result, the path comparison fails because:
+
+  - v6 writes: `[includeIf "gitdir:/Users/runner/actions-runner/_work/repo/repo/.git"]`
+  - Git resolves the actual path as: `/Volumes/External/runner-work/repo/repo/.git`
+  - The paths don't match → the condition never triggers → credentials file never loaded
+
+  The checkout step itself succeeds (it runs before credentials are needed for private
+  operations), but the fetch step fails with "terminal prompts disabled" because no
+  credential helper can supply a username/password.
+
+  This is distinct from:
+  - `permissions-auth-088`: manually invoked `docker run` not having `$RUNNER_TEMP` mounted
+  - `permissions-auth-090`: Docker container actions (using: docker) missing credentials
+
+  It only affects self-hosted runners where `_work` is a symlink — GitHub-hosted runners
+  always use canonical (non-symlinked) paths.
+
+  A fix PR (#2394) was submitted to checkout to use `git rev-parse --absolute-git-dir`
+  instead of the raw path, but it had not merged as of May 2026.
+
+  Sources: actions/checkout#2393 (Mar 2026, open); actions/checkout#2394 (fix PR, open)
+fix: |
+  Option 1 — Downgrade to checkout@v5 until checkout#2394 lands:
+
+      uses: actions/checkout@v5
+
+  v5 stores credentials as HTTP Authorization headers (`http.*.extraheader`) directly
+  in `.git/config`, which does not use path-based conditions and works regardless of
+  symlinks.
+
+  Option 2 — Resolve the symlink before runner registration by using the canonical
+  path for the runner's `_work` directory (not a symlink):
+
+      # On the runner host — configure runner with canonical path
+      ./config.sh --work /Volumes/External/runner-work  # Use the real path, not a symlink
+
+  Option 3 — Use `persist-credentials: false` and set up credentials manually using
+  the GitHub token in a way that doesn't rely on `includeIf`:
+
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up git credentials
+        run: |
+          git config --global credential.helper '!f() { echo "username=x-access-token"; echo "password=${{ github.token }}"; }; f'
+fix_code:
+  - language: yaml
+    label: 'Downgrade to checkout@v5 for self-hosted runners with symlinked _work'
+    code: |
+      steps:
+        - name: Checkout
+          # Use v5 on self-hosted runners with symlinked _work until checkout#2394 merges
+          uses: actions/checkout@v5
+          with:
+            fetch-depth: 0
+            token: ${{ secrets.GITHUB_TOKEN }}
+
+  - language: yaml
+    label: 'Use persist-credentials:false with inline credential helper (works with symlinks)'
+    code: |
+      steps:
+        - name: Checkout
+          uses: actions/checkout@v6
+          with:
+            persist-credentials: false  # Don't write includeIf directives
+
+        - name: Configure git credentials
+          run: |
+            git config --global credential.https://github.com.username x-access-token
+            git config --global credential.helper \
+              '!f() { echo "password=${{ github.token }}"; }; f'
+
+        - name: Your git operations
+          run: git fetch origin && git push origin HEAD
+
+prevention:
+  - 'Before upgrading self-hosted runners from checkout@v5 to v6, verify that the runner _work directory is NOT a symlink (run: readlink -f $(pwd))'
+  - 'If the _work directory must be on an external volume, configure the runner to use the canonical path directly rather than a symlink'
+  - 'After upgrading to checkout@v6, run a test workflow with git fetch on any self-hosted runner with an external volume to catch symlink issues early'
+  - 'Track actions/checkout#2394 for the upstream fix; pin to the version that includes the fix once merged'
+docs:
+  - url: 'https://github.com/actions/checkout/issues/2393'
+    label: 'checkout#2393: v6 includeIf matching fails on self-hosted runners with symlinked _work directory (Mar 2026)'
+  - url: 'https://github.com/actions/checkout/pull/2394'
+    label: 'checkout#2394: Fix PR — use git rev-parse --absolute-git-dir instead of raw path (open)'
+  - url: 'https://github.com/actions/checkout/issues/2359'
+    label: 'checkout#2359: Related — v6 credentials and docker run (original includeIf discussion)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners'
+    label: 'GitHub Docs: About self-hosted runners'
