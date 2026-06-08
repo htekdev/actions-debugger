@@ -1,0 +1,126 @@
+id: silent-failures-153
+title: 'Ephemeral/JIT Runner Reports "Lost Communication" Despite Successful Job Completion'
+category: silent-failures
+severity: silent-failure
+tags:
+  - ephemeral-runner
+  - jit-runner
+  - lost-communication
+  - broker-disconnect
+  - self-hosted
+  - false-positive
+  - one-time-use
+patterns:
+  - regex: 'The self-hosted runner.*lost communication with the server'
+    flags: 'i'
+  - regex: 'GET request to broker\.actions\.githubusercontent\.com.*has been cancelled'
+    flags: 'i'
+  - regex: 'Fire signal for one time used runner'
+    flags: 'i'
+  - regex: 'Worker finished for job .{10,50} Code: 100'
+    flags: 'i'
+error_messages:
+  - 'The self-hosted runner: <hostname> lost communication with the server.'
+  - 'GET request to https://broker.actions.githubusercontent.com/message?sessionId=... has been cancelled.'
+  - 'Worker finished for job f19fed06-... Code: 100'
+  - 'Job has finished at backend, the runner will exit since it is running under onetime use mode.'
+root_cause: |
+  Ephemeral (one-time-use) JIT runners that successfully complete a job are frequently
+  misreported by GitHub as having "lost communication with the server" due to a race
+  condition in the runner's cleanup sequence.
+
+  The problem lives in `Runner.cs` around line 576. After the one-time-use job completes,
+  the runner immediately cancels the in-flight broker long-poll connection with zero grace
+  period:
+
+  ```
+  messageQueueLoopTokenSource.Cancel();  // immediate teardown, no grace period
+  ```
+
+  This abrupt TCP teardown severs the connection to `broker.actions.githubusercontent.com`
+  before GitHub's backend systems have synchronized the job's completion status. Two
+  independent GitHub backend systems then race:
+
+  1. **Pipeline service** — received `CompleteJobAsync`, knows the job succeeded.
+  2. **Broker health monitor** — sees the TCP disconnect and flags "runner lost communication."
+
+  When the broker health monitor wins the race (affects ~5–10% of ephemeral runs in high-volume
+  environments), the job is reported as failed or stuck despite the runner having exited cleanly
+  with return code 0.
+
+  The runner diagnostic logs show the paradox clearly — all timestamps are identical:
+
+  ```
+  [08:03:33Z INFO] Worker finished for job f19fed06-... Code: 100
+  [08:03:33Z INFO] finish job request for job ... with result: Succeeded
+  [08:03:33Z INFO] Received job status event. JobState: Online  ← GitHub confirmed completion
+  [08:03:33Z INFO] Fire signal for one time used runner.
+  [08:03:33Z INFO] Stop message queue looping.
+  [08:03:33Z WARN] GET request to broker.actions.githubusercontent.com/message... has been cancelled.
+  [08:03:33Z ERR ] TaskCanceledException: The operation was canceled.  ← Broker sees disconnect
+  [08:03:33Z INFO] Runner execution has finished with return code 0
+  ```
+
+  The race is more likely on short jobs (< 60 seconds) where GitHub's backend has less time
+  to propagate completion before the runner exits. Open bug: actions/runner#4309 (filed
+  2026-03-21). Related issues: #3539, #3981, #2040.
+fix: |
+  **No user-side fix exists today** — this is a runner bug that requires a grace period
+  before the message queue is cancelled. The proposed fix in actions/runner#4309 is:
+
+  ```csharp
+  // Add 5-second grace period before tearing down broker connection
+  await Task.Delay(TimeSpan.FromSeconds(5));
+  messageQueueLoopTokenSource.Cancel();
+  ```
+
+  **Workarounds available today:**
+
+  1. **Re-run the workflow** — The underlying job completed successfully; re-running simply
+     re-executes the same logic and should succeed (or the artifact/deployment output may
+     already exist from the "failed" run).
+
+  2. **Add a post-job sleep step** — Keep the broker connection alive slightly longer by
+     adding a 5–10 second sleep at the end of your job:
+     ```yaml
+     - name: Grace period (JIT broker race workaround)
+       if: always()
+       run: sleep 10
+     ```
+     This keeps the job running while GitHub's backend propagates completion.
+
+  3. **Check runner diagnostic logs before re-running** — Confirm the job actually failed
+     vs. the false-positive scenario. If you see `Worker finished ... Code: 100` and
+     `Runner execution has finished with return code 0`, the job succeeded and artifacts
+     were created even if the UI shows failure.
+
+  4. **Pin runner version** — The issue is confirmed on runner versions 2.331.0 and
+     2.333.0+. Monitor actions/runner#4309 for a fix release.
+fix_code:
+  - language: yaml
+    label: 'Workaround: add grace-period sleep to keep broker connection alive'
+    code: |
+      jobs:
+        build:
+          runs-on: [self-hosted, ephemeral]
+          steps:
+            - name: Build and test
+              run: make build test
+
+            # Keep broker connection alive while GitHub's pipeline service
+            # propagates job completion — prevents false "lost communication"
+            - name: Broker grace period (JIT runner workaround)
+              if: always()
+              run: sleep 10
+prevention:
+  - 'Check runner diagnostic logs (`Runner_*.log`) before treating "lost communication" as a real failure — look for `Worker finished ... Code: 100`.'
+  - 'For high-volume ephemeral runner environments (hundreds of jobs/day), expect ~5–10% of very short jobs to show this false positive until actions/runner#4309 is fixed.'
+  - 'Avoid making re-run decisions based purely on the GitHub UI "lost communication" message — verify via logs and artifact presence.'
+  - 'Add `sleep 10` as an `if: always()` step at the end of ephemeral runner jobs to reduce race probability.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4309'
+    label: 'actions/runner#4309: Ephemeral/JIT runner reports "lost communication" despite successful completion (open bug)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/autoscaling-with-self-hosted-runners#using-ephemeral-runners-for-autoscaling'
+    label: 'GitHub Docs: Using ephemeral runners for autoscaling'
+  - url: 'https://github.com/actions/runner/issues/3539'
+    label: 'actions/runner#3539: "Lost communication" due to resource starvation (different root cause)'

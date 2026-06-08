@@ -1,0 +1,134 @@
+id: caching-artifacts-107
+title: 'download-artifact v8 Silently Exits with Code -1073740791 on Windows — No Error Logged'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - download-artifact
+  - windows
+  - silent-failure
+  - exit-code
+  - no-error-message
+  - arm64
+  - blob-download
+patterns:
+  - regex: 'Node Action run completed with exit code -1073740791'
+    flags: 'i'
+  - regex: 'Downloading single artifact\s*$'
+    flags: 'im'
+  - regex: 'Redirecting to blob download url.*\n(?!.*Artifact download completed)'
+    flags: 'im'
+  - regex: 'download-artifact.*exit code -107374'
+    flags: 'i'
+error_messages:
+  - '##[debug]Node Action run completed with exit code -1073740791'
+  - 'Downloading single artifact'
+  - 'Redirecting to blob download url: https://productionresultssa...'
+root_cause: |
+  `actions/download-artifact` (v4, v7, v8) intermittently exits with Windows error code
+  `-1073740791` (0xC0000409 — STATUS_STACK_BUFFER_OVERRUN, a security-triggered process
+  termination) on Windows runners after the download begins, with no error message written
+  to the Actions log. The step shows as failed with no diagnostic output other than
+  optionally the `Node Action run completed with exit code -1073740791` debug line.
+
+  Log output cuts off at one of these points depending on where the crash occurs:
+  - After "Downloading single artifact" with nothing following (most common)
+  - After "Redirecting to blob download url: ..." before the SHA digest line
+  - After "Starting download of artifact to: ..."
+
+  The underlying issue is a native Node.js crash triggered during Windows I/O operations
+  in the `@actions/artifact` library's download pipeline. The crash is non-deterministic
+  and occurs more frequently on:
+  - Windows ARM64 runners (`windows-latest` on ARM64 hardware)
+  - Large artifacts (> 500 MB)
+  - Parallel downloads across concurrent jobs
+
+  The root cause appears to be an unhandled promise rejection in the chunk-streaming loop
+  inside `@actions/artifact`. When a download chunk triggers a low-level Windows I/O
+  error (e.g., a connection reset from Azure Blob Storage), the unhandled rejection causes
+  Node.js to call `abort()`, which Windows intercepts as a stack buffer overrun and
+  terminates the process with status 0xC0000409.
+
+  Open issue: actions/download-artifact#475 (filed 2026-04-05, 9+ reactions).
+  Related toolkit fix PR: actions/toolkit#2406 (propagate download error + verify length).
+  Related: actions/download-artifact#454 (download incomplete, no error reported).
+
+  The issue became more prevalent in April–May 2026 and affects v4, v7, and v8 of the action.
+fix: |
+  **Short term: Retry the failed job** — The download failure is transient. Re-running the
+  failed job is the fastest path to success as the failure is non-deterministic.
+
+  **Add explicit retry logic around the download step:**
+
+  ```yaml
+  - name: Download artifact (with retry)
+    uses: nick-fields/retry@v3
+    with:
+      timeout_minutes: 10
+      max_attempts: 3
+      command: |
+        gh run download ${{ github.run_id }} -n my-artifact -D ./dist
+  ```
+
+  **Or use a retry wrapper for `actions/download-artifact`:**
+
+  ```yaml
+  - name: Download artifact
+    id: download
+    uses: actions/download-artifact@v8
+    with:
+      name: my-artifact
+      path: dist
+    continue-on-error: true
+
+  - name: Retry download on failure
+    if: steps.download.outcome == 'failure'
+    uses: actions/download-artifact@v8
+    with:
+      name: my-artifact
+      path: dist
+  ```
+
+  **On Windows ARM64 specifically:** Pin to `windows-latest` (x64) if your workload does not
+  require ARM64 to reduce exposure until the toolkit fix is released.
+
+  **Enable debug logging** to get more diagnostic output:
+  - Set secret `ACTIONS_RUNNER_DEBUG=true` and `ACTIONS_STEP_DEBUG=true`
+  - This will surface the `exit code -1073740791` line if not already visible.
+fix_code:
+  - language: yaml
+    label: 'Retry wrapper around download-artifact to handle transient Windows crashes'
+    code: |
+      - name: Download artifact (attempt 1)
+        id: download-attempt-1
+        uses: actions/download-artifact@v8
+        with:
+          name: my-artifact
+          path: dist
+        continue-on-error: true
+
+      - name: Download artifact (attempt 2 — retry on Windows crash)
+        if: steps.download-attempt-1.outcome == 'failure'
+        uses: actions/download-artifact@v8
+        with:
+          name: my-artifact
+          path: dist
+  - language: yaml
+    label: 'Enable debug logging to confirm exit code -1073740791'
+    code: |
+      # In repository Settings > Secrets > Actions, add:
+      # ACTIONS_RUNNER_DEBUG = true
+      # ACTIONS_STEP_DEBUG = true
+      # Then look for this line in the debug output:
+      # ##[debug]Node Action run completed with exit code -1073740791
+prevention:
+  - 'Monitor actions/download-artifact#475 and actions/toolkit#2406 for the fix; upgrade action version once released.'
+  - 'Add `continue-on-error: true` + retry logic for download steps in Windows workflows until the fix lands.'
+  - 'For large artifacts (> 500 MB) on Windows, split into smaller named artifacts to reduce per-download I/O pressure.'
+  - 'Enable `ACTIONS_STEP_DEBUG=true` to surface the exit code line that is otherwise hidden in non-debug runs.'
+docs:
+  - url: 'https://github.com/actions/download-artifact/issues/475'
+    label: 'download-artifact#475: Action failed without any error message (open bug, 9+ reactions)'
+  - url: 'https://github.com/actions/download-artifact/issues/454'
+    label: 'download-artifact#454: download incomplete but no error reported'
+  - url: 'https://github.com/actions/toolkit/pull/2406'
+    label: 'actions/toolkit#2406: Propagate download error and verify length (fix PR)'
