@@ -1,0 +1,144 @@
+id: runner-environment-328
+title: 'checkout@v6 includeIf Credential Match Fails on Self-Hosted Runners with Symlinked _work Directory'
+category: runner-environment
+severity: error
+tags:
+  - checkout-v6
+  - self-hosted
+  - symlink
+  - includeif
+  - git-credentials
+  - terminal-prompts-disabled
+  - authentication
+patterns:
+  - regex: 'fatal: could not read Username for .https://github\.com/.: terminal prompts disabled'
+    flags: 'i'
+  - regex: 'The process .*/git. failed with exit code 128'
+    flags: 'i'
+  - regex: 'includeIf.*gitdir:.*_work'
+    flags: 'i'
+  - regex: 'Removing includeIf entries pointing to credentials config files'
+    flags: 'i'
+error_messages:
+  - "Error: fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+  - "Error: The process '/usr/bin/git' failed with exit code 128"
+  - "Waiting 12 seconds before trying again"
+root_cause: |
+  `actions/checkout@v6` switched from writing credentials directly into `.git/config` as
+  `http.https://github.com/.extraheader` (v5 behavior) to using path-based `includeIf "gitdir:..."`
+  directives that point to a separate credentials config file.
+
+  On self-hosted runners where the `_work` directory is a **symlink** to a different path
+  (e.g., an external volume, a tmpfs mount, or an NFS path), git's `gitdir:` condition
+  matching always fails because:
+
+  1. `checkout@v6` writes the `includeIf` directive using the **symlink path** (e.g.,
+     `/Users/runner/actions-runner-N/_work/repo/.git`).
+  2. When git evaluates `gitdir:`, it **resolves symlinks** and uses the **real path**
+     (e.g., `/Volumes/External/runner-work/repo/.git`).
+  3. The symlink path and the real path never match, so the credentials config file is
+     never included, and git falls through to interactive prompts — which are disabled in CI,
+     producing `terminal prompts disabled`.
+
+  The fetch step retries 3 times (12s, 11s, 10s delays) and then fails with exit code 128.
+
+  This is a regression from `actions/checkout@v5` which was unaffected because it wrote
+  credentials directly into `.git/config` as `http.extraheader`, requiring no path matching.
+
+  Common self-hosted runner configurations that hit this:
+  - macOS Apple Silicon runners with `_work` on an external SSD (common for disk-intensive builds)
+  - Linux runners with `_work` mounted on tmpfs or NFS for performance
+  - Docker-based self-hosted runners where the workspace volume is mounted at a different host path
+  - ARC (Actions Runner Controller) runners with custom work directory volume mounts
+
+  Open issue: actions/checkout#2393 (filed 2026-03-25). A fix PR (#2394) exists — uses
+  `git rev-parse --absolute-git-dir` to resolve the real path before writing the `includeIf`.
+fix: |
+  **Option 1 (recommended): Pin to `actions/checkout@v5` until the fix is released**
+
+  ```yaml
+  - uses: actions/checkout@v5
+    with:
+      token: ${{ secrets.GITHUB_TOKEN }}
+  ```
+
+  v5 writes credentials as `http.https://github.com/.extraheader` directly in `.git/config`
+  and is not affected by symlink resolution issues.
+
+  **Option 2: Resolve the symlink before runner startup**
+
+  If you control the runner configuration, eliminate the symlink by mounting the volume
+  directly at the expected path instead of symlinking to it:
+
+  ```bash
+  # Instead of:
+  ln -s /Volumes/External/runner-work /Users/runner/actions-runner-N/_work
+
+  # Mount directly at the expected path or configure runner to use the real path
+  export RUNNER_WORKDIR=/Volumes/External/runner-work
+  ```
+
+  **Option 3: Use SSH key authentication instead**
+
+  Configure a deploy key and use SSH URLs to bypass HTTP credential matching entirely:
+
+  ```yaml
+  - uses: actions/checkout@v6
+    with:
+      ssh-key: ${{ secrets.DEPLOY_KEY }}
+  ```
+
+  **Option 4: Manual credential injection after checkout**
+
+  If you must use v6, inject credentials manually via git config after checkout:
+
+  ```yaml
+  - uses: actions/checkout@v6
+    with:
+      persist-credentials: false
+
+  - name: Inject git credentials manually
+    run: |
+      git config --global credential.helper store
+      echo "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com" \
+        > ~/.git-credentials
+  ```
+fix_code:
+  - language: yaml
+    label: 'Pin to checkout@v5 to avoid symlink includeIf mismatch'
+    code: |
+      jobs:
+        build:
+          runs-on: [self-hosted, macos-arm64]
+          steps:
+            # Use v5 on self-hosted runners with symlinked _work directories
+            # until actions/checkout#2393 is fixed in v6
+            - uses: actions/checkout@v5
+              with:
+                token: ${{ secrets.GITHUB_TOKEN }}
+                fetch-depth: 0
+  - language: yaml
+    label: 'Use SSH key to bypass HTTP credential matching entirely'
+    code: |
+      jobs:
+        build:
+          runs-on: [self-hosted, macos-arm64]
+          steps:
+            - uses: actions/checkout@v6
+              with:
+                ssh-key: ${{ secrets.DEPLOY_KEY }}
+                fetch-depth: 0
+prevention:
+  - 'Audit self-hosted runner configurations for symlinked `_work` directories before upgrading from checkout@v5 to @v6.'
+  - 'Run `readlink -f $GITHUB_WORKSPACE` in a debug step to confirm whether the workspace path is a symlink.'
+  - 'Monitor actions/checkout#2393 for the fix and test on a non-production runner before upgrading.'
+  - 'For ARC runners: ensure the `workspaceVolume` and `workspaceMountPath` match the path that git resolves to.'
+docs:
+  - url: 'https://github.com/actions/checkout/issues/2393'
+    label: 'checkout#2393: v6 credential includeIf matching fails on self-hosted runners with symlinked _work (open bug)'
+  - url: 'https://github.com/actions/checkout/pull/2394'
+    label: 'checkout#2394: fix: ensure symlinked git directories work (pending PR)'
+  - url: 'https://github.com/actions/checkout/releases/tag/v6.0.0'
+    label: 'checkout v6.0.0 release notes: new includeIf credential mechanism'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/using-self-hosted-runners-in-a-workflow'
+    label: 'GitHub Docs: Using self-hosted runners in a workflow'
