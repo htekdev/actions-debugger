@@ -1,0 +1,132 @@
+id: silent-failures-166
+title: 'Job-Level continue-on-error Makes needs.X.result Always "success" — Downstream Failure Handlers Never Run'
+category: silent-failures
+severity: silent-failure
+tags:
+  - continue-on-error
+  - needs
+  - job-result
+  - failure-handler
+  - downstream-job
+  - silent-failure
+  - job-conclusion
+patterns:
+  - regex: 'continue-on-error:\s*true'
+    flags: 'i'
+  - regex: 'needs\.[a-z_-]+\.result\s*==\s*[''"]failure[''"]'
+    flags: 'i'
+error_messages:
+  - 'needs.sync.result == ''failure'' is never true for a job with continue-on-error: true'
+  - 'Downstream job with if: needs.X.result == ''failure'' is always skipped'
+root_cause: |
+  When `continue-on-error: true` is set at the **job** level (not step level), GitHub
+  Actions records the job's conclusion as `success` regardless of whether any steps
+  internally failed. This means the `result` field exposed to downstream `needs` jobs
+  is always `success` — even when every step in the job exited with a non-zero code.
+
+  The consequence: any downstream job that conditionally runs based on the upstream
+  job failing is silently skipped. All of the following conditions evaluate to false
+  in a dependent job when the upstream job has `continue-on-error: true` and its steps
+  fail:
+
+    - `if: needs.X.result == 'failure'`
+    - `if: failure()`
+    - `if: ${{ contains(needs.*.result, 'failure') }}`
+
+  This is by design — `continue-on-error: true` was built to prevent workflow
+  cancellation when a job fails, and it achieves this by converting the job conclusion
+  to `success`. But the side effect is that all failure-detection mechanisms in
+  downstream jobs stop working. The failure is masked at the job-graph level, not just
+  within the job itself.
+
+  This behaviour is distinct from step-level `continue-on-error` (covered by
+  silent-failures-005 and silent-failures-016), where the job conclusion may still
+  propagate correctly.
+
+  The problem causes production outages when:
+    - A sync or gate job uses `continue-on-error: true` to tolerate a "no changes"
+      exit code (e.g., git push returns 1 when nothing to push).
+    - Downstream deploy or notify jobs check `needs.sync.result == 'failure'` to
+      trigger rollback or alerts — those jobs never run.
+fix: |
+  Option 1 — use a step output to communicate actual failure state:
+  Remove `continue-on-error: true` from the job. On the specific step that may fail
+  non-fatally, add `continue-on-error: true` at the step level, then capture the
+  outcome in a job output. Downstream jobs check the output value instead of result.
+
+  Option 2 — emit a known value via GITHUB_OUTPUT and check it downstream:
+  After the step that may fail, write a status flag to GITHUB_OUTPUT. Downstream jobs
+  read `needs.X.outputs.status` to determine if the upstream work actually completed.
+
+  Option 3 — split into two jobs:
+  Separate the "fallible" part (with continue-on-error: true on the step) from the
+  "gate" job. The gate job succeeds only when the fallible job produced the desired
+  outcome, and downstream jobs depend on the gate.
+fix_code:
+  - language: yaml
+    label: 'WRONG — job-level c-o-e hides failure from downstream'
+    code: |
+      jobs:
+        sync:
+          runs-on: ubuntu-latest
+          continue-on-error: true   # BUG: makes result == 'success' even when steps fail
+          steps:
+            - run: git push  # may exit 1 if nothing to push
+
+        deploy:
+          needs: sync
+          if: needs.sync.result == 'failure'  # NEVER runs — result is always 'success'
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Handling sync failure"
+
+  - language: yaml
+    label: 'CORRECT — step-level c-o-e + output to communicate actual state'
+    code: |
+      jobs:
+        sync:
+          runs-on: ubuntu-latest
+          outputs:
+            did_push: ${{ steps.push.outputs.did_push }}
+          steps:
+            - id: push
+              continue-on-error: true   # step-level: job conclusion still propagates
+              run: |
+                if git push; then
+                  echo "did_push=true" >> "$GITHUB_OUTPUT"
+                else
+                  echo "did_push=false" >> "$GITHUB_OUTPUT"
+                fi
+
+        deploy:
+          needs: sync
+          if: needs.sync.outputs.did_push == 'false'   # reads actual state
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Nothing was pushed — skipping deploy"
+
+  - language: yaml
+    label: 'CORRECT — check step.outcome instead of job result'
+    code: |
+      jobs:
+        sync:
+          runs-on: ubuntu-latest
+          steps:
+            - id: push_step
+              continue-on-error: true
+              run: git push
+
+            - name: Surface push failure as annotation
+              if: steps.push_step.outcome == 'failure'
+              run: echo "::warning::git push failed — no changes or rejected"
+prevention:
+  - 'Avoid continue-on-error: true at job level when any downstream job needs to detect failure; use step-level continue-on-error and propagate state via GITHUB_OUTPUT.'
+  - 'Prefer explicit output flags (did_succeed=true/false) over relying on needs.X.result for fine-grained failure signalling.'
+  - 'Use actionlint to validate workflows — it can detect some continue-on-error usage patterns that may be unintentional.'
+docs:
+  - url: 'https://github.com/actions/toolkit/issues/1739'
+    label: 'actions/toolkit#1739 — continue-on-error should not return success in needs_job_result (May 2024)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idcontinue-on-error'
+    label: 'GitHub Docs — jobs.<job_id>.continue-on-error'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#needs-context'
+    label: 'GitHub Docs — needs context (result field)'
