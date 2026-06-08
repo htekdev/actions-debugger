@@ -1,0 +1,174 @@
+id: permissions-auth-096
+title: 'Specifying any single permissions key in a block sets all other unspecified scopes to none — "Resource not accessible by integration"'
+category: permissions-auth
+severity: silent-failure
+tags:
+  - permissions
+  - github-token
+  - id-token
+  - contents-read
+  - resource-not-accessible
+  - scope-reset
+patterns:
+  - regex: 'Resource not accessible by integration'
+    flags: 'i'
+  - regex: 'HttpError.*Resource not accessible by integration'
+    flags: 'i'
+  - regex: 'RequestError.*Resource not accessible by integration'
+    flags: 'i'
+error_messages:
+  - "Error: Resource not accessible by integration"
+  - "HttpError: Resource not accessible by integration"
+  - "RequestError: Resource not accessible by integration"
+root_cause: |
+  In GitHub Actions, adding a `permissions:` block — whether at the workflow level or at
+  the job level — resets ALL permission scopes that are NOT explicitly listed to `none`.
+
+  This is a complete reset, not an additive operation. There is no way to say "give me
+  the default permissions plus id-token: write." You must enumerate every scope you need.
+
+  The most common trigger:
+
+  ```yaml
+  jobs:
+    deploy:
+      permissions:
+        id-token: write  # added for OIDC / AWS authentication
+      # ALL other permissions are now 'none': contents, pull-requests, issues, packages, etc.
+      steps:
+        - uses: actions/checkout@v4  # FAILS: needs contents: read — now 'none'
+  ```
+
+  Before the `permissions:` block was added, the job inherited GitHub's default token
+  permissions (`contents: read` for public repos, etc.). After adding even a single
+  key, the job's effective token has ONLY the explicitly listed permission — everything
+  else is `none`.
+
+  GitHub's docs state: "If you specify the access for any of these scopes, all of those
+  that are not specified are set to `none`."
+
+  This is a silent failure: the workflow YAML is valid, the permissions block looks
+  intentional, and the error only surfaces at runtime when the missing permission is
+  actually used. The error message "Resource not accessible by integration" gives no
+  indication of which permission is missing or that a permissions block caused it.
+
+  Common scenarios where this bites:
+  - Adding `id-token: write` for OIDC (AWS, GCP, Azure) without `contents: read`
+    breaks `actions/checkout`
+  - Adding `pull-requests: write` for PR comments without `contents: read`
+    breaks `actions/checkout` on private repos
+  - Adding `packages: write` for GHCR push without `contents: read` breaks checkout
+  - Adding `security-events: write` for SARIF upload without restoring other permissions
+fix: |
+  Always enumerate ALL permissions your job needs when adding a `permissions:` block.
+  There is no additive syntax — you must be explicit about every scope required.
+
+  Step 1: Find every action/command in the job that uses the GITHUB_TOKEN implicitly
+  or explicitly (checkout, gh CLI, API calls, etc.)
+
+  Step 2: Add ALL required scopes to the permissions block — do not rely on defaults.
+
+  The most common minimum set when adding `id-token: write` for OIDC:
+  ```yaml
+  permissions:
+    id-token: write    # OIDC
+    contents: read     # actions/checkout
+  ```
+
+  For jobs that also comment on PRs, create releases, or upload artifacts, add those:
+  ```yaml
+  permissions:
+    id-token: write       # OIDC
+    contents: write       # create release / push artifacts
+    pull-requests: write  # comment on PR
+    packages: write       # push to GHCR
+  ```
+fix_code:
+  - language: yaml
+    label: 'BROKEN — id-token: write zeroes contents: read, breaking checkout'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          permissions:
+            id-token: write   # Added for OIDC. BUG: this sets contents to 'none'!
+          steps:
+            - uses: actions/checkout@v4   # FAILS: contents: read is now 'none'
+            - uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-to-assume: arn:aws:iam::123456789012:role/MyRole
+                aws-region: us-east-1
+
+  - language: yaml
+    label: 'FIXED — enumerate all required permissions explicitly'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          permissions:
+            id-token: write  # OIDC
+            contents: read   # actions/checkout
+          steps:
+            - uses: actions/checkout@v4   # OK: contents: read is explicitly granted
+            - uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-to-assume: arn:aws:iam::123456789012:role/MyRole
+                aws-region: us-east-1
+
+  - language: yaml
+    label: 'Workflow-level permissions + job-level escalation (best practice)'
+    code: |
+      # Workflow-level: minimal read-only defaults
+      permissions:
+        contents: read
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          # Inherits workflow-level: contents: read (no job-level permissions needed)
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm ci && npm test
+
+        deploy:
+          needs: build
+          runs-on: ubuntu-latest
+          permissions:
+            id-token: write   # OIDC
+            contents: read    # Must re-declare — job-level block resets everything
+          steps:
+            - uses: actions/checkout@v4
+            - uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-to-assume: arn:aws:iam::123456789012:role/MyRole
+                aws-region: us-east-1
+
+  - language: yaml
+    label: 'PR workflow — common full permission set to avoid Resource not accessible'
+    code: |
+      jobs:
+        pr-comment:
+          runs-on: ubuntu-latest
+          permissions:
+            contents: read          # actions/checkout
+            pull-requests: write    # commenting on PR
+            issues: write           # if you also comment on issues
+          steps:
+            - uses: actions/checkout@v4
+            - name: Comment on PR
+              run: gh pr comment ${{ github.event.pull_request.number }} --body "Done"
+              env:
+                GH_TOKEN: ${{ github.token }}
+prevention:
+  - 'Whenever you add a permissions: block, audit every action and gh CLI command in the job for required scopes'
+  - 'Treat permissions: as a whitelist — only listed scopes are granted, everything else becomes none'
+  - 'Use the most minimal workflow-level permissions and escalate at job level for specific jobs'
+  - 'When adding id-token: write for OIDC, always also add contents: read if the job runs actions/checkout'
+  - 'Check GitHub Actions permissions documentation to see the default value of each scope for your repo visibility'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/controlling-permissions-for-github_token'
+    label: 'GitHub Docs: Controlling permissions for GITHUB_TOKEN'
+  - url: 'https://docs.github.com/en/actions/using-jobs/assigning-permissions-to-jobs'
+    label: 'GitHub Docs: Assigning permissions to jobs — specifying any scope sets all others to none'
+  - url: 'https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/about-security-hardening-with-openid-connect#adding-permissions-settings'
+    label: 'GitHub Docs: OIDC — adding permissions settings (id-token: write requires explicit contents: read)'

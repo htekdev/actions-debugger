@@ -1,0 +1,173 @@
+id: yaml-syntax-096
+title: '"id-token: read" is not a valid permission level for id-token — only write or none'
+category: yaml-syntax
+severity: warning
+tags:
+  - permissions
+  - id-token
+  - oidc
+  - actionlint
+  - read-all
+  - invalid-permission-level
+patterns:
+  - regex: 'id-token:\s*read'
+    flags: 'i'
+  - regex: 'permission-level-write-or-no-access.*id-token'
+    flags: 'i'
+  - regex: 'id.token.*read.*not valid'
+    flags: 'i'
+error_messages:
+  - "id-token: read"
+  - "permissions: read-all sets id-token to none, not read"
+root_cause: |
+  The `id-token` permission only accepts two valid levels: `write` or `none`.
+  The `read` level is syntactically accepted by YAML but is functionally treated as
+  `none` — it does NOT grant any OIDC token generation capability.
+
+  Developers hit this in two ways:
+
+  **1. Explicitly writing `id-token: read`:**
+  ```yaml
+  permissions:
+    id-token: read   # WRONG — treated as none; OIDC token generation fails
+    contents: read
+  ```
+  The workflow runs without error but `getIDToken()` or cloud provider OIDC auth fails
+  silently because the token was never granted.
+
+  **2. Using `permissions: read-all` expecting OIDC to work:**
+  ```yaml
+  permissions: read-all   # WRONG — sets id-token to 'read' = functionally 'none'
+  jobs:
+    deploy:
+      steps:
+        - uses: aws-actions/configure-aws-credentials@v4  # FAILS — no OIDC token
+  ```
+  `read-all` expands to `read` for every scope. For `id-token`, `read` is not
+  meaningful (there is nothing to "read" for OIDC), so GitHub treats it as `none`.
+
+  This is a particularly confusing "silent failure" for workflows that use
+  `permissions: read-all` as a security baseline and then add OIDC authentication —
+  they need to either switch to explicit scopes or add a job-level `permissions:
+  id-token: write` override.
+
+  The GitHub workflow schema explicitly defines `id-token` as:
+  ```json
+  "id-token": {
+    "type": "permission-level-write-or-no-access",
+    "description": "Token to request an OpenID Connect token."
+  }
+  ```
+  There are no `id-token` resources to "read" — the permission only controls whether
+  the OIDC token REQUEST endpoint is made available to the runner.
+
+  actionlint flags `id-token: read` as a warning in newer versions.
+fix: |
+  Set `id-token: write` explicitly to enable OIDC token generation. You cannot rely
+  on `read-all` or `read` to grant OIDC capability.
+
+  If using `permissions: read-all` as a baseline, override at the job level:
+
+  ```yaml
+  permissions: read-all   # baseline — id-token is effectively 'none' here
+
+  jobs:
+    deploy:
+      permissions:
+        id-token: write   # override to enable OIDC for this job only
+        contents: read    # must re-enumerate since job-level block resets all others
+  ```
+
+  Or remove `read-all` and enumerate all scopes explicitly at the workflow level:
+
+  ```yaml
+  permissions:
+    contents: read
+    id-token: write   # OIDC
+    pull-requests: read
+    # ... other scopes your workflow needs
+  ```
+fix_code:
+  - language: yaml
+    label: 'BROKEN — id-token: read is treated as none, OIDC auth fails silently'
+    code: |
+      permissions:
+        id-token: read   # BUG: 'read' is treated as 'none' for id-token
+        contents: read
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-to-assume: arn:aws:iam::123456789012:role/MyRole
+                aws-region: us-east-1
+              # FAILS silently — no OIDC token available because id-token is 'none'
+
+  - language: yaml
+    label: 'FIXED — id-token: write enables OIDC token generation'
+    code: |
+      permissions:
+        id-token: write  # OIDC — only 'write' or 'none' are valid
+        contents: read
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-to-assume: arn:aws:iam::123456789012:role/MyRole
+                aws-region: us-east-1
+              # Works: OIDC token is generated and used for authentication
+
+  - language: yaml
+    label: 'BROKEN — permissions: read-all does not enable OIDC (id-token gets "read" = none)'
+    code: |
+      permissions: read-all   # BUG: id-token gets 'read' which equals 'none'
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: aws-actions/configure-aws-credentials@v4
+              # FAILS — OIDC token not available despite read-all
+
+  - language: yaml
+    label: 'FIXED — override id-token: write at job level when workflow uses read-all'
+    code: |
+      permissions: read-all   # workflow-level baseline for read-only jobs
+
+      jobs:
+        lint:
+          runs-on: ubuntu-latest
+          # Inherits read-all — no OIDC needed here
+          steps:
+            - uses: actions/checkout@v4
+
+        deploy:
+          runs-on: ubuntu-latest
+          permissions:
+            id-token: write  # override for OIDC
+            contents: read   # must re-declare (job-level block resets all others)
+          steps:
+            - uses: actions/checkout@v4
+            - uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-to-assume: arn:aws:iam::123456789012:role/MyRole
+                aws-region: us-east-1
+prevention:
+  - 'Never use id-token: read — it is treated identically to id-token: none and will not enable OIDC'
+  - 'When using permissions: read-all as a security baseline, override id-token at job level for any job needing OIDC'
+  - 'Remember: id-token only has two meaningful values: write (enable OIDC) and none (disable OIDC)'
+  - 'Run actionlint — it flags id-token: read as an invalid permission level in newer versions'
+docs:
+  - url: 'https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/about-security-hardening-with-openid-connect'
+    label: 'GitHub Docs: OIDC security hardening — id-token: write required'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/controlling-permissions-for-github_token'
+    label: 'GitHub Docs: Controlling GITHUB_TOKEN permissions — valid permission levels per scope'
+  - url: 'https://github.com/github/docs/issues/33483'
+    label: 'github/docs#33483: id-token: read is not valid — read is same as none (confirmed by Actions Engineering)'
+  - url: 'https://github.com/actions/languageservices/blob/main/workflow-parser/src/workflow-v1.0.json'
+    label: 'GitHub Actions workflow schema — id-token defined as permission-level-write-or-no-access'

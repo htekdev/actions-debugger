@@ -1,0 +1,123 @@
+id: concurrency-timing-082
+title: 'queue: max combined with cancel-in-progress: true is an invalid concurrency configuration — workflow validation error'
+category: concurrency-timing
+severity: error
+tags:
+  - concurrency
+  - queue
+  - cancel-in-progress
+  - validation-error
+  - workflow-syntax
+  - queue-max
+patterns:
+  - regex: 'The combination of queue.*max.*cancel-in-progress.*true.*is not allowed'
+    flags: 'i'
+  - regex: 'queue.*max.*cannot.*combined.*cancel-in-progress'
+    flags: 'i'
+  - regex: 'Invalid workflow file.*concurrency.*queue.*cancel-in-progress'
+    flags: 'i'
+  - regex: 'result in a workflow validation error'
+    flags: 'i'
+error_messages:
+  - "The combination of queue: max and cancel-in-progress: true is not allowed and will result in a workflow validation error."
+  - "Invalid workflow file: .github/workflows/ci.yml (Line X, Col Y): queue: max cannot be combined with cancel-in-progress: true"
+root_cause: |
+  GitHub Actions explicitly forbids the combination of `queue: max` and
+  `cancel-in-progress: true` in the same `concurrency` block. The two options
+  describe fundamentally conflicting behaviors:
+
+  - `queue: max` — allow up to 100 runs to queue in the concurrency group; never
+    cancel existing pending runs to make room for new ones
+  - `cancel-in-progress: true` — when a new run arrives, immediately cancel the
+    currently running run in the same concurrency group
+
+  These two options are logically contradictory: `queue: max` is designed to PRESERVE
+  queued and in-progress runs, while `cancel-in-progress: true` is designed to DISCARD
+  them. GitHub enforces this at validation time, preventing the workflow from running at all.
+
+  The `queue` property was introduced in May 2026 (GitHub Actions changelog). Developers
+  who copy a `cancel-in-progress: true` concurrency block and then add `queue: max` to
+  allow more parallel runs will immediately hit this validation error.
+
+  GitHub's internal compiler (`gh-aw`) added a `validateConcurrencyQueueConfiguration`
+  check that catches this at compile time and emits a standardized error.
+
+  This is distinct from the GHES incompatibility with `queue: max` — that error is about
+  GHES not supporting the `queue` property at all. This error is about a logically
+  invalid combination that fails even on GitHub.com.
+fix: |
+  Choose ONE of the two behaviors — you cannot have both:
+
+  Option 1 — Use `queue: max` without `cancel-in-progress` to allow runs to queue
+  (good for deployments, release workflows, or any workflow where you want all runs
+  to eventually execute):
+
+  ```yaml
+  concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    queue: max   # allow up to 100 pending runs
+    # no cancel-in-progress — all queued runs execute eventually
+  ```
+
+  Option 2 — Use `cancel-in-progress: true` without `queue: max` to cancel superseded
+  runs (good for CI checks on pull requests where only the latest commit matters):
+
+  ```yaml
+  concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true   # cancel running/pending runs when a new one arrives
+    # no queue: max
+  ```
+
+  Option 3 — Use neither for the default single-slot queuing behavior (one running,
+  one pending; additional runs cancel the pending slot):
+
+  ```yaml
+  concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    # default: single pending slot, no cancel-in-progress
+  ```
+fix_code:
+  - language: yaml
+    label: 'BROKEN — queue: max + cancel-in-progress: true is invalid'
+    code: |
+      # This fails workflow validation
+      concurrency:
+        group: '${{ github.workflow }}-${{ github.ref }}'
+        queue: max                 # ERROR: cannot combine with cancel-in-progress: true
+        cancel-in-progress: true   # ERROR: conflicts with queue: max
+
+  - language: yaml
+    label: 'FIX option A — queue: max only (allow all runs to eventually execute)'
+    code: |
+      # Good for deployments — every queued run eventually executes
+      concurrency:
+        group: '${{ github.workflow }}-${{ github.ref }}'
+        queue: max   # up to 100 runs can queue; none are cancelled
+
+  - language: yaml
+    label: 'FIX option B — cancel-in-progress only (cancel superseded CI runs)'
+    code: |
+      # Good for PR CI — only the latest commit's run matters
+      concurrency:
+        group: '${{ github.workflow }}-${{ github.ref }}'
+        cancel-in-progress: true   # cancel old runs when a new push arrives
+
+  - language: yaml
+    label: 'FIX option C — conditional cancel-in-progress (cancel on main, queue on release)'
+    code: |
+      # Cancel CI on main/feature branches, never cancel release branches
+      concurrency:
+        group: '${{ github.workflow }}-${{ github.ref }}'
+        cancel-in-progress: ${{ !startsWith(github.ref, 'refs/heads/release/') }}
+prevention:
+  - 'Never add queue: max to an existing concurrency block that already has cancel-in-progress: true'
+  - 'Choose one model: queueing (queue: max) OR cancellation (cancel-in-progress: true) — not both'
+  - 'Use queue: max for deployment workflows where every run must eventually execute'
+  - 'Use cancel-in-progress: true for CI workflows where only the latest commit matters'
+  - 'Run actionlint locally — it will flag this invalid combination before you push'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs'
+    label: 'GitHub Docs: Control workflow concurrency — queue property and cancel-in-progress'
+  - url: 'https://github.blog/changelog/2026-05-07-github-actions-concurrency-queue-max/'
+    label: 'GitHub Changelog: GitHub Actions concurrency queue: max (May 2026)'

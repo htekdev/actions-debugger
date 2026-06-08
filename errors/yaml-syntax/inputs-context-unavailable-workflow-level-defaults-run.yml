@@ -1,0 +1,178 @@
+id: yaml-syntax-095
+title: '"Unrecognized named-value: ''inputs''" in workflow-level defaults.run — inputs context only available at job level'
+category: yaml-syntax
+severity: error
+tags:
+  - inputs
+  - defaults
+  - workflow_call
+  - working-directory
+  - context-availability
+  - actionlint
+patterns:
+  - regex: 'Unrecognized named-value: ''inputs'''
+    flags: 'i'
+  - regex: 'context ''inputs'' is not allowed here'
+    flags: 'i'
+  - regex: 'Invalid workflow file.*defaults\.run'
+    flags: 'i'
+error_messages:
+  - "The workflow is not valid. Unrecognized named-value: 'inputs'. Located at position 1 within expression: inputs.service"
+  - "context 'inputs' is not allowed here. available contexts are ..."
+root_cause: |
+  The `inputs` context is NOT available in the workflow-level `defaults.run` block.
+
+  This is a common mistake when authoring reusable (`workflow_call`) workflows that
+  accept an input like `service` or `working-directory` and then try to use it in a
+  global `defaults.run.working-directory` setting:
+
+  ```yaml
+  # BROKEN — inputs context not available at workflow-level defaults
+  on:
+    workflow_call:
+      inputs:
+        service:
+          type: string
+          required: true
+
+  defaults:
+    run:
+      working-directory: './services/${{ inputs.service }}'  # ERROR here
+
+  jobs:
+    test:
+      runs-on: ubuntu-latest
+      steps:
+        - run: npm test
+  ```
+
+  According to the GitHub Actions context availability table, `defaults.run` at the
+  workflow level has NO available contexts at all. The `inputs` context only becomes
+  available at `jobs.<job_id>.defaults.run` (job-level), not at the workflow level.
+
+  The same error occurs for `defaults.run.shell` if you try to use any context
+  expression there at the workflow level.
+
+  actionlint v1.6.x+ reports this as a static analysis error before the workflow runs.
+  When caught only at runtime, the error appears in the workflow validation phase before
+  any job starts.
+fix: |
+  Move the `defaults.run` block inside each job definition, where the `inputs` context
+  IS available. Alternatively, set a workflow-level `env:` variable and reference the
+  env variable in a job-level `defaults.run.working-directory`.
+
+  Option 1 — Job-level defaults (recommended):
+
+  ```yaml
+  jobs:
+    test:
+      runs-on: ubuntu-latest
+      defaults:
+        run:
+          working-directory: './services/${{ inputs.service }}'  # OK here
+      steps:
+        - run: npm test
+  ```
+
+  Option 2 — Workflow-level env variable + job-level defaults reference:
+
+  ```yaml
+  env:
+    SERVICE_DIR: './services/${{ inputs.service }}'  # inputs available in workflow env
+
+  jobs:
+    test:
+      runs-on: ubuntu-latest
+      defaults:
+        run:
+          working-directory: ${{ env.SERVICE_DIR }}
+      steps:
+        - run: npm test
+  ```
+
+  Option 3 — Pass working-directory inline on each step explicitly.
+fix_code:
+  - language: yaml
+    label: 'Correct — move defaults.run to job level where inputs context is available'
+    code: |
+      name: CI
+      on:
+        workflow_call:
+          inputs:
+            service:
+              description: 'Service directory to run CI for'
+              required: true
+              type: string
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          defaults:
+            run:
+              # inputs IS available here (job-level defaults)
+              working-directory: './services/${{ inputs.service }}'
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm ci
+            - run: npm test
+
+  - language: yaml
+    label: 'BROKEN — inputs context not available at workflow-level defaults (causes validation error)'
+    code: |
+      name: CI
+      on:
+        workflow_call:
+          inputs:
+            service:
+              type: string
+              required: true
+
+      # THIS FAILS — inputs is not available at workflow-level defaults
+      defaults:
+        run:
+          working-directory: './services/${{ inputs.service }}'
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+
+  - language: yaml
+    label: 'Alternative — workflow-level env variable to share across jobs'
+    code: |
+      name: CI
+      on:
+        workflow_call:
+          inputs:
+            service:
+              type: string
+              required: true
+
+      # inputs IS available in workflow-level env:
+      env:
+        WORK_DIR: './services/${{ inputs.service }}'
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          defaults:
+            run:
+              # env IS available at job-level defaults
+              working-directory: ${{ env.WORK_DIR }}
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+prevention:
+  - 'Check the GitHub context availability table before using any expression in defaults.run — workflow-level defaults allow NO contexts'
+  - 'Use job-level defaults.run when you need inputs, env, or other context expressions in working-directory'
+  - 'Run actionlint locally before pushing — it catches context-unavailability errors statically'
+  - 'If multiple jobs need the same working-directory, use a workflow-level env: variable and reference it in each job-level defaults.run'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#context-availability'
+    label: 'GitHub Docs: Context availability table — which contexts are allowed where'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#defaultsrun'
+    label: 'GitHub Docs: Workflow syntax — defaults.run'
+  - url: 'https://stackoverflow.com/questions/78497289/github-action-unrecognized-named-value-inputs-for-workflow-defaults'
+    label: 'Stack Overflow: Unrecognized named-value inputs for workflow defaults'
