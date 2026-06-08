@@ -1,0 +1,84 @@
+id: runner-environment-350
+title: 'macOS Runner Preinstalled `homebrew/core` Tap in Dirty Git State — `brew doctor` and `brew test-bot` Fail'
+category: runner-environment
+severity: error
+tags:
+  - macos
+  - homebrew
+  - brew
+  - tap
+  - dirty-state
+  - runner-image
+  - ci-runner
+patterns:
+  - regex: '/opt/homebrew/Library/Taps/homebrew/homebrew-core is not clean'
+    flags: 'i'
+  - regex: 'homebrew/homebrew-core.*is not clean'
+    flags: 'i'
+  - regex: 'brew test-bot.*setup.*failed|test-bot.*only-setup.*failed'
+    flags: 'i'
+  - regex: 'Error: homebrew/core.*uncommitted modifications'
+    flags: 'i'
+error_messages:
+  - "Warning: /opt/homebrew/Library/Taps/homebrew/homebrew-core is not clean!"
+  - "Error: homebrew/homebrew-core is not clean! The following uncommitted modifications were found:"
+  - "brew test-bot --only-setup failed!"
+root_cause: |
+  GitHub-hosted macOS runner images (macos-14, macos-15, macos-latest) preinstall
+  Homebrew and its tap repositories (`homebrew/core`, `homebrew/cask`) during the image
+  build process. The image build sometimes leaves uncommitted modifications in the tap
+  git repository — for example, regenerated formula JSON API caches, modified .git
+  metadata, or leftover intermediate files — resulting in a dirty working tree.
+
+  When a workflow runs `brew doctor`, Homebrew reports the tap as not clean:
+    Warning: /opt/homebrew/Library/Taps/homebrew/homebrew-core is not clean!
+
+  This also breaks CI pipelines that use `brew test-bot --only-setup` (used by Homebrew
+  formula maintainers and tap owners) because test-bot validates the tap state before
+  running tests and exits non-zero when the tap is dirty.
+
+  Documented in actions/runner-images#13284 (reported December 2025, confirmed as a
+  recurring preinstalled image state issue). The dirty state appears intermittently
+  across runner image refreshes when the image build pipeline does not clean up after
+  Homebrew tap updates.
+fix: |
+  Clean the preinstalled Homebrew tap repository at the start of jobs that run
+  `brew doctor`, `brew test-bot`, or any Homebrew operations that check tap state:
+
+    git -C "$(brew --repository homebrew/core)" clean -df
+
+  For cask tap as well if needed:
+
+    git -C "$(brew --repository homebrew/cask)" clean -df
+
+  This removes untracked files from the tap's working tree and makes it clean before
+  any brew commands run. Add this as the first step in any job that uses brew.
+fix_code:
+  - language: yaml
+    label: "Clean dirty homebrew/core tap before brew operations"
+    code: |
+      - name: Clean preinstalled Homebrew tap state
+        run: |
+          git -C "$(brew --repository homebrew/core)" clean -df
+          git -C "$(brew --repository homebrew/cask)" clean -df 2>/dev/null || true
+      - name: Run brew doctor (now succeeds)
+        run: brew doctor
+  - language: yaml
+    label: "Minimal cleanup for brew test-bot formula CI"
+    code: |
+      - name: Set up Homebrew
+        run: git -C "$(brew --repository homebrew/core)" clean -df
+      - name: Run brew test-bot
+        run: brew test-bot --only-setup
+prevention:
+  - "Add a tap-clean step as a pre-condition in any job that calls brew doctor, brew test-bot, or brew upgrade"
+  - "File an issue at actions/runner-images when you encounter the dirty tap state to help track its frequency"
+  - "For formula/tap CI, wrap brew test-bot with a pre-clean step in your CI template"
+  - "Set HOMEBREW_NO_INSTALL_CLEANUP=1 if your workflow doesn't need cleanup to reduce tap state churn"
+docs:
+  - url: "https://github.com/actions/runner-images/issues/13284"
+    label: "actions/runner-images#13284 — dirty homebrew/core tap on macOS runner images"
+  - url: "https://docs.brew.sh/Manpage#doctor-dr-options"
+    label: "Homebrew docs — brew doctor"
+  - url: "https://github.com/Homebrew/homebrew-test-bot"
+    label: "Homebrew test-bot CI tool"

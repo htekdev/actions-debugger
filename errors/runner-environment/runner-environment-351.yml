@@ -1,0 +1,97 @@
+id: runner-environment-351
+title: 'docker-compose v1 Fails with `KeyError: "ContainerConfig"` After Docker 29.x Runner Image Update'
+category: runner-environment
+severity: error
+tags:
+  - docker
+  - docker-compose
+  - docker-29
+  - runner-image-update
+  - api-breaking
+  - ubuntu
+  - containerconfig
+patterns:
+  - regex: 'KeyError:\s*[''"]?ContainerConfig[''"]?'
+    flags: 'i'
+  - regex: "ERROR:.*ContainerConfig"
+    flags: 'i'
+  - regex: 'KeyError: .ContainerConfig.'
+    flags: 'i'
+  - regex: "docker/api/types.*ContainerConfig.*KeyError|ContainerConfig.*KeyError.*compose"
+    flags: 'i'
+error_messages:
+  - "KeyError: 'ContainerConfig'"
+  - "ERROR: for app_redis_1  'ContainerConfig'"
+  - "ERROR: for web  'ContainerConfig'"
+root_cause: |
+  Docker Engine 25+ (API v1.45+) removed the deprecated `ContainerConfig` field from
+  container inspect responses. GitHub-hosted runner images updated Docker from 28.x to
+  29.x on February 9, 2026 (actions/runner-images#13474; rolled back on ubuntu-24.04
+  but applied to ubuntu-22.04 and Windows runners).
+
+  docker-compose v1 (the Python-based `docker-compose` binary) accesses
+  `container["ContainerConfig"]` internally when running commands like
+  `docker-compose up`, `docker-compose run`, and `docker-compose ps`. With Docker 29.x,
+  the API no longer returns this key, causing docker-compose v1 to crash with a Python
+  `KeyError: 'ContainerConfig'` traceback.
+
+  This is distinct from the "docker-compose: command not found" error (runner-environment-031)
+  — this occurs even when the docker-compose v1 binary IS present (e.g., installed manually
+  in CI) but the underlying Docker daemon has been updated to 29.x. Documented in
+  docker/compose#12768 and reported across multiple community threads.
+fix: |
+  Migrate from docker-compose v1 to Docker Compose v2 plugin (`docker compose` with a
+  space). The v2 plugin uses the current Docker API and does not access the removed
+  ContainerConfig field.
+
+  Replace all `docker-compose` invocations with `docker compose` in workflow YAML:
+
+    # Before (v1 — breaks with Docker 29.x)
+    docker-compose up -d
+    docker-compose run --rm app test
+
+    # After (v2 plugin — works with Docker 29.x)
+    docker compose up -d
+    docker compose run --rm app test
+
+  If you must keep v1 temporarily, pin the Docker daemon to 28.x or install an older
+  docker-compose that is patched against the API change (not recommended long-term as
+  docker-compose v1 is deprecated).
+fix_code:
+  - language: yaml
+    label: "Migrate docker-compose v1 to docker compose v2 in workflow steps"
+    code: |
+      # Before (breaks with Docker 29.x runner image update)
+      # - run: docker-compose up -d
+      # - run: docker-compose run --rm app pytest
+
+      # After — use docker compose (v2 plugin) with space instead of hyphen
+      - name: Start services
+        run: docker compose up -d
+      - name: Run tests
+        run: docker compose run --rm app pytest
+      - name: Tear down
+        run: docker compose down
+  - language: yaml
+    label: "Install a legacy compatibility shim only if immediate migration is not possible"
+    code: |
+      # Temporary workaround only — migrate to docker compose (v2) ASAP
+      - name: Install docker-compose v2 shim
+        run: |
+          sudo curl -SL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 \
+            -o /usr/local/bin/docker-compose
+          sudo chmod +x /usr/local/bin/docker-compose
+prevention:
+  - "Migrate all docker-compose (hyphen) invocations to docker compose (space) — v1 is end-of-life and incompatible with Docker 25+ API"
+  - "Run docker compose version in CI to confirm the v2 plugin is active before any compose operations"
+  - "Review docker-compose.yml files for v1-only syntax (e.g., container_name interactions, old volume syntax) when migrating to v2"
+  - "Pin docker compose version explicitly if your workflow requires a specific feature set"
+docs:
+  - url: "https://github.com/docker/compose/issues/12768"
+    label: "docker/compose#12768 — ContainerConfig KeyError with Docker API 1.45+"
+  - url: "https://github.com/actions/runner-images/issues/13474"
+    label: "actions/runner-images#13474 — Docker 29.x runner image update (Feb 2026)"
+  - url: "https://docs.docker.com/compose/migrate/"
+    label: "Docker Compose v1 to v2 migration guide"
+  - url: "https://stackoverflow.com/questions/78380867/docker-compose-run-issue-2024-error-containerconfig"
+    label: "Stack Overflow — docker-compose ContainerConfig KeyError"
