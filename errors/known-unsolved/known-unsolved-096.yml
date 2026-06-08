@@ -1,0 +1,114 @@
+id: known-unsolved-096
+title: "ARC / Self-Hosted Runner Random Job Cancellation — 'The operation was canceled.'"
+category: known-unsolved
+severity: error
+tags:
+  - arc
+  - self-hosted-runner
+  - cancellation
+  - oom
+  - actions-runner-controller
+  - broker-api
+patterns:
+  - regex: 'Error: The operation was canceled\.'
+    flags: 'i'
+  - regex: 'Error: A task was canceled\.'
+    flags: 'i'
+  - regex: 'System\.OperationCanceledException: The operation was canceled\.'
+    flags: 'i'
+  - regex: 'An error occurred: Runner not found'
+    flags: 'i'
+  - regex: 'Runner will be shutdown for UserCancelled'
+    flags: 'i'
+error_messages:
+  - "Error: The operation was canceled."
+  - "Error: A task was canceled."
+  - "System.OperationCanceledException: The operation was canceled."
+  - "An error occurred: Runner not found"
+  - "[INFO HostContext] Runner will be shutdown for UserCancelled"
+root_cause: |
+  Jobs on self-hosted runners (especially ARC / Actions Runner Controller scale-sets)
+  are randomly cancelled with "The operation was canceled." or "A task was canceled."
+  during setup-job or mid-execution, with no informative error about the underlying cause.
+
+  Three root causes have been identified (actions/runner#3819, Apr 2025):
+
+  1. **ARC broker API race condition**: The ARC scale-set-controller confirms the runner
+     exists via `GET _apis/distributedtask/pools/0/agents/{id}`, but the runner itself
+     immediately receives a `RunnerNotFound` response from the broker's `/message` endpoint
+     (a different API). The two endpoints briefly disagree, causing the runner to shut down
+     with "Runner not found" and the job to appear cancelled.
+
+  2. **OOM kill**: The runner process (or a child process) is killed by the Linux OOM
+     killer due to memory pressure. The runner interprets the abrupt termination as a
+     cancellation rather than an OOM kill, so no memory-related message appears in the
+     job log. Workaround: reduce `--max-old-space-size` in `NODE_OPTIONS` or provision
+     a runner node with more RAM.
+
+  3. **GitHub-hosted runner transient service errors**: GitHub-hosted runners on
+     `ubuntu-latest` occasionally exhibit the same symptom during GitHub infrastructure
+     degradation events; retrying the job resolves it.
+
+  The cancellation cascades silently through all remaining steps (`Re-evaluate condition
+  on job cancellation` appears in debug logs), making it hard to distinguish from a
+  legitimate workflow cancel.
+fix: |
+  There is no reliable fix because the root cause is a service-side race condition or
+  out-of-memory kill, neither of which is controllable from the workflow YAML.
+
+  Mitigations by root cause:
+
+  **ARC broker race:**
+  - Update ARC and the runner to the latest versions; GitHub has made incremental
+    improvements to the broker reconnection logic.
+  - Add an automatic retry at the job level (use a wrapper action or runner restart
+    policy in your ARC Helm values).
+
+  **OOM kill:**
+  - Add `NODE_OPTIONS: --max-old-space-size=4096` to reduce Node.js heap size for
+    memory-intensive jobs.
+  - Provision runner nodes with more RAM, or use fewer concurrent jobs per node.
+  - Check for OOM events: `dmesg | grep -E "oom|killed"` on the runner host.
+
+  **Transient GitHub-hosted runner failure:**
+  - Re-run the failed job; transient failures resolve on retry.
+  - Check https://githubstatus.com for ongoing incidents.
+fix_code:
+  - language: yaml
+    label: "Retry on cancellation using a reusable wrapper (workaround)"
+    code: |
+      # No workflow-level fix exists; re-run failed jobs manually or via API:
+      # gh run rerun <run-id> --failed
+
+      # For ARC: set runner restart policy in Helm values
+      # autoscalingRunnerSet:
+      #   maxRunners: 10
+      #   template:
+      #     spec:
+      #       restartPolicy: OnFailure
+  - language: yaml
+    label: "Reduce Node.js memory to prevent OOM kills"
+    code: |
+      jobs:
+        build:
+          runs-on: self-hosted
+          env:
+            NODE_OPTIONS: '--max-old-space-size=4096'
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm ci && npm run build
+prevention:
+  - "Monitor runner-node memory usage; provision nodes with ≥4 GB RAM per concurrent job."
+  - "Keep ARC (actions-runner-controller) and runner binaries up to date to benefit from broker reconnection improvements."
+  - "For ARC deployments: set `restartPolicy: OnFailure` in the runner pod template so jobs retry on ephemeral failures."
+  - "Enable debug logging (`ACTIONS_RUNNER_DEBUG: true` secret) to capture broker communication details when investigating."
+  - "After a job is cancelled with no clear reason, check `dmesg | grep -i oom` on the runner host before suspecting workflow issues."
+docs:
+  - url: "https://github.com/actions/runner/issues/3819"
+    label: "actions/runner#3819 — A lot of random 'A task was cancelled' errors (48 reactions, Apr 2025)"
+  - url: "https://github.com/actions/runner/issues/3857"
+    label: "actions/runner#3857 — An error occurred: Runner not found (ARC race condition)"
+  - url: "https://github.com/actions/actions-runner-controller/issues/4091"
+    label: "ARC#4091 — EphemeralRunner stuck in failed state after job cancellation"
+  - url: "https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/monitoring-and-troubleshooting-self-hosted-runners"
+    label: "Monitoring and troubleshooting self-hosted runners"
