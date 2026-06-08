@@ -1,0 +1,119 @@
+id: permissions-auth-094
+title: 'azure/login v3 OIDC intermittently fails with "No subscriptions found" despite valid subscription-id'
+category: permissions-auth
+severity: error
+tags:
+  - azure
+  - oidc
+  - azure-login
+  - federated-credentials
+  - subscription
+  - intermittent
+  - arm
+  - az-cli
+patterns:
+  - regex: 'No subscriptions found for (\*+|[a-f0-9-]{36})'
+    flags: 'i'
+  - regex: 'Login failed with Error.*az(\.cmd)? failed with exit code 1.*auth-type'
+    flags: 'i'
+  - regex: 'Attempting Azure CLI login by using OIDC'
+    flags: 'i'
+error_messages:
+  - "Error: No subscriptions found for ***."
+  - "Error: Login failed with Error: The process '/usr/bin/az' failed with exit code 1. Double check if the 'auth-type' is correct. Refer to https://github.com/Azure/login#readme for more information."
+  - "Error: Login failed with Error: The process 'C:\\Program Files\\Microsoft SDKs\\Azure\\CLI2\\wbin\\az.cmd' failed with exit code 1."
+  - "Attempting Azure CLI login by using OIDC..."
+root_cause: |
+  When using `azure/login@v2` or `azure/login@v3` with OIDC federated credentials and an
+  explicit `subscription-id` input, the action calls `az login --federated-token <token>`
+  which queries the Azure Resource Manager (ARM) subscription enumeration API before setting
+  the active subscription.
+
+  Intermittently (affecting ~10-20% of runs), the ARM subscription enumeration endpoint
+  returns HTTP 200 with an empty `value: []` for a valid service principal that has
+  subscriptions assigned. This is a **transient server-side issue**, not a configuration
+  error — the same workflow, same credentials, same subscription succeeds and fails in
+  parallel jobs within the same run.
+
+  The failure pattern:
+  1. `azure/login` calls `az login --federated-token ... --allow-no-subscriptions false`
+  2. ARM returns empty subscription list (transient)
+  3. `az login` exits 1 with "No subscriptions found for <SPN>"
+  4. `azure/login` logs the exit-code-1 error and fails the step
+
+  Despite `subscription-id` being explicitly provided, the action validates via subscription
+  enumeration before calling `az account set`. This pre-check fails on the transient empty
+  response even when the subscription ID is known and valid.
+
+  The issue appears linked to Azure ARM API load-balancing inconsistency where some backend
+  nodes return the complete subscription list while others intermittently return empty. It
+  is non-deterministic and typically resolves on retry.
+
+  Source: Azure/login#592 (May 2026, open, 10+ reactions), Azure CLI issue #33480
+fix: |
+  **Immediate workaround**: Add `allow-no-subscriptions: true` to the `azure/login` step.
+
+  The action code in `AzureCliLogin.ts` still calls `az account set --subscription <id>`
+  even when `allow-no-subscriptions: true` is used, as long as `subscription-id` is also
+  provided. This means subsequent `az` commands continue to operate against the correct
+  subscription — the flag only bypasses the pre-enumeration check that is failing.
+
+  Note: `allow-no-subscriptions: true` WITHOUT a `subscription-id` would leave the session
+  without an active subscription and break ARM-level `az` commands. Always combine the flag
+  with an explicit `subscription-id`.
+
+  **Belt-and-suspenders**: Add retry logic around the login step to automatically recover
+  from the intermittent ARM enumeration failure without manual re-run.
+fix_code:
+  - language: yaml
+    label: 'Add allow-no-subscriptions: true to bypass intermittent ARM enumeration failure'
+    code: |
+      - name: Azure Login
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          # Workaround for Azure/login#592: intermittent empty ARM subscription list
+          # The subscription-id is still respected via az account set after login.
+          allow-no-subscriptions: true
+
+  - language: yaml
+    label: 'Retry login step with nick-fields/retry (recommended for production deployments)'
+    code: |
+      - name: Azure Login (with retry)
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 3
+          max_attempts: 3
+          retry_wait_seconds: 15
+          command: |
+            az login --federated-token "$(cat $ACTIONS_ID_TOKEN_REQUEST_URL)" \
+              --service-principal \
+              -u ${{ secrets.AZURE_CLIENT_ID }} \
+              -t ${{ secrets.AZURE_TENANT_ID }} \
+              --allow-no-subscriptions
+            az account set --subscription ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Or wrap the action itself:
+      # - name: Azure Login
+      #   uses: azure/login@v3
+      #   with:
+      #     client-id: ${{ secrets.AZURE_CLIENT_ID }}
+      #     tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+      #     subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      #     allow-no-subscriptions: true
+      #   # Add a continue-on-error + retry step pair pattern here
+
+prevention:
+  - "Always add 'allow-no-subscriptions: true' with 'subscription-id' when using azure/login@v2+ with OIDC — this safely bypasses the intermittent ARM enumeration failure without changing downstream behavior."
+  - "Add retry logic (up to 3 attempts, 15s delay) around azure/login steps in production deployment workflows where transient ARM API failures would require manual re-run."
+  - "Monitor azure/login failure rates per repository — a sudden spike in 'No subscriptions found' errors signals a transient Azure ARM service issue."
+  - "Check Azure/login#592 and Azure CLI#33480 for status updates before escalating as a credential misconfiguration issue."
+docs:
+  - url: 'https://github.com/Azure/login/issues/592'
+    label: 'Azure/login#592: Intermittent No subscriptions found with OIDC + subscription-id (May 2026)'
+  - url: 'https://github.com/Azure/azure-cli/issues/33480'
+    label: 'Azure CLI#33480: Transient empty ARM subscription list causes OIDC login to fail'
+  - url: 'https://github.com/Azure/login/blob/main/README.md#readme'
+    label: 'azure/login README — allow-no-subscriptions and auth-type options'

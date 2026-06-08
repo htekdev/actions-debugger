@@ -1,0 +1,135 @@
+id: known-unsolved-094
+title: 'ARC direct-CR (GitOps/ArgoCD) deployment without gha-runner-scale-set Helm chart — EphemeralRunner finalizer stuck due to missing secrets list permission'
+category: known-unsolved
+severity: limitation
+tags:
+  - arc
+  - kubernetes
+  - gitops
+  - argocd
+  - flux
+  - ephemeral-runner
+  - finalizer
+  - helm
+  - rbac
+  - secrets
+  - gha-runner-scale-set
+patterns:
+  - regex: 'cannot list resource.*secrets.*arc.*gha-rs-controller|secrets is forbidden.*arc.*gha-rs-controller'
+    flags: 'i'
+  - regex: 'Failed to clean up container hooks resources.*failed to list runner-linked secrets'
+    flags: 'i'
+  - regex: 'EphemeralRunner.*Cleaning up runner linked secrets'
+    flags: 'i'
+error_messages:
+  - "Failed to clean up container hooks resources error=\"failed to list runner-linked secrets: secrets is forbidden: User \\\"system:serviceaccount:arc-system:arc-gha-rs-controller\\\" cannot list resource \\\"secrets\\\" in API group \\\"\\\" in the namespace \\\"arc-system\\\"\""
+  - "secrets is forbidden: User \"system:serviceaccount:arc-system:arc-gha-rs-controller\" cannot list resource \"secrets\" in API group \"\" in the namespace \"arc-system\""
+root_cause: |
+  The ARC (Actions Runner Controller) officially supports installation only via the Helm
+  charts `gha-runner-scale-set-controller` (controller) and `gha-runner-scale-set` (per
+  scale set). Many GitOps practitioners (ArgoCD, Flux, raw kubectl apply) declare
+  `AutoscalingRunnerSet` CRs directly as Kubernetes manifests, bypassing the Helm chart.
+
+  When the `gha-runner-scale-set` Helm chart is not used:
+  - The chart-provisioned **per-namespace manager Role** (which grants the controller
+    ServiceAccount `list` on Secrets in the target namespace) is never created.
+  - The controller's dynamically-created **listener Role** only grants `create, delete,
+    get, patch, update` on Secrets — NOT `list`. This matches ADR-2023-04-11 which
+    explicitly limited the listener Role to avoid cluster-wide list.
+
+  The `EphemeralRunner` finalizer cleanup path in `ephemeralrunner_controller.go` calls
+  `client.List` on Secrets with a label selector to clean up container hooks resources.
+  Without the `list` verb, the controller cannot complete this call:
+
+  ```
+  Failed to clean up container hooks resources
+    error="failed to list runner-linked secrets: secrets is forbidden:
+           cannot list resource 'secrets' in namespace 'arc-system'"
+  ```
+
+  The EphemeralRunner CR stays in `Phase=Running` with `deletionTimestamp` set and its
+  finalizer (`ephemeralrunner.actions.github.com/finalizer`) never removed. This causes:
+  - Orphan EphemeralRunner CRs accumulate indefinitely
+  - EphemeralRunnerSets do not garbage-collect (their ER children cannot finalize)
+  - Controller logs the error every ~10 seconds as the workqueue retries
+  - At scale, controller CPU/memory churn and eventual OOM
+
+  **Maintainer response**: "The only installation method supported is through helm."
+  Direct-CR deployment is explicitly unsupported.
+
+  Source: actions/actions-runner-controller#4510 (May 2026, open, maintainer confirmed)
+fix: |
+  **Option 1 — Use the official Helm chart** (supported and recommended):
+  Avoid declaring `AutoscalingRunnerSet` CRs directly. Use the `gha-runner-scale-set`
+  Helm chart for each scale set. For GitOps, wrap the Helm chart in a HelmRelease
+  (Flux) or Helm Application (ArgoCD). The chart auto-provisions the necessary RBAC.
+
+  **Option 2 — Provision a supplemental RBAC Role** (unsupported workaround):
+  Create a namespace-scoped Role and RoleBinding that adds `list` on Secrets for the
+  controller ServiceAccount. This closes the RBAC gap without changing your deployment
+  method, but is not a documented or guaranteed approach.
+
+  **Option 3 — Emergency cleanup** (remove stuck finalizers manually):
+  Strip finalizers from stuck EphemeralRunner CRs to allow immediate GC. Run after
+  any jobs using the affected runners have completed.
+fix_code:
+  - language: yaml
+    label: 'Supplemental RBAC Role — grants secrets list to controller SA (unsupported workaround)'
+    code: |
+      # Apply to the namespace where ARC controller and runner sets run
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: Role
+      metadata:
+        name: arc-controller-ephemeralrunner-finalizer-secrets-list
+        namespace: arc-system   # Change to your runner namespace
+      rules:
+        - apiGroups: [""]
+          resources: ["secrets"]
+          verbs: ["list", "watch"]
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: RoleBinding
+      metadata:
+        name: arc-controller-ephemeralrunner-finalizer-secrets-list
+        namespace: arc-system
+      subjects:
+        - kind: ServiceAccount
+          name: arc-gha-rs-controller   # Change to match your controller SA name
+          namespace: arc-system
+      roleRef:
+        kind: Role
+        name: arc-controller-ephemeralrunner-finalizer-secrets-list
+        apiGroup: rbac.authorization.k8s.io
+
+  - language: yaml
+    label: 'Emergency cleanup — remove finalizer from stuck EphemeralRunner CRs'
+    code: |
+      # List EphemeralRunner CRs with a deletionTimestamp (stuck finalizer):
+      # kubectl get ephemeralrunner -A -o json | \
+      #   jq -r '.items[] | select(.metadata.deletionTimestamp != null) | .metadata.name'
+
+      # Remove finalizer from a single stuck CR:
+      # kubectl patch ephemeralrunner <name> -n arc-system \
+      #   -p '{"metadata":{"finalizers":[]}}' --type=merge
+
+      # Bulk cleanup (verify first — this removes all finalizers from all stuck CRs):
+      # kubectl get ephemeralrunner -A -o json | \
+      #   jq -r '.items[] | select(.metadata.deletionTimestamp != null) |
+      #     "\(.metadata.namespace) \(.metadata.name)"' | \
+      #   while read ns name; do
+      #     kubectl patch ephemeralrunner "$name" -n "$ns" \
+      #       -p '{"metadata":{"finalizers":[]}}' --type=merge
+      #   done
+
+prevention:
+  - "Use the official gha-runner-scale-set Helm chart for ALL scale set deployments — direct-CR deployment is unsupported and misses critical RBAC provisioning required for finalizer cleanup."
+  - "For GitOps (ArgoCD/Flux), wrap the Helm chart in a HelmRelease manifest rather than running helm template and applying raw manifests."
+  - "Monitor controller logs for 'secrets is forbidden' errors — they appear every ~10 seconds per stuck EphemeralRunner CR and indicate accumulating RBAC debt."
+  - "Set up periodic CR audits: kubectl get ephemeralrunner -A | grep -v Complete to catch accumulating orphans before they cause controller OOM."
+docs:
+  - url: 'https://github.com/actions/actions-runner-controller/issues/4510'
+    label: 'ARC#4510: EphemeralRunner finalizer stuck — secrets list forbidden in direct-CR deployments'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners-with-actions-runner-controller/deploying-runner-scale-sets-with-actions-runner-controller'
+    label: 'GitHub Docs: Deploying ARC runner scale sets (Helm chart required)'
+  - url: 'https://github.com/actions/actions-runner-controller/blob/master/docs/adrs/2023-04-11-limit-manager-role-permission.md'
+    label: 'ARC ADR-2023-04-11: Limit manager role permission (explains why list is omitted from listener Role)'
