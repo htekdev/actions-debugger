@@ -1,0 +1,101 @@
+id: caching-artifacts-108
+title: 'upload-artifact Fails "No such file or directory" When GITHUB_WORKSPACE Deleted by a Prior Step'
+category: caching-artifacts
+severity: error
+tags:
+  - upload-artifact
+  - v6
+  - v7
+  - v8
+  - GITHUB_WORKSPACE
+  - working-directory
+  - node-startup
+  - deleted-directory
+patterns:
+  - regex: 'An error occurred trying to start process.*node.*with working directory.*No such file or directory'
+    flags: 'is'
+  - regex: 'failed to start.*working directory.*does not exist|working directory.*No such file or directory'
+    flags: 'is'
+  - regex: 'start process.*\/node.*\/work\/.*No such file or directory'
+    flags: 'i'
+error_messages:
+  - "Error: An error occurred trying to start process '/home/runner/actions-runner/cached/externals/node24/bin/node' with working directory '/home/runner/work/repo/repo'. No such file or directory"
+root_cause: |
+  `actions/upload-artifact` (v6+) starts its Node.js subprocess using `$GITHUB_WORKSPACE`
+  (typically `/home/runner/work/<repo>/<repo>`) as the working directory. When a prior step
+  in the same job deletes `$GITHUB_WORKSPACE` — for example via an explicit cleanup step,
+  a Docker purge that wipes mounted volumes, a script that removes the checkout directory,
+  or a test suite that cleans up its own fixture directory — the Node.js process cannot be
+  spawned because the OS rejects `fork+chdir` to a path that no longer exists.
+
+  The error surfaces as an OS-level process start failure, not an artifact-specific error:
+
+    "An error occurred trying to start process '/...node' with working directory
+     '/home/runner/work/<repo>/<repo>'. No such file or directory"
+
+  This affects `upload-artifact` v6 and later (which all start Node from `$GITHUB_WORKSPACE`)
+  and triggers for any other composite or JavaScript action invoked after the workspace
+  directory is deleted.
+
+  The upload never begins — the step fails before any artifact content is processed.
+
+  Open: actions/upload-artifact#782 (filed Mar 2026).
+fix: |
+  Option 1 (recommended): Reorder steps so upload-artifact runs BEFORE any cleanup step
+  that deletes $GITHUB_WORKSPACE. Artifact uploads should precede workspace cleanup.
+
+  Option 2: Copy files to a path outside $GITHUB_WORKSPACE before deleting the workspace,
+  then upload from the safe location (e.g. /tmp). The artifact files can be outside
+  $GITHUB_WORKSPACE — only the working directory path must exist when Node.js starts.
+
+  Option 3: If cleanup cannot be moved, recreate an empty directory at $GITHUB_WORKSPACE
+  before running upload-artifact. Node.js only needs the directory to exist as a startup
+  location; the actual artifact files can be anywhere accessible.
+
+  Note: upload-artifact requires the artifact source path to exist, but that path does
+  not have to be inside $GITHUB_WORKSPACE — /tmp or other absolute paths work fine.
+fix_code:
+  - language: yaml
+    label: 'Fix 1 — upload before workspace cleanup (recommended)'
+    code: |
+      steps:
+        - uses: actions/checkout@v4
+
+        # ... build steps that produce output in /tmp/results ...
+
+        - name: Upload results (BEFORE any cleanup)
+          uses: actions/upload-artifact@v8
+          with:
+            name: build-results
+            path: /tmp/results/     # safe path outside workspace
+
+        - name: Cleanup workspace   # safe — upload already done
+          run: rm -rf "$GITHUB_WORKSPACE"
+  - language: yaml
+    label: 'Fix 2 — recreate workspace stub when cleanup order cannot change'
+    code: |
+      steps:
+        - name: Cleanup (must run first)
+          run: |
+            rm -rf "$GITHUB_WORKSPACE"
+            # Copy artifact to /tmp before deletion:
+            cp -r artifacts/ /tmp/artifacts/
+
+        - name: Restore workspace stub for Node.js startup
+          run: mkdir -p "$GITHUB_WORKSPACE"
+
+        - name: Upload artifact
+          uses: actions/upload-artifact@v8
+          with:
+            name: results
+            path: /tmp/artifacts/   # outside deleted workspace; stub dir satisfies Node.js
+prevention:
+  - 'Never delete $GITHUB_WORKSPACE before the last upload-artifact, download-artifact, or any other Node.js action step in the job.'
+  - 'When a job performs workspace cleanup, schedule all artifact upload steps before any rm -rf $GITHUB_WORKSPACE operations.'
+  - 'Copy artifact files to /tmp or another persistent path before deleting the workspace if the artifact sources live inside $GITHUB_WORKSPACE.'
+  - 'Node.js actions (setup-*, upload-artifact, download-artifact) require $GITHUB_WORKSPACE to exist as the process working directory even if their actual file arguments point elsewhere.'
+docs:
+  - url: 'https://github.com/actions/upload-artifact/issues/782'
+    label: 'actions/upload-artifact#782 — Fails when repository/working directory was deleted (open Mar 2026)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/store-information-in-variables#default-environment-variables'
+    label: 'GitHub Docs — GITHUB_WORKSPACE default environment variable'

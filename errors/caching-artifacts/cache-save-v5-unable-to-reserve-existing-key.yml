@@ -1,0 +1,122 @@
+id: caching-artifacts-109
+title: 'actions/cache/save@v5 Fails "Unable to Reserve Cache" When Exact Key Already Exists from a Prior Run'
+category: caching-artifacts
+severity: error
+tags:
+  - actions/cache
+  - cache-save
+  - v5
+  - unable-to-reserve
+  - key-collision
+  - split-cache
+  - first-write-wins
+patterns:
+  - regex: 'Unable to reserve cache with key.*another job may be creating this cache'
+    flags: 'i'
+  - regex: 'Failed to save: Unable to reserve cache'
+    flags: 'i'
+  - regex: 'Warning: Cache save failed\.'
+    flags: 'i'
+error_messages:
+  - 'Failed to save: Unable to reserve cache with key <key>, another job may be creating this cache.'
+  - 'Warning: Cache save failed.'
+root_cause: |
+  The GitHub Actions cache service uses a first-write-wins model for cache entries: once a
+  cache with an exact key has been successfully saved for a given branch/ref, subsequent
+  calls to `actions/cache/save@v5` attempting to write the same exact key fail with:
+
+    "Unable to reserve cache with key <key>, another job may be creating this cache."
+
+  The error message mentions "another job may be creating this cache" but this is misleading
+  — the failure occurs even in single-job, single-run workflows with no concurrency. The
+  true cause is that the cache service has already reserved (and filled) a slot for the exact
+  key in a PREVIOUS workflow run. Once occupied, the slot cannot be overwritten.
+
+  This affects workflows using the split `cache/restore` + `cache/save` pattern (rather than
+  the combined `cache@v5` action) when the cache key is static or does not change between runs.
+
+  Common patterns that trigger this:
+  - Using a fixed key like `runner.os-node-modules` with no hash component
+  - Calling `cache/save` with `key` set to the same key that `cache/restore` already found
+    (cache-hit == true) — the restore succeeded, meaning the key exists; save will fail
+  - Running the same workflow twice on the same branch with an identical static key
+
+  The combined `actions/cache@v5` automatically skips the save step when `cache-hit` is
+  true (exact match), which is why this error is more common with the split pattern.
+fix: |
+  Option 1 (recommended): Include a content-hash in the cache key so the key changes
+  when the cached content changes. This is the standard cache pattern.
+
+  Option 2: Check the `cache-hit` output from `cache/restore` and skip `cache/save`
+  when it is true. An exact cache hit means the existing cache is up-to-date.
+
+  Option 3: Use the combined `actions/cache@v5` action instead of the split save/restore
+  pattern. The combined action automatically skips save on exact cache-hit.
+
+  Option 4 (workaround): Append `${{ github.run_id }}` or `${{ github.run_attempt }}` to
+  the save key to force a new, unique key on every save. Pair with `restore-keys` for
+  fuzzy fallback matching. This wastes cache space but eliminates the error.
+fix_code:
+  - language: yaml
+    label: 'Fix 1 — include content hash in key so key changes when content changes'
+    code: |
+      - name: Restore node modules cache
+        id: cache-restore
+        uses: actions/cache/restore@v5
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      # ... install steps ...
+
+      - name: Save node modules cache
+        uses: actions/cache/save@v5
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          # key changes when package-lock.json changes → new slot reserved on each change
+  - language: yaml
+    label: 'Fix 2 — skip save when cache-hit is true (exact match already exists)'
+    code: |
+      - name: Restore cache
+        id: cache-restore
+        uses: actions/cache/restore@v5
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+
+      - name: Install dependencies
+        if: steps.cache-restore.outputs.cache-hit != 'true'
+        run: npm ci
+
+      - name: Save cache (skip if already hit)
+        if: steps.cache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+  - language: yaml
+    label: 'Fix 3 — use combined actions/cache@v5 (auto-skips save on exact cache hit)'
+    code: |
+      - name: Cache node modules
+        uses: actions/cache@v5
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+          # Combined action: save is automatically skipped when cache-hit is 'true'
+prevention:
+  - 'Always include a content-hash (hashFiles) in cache keys so the key changes when the cached content changes, preventing collisions across runs.'
+  - 'In the split cache/restore + cache/save pattern, check `steps.<id>.outputs.cache-hit != true` before calling cache/save to skip redundant saves.'
+  - 'Use the combined `actions/cache@v5` instead of the split pattern when you want automatic skip-on-hit behavior without additional conditionals.'
+  - 'Static cache keys (e.g. without hashFiles or run-specific suffixes) will always fail to save after the first successful run for that branch.'
+docs:
+  - url: 'https://github.com/actions/cache/issues/1707'
+    label: 'actions/cache#1707 — Unable to reserve cache with key, another job may be creating (10 reactions, open Jan 2026)'
+  - url: 'https://github.com/actions/cache/blob/main/save/README.md'
+    label: 'actions/cache save README — split cache restore+save usage and key recommendations'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows#matching-a-cache-key'
+    label: 'GitHub Docs — Cache key matching and first-write-wins behavior'
