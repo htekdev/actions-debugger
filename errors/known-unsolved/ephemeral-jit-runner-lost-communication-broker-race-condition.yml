@@ -1,0 +1,118 @@
+id: known-unsolved-096
+title: 'Ephemeral/JIT Runner "Lost Communication" Despite Successful Job Completion — Broker Race Condition'
+category: known-unsolved
+severity: silent-failure
+tags:
+  - ephemeral
+  - JIT
+  - self-hosted
+  - lost-communication
+  - broker
+  - race-condition
+  - ARC
+  - one-time-use
+patterns:
+  - regex: 'The self-hosted runner lost communication with the server'
+    flags: 'i'
+  - regex: 'runner.*lost communication.*server'
+    flags: 'i'
+  - regex: 'GET request.*broker\.actions\.githubusercontent\.com.*has been cancelled'
+    flags: 'i'
+error_messages:
+  - "The self-hosted runner lost communication with the server."
+  - "GET request to broker.actions.githubusercontent.com/message... has been cancelled."
+  - "TaskCanceledException: The operation was canceled."
+root_cause: |
+  Ephemeral (one-time-use) and JIT self-hosted runners are frequently reported as "lost
+  communication" by GitHub, even when the job completed successfully. This is a known
+  race condition in the runner's broker disconnect sequence.
+
+  After an ephemeral runner finishes its job:
+  1. `CompleteJobAsync` reports success to GitHub's pipeline service
+  2. The runner immediately cancels the broker message queue connection (zero grace period)
+     via `messageQueueLoopTokenSource.Cancel()` in Runner.cs line 576
+  3. GitHub's broker health monitoring detects the TCP disconnect and flags the runner
+     as "lost communication"
+  4. GitHub's pipeline service (which knows the job succeeded) and the broker health
+     monitor (which only sees the disconnect) are two independent backend systems
+
+  When the broker health monitor propagates its state before the pipeline service does:
+  - GitHub UI shows the job as "The self-hosted runner lost communication with the server"
+  - In some cases the job stays stuck as "queued" or "in_progress" for 10-30+ minutes
+  - The `workflow_job.completed` webhook may be delayed or not delivered
+
+  The runner's own logs will show a fully successful completion immediately before the
+  "cancelled" error, with all timestamps at the same second — confirming the race.
+
+  This is most likely to occur with:
+  - Short jobs (< 60 seconds) — the race window is larger relative to job duration
+  - ARC-managed runners with Ephemeral: true and UseV2Flow: true
+  - High-frequency workflows launching many short ephemeral runners simultaneously
+
+  GitHub team is aware of the issue. A proposed fix (5-second grace period before
+  broker disconnect) was submitted but has not been merged as of Jun 2026.
+
+  Sources: actions/runner#4309 (Mar 2026, open, 5 reactions), tested on v2.331.0 and
+  v2.333.0 — same behavior on both.
+fix: |
+  There is no user-configurable fix. The root cause requires a change to runner source
+  code (a grace period before broker teardown in Runner.cs) which GitHub has not yet
+  shipped.
+
+  Workarounds:
+  1. Retry on failure: Add `retry-on-error` logic in your calling workflow or use a
+     retry action to rerun jobs that fail with "lost communication."
+  2. Avoid short ephemeral jobs: If feasible, pad ephemeral jobs to > 60 seconds
+     (e.g., with a startup sleep) to reduce the race window.
+  3. Ignore and requeue: For non-critical jobs, configure the workflow to treat
+     "lost communication" as a transient failure and rerun automatically.
+  4. Use non-ephemeral runners where job completion reliability is critical: switch
+     to persistent self-hosted runners that don't teardown after each job.
+fix_code:
+  - language: yaml
+    label: 'Retry on lost communication using a reusable job retry pattern'
+    code: |
+      jobs:
+        build:
+          runs-on: [self-hosted, ephemeral]
+          # This job may report "lost communication" even on success.
+          # The calling workflow (or CI system) should retry once on failure.
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm ci && npm test
+
+        retry-build:
+          needs: build
+          if: failure()  # Triggered when build reports "lost communication"
+          runs-on: [self-hosted, ephemeral]
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm ci && npm test
+
+  - language: yaml
+    label: 'Add startup padding to reduce broker race window on short jobs'
+    code: |
+      jobs:
+        build:
+          runs-on: [self-hosted, ephemeral]
+          steps:
+            # Workaround: slight delay at job start to allow broker to stabilize.
+            # Reduces (but does not eliminate) the lost-communication race window.
+            - name: Runner startup buffer
+              run: sleep 5
+
+            - uses: actions/checkout@v4
+            - run: npm test
+
+prevention:
+  - 'For ephemeral/JIT runners running short jobs, configure workflow retry logic to handle false "lost communication" failures'
+  - 'Monitor runner diagnostic logs for the pattern: successful completion logs at identical timestamps immediately followed by TaskCanceledException'
+  - 'If workflow_job.completed webhooks are missing, suspect the ephemeral broker race — check runner logs before assuming a real failure'
+  - 'For mission-critical CI pipelines, prefer persistent self-hosted runners until actions/runner#4309 is resolved upstream'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4309'
+    label: 'actions/runner#4309: Ephemeral/JIT runner reports lost communication despite successful completion (Mar 2026)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners#ephemeral-runners'
+    label: 'GitHub Docs: About ephemeral self-hosted runners'
+  - url: 'https://github.com/actions/actions-runner-controller/discussions'
+    label: 'ARC Discussions — community reports of lost communication on ephemeral runners'
