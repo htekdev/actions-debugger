@@ -1,0 +1,99 @@
+id: caching-artifacts-116
+title: "upload-artifact 'Upload progress stalled.' — write EPIPE to Azure Blob Storage"
+category: caching-artifacts
+severity: error
+tags:
+  - upload-artifact
+  - upload-progress-stalled
+  - epipe
+  - blob-storage
+  - self-hosted
+  - macos
+  - broken-pipe
+patterns:
+  - regex: 'Error: Upload progress stalled\.'
+    flags: 'i'
+  - regex: 'failed, reason: write EPIPE'
+    flags: 'i'
+  - regex: 'Upload progress stalled'
+    flags: 'i'
+error_messages:
+  - "Error: Upload progress stalled."
+  - "failed, reason: write EPIPE"
+  - "request to https://productionresultssa*.blob.core.windows.net/actions-results/... failed, reason: write EPIPE"
+root_cause: |
+  `upload-artifact` (v4+) streams artifact data as a zip archive to Azure Blob
+  Storage via chunked PUT requests. When the underlying TCP connection to the Azure
+  Blob Storage endpoint (`productionresultssaN.blob.core.windows.net`) is reset or
+  closed by the remote side before the upload completes, Node.js raises an EPIPE
+  (broken pipe) error on the write stream. The artifact action surfaces this as
+  "Error: Upload progress stalled." and fails the step.
+
+  This occurs most frequently on:
+  - **Self-hosted macOS runners** — the macOS networking stack can aggressively
+    close idle connections to Azure under certain network conditions
+  - **Runners behind proxies or firewalls** that reset long-lived TCP connections
+    mid-transfer (especially connections that pause between chunks)
+  - **GitHub-hosted runners** during transient Azure Blob Storage degradations
+
+  The "Upload progress stalled." error with EPIPE is distinct from:
+  - The silent large-file hang (no error, job eventually cancelled) — covered
+    by caching-artifacts-021
+  - SAS token expiry on very long-running jobs (logs show auth error, not EPIPE)
+fix: |
+  1. **Retry the job** — EPIPE failures to blob storage are almost always transient.
+     A re-run resolves the issue in the vast majority of cases.
+
+  2. **Reduce upload concurrency** — Set the `ACTIONS_ARTIFACT_UPLOAD_CONCURRENCY`
+     environment variable to `1` or `2` to serialize chunk writes and reduce
+     connection pressure:
+     ```
+     env:
+       ACTIONS_ARTIFACT_UPLOAD_CONCURRENCY: 2
+     ```
+
+  3. **Check firewall/proxy settings** — Ensure the runner can maintain long-lived
+     HTTPS connections to `*.blob.core.windows.net` without the connection being
+     reset mid-transfer by a proxy or firewall.
+
+  4. **Split large artifacts** — Upload multiple smaller artifacts instead of one
+     large one to reduce per-connection transfer time.
+fix_code:
+  - language: yaml
+    label: 'Reduce upload concurrency to minimize EPIPE risk'
+    code: |
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        env:
+          ACTIONS_ARTIFACT_UPLOAD_CONCURRENCY: 2
+        with:
+          name: my-artifact
+          path: ./dist/
+  - language: yaml
+    label: 'Add retry logic for transient EPIPE failures'
+    code: |
+      - name: Upload artifact (with retry)
+        id: upload
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: my-artifact
+          path: ./dist/
+      - name: Retry upload if first attempt failed
+        if: steps.upload.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: my-artifact
+          path: ./dist/
+prevention:
+  - 'Avoid running many upload-artifact steps simultaneously on the same self-hosted macOS runner to reduce connection pressure.'
+  - 'Configure firewall and proxy rules to allow sustained long-lived TCP connections (>10 min) to *.blob.core.windows.net.'
+  - 'Set ACTIONS_ARTIFACT_UPLOAD_CONCURRENCY=1 in environments with known network instability.'
+  - 'Use continue-on-error: true and retry logic for non-critical artifact uploads.'
+docs:
+  - url: 'https://github.com/actions/upload-artifact/issues/740'
+    label: 'actions/upload-artifact#740 — [bug] V4 - Upload progress stalled. (Nov 2025)'
+  - url: 'https://github.com/actions/upload-artifact/issues/527'
+    label: 'actions/upload-artifact#527 — [bug] v4 hangs uploading from mac runners (16 reactions, 2024-2026)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-and-sharing-data-from-a-workflow'
+    label: 'GitHub Docs — Storing and sharing data from a workflow'

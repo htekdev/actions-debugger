@@ -1,0 +1,109 @@
+id: silent-failures-162
+title: '${{ }} expressions in on: trigger filter sections are treated as literal strings — trigger silently never fires'
+category: silent-failures
+severity: silent-failure
+tags:
+  - expressions
+  - on-triggers
+  - branches-filter
+  - paths-filter
+  - literal-string
+  - never-fires
+  - workflow-syntax
+patterns:
+  - regex: '\$\{\{\s*vars\.\w+\s*\}\}'
+    flags: 'im'
+  - regex: '\$\{\{\s*env\.\w+\s*\}\}'
+    flags: 'im'
+  - regex: 'on:\s*\n\s+push:\s*\n(?:.*\n)*?\s+branches:\s*\n(?:\s*-\s*\$\{\{)'
+    flags: 'im'
+error_messages:
+  - "# No error is emitted — the workflow YAML is valid but the trigger never fires"
+  - "on:\n  push:\n    branches:\n      - ${{ vars.DEPLOY_BRANCH }}"
+root_cause: |
+  GitHub Actions does not evaluate `${{ }}` expression syntax in the `on:` section
+  of a workflow file. The `on:` block is processed as static YAML at workflow
+  registration time — before any event, runner, or expression context exists. There
+  is nothing to evaluate the expression against.
+
+  When a developer writes:
+
+  ```yaml
+  on:
+    push:
+      branches:
+        - ${{ vars.DEPLOY_BRANCH }}
+  ```
+
+  GitHub treats `${{ vars.DEPLOY_BRANCH }}` as a literal branch name string. Since
+  no git branch is literally named `${{ vars.DEPLOY_BRANCH }}`, the push filter
+  never matches any real branch. The workflow is never triggered, and no error,
+  warning, or annotation is emitted.
+
+  This silent failure applies to all `on.*` filter lists, including:
+  - `on.push.branches`, `on.push.tags`, `on.push.branches-ignore`, `on.push.paths`
+  - `on.pull_request.branches`, `on.pull_request.paths`
+  - `on.pull_request_target.branches`
+  - `on.schedule[].cron` (the cron string must be a literal)
+  - `on.workflow_run.workflows` (workflow name must be a literal)
+
+  The workflow file passes YAML schema validation and appears in the Actions tab,
+  but clicking "Run workflow" or pushing to the matching branch produces no run.
+  The only indication is the absence of triggered runs.
+
+  Expressions ARE evaluated in `jobs:` and `steps:` contexts because a runner
+  environment and event payload are available at that point. The `on:` section
+  has no such context.
+fix: |
+  Move any dynamic routing logic from `on:` filters into `jobs.<job_id>.if:`
+  conditions. Use `vars` or `env` in the `if:` expression instead.
+
+  For branch-specific deployment:
+  - Define the deploy branch as a repository variable (e.g., `DEPLOY_BRANCH`)
+  - Trigger the workflow broadly on `push`
+  - Add `if: github.ref == format('refs/heads/{0}', vars.DEPLOY_BRANCH)` at the
+    job level to skip jobs that do not match
+
+  Use literal branch names or glob patterns directly in `on:` filters for static
+  routing that does not change at runtime.
+fix_code:
+  - language: yaml
+    label: 'Move dynamic branch logic to job-level if: condition (using vars)'
+    code: |
+      on:
+        push:
+          branches: ['**']   # trigger on all branches
+
+      jobs:
+        deploy:
+          # Check vars at job level — expressions ARE evaluated here
+          if: github.ref == format('refs/heads/{0}', vars.DEPLOY_BRANCH)
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: echo "Deploying ${{ github.ref }}"
+  - language: yaml
+    label: 'Use literal branch names or globs directly in on: filters'
+    code: |
+      # Expressions are NOT evaluated in on: filters — use literal names
+      on:
+        push:
+          branches:
+            - main                # ✅ literal string
+            - 'release/**'        # ✅ glob pattern
+            - 'feature/*'         # ✅ glob pattern
+            # - ${{ vars.BRANCH }} ← WRONG: treated as literal, never matches
+prevention:
+  - 'Never use `${{ }}` expression syntax in `on:` trigger sections — expressions are only resolved in `jobs:` and `steps:` sections where a runner context exists.'
+  - 'Use `jobs.<job_id>.if:` or `steps.<step_id>.if:` conditions for all dynamic routing based on `vars`, `env`, or event payload data.'
+  - 'Lint workflows with `actionlint` — it flags `${{ }}` expressions used in positions where they are not evaluated (including `on:` filters).'
+  - 'After adding or modifying `on:` filters, test by pushing to a matching branch and verifying a run appears in the Actions tab.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#on'
+    label: 'GitHub Docs — Workflow syntax: on (trigger events)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/triggering-a-workflow#using-filters'
+    label: 'GitHub Docs — Using filters to target specific branches, tags, or paths'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions'
+    label: 'GitHub Docs — Evaluate expressions in workflows and actions'
+  - url: 'https://rhysd.github.io/actionlint/'
+    label: 'actionlint — static checker for GitHub Actions workflow files'
