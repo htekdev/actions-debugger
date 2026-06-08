@@ -1,0 +1,133 @@
+id: runner-environment-322
+title: 'setup-python caches OS-incompatible Python binaries on self-hosted runners with multiple container OS variants'
+category: runner-environment
+severity: error
+tags:
+  - setup-python
+  - self-hosted
+  - container
+  - glibc
+  - ssl
+  - tool-cache
+  - ubuntu
+  - toolcache
+  - multi-os
+patterns:
+  - regex: 'GLIBC_2\.\d+.*not found.*python|python.*GLIBC_2\.\d+.*not found'
+    flags: 'i'
+  - regex: 'ssl module.*not available.*python|Can''t connect to HTTPS URL because the SSL module'
+    flags: 'i'
+  - regex: 'setup-python.*self.*hosted.*cache.*incompatible|toolcache.*python.*wrong.*os'
+    flags: 'i'
+error_messages:
+  - "python: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.34' not found (required by python)"
+  - "python: /lib/x86_64-linux-gnu/libm.so.6: version `GLIBC_2.38' not found (required by /__w/_tool/Python/3.8.18/x64/lib/libpython3.8.so.1.0)"
+  - "WARNING: pip is configured with locations that require TLS/SSL, however the ssl module in Python is not available."
+  - "Can't connect to HTTPS URL because the SSL module is not available."
+  - "SSLError(\"Can't connect to HTTPS URL because the SSL module is not available.\")"
+root_cause: |
+  `actions/setup-python` uses an OS-agnostic tool cache path for storing downloaded Python
+  binaries on self-hosted runners. The default path is:
+    `$RUNNER_TOOL_CACHE/Python/<version>/<arch>/`
+  e.g., `/opt/actions-runner/_work/_tool/Python/3.8.18/x64/`
+
+  When a single self-hosted runner executes jobs in containers with different Linux
+  distributions or versions (e.g., Ubuntu 20.04 and Ubuntu 24.04 in the same matrix),
+  the following race condition occurs:
+
+  1. Job A runs in Ubuntu 24.04 container → cache miss → downloads Python 3.8.18 built
+     against Ubuntu 24.04 (glibc 2.34+, OpenSSL 3.x) → cached to shared path.
+  2. Job B runs in Ubuntu 20.04 container → cache HIT (finds the Python from Job A) →
+     uses Ubuntu 24.04 Python binary → fails with glibc/SSL version errors.
+
+  The Ubuntu 24.04 Python binary is dynamically linked against newer glibc and OpenSSL
+  versions that do not exist on Ubuntu 20.04, causing crashes at import time.
+
+  The reverse direction is equally problematic: a Python binary built for Ubuntu 20.04
+  (OpenSSL 1.x) fails SSL operations when run on Ubuntu 24.04 because the SSL module was
+  compiled against a different OpenSSL.
+
+  This issue is specific to self-hosted runners where the tool cache persists across jobs
+  in different container environments. GitHub-hosted runners are not affected because each
+  job gets a fresh VM.
+fix: |
+  Set `AGENT_TOOLSDIRECTORY` (or `RUNNER_TOOL_CACHE`) to a unique OS-specific path before
+  invoking `actions/setup-python`. This forces each container OS variant to maintain its
+  own separate Python installation cache.
+
+  Add a step at the beginning of your job (before `actions/setup-python`) to set the
+  environment variable to an OS-specific path:
+
+  ```yaml
+  - name: Isolate tool cache per OS
+    run: |
+      OS_LABEL="${{ matrix.container }}"
+      OS_LABEL="${OS_LABEL//[^a-zA-Z0-9_-]/-}"
+      echo "AGENT_TOOLSDIRECTORY=${{ runner.temp }}/tools-${OS_LABEL}" >> $GITHUB_ENV
+  ```
+
+  Alternatively, define a matrix variable for the cache path and use it explicitly.
+fix_code:
+  - language: yaml
+    label: 'Isolate tool cache per container OS in matrix'
+    code: |
+      jobs:
+        test:
+          runs-on: self-hosted
+          strategy:
+            matrix:
+              container: ['ubuntu:20.04', 'ubuntu:24.04']
+          container:
+            image: ${{ matrix.container }}
+          steps:
+            - name: Set OS-specific tool cache path
+              run: |
+                SAFE_OS="${{ matrix.container }}"
+                SAFE_OS="${SAFE_OS//[^a-zA-Z0-9_-]/-}"
+                echo "AGENT_TOOLSDIRECTORY=${{ runner.temp }}/tools-${SAFE_OS}" >> $GITHUB_ENV
+
+            - name: Set up Python
+              uses: actions/setup-python@v5
+              with:
+                python-version: '3.11'
+
+            - name: Install dependencies
+              run: pip install -r requirements.txt
+
+  - language: yaml
+    label: 'Per-OS tool cache with explicit matrix variable'
+    code: |
+      jobs:
+        test:
+          runs-on: self-hosted
+          strategy:
+            matrix:
+              include:
+                - container: 'ubuntu:20.04'
+                  os_tag: 'ubuntu-20-04'
+                - container: 'ubuntu:24.04'
+                  os_tag: 'ubuntu-24-04'
+          container:
+            image: ${{ matrix.container }}
+          env:
+            AGENT_TOOLSDIRECTORY: /opt/runner-tools/${{ matrix.os_tag }}
+          steps:
+            - name: Set up Python
+              uses: actions/setup-python@v5
+              with:
+                python-version: '3.11'
+prevention:
+  - "Always set AGENT_TOOLSDIRECTORY to an OS-specific path when running jobs in different Linux container versions on the same self-hosted runner"
+  - "Include the container image name or OS version in the tool cache path to ensure isolation"
+  - "Monitor for glibc or SSL errors after changing the container image used in a matrix"
+  - "When upgrading container OS versions (e.g., 20.04 → 24.04), clear the shared tool cache to avoid stale binaries"
+  - "Consider using GitHub-hosted runners for cross-OS testing to avoid shared tool cache issues"
+docs:
+  - url: 'https://github.com/actions/setup-python/blob/main/docs/advanced-usage.md#linux'
+    label: 'actions/setup-python Advanced Usage: Self-hosted Linux runners'
+  - url: 'https://github.com/actions/setup-python/issues/1087'
+    label: 'GitHub Issue: Self-hosted runners cache/reuse OS-incompatible python installations (#1087)'
+  - url: 'https://github.com/actions/setup-python/issues/1261'
+    label: 'GitHub Issue: Intermittent GLIBC errors on self-hosted Ubuntu runners across multiple architectures (#1261)'
+  - url: 'https://docs.github.com/en/actions/using-jobs/running-jobs-in-a-container'
+    label: 'GitHub Docs: Running jobs in a container'
