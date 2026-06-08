@@ -1,0 +1,98 @@
+id: silent-failures-159
+title: 'github.action_path expression returns host path inside container job — scripts fail with "No such file or directory"'
+category: silent-failures
+severity: silent-failure
+tags:
+  - composite-action
+  - container
+  - github-action-path
+  - host-path
+  - container-path
+  - path-mismatch
+patterns:
+  - regex: '\$\{\{\s*github\.action_path\s*\}\}'
+    flags: 'i'
+  - regex: 'No such file or directory.*github_action_path|github\.action_path.*No such file'
+    flags: 'i'
+  - regex: '/home/runner/work/.*action_path.*container'
+    flags: 'i'
+error_messages:
+  - 'No such file or directory'
+  - '/home/runner/work/_actions/...: No such file or directory'
+  - 'bash: line 1: /home/runner/work/_actions/.../run.sh: No such file or directory'
+root_cause: |
+  When a composite action uses `${{ github.action_path }}` in a `run:` step and the job
+  runs inside a container, the expression resolves to the **host runner filesystem path**
+  (e.g. `/home/runner/work/_actions/owner/action/v1`) rather than the container-mapped
+  path (e.g. `/__w/_actions/owner/action/v1`).
+
+  The runner evaluates `github.action_path` before launching the container process, so
+  the resolved value is the host filesystem location. Inside the container, the host
+  filesystem is bind-mounted under `/__w/` instead of `/home/runner/work/`, so any
+  script or file referenced via the expression path does not exist at the resolved path
+  from inside the container.
+
+  The failure is silent from the action step itself — the expression substitution
+  succeeds with no warning, and only the downstream `run:` command fails when the
+  shell tries to execute the non-existent path.
+
+  This affects composite actions called from jobs using `container:` or
+  `jobs.<job_id>.container`, including both Docker images and ARC
+  (Actions Runner Controller) Kubernetes-mode runners.
+
+  Tracked upstream: actions/runner#2185 (opened Oct 2022, still open Nov 2024, 21
+  reactions). A PR to fix the issue (#2517) was merged but a feature flag governs
+  the new behavior; as of late 2024 the fix is not universally applied.
+fix: |
+  Replace `${{ github.action_path }}` in `run:` steps with the environment variable
+  `$GITHUB_ACTION_PATH`. Environment variables are translated to container-mapped paths
+  by the runner before being injected into the container, so `$GITHUB_ACTION_PATH`
+  resolves correctly regardless of whether the job is running in a container.
+
+  Do NOT use the expression form inside `run:` steps in composite actions that may be
+  called from container jobs. Reserve expressions for `env:` or `with:` where the
+  container-path translation is applied.
+fix_code:
+  - language: yaml
+    label: 'Wrong — expression in run: resolves to host path'
+    code: |
+      runs:
+        using: composite
+        steps:
+          - name: Run script
+            shell: bash
+            run: ${{ github.action_path }}/scripts/setup.sh
+  - language: yaml
+    label: 'Correct — use $GITHUB_ACTION_PATH env var (container-safe)'
+    code: |
+      runs:
+        using: composite
+        steps:
+          - name: Run script
+            shell: bash
+            run: $GITHUB_ACTION_PATH/scripts/setup.sh
+  - language: yaml
+    label: 'Alternative — expose via env: if you need it as a variable'
+    code: |
+      runs:
+        using: composite
+        steps:
+          - name: Run script
+            shell: bash
+            env:
+              ACTION_DIR: ${{ github.action_path }}
+            run: |
+              # $ACTION_DIR is set by the runner before container launch — container-safe
+              "$ACTION_DIR/scripts/setup.sh"
+prevention:
+  - 'Use $GITHUB_ACTION_PATH (env var) instead of ${{ github.action_path }} (expression) in all run: steps within composite actions.'
+  - 'Audit composite actions that ship scripts and call them via the expression form — switch to the env-var form before adding container: to any job that calls these actions.'
+  - 'Test composite actions from a job with a container: image to catch path-mismatch failures before merging.'
+  - 'When using ARC (Actions Runner Controller) in Kubernetes mode, all steps run inside containers — this issue affects all ARC-based composite action usage.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/2185'
+    label: 'actions/runner#2185 — github.action_path contains wrong path inside container'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#github-context'
+    label: 'GitHub Actions contexts — github.action_path'
+  - url: 'https://docs.github.com/en/actions/sharing-automations/creating-actions/metadata-syntax-for-github-actions#environment-variables'
+    label: 'Composite action environment variables — GITHUB_ACTION_PATH'

@@ -1,0 +1,116 @@
+id: silent-failures-161
+title: 'github.action_repository and github.action_ref are always empty in composite action run: steps'
+category: silent-failures
+severity: silent-failure
+tags:
+  - composite-action
+  - github-action-ref
+  - github-action-repository
+  - empty-context
+  - action-metadata
+  - run-step
+patterns:
+  - regex: '\$\{\{\s*github\.action_ref\s*\}\}'
+    flags: 'i'
+  - regex: '\$\{\{\s*github\.action_repository\s*\}\}'
+    flags: 'i'
+  - regex: 'github\.action_ref.*empty|github\.action_repository.*empty'
+    flags: 'i'
+error_messages:
+  - 'github.action_ref is empty'
+  - 'github.action_repository is empty'
+root_cause: |
+  In composite actions, `${{ github.action_ref }}` and `${{ github.action_repository }}`
+  evaluate to **empty string** when used directly inside `run:` step expressions or in
+  the `run:` block body.
+
+  The runner populates `github.action_ref` and `github.action_repository` in the `env:`
+  context before executing a step, but these values are NOT injected into the `run:`
+  expression evaluation context for composite action steps. The runner only fills
+  these fields for `uses:` steps (Node.js and Docker actions) that reference external
+  actions — for the `run:` directive within a composite action, the fields remain empty.
+
+  This means any logic that uses these values to detect the action's version or
+  repository (e.g. to show an upgrade reminder, select a behavior branch, or construct
+  a download URL) silently receives an empty string instead of the actual ref/repo.
+
+  Compounding the issue: when `github.action_ref` is empty, `github.repository ==
+  github.action_repository` is always `false`, and any branch/version-conditional logic
+  silently falls through to the wrong branch.
+
+  Workaround using `env:` section DOES work because environment variable values are
+  resolved before the container/shell step executes, and the runner CAN populate the env
+  values correctly when the composite action is invoked externally (non-locally). For
+  local composite actions called via `uses: ./.github/actions/...`, the ref will always
+  be empty because local calls have no external ref.
+
+  Tracked upstream: actions/runner#2473 (opened Mar 2023, 13 reactions, still open
+  Apr 2026). GitHub Actions Engineering confirmed the behavior is "nuanced" and is
+  considering making `action_ref` reflect the most-nested composite action.
+fix: |
+  Pass `github.action_ref` and `github.action_repository` through the `env:` section
+  of the step, or define them as `inputs:` with `default:` values. Both approaches
+  work because the runner resolves these values before launching the shell process.
+
+  For local composite actions (called via `uses: ./.github/actions/...`), `action_ref`
+  will always be empty regardless — there is no external ref for local calls.
+fix_code:
+  - language: yaml
+    label: 'Wrong — expression in run: block returns empty string'
+    code: |
+      runs:
+        using: composite
+        steps:
+          - name: Show version
+            shell: bash
+            run: |
+              # github.action_ref is always empty here
+              echo "Running action version: ${{ github.action_ref }}"
+              echo "Action repo: ${{ github.action_repository }}"
+  - language: yaml
+    label: 'Correct — pass via env: section (resolved before shell launch)'
+    code: |
+      runs:
+        using: composite
+        steps:
+          - name: Show version
+            shell: bash
+            env:
+              ACTION_REF: ${{ github.action_ref }}
+              ACTION_REPOSITORY: ${{ github.action_repository }}
+            run: |
+              echo "Running action version: $ACTION_REF"
+              echo "Action repo: $ACTION_REPOSITORY"
+  - language: yaml
+    label: 'Alternative — capture via inputs with default values'
+    code: |
+      # In action.yml — define inputs that self-populate
+      inputs:
+        _action_ref:
+          description: Internal — auto-populated action ref
+          default: ${{ github.action_ref }}
+        _action_repository:
+          description: Internal — auto-populated action repository
+          default: ${{ github.action_repository }}
+      runs:
+        using: composite
+        steps:
+          - name: Check for upgrade
+            shell: bash
+            run: |
+              echo "Action ref: ${{ inputs._action_ref }}"
+              if [ "${{ inputs._action_ref }}" != "v2" ]; then
+                echo "::warning::Please upgrade to v2"
+              fi
+prevention:
+  - 'Never use ${{ github.action_ref }} or ${{ github.action_repository }} directly in run: blocks within composite actions — they will always be empty.'
+  - 'Use env: section variables or inputs with default: ${{ github.action_ref }} to safely capture these values.'
+  - 'For local composite actions (uses: ./.github/actions/...), action_ref is always empty by design — use a different mechanism for version detection in test workflows.'
+  - 'When nesting composite actions, be aware that action_ref reflects the outermost action call, not the innermost — pass action_ref as an input with default if each level needs its own ref.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/2473'
+    label: 'actions/runner#2473 — github.action_repository and github.action_ref are empty in run for composite actions'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#github-context'
+    label: 'GitHub Actions contexts — github.action_ref, github.action_repository'
+  - url: 'https://docs.github.com/en/actions/sharing-automations/creating-actions/metadata-syntax-for-github-actions#runs-for-composite-actions'
+    label: 'Metadata syntax for composite actions'
