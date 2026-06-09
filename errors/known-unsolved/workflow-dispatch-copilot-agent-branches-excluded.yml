@@ -1,0 +1,120 @@
+id: known-unsolved-108
+title: 'workflow_dispatch Branch Selector Excludes GitHub Copilot Agent Branches —
+  Cannot Trigger Workflow Manually'
+category: known-unsolved
+severity: limitation
+tags:
+  - workflow-dispatch
+  - copilot
+  - copilot-agent
+  - branch-selector
+  - ui
+  - manual-trigger
+  - branch-visibility
+patterns:
+  - regex: 'copilot[/_-][a-f0-9]{8,}'
+    flags: 'i'
+  - regex: 'refs/heads/copilot/'
+    flags: 'i'
+error_messages:
+  - "No branches matching 'copilot/' found in the workflow_dispatch branch selector"
+  - "(Copilot branch not listed in Actions > Run workflow branch dropdown)"
+root_cause: |
+  GitHub Copilot Workspace and GitHub Copilot coding agent create branches with the
+  pattern `copilot/<task-id>` (e.g., `copilot/fix-abc123-d456ef`). These branches
+  are used by the agent to push code changes and open pull requests.
+
+  When a repository has a `workflow_dispatch` workflow, the GitHub Actions UI shows
+  a "Run workflow" button with a branch selector dropdown. GitHub intentionally
+  excludes all `copilot/*` branches from this dropdown — they are not surfaced as
+  targetable branches for manual workflow dispatch in the web interface.
+
+  The exclusion appears to be a deliberate platform decision to avoid users
+  accidentally running production workflows against temporary agent branches,
+  but it blocks legitimate use cases such as:
+  - Running a CI workflow against an agent branch before approving the PR
+  - Triggering a deployment-dry-run workflow targeting the agent's code
+  - Running integration tests on the agent's proposed changes without merging
+
+  The `gh workflow run` CLI and the REST API (`POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches`)
+  also appear to silently drop or refuse `workflow_dispatch` events targeting
+  `copilot/*` branches in some configurations. The runner itself does not log
+  an error — the job simply does not appear in the Actions run list.
+
+  This behaviour was confirmed on `actions/runner` v2.329.x–v2.334.x and GitHub
+  SaaS as of early 2026. It may be subject to change as GitHub's Copilot agent
+  feature matures.
+fix: |
+  There is no supported workaround that allows `workflow_dispatch` from the UI to
+  target a `copilot/*` branch directly.
+
+  **Alternatives:**
+
+  1. **Use `pull_request` or `push` triggers** — the Copilot agent opens a PR
+     targeting the default branch; configure CI to run on that PR automatically
+     instead of relying on manual dispatch.
+
+  2. **Approve the automated CI run** — when the agent pushes to its branch,
+     any workflows triggered by `push` or `pull_request` from forks/agents
+     will queue and wait for your approval (if fork/first-time contributor rules
+     apply). Approve from the "Actions" tab without needing to manually dispatch.
+
+  3. **Use the GitHub CLI to dispatch against the branch** — the `gh` CLI bypasses
+     the UI dropdown, but note that the API may still reject copilot branches in
+     some orgs/repos:
+     ```bash
+     gh workflow run <workflow-file> --ref copilot/<branch-suffix>
+     ```
+
+  4. **Create a temporary branch from the copilot branch** — check out the copilot
+     branch locally, create a regular branch from it with a non-copilot name, push
+     it, and dispatch from that branch:
+     ```bash
+     git checkout copilot/<branch-suffix>
+     git checkout -b ci/test-copilot-<branch-suffix>
+     git push origin ci/test-copilot-<branch-suffix>
+     # Now 'ci/test-copilot-...' appears in the Run workflow dropdown
+     ```
+fix_code:
+  - language: yaml
+    label: 'Use push trigger on copilot/** pattern to auto-run CI without manual dispatch'
+    code: |
+      name: CI
+
+      on:
+        push:
+          branches:
+            - main
+            - 'feature/**'
+            - 'copilot/**'   # <-- explicitly include copilot agent branches
+        pull_request:
+          branches: [main]
+        workflow_dispatch:   # still works for non-copilot branches via UI
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./run-tests.sh
+  - language: bash
+    label: 'Trigger dispatch from CLI (may work where UI does not)'
+    code: |
+      # Replace <workflow-file> and <branch-suffix> with actual values
+      gh workflow run ci.yml --ref "copilot/fix-123-abc456ef" --repo owner/repo
+prevention:
+  - 'Configure `push` triggers on `copilot/**` branches so CI runs automatically
+    when the agent pushes, eliminating the need for manual dispatch.'
+  - 'Use `pull_request` events triggered by the agent''s auto-opened PR as your
+    primary CI gate, rather than relying on `workflow_dispatch`.'
+  - 'Follow the GitHub public roadmap for Copilot Workspace / Copilot coding agent
+    feature updates — `workflow_dispatch` support for agent branches may be added
+    in future platform releases.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4246'
+    label: 'actions/runner#4246 — Cannot trigger workflows manually targeting a copilot
+      agent branch (Feb 2026)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_dispatch'
+    label: 'GitHub Docs — workflow_dispatch event'
+  - url: 'https://docs.github.com/en/copilot/using-github-copilot/coding-agent/about-github-copilots-coding-agent'
+    label: 'GitHub Docs — About GitHub Copilot coding agent'

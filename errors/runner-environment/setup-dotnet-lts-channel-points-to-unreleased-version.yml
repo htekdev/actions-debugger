@@ -1,0 +1,115 @@
+id: runner-environment-390
+title: 'setup-dotnet LTS Channel aka.ms Redirect Points to Unreleased Patch Version —
+  404 at Patch Cycle Boundary'
+category: runner-environment
+severity: error
+tags:
+  - dotnet
+  - setup-dotnet
+  - lts
+  - aka-ms
+  - version-not-found
+  - install-scripts
+  - 404
+  - patch-cycle
+patterns:
+  - regex: 'dotnet-install: The resource at aka\.ms link.*is not available'
+    flags: 'i'
+  - regex: 'dotnet_install: Error: Could not find \.NET Core (SDK|Runtime) with version
+      = \d+\.\d+\.\d+'
+    flags: 'i'
+  - regex: 'curl: \(22\) The requested URL returned error: 404.*builds\.dotnet\.microsoft\.com'
+    flags: 'i'
+  - regex: 'Failed to install dotnet.*exit code: 1.*dotnet_install: Error: Could not
+      find'
+    flags: 'i'
+error_messages:
+  - "dotnet-install: Attempting to download using aka.ms link https://builds.dotnet.microsoft.com/dotnet/Sdk/10.0.201/dotnet-sdk-10.0.201-linux-x64.tar.gz"
+  - "curl: (22) The requested URL returned error: 404 Not Found"
+  - "dotnet-install: The resource at aka.ms link 'https://builds.dotnet.microsoft.com/dotnet/Sdk/10.0.201/dotnet-sdk-10.0.201-linux-x64.tar.gz' is not available."
+  - "dotnet_install: Error: Could not find `.NET Core SDK` with version = 10.0.201"
+  - "Error: Failed to install dotnet, exit code: 1. dotnet_install: Error: Could not find `.NET Core SDK` with version = 10.0.201"
+  - "Warning: Failed to install dotnet runtime + cli, exit code: 1. dotnet_install: Error: Could not find `.NET Core Runtime` with version = 10.0.5"
+root_cause: |
+  The `actions/setup-dotnet` action resolves `dotnet-version: '10.0.x'` (or any
+  `x.y.x` wildcard against an active LTS channel) by consulting the official
+  `install-dotnet.sh` script, which follows aka.ms redirect URLs to locate the
+  current LTS build.
+
+  At the boundary of each .NET patch release cycle, the install-scripts repository
+  updates the aka.ms redirects for `LTS` to point to the **next** patch version
+  (e.g., 10.0.5 / 10.0.201) **before** the build artifacts have been published
+  to `builds.dotnet.microsoft.com`. The result: every `dotnet-version: 'x.y.x'`
+  wildcard for the affected channel returns a 404 until the new build is live —
+  typically a window of minutes to hours.
+
+  Observed reproducibly in March 2026 (10.0.5 / 10.0.201 affected all LTS users),
+  confirmed with `actions/setup-dotnet@v4` and `@v5` on ubuntu-latest, self-hosted
+  Linux, and GitHub-hosted runners. The issue reappears at each patch release cycle
+  whenever the install-scripts pointer races ahead of the CDN publication.
+
+  The fix is in the `dotnet/install-scripts` repository (the pointer must not be
+  advanced until artifacts are fully available). As a user, the issue self-resolves
+  when the build is published, usually within hours.
+fix: |
+  **Immediate mitigations:**
+
+  1. **Pin to a specific released version** instead of using the `x.y.x` wildcard:
+     ```yaml
+     - uses: actions/setup-dotnet@v4
+       with:
+         dotnet-version: '10.0.4'   # known-good version
+     ```
+
+  2. **Re-run the failed workflow.** The pointer race is short-lived; the workflow
+     usually succeeds on retry after the CDN is updated (typically within hours).
+
+  3. **Use `quality: ga` channel with caching** to avoid the install-scripts
+     resolution path entirely by ensuring a cached copy is available.
+
+  4. **Monitor `dotnet/install-scripts`** for the latest pointer fix and upgrade
+     `actions/setup-dotnet` to the patched version once it merges.
+fix_code:
+  - language: yaml
+    label: 'Pin to a specific known-good patch version'
+    code: |
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          # Pin to last known-good version instead of '10.0.x' until patch cycle stabilises
+          dotnet-version: '10.0.4'
+  - language: yaml
+    label: 'Use the dotnet-version-file approach to avoid wildcard resolution'
+    code: |
+      # global.json in repo root:
+      # {
+      #   "sdk": { "version": "10.0.200", "rollForward": "latestPatch" }
+      # }
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          # Reads version from global.json — uses rollForward to pick latest patch
+          dotnet-version-file: 'global.json'
+prevention:
+  - 'Avoid bare `x.y.x` wildcards (e.g. `10.0.x`) in workflows that must succeed
+    immediately; pin to a specific version and use Dependabot or Renovate to keep
+    it current.'
+  - 'Consider using `dotnet-version-file: global.json` with `"rollForward": "latestPatch"`;
+    it resolves at build-time via the tool-cache rather than following live aka.ms
+    redirects.'
+  - 'Add a retry step or a workflow-level `on-failure` notification so transient
+    CDN races do not silently block your pipeline for hours unnoticed.'
+  - 'Follow `dotnet/install-scripts` releases to get early warning of pointer updates
+    at upcoming patch cycle boundaries.'
+docs:
+  - url: 'https://github.com/actions/setup-dotnet/issues/711'
+    label: 'actions/setup-dotnet#711 — dotnet-version: 10.0.x tries to download non-existent
+      version 10.0.5 (Mar 2026)'
+  - url: 'https://github.com/actions/setup-dotnet/issues/712'
+    label: 'actions/setup-dotnet#712 — Failure to setup 10.0.x on linux runner (Mar
+      2026)'
+  - url: 'https://github.com/dotnet/install-scripts'
+    label: 'dotnet/install-scripts — the install.sh LTS pointer that triggers this
+      race'
+  - url: 'https://docs.github.com/en/actions/use-cases-and-examples/building-and-testing/building-and-testing-net'
+    label: 'GitHub Docs — Building and testing .NET with GitHub Actions'
