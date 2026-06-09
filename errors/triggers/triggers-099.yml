@@ -1,0 +1,123 @@
+id: triggers-099
+title: 'workflow_call Reusable Workflow Boolean Inputs Always Received as String — if: inputs.flag == false Never Matches'
+category: triggers
+severity: silent-failure
+tags:
+  - workflow-call
+  - reusable-workflow
+  - inputs
+  - boolean
+  - type-coercion
+  - expression
+patterns:
+  - regex: 'inputs\.[a-zA-Z_][a-zA-Z0-9_]*\s*==\s*false'
+    flags: 'i'
+  - regex: 'inputs\.[a-zA-Z_][a-zA-Z0-9_]*\s*==\s*true'
+    flags: 'i'
+  - regex: 'fromJSON\(inputs\.'
+    flags: 'i'
+error_messages:
+  - "Step skipped unexpectedly — if: ${{ inputs.enabled == false }} evaluated to false when input was passed as false"
+  - "Step always runs — if: ${{ inputs.skip }} is always truthy because inputs.skip is string 'false'"
+  - "Condition never satisfied — inputs.deploy == true returns false even when caller passes true"
+root_cause: |
+  Even when a reusable workflow declares an input with `type: boolean`, the value is
+  delivered to the called workflow as a string ("true" or "false") at runtime.
+  GitHub Actions serializes all workflow inputs as JSON strings in the event payload
+  before passing them to the runner expression engine.
+
+  As a result, boolean comparisons behave unexpectedly in the called workflow:
+  - `if: ${{ inputs.flag == false }}` — NEVER matches because `"false" != false`
+    (string "false" does not equal boolean false in GitHub expression language)
+  - `if: ${{ inputs.flag }}` — ALWAYS truthy even when flag was passed as false,
+    because a non-empty string is always truthy in GitHub expressions
+  - `if: ${{ inputs.flag == true }}` — NEVER matches because `"true" != true`
+
+  This affects both `workflow_dispatch` (covered in triggers-016) AND `workflow_call`
+  (reusable workflows). In workflow_call, the `type: boolean` annotation in the called
+  workflow's `on.workflow_call.inputs` block controls how callers must pass the value but
+  does NOT cause the runner to deliver actual boolean values at expression-evaluation time.
+
+  The `type: boolean` declaration only affects:
+  - The GitHub UI (checkbox vs text field for workflow_dispatch inputs)
+  - Static analysis tools like actionlint
+  It does NOT change how the value is represented in the expression runtime.
+
+  Callers may pass `true` as a YAML boolean, a JSON boolean, or the string "true" — all
+  result in the callee receiving the string "true".
+fix: |
+  Compare workflow_call inputs against the STRING values 'true' and 'false' instead of
+  boolean literals, or use fromJSON() to coerce the string to a JSON boolean.
+
+  Option 1 — String comparison (simplest and most readable):
+    if: ${{ inputs.flag == 'true' }}
+    if: ${{ inputs.flag != 'true' }}    # equivalent to flag == false
+
+  Option 2 — fromJSON() coercion (allows == true / == false comparisons):
+    if: ${{ fromJSON(inputs.flag) == true }}
+    if: ${{ fromJSON(inputs.flag) == false }}
+
+  Option 3 — Treat the input as a string throughout and never use boolean operators:
+    if: ${{ inputs.flag == 'true' }}    # explicit string match
+fix_code:
+  - language: yaml
+    label: 'Reusable workflow with boolean input — correct string comparison pattern'
+    code: |
+      # called-workflow.yml (reusable workflow)
+      on:
+        workflow_call:
+          inputs:
+            deploy:
+              type: boolean
+              required: true
+              description: 'Set true to deploy, false to skip deployment'
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Deploy (runs when deploy is true)
+              # WRONG — inputs.deploy is string "true"/"false", not boolean
+              # if: ${{ inputs.deploy == true }}
+
+              # CORRECT — compare against string literal 'true'
+              if: ${{ inputs.deploy == 'true' }}
+              run: echo "Deploying to production..."
+
+            - name: Skip notice (runs when deploy is false)
+              # CORRECT — inverse string check
+              if: ${{ inputs.deploy != 'true' }}
+              run: echo "Deploy skipped"
+  - language: yaml
+    label: 'Caller passing boolean — and fromJSON workaround in callee'
+    code: |
+      # caller-workflow.yml
+      jobs:
+        call-reusable:
+          uses: ./.github/workflows/called-workflow.yml
+          with:
+            # Caller passes YAML boolean — callee receives string "true" or "false"
+            deploy: ${{ github.ref == 'refs/heads/main' }}
+
+      # In called-workflow.yml — using fromJSON for == false comparison:
+      # steps:
+      #   - name: Skip on false
+      #     if: ${{ fromJSON(inputs.deploy) == false }}
+      #     run: echo "deploy was false"
+prevention:
+  - "Never use == true or == false to compare workflow_call or workflow_dispatch inputs — always compare against the string 'true' or 'false'."
+  - "Use fromJSON(inputs.boolInput) when you need a real boolean for complex expressions or matrix include/exclude configurations."
+  - "Add a comment in called workflow YAML noting that boolean inputs are received as strings despite the type: boolean declaration."
+  - "Run actionlint in CI to detect boolean comparison anti-patterns before they cause silent logic errors."
+  - "Document the required string comparison pattern in your reusable workflow's README or inputs description field."
+docs:
+  - url: 'https://github.com/actions/runner/issues/1483'
+    label: 'actions/runner#1483 — Boolean inputs are not actually booleans (213 reactions)'
+  - url: 'https://github.com/orgs/community/discussions/9343'
+    label: 'GitHub Community: Boolean inputs in reusable workflows and string coercion'
+  - url: 'https://stackoverflow.com/questions/74074371/boolean-input-not-passed-correctly-to-reusable-workflow'
+    label: 'Stack Overflow: Boolean input not passed correctly to reusable workflow'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/passing-information-between-jobs'
+    label: 'GitHub Docs: Passing information between jobs'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#onworkflow_callinputs'
+    label: 'GitHub Docs: on.workflow_call.inputs syntax'
