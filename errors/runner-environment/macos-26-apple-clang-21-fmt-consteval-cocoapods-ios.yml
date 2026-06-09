@@ -1,0 +1,103 @@
+id: runner-environment-360
+title: 'macOS 26 Apple Clang 21 rejects fmt consteval in CocoaPods iOS builds'
+category: runner-environment
+severity: error
+tags:
+  - macos-26
+  - macos-latest
+  - apple-clang
+  - clang-21
+  - xcode-26
+  - ios-ci
+  - cocoapods
+  - react-native
+  - fmt
+  - consteval
+  - cpp
+patterns:
+  - regex: 'call to consteval function.*is not a constant expression'
+    flags: 'i'
+  - regex: 'fmt::basic_format_string.*consteval|FMT_STRING.*not a constant expression'
+    flags: 'i'
+  - regex: 'error:.*FMT_COMPILE_STRING.*not a constant expression'
+    flags: 'i'
+error_messages:
+  - "error: call to consteval function 'fmt::basic_format_string<char, ...>::basic_format_string<FMT_COMPILE_STRING, 0>' is not a constant expression"
+  - "note: 'basic_format_string' is not a constant expression because it calls a non-consteval function"
+  - "fmt/include/fmt/format-inl.h:59: error in call to consteval function"
+root_cause: |
+  Apple Clang 21 (Xcode 26.4.1 on macOS 26) is significantly stricter about
+  consteval evaluation than Clang 17 (Xcode 16.4 on macOS 15).
+
+  The fmt library ≤11.0.2 — bundled in React Native's RCT-Folly CocoaPod
+  which pins `fmt = 11.0.2` — sets FMT_USE_CONSTEVAL=1 for Apple clang ≥14
+  via __apple_build_version__ detection. This enables a consteval constructor
+  in fmt::basic_format_string. Apple Clang 21 enforces that all call sites of
+  a consteval constructor must themselves be constant expressions. The
+  FMT_STRING(…) usages in format-inl.h are NOT constant expressions, so Clang
+  21 rejects them with this error at lines 59, 60, 1387, 1391, and 1394.
+
+  The fmt 12.1.0 release (late 2025) added a proper #ifdef guard allowing
+  FMT_USE_CONSTEVAL to be overridden from outside. React Native ≥0.83.9
+  ships this fix.
+
+  The macos-latest label switches to macOS 26 (Xcode 26.4.1, Clang 21)
+  starting June 15, 2026. iOS CI workflows that don't pin their macOS version
+  will hit this error when RCT-Folly / React Native pins an old fmt version.
+fix: |
+  Option 1 — Upgrade React Native to ≥0.83.9:
+    This version bumps fmt to 12.1.0 which has proper Clang 21 compatibility.
+    facebook/react-native PR #56225 implements this fix.
+
+  Option 2 — Downgrade fmt to C++17 in the Podfile:
+    In ios/Podfile, force fmt to compile in C++17 mode, which disables the
+    consteval code path via -std=c++17.
+
+  Option 3 — Pin macOS version to avoid Clang 21 temporarily:
+    runs-on: macos-15
+
+  Note: passing -DFMT_USE_CONSTEVAL=0 via compiler flags does NOT work for
+  fmt ≤11.0.2 because base.h unconditionally redefines FMT_USE_CONSTEVAL
+  through its own #if/#elif chain, overwriting any -D flag (fixed in 12.1.0).
+fix_code:
+  - language: yaml
+    label: 'Pin fmt Pod to C++17 to disable consteval code path (Podfile)'
+    code: |
+      # ios/Podfile
+      post_install do |installer|
+        installer.pods_project.targets.each do |target|
+          if target.name == 'fmt'
+            target.build_configurations.each do |config|
+              # Force C++17: disables the consteval branch in fmt ≤11.0.2
+              config.build_settings['CLANG_CXX_LANGUAGE_STANDARD'] = 'c++17'
+            end
+          end
+        end
+      end
+  - language: yaml
+    label: 'Pin macOS runner version while upgrading React Native'
+    code: |
+      jobs:
+        build-ios:
+          # Pin to macos-15 (Xcode 16.4, Clang 17) until RN ≥0.83.9 is adopted
+          runs-on: macos-15
+          steps:
+            - uses: actions/checkout@v4
+            - name: Install pods
+              run: cd ios && pod install
+            - name: Build iOS
+              run: xcodebuild build -workspace ios/App.xcworkspace ...
+prevention:
+  - "Upgrade React Native to ≥0.83.9 before the macos-latest → macos-26 transition on June 15, 2026."
+  - "Test iOS CocoaPods builds on macos-26 preview image before migration."
+  - "Monitor the React Native fmt bump PR: facebook/react-native#56225."
+  - "Avoid fmt ≤11.0.2 in new CocoaPods or manually override with fmt ≥12.1.0 in Podfile."
+docs:
+  - url: 'https://github.com/fmtlib/fmt/issues/4740'
+    label: 'fmtlib/fmt #4740: FMT_STRING consteval error with Apple clang 21 (Xcode 26.4)'
+  - url: 'https://github.com/facebook/react-native/issues/55601'
+    label: 'React Native #55601: iOS build fails on Xcode 26.4 due to fmt consteval'
+  - url: 'https://github.com/facebook/react-native/pull/56225'
+    label: 'React Native PR #56225: Bump fmt to 12.1.0 to fix Xcode 26.4 compilation'
+  - url: 'https://github.com/actions/runner-images/issues/14167'
+    label: 'macOS: macos-latest label will use macos-26 in June 2026'

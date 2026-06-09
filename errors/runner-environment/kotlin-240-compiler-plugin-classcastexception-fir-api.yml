@@ -1,0 +1,104 @@
+id: runner-environment-361
+title: 'Kotlin 2.4.0 breaks Koin and other compiler plugins via internal FIR extension API change'
+category: runner-environment
+severity: error
+tags:
+  - kotlin-240
+  - android
+  - koin
+  - compiler-plugin
+  - fir-extension
+  - kotlin-api
+  - breaking-change
+  - runner-image
+  - classcastexception
+patterns:
+  - regex: 'FirExtensionRegistrarAdapter.*cannot be cast to.*ProjectExtensionDescriptor'
+    flags: 'i'
+  - regex: 'KoinPluginComponentRegistrar.*registerExtensions|KotzillaPluginRegistrar.*registerProjectComponents'
+    flags: 'i'
+  - regex: 'IrGenerationExtension.*getExtensionPointName.*NoSuchMethodError'
+    flags: 'i'
+  - regex: "Kotlin '2\.4\.[0-9]' is above the verified ceiling"
+    flags: 'i'
+error_messages:
+  - "java.lang.ClassCastException: org.jetbrains.kotlin.fir.extensions.FirExtensionRegistrarAdapter$Companion cannot be cast to org.jetbrains.kotlin.extensions.ProjectExtensionDescriptor"
+  - "at org.koin.compiler.plugin.KoinPluginComponentRegistrar.registerExtensions"
+  - "java.lang.NoSuchMethodError: 'org.jetbrains.kotlin.com.intellij.openapi.extensions.ExtensionPointName org.jetbrains.kotlin.backend.common.extensions.IrGenerationExtension$Companion.getExtensionPointName()'"
+  - "[Kotzilla] Kotlin '2.4.0-release-281' is above the verified ceiling (2.3.x)"
+  - "Problem found: Kotlin compiler error (id: kotlin:compiler:error:compiler-error)"
+root_cause: |
+  Kotlin 2.4.0 (released June 3, 2026) changed the internal Kotlin Compiler
+  Plugin (KCP) API. Two breaking changes affect third-party compiler plugins:
+
+  1. FirExtensionRegistrarAdapter$Companion lost its legacy ProjectExtensionDescriptor
+     cast path — the Koin compiler plugin (io.insert-koin.compiler.plugin ≤1.0.0)
+     calls registerExtensions() which casts this companion object using the old
+     API, producing a ClassCastException during Kotlin compilation.
+
+  2. IrGenerationExtension$Companion.getExtensionPointName() was removed — the
+     Kotzilla plugin (io.kotzilla.kotzilla-plugin ≤2.2.0) calls this method
+     directly, producing NoSuchMethodError.
+
+  The ubuntu-24.04 runner image bumped system Kotlin from 2.3.21 to 2.4.0 in
+  the June 8, 2026 image update. Additionally, developers updating their
+  project's Kotlin version to 2.4.0 (in libs.versions.toml / build.gradle)
+  will hit this error if they use Koin annotations or similar Kotlin compiler
+  plugins that have not yet been updated for the 2.4.0 API.
+
+  Workaround in the Koin issue report: downgrading kotlin to 2.3.21 resolves
+  the error.
+fix: |
+  Option 1 — Downgrade Kotlin to 2.3.21 in your version catalog:
+    In libs.versions.toml: kotlin = "2.3.21"
+    In build.gradle.kts: kotlin("android") version "2.3.21"
+
+  Option 2 — Wait for plugin compatibility update:
+    - Koin: monitor InsertKoinIO/koin#2431 for a release of
+      io.insert-koin.compiler.plugin that supports Kotlin 2.4.x.
+    - Kotzilla: monitor for updated io.kotzilla.kotzilla-plugin.
+
+  Option 3 — Use onlyIf{} to skip plugin on Kotlin 2.4+ builds until
+    compatible plugin version ships.
+
+  Note: the ClassCastException / NoSuchMethodError will appear for ANY
+  Kotlin compiler plugin using the old FIR or IR extension registration APIs.
+  If you use other KCP-based plugins (Dagger/Hilt KSP generates via KSP not
+  KCP and is unaffected; Arrow KSP likewise unaffected).
+fix_code:
+  - language: yaml
+    label: 'Downgrade Kotlin to 2.3.21 in version catalog until plugin updates'
+    code: |
+      # libs.versions.toml — pin to last known-good Kotlin version
+      [versions]
+      kotlin = "2.3.21"   # downgraded from 2.4.0; bump after koin plugin release
+      koin = "4.2.1"
+      koinPlugin = "1.0.0"
+
+      [plugins]
+      kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+      koin-compiler = { id = "io.insert-koin.compiler.plugin", version.ref = "koinPlugin" }
+  - language: yaml
+    label: 'CI workflow — pin system Kotlin version via setup-java with Kotlin SDK'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            # If using system kotlinc, pin to 2.3.x via setup-java or
+            # use the project's own Gradle Kotlin version instead of system kotlinc
+            - name: Build with Gradle (uses project Kotlin, not system kotlinc)
+              run: ./gradlew assembleDebug
+prevention:
+  - "Before upgrading to Kotlin 2.4.0, check all Kotlin Compiler Plugin dependencies for 2.4.x compatibility."
+  - "Use KSP (Kotlin Symbol Processing) instead of KCP-based plugins where possible — KSP is unaffected by this API change."
+  - "Monitor Koin release tracker InsertKoinIO/koin#2431 for a Kotlin 2.4.0-compatible plugin release."
+  - "Test on Kotlin 2.4.0 in a separate CI branch before migrating the main branch."
+docs:
+  - url: 'https://github.com/InsertKoinIO/koin/issues/2431'
+    label: 'koin #2431: Koin compiler plugin is incompatible with Kotlin 2.4.0'
+  - url: 'https://github.com/JetBrains/kotlin/releases/tag/v2.4.0'
+    label: 'Kotlin 2.4.0 Release Notes — compiler plugin API changes'
+  - url: 'https://kotlinlang.org/docs/whatsnew24.html'
+    label: "What's new in Kotlin 2.4.0"
