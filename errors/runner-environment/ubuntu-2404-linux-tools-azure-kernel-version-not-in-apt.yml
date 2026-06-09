@@ -1,0 +1,146 @@
+id: runner-environment-376
+title: 'Ubuntu 24.04 Runners: `linux-tools-$(uname -r)` Not in apt — bpftool, perf, and eBPF Tools Fail'
+category: runner-environment
+severity: error
+tags:
+  - ubuntu
+  - ubuntu-24.04
+  - ebpf
+  - bpftool
+  - perf
+  - linux-tools
+  - azure-kernel
+  - kernel
+patterns:
+  - regex: 'bpftool not found for kernel'
+    flags: 'i'
+  - regex: 'You may need to install the following packages for this specific kernel'
+    flags: 'i'
+  - regex: 'Unable to locate package linux-tools-[0-9\.]+-[a-z0-9-]+-azure'
+    flags: 'i'
+  - regex: 'linux-tools-.*-azure.*No such file or directory'
+    flags: 'i'
+error_messages:
+  - 'WARNING: bpftool not found for kernel 6.17.0-1015'
+  - '  You may need to install the following packages for this specific kernel:'
+  - '    linux-tools-6.17.0-1015-azure'
+  - '    linux-cloud-tools-6.17.0-1015-azure'
+  - 'E: Unable to locate package linux-tools-6.17.0-1015-azure'
+root_cause: |
+  GitHub Actions ubuntu-24.04 hosted runners use an **Azure-optimized kernel**
+  (e.g., `6.17.0-1015-azure`, `6.11.0-1021-azure`). Many kernel-level tools
+  — `bpftool`, `perf`, BCC tools, and kernel probes — require kernel-specific
+  packages named `linux-tools-<version>-azure` and
+  `linux-cloud-tools-<version>-azure`.
+
+  The standard Ubuntu approach of installing `linux-tools-$(uname -r)` fails
+  on GitHub Actions runners because:
+
+  1. **Version-specific packages lag behind kernel updates**: The Ubuntu apt
+     repository often does not carry `linux-tools-<exact-kernel-version>-azure`
+     for the specific kernel version currently running in the GitHub Actions image.
+     The Azure kernel metapackage (`linux-tools-azure`) installs a DIFFERENT
+     kernel's tools (the latest available in apt), not the one actually running.
+
+  2. **The wrapper script reports a mismatch**: `/usr/sbin/bpftool` is a shell
+     wrapper that locates the actual kernel-specific binary. When the binary for
+     the running kernel is not installed, the wrapper emits:
+       WARNING: bpftool not found for kernel <version>
+     and returns a non-zero exit code.
+
+  3. **`perf` has the same issue**: `which perf` succeeds but `perf record` or
+     `perf stat` fail because the running kernel version's `perf` binary is not
+     installed.
+
+  The root cause is that GitHub Actions uses Azure-patched kernels that stay
+  ahead of what Ubuntu's main/universe apt repos provide. Once a runner image is
+  built, the apt repository may not yet carry the matching
+  `linux-tools-<kernel>-azure` package for that exact kernel.
+
+  Confirmed regression on image version `20260525.161.1` with kernel
+  `6.17.0-1015-azure` (ubuntu-24.04, June 2026).
+
+  Reference: actions/runner-images#14203 (June 2026, open)
+fix: |
+  **Option A (recommended): Install from kernel headers source**
+  Build bpftool from kernel source rather than relying on the apt package:
+    git clone https://github.com/libbpf/bpftool.git
+    cd bpftool/src && make install
+
+  **Option B: Use a Docker container for eBPF work**
+  Run the eBPF workload inside a Docker container that can install the correct
+  kernel tools independently of the host kernel version:
+    docker run --privileged --pid=host -v /sys:/sys:ro ubuntu:24.04 bash -c \
+      "apt-get install -y bpftool && bpftool prog list"
+
+  **Option C: Install via snap (for bpftool)**
+  The snap version of bpftool is kernel-independent:
+    sudo snap install bpftool
+
+  **Option D: Pin to ubuntu-22.04 if the pattern works there**
+  ubuntu-22.04 runners run an older kernel where the version-specific packages
+  may be available in apt. Confirm with `uname -r` and `apt-cache show linux-tools-$(uname -r)`.
+
+  **Option E: Gracefully handle the mismatch**
+  If you need linux-tools for perf or BCC, install the generic azure metapackage
+  and accept that it may point to a different kernel's tools. For most user-space
+  perf sampling use cases, the generic `linux-perf` package works:
+    sudo apt-get install -y linux-perf
+fix_code:
+  - language: yaml
+    label: 'Wrong — standard linux-tools pattern that fails on GitHub Actions azure kernels'
+    code: |
+      - name: Install bpftool (WRONG — version-specific package not in apt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            linux-tools-$(uname -r) \         # fails: not in apt for Azure kernels
+            linux-cloud-tools-$(uname -r) \   # fails: not in apt for Azure kernels
+            linux-tools-azure \
+            linux-tools-common
+          bpftool -V  # fails with "bpftool not found for kernel ..."
+  - language: yaml
+    label: 'Fix Option A — build bpftool from source (libbpf/bpftool)'
+    code: |
+      - name: Install bpftool from source
+        run: |
+          sudo apt-get install -y \
+            clang \
+            llvm \
+            libelf-dev \
+            libbpf-dev \
+            zlib1g-dev \
+            pkg-config \
+            libcap-dev
+          git clone --recurse-submodules https://github.com/libbpf/bpftool.git
+          cd bpftool/src
+          make
+          sudo make install
+          bpftool -V
+  - language: yaml
+    label: 'Fix Option B — use linux-perf for perf sampling (generic, kernel-independent)'
+    code: |
+      - name: Install linux-perf (generic, works regardless of kernel version)
+        run: |
+          sudo apt-get install -y linux-perf
+          perf stat echo hello
+  - language: yaml
+    label: 'Fix Option C — snap bpftool (kernel-independent)'
+    code: |
+      - name: Install bpftool via snap
+        run: |
+          sudo snap install bpftool
+          bpftool -V
+prevention:
+  - 'Avoid `linux-tools-$(uname -r)` in CI workflows on ubuntu-24.04 GitHub Actions runners — the Azure kernel version may not be in apt.'
+  - 'Use `linux-perf` (generic) instead of `linux-tools-$(uname -r)` for user-space perf sampling on GitHub Actions hosted runners.'
+  - 'Build eBPF tools from source (libbpf/bpftool) or use snap for a kernel-independent installation.'
+  - 'Check the actual running kernel with `uname -r` and verify `apt-cache show linux-tools-$(uname -r)` returns a result before relying on it in CI.'
+  - 'For privileged eBPF workflows, consider running in a Docker container where you control the kernel tools version independently.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14203'
+    label: 'runner-images#14203 — Cannot install bpftool in ubuntu-latest runner'
+  - url: 'https://github.com/libbpf/bpftool'
+    label: 'libbpf/bpftool — Build bpftool from source'
+  - url: 'https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2404-Readme.md'
+    label: 'Ubuntu 24.04 runner image — preinstalled software README'

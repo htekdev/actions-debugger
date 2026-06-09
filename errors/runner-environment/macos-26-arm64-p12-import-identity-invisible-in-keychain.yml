@@ -1,0 +1,131 @@
+id: runner-environment-375
+title: 'macOS-26-arm64: .p12 Certificate Imports Successfully but Identity Invisible in Keychain — "No local code signing identities found"'
+category: runner-environment
+severity: error
+tags:
+  - macos
+  - macos-26
+  - arm64
+  - code-signing
+  - keychain
+  - certificate
+  - ios
+  - fastlane
+  - p12
+patterns:
+  - regex: 'There are no local code signing identities found'
+    flags: 'i'
+  - regex: 'No valid code signing certificates were found'
+    flags: 'i'
+  - regex: '1 key imported.*no.*identit'
+    flags: 'is'
+  - regex: 'security find-identity.*0 valid identities found'
+    flags: 'i'
+error_messages:
+  - 'ERROR: There are no local code signing identities found.'
+  - 'You can run `security find-identity -v -p codesigning /Users/runner/Library/Keychains/<keychain>-db` to get this output.'
+  - 'No valid code signing certificates were found'
+  - '0 valid identities found'
+  - '1 key imported.'
+root_cause: |
+  On `macos-26` (arm64) runner images, a regression introduced around the
+  `macos-26-arm64@20260402.0322` image causes `.p12` certificate imports to silently
+  fail to register in the Keychain identity store, even though the `security import`
+  command reports success ("1 key imported").
+
+  The sequence that breaks:
+  1. `security create-keychain -p "" build.keychain` — creates a temporary Keychain
+  2. `security import cert.p12 -k ~/Library/Keychains/build.keychain-db -P "$PASSWORD" -T /usr/bin/codesign` — reports "1 key imported" (exit 0)
+  3. `security find-identity -v -p codesigning ~/Library/Keychains/build.keychain-db` — reports "0 valid identities found"
+
+  Root cause is attributed to changes in how macOS 26 arm64 Keychain trust settings
+  interact with p12 certificate imports. Specifically, the `-T /usr/bin/codesign`
+  trust flag is imported correctly, but a missing `security set-key-partition-list`
+  step (granting partition list access) prevents the identity from appearing as valid
+  when queried by `security find-identity -v -p codesigning`. The Secure Enclave
+  access model changed between macOS 15 and macOS 26 on Apple Silicon, requiring
+  the additional partition list grant that was not needed on Intel or macOS 15 ARM.
+
+  Fastlane `match` with `readonly: true` is particularly affected because it skips
+  the partition list grant step that manual workflows typically include.
+
+  References:
+  - actions/runner-images#13884 (April 2026, open): regression confirmed in
+    `macos-26-arm64@20260402.0322`; reverting to `macos-15` resolves the issue
+  - tauri-apps/tauri-action#941: similar codesign hang on macOS Actions
+  - actions/runner#3407: self-hosted macOS runner code-signing step fails as service
+fix: |
+  Add an explicit `security set-key-partition-list` step immediately after the
+  `security import` command. This grants the partition list that allows
+  codesign and other tools to access the imported key on macOS 26 arm64.
+
+  **Option A (recommended): Add partition list grant step**
+  After importing the p12, run:
+    security set-key-partition-list \
+      -S "apple-tool:,apple:,codesign:" \
+      -s -k "" build.keychain
+
+  **Option B: Pin to macos-15 label**
+  If code signing is the only blocker, temporarily target `macos-15` until
+  the runner-images regression is resolved in a newer macOS 26 image version.
+
+  **Option C: Use apple-actions/import-codesign-certs@v3+**
+  The `apple-actions/import-codesign-certs` action handles the partition list
+  grant automatically. Ensure you are on v3 or newer which includes the
+  `set-key-partition-list` call internally.
+fix_code:
+  - language: yaml
+    label: 'Add partition list grant after p12 import (fixes macOS 26 arm64)'
+    code: |
+      - name: Import distribution certificate
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain"
+          security create-keychain -p "" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "" "$KEYCHAIN_PATH"
+          # Import the certificate
+          security import "$CERTIFICATE_PATH" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          # REQUIRED on macOS 26 arm64: grant partition list access
+          # Without this, `security find-identity -v -p codesigning` returns 0 identities
+          security set-key-partition-list \
+            -S "apple-tool:,apple:,codesign:" \
+            -s -k "" "$KEYCHAIN_PATH"
+          # Add to search list
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          # Verify the identity is visible
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+        env:
+          CERTIFICATE_PATH: ${{ steps.certificate.outputs.path }}
+          CERTIFICATE_PASSWORD: ${{ secrets.CERTIFICATE_PASSWORD }}
+  - language: yaml
+    label: 'Fallback: pin to macos-15 while regression is unresolved'
+    code: |
+      jobs:
+        ios-build:
+          # Use macos-15 until macos-26-arm64 p12 identity issue is resolved
+          runs-on: macos-15
+          steps:
+            - uses: actions/checkout@v4
+            - name: Install certificates via apple-actions (handles partition list automatically)
+              uses: apple-actions/import-codesign-certs@v3
+              with:
+                p12-file-base64: ${{ secrets.CERTIFICATES_P12 }}
+                p12-password: ${{ secrets.CERTIFICATES_P12_PASSWORD }}
+prevention:
+  - 'Always call `security set-key-partition-list -S "apple-tool:,apple:,codesign:" -s -k "" <keychain>` after `security import` on macOS 26 arm64 runners.'
+  - 'Verify the identity is visible immediately after import: `security find-identity -v -p codesigning <keychain>` should return 1 or more valid identities.'
+  - 'Use `apple-actions/import-codesign-certs@v3` or later which includes the partition list grant step and handles macOS version differences.'
+  - 'Test code-signing steps on the target macOS runner image version before relying on them in production CI pipelines.'
+  - 'If using Fastlane `match`, ensure the Matchfile or Fastfile includes `setup_keychain: true` and that keychain access grants are applied after certificate import.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/13884'
+    label: 'runner-images#13884 — macos-26-arm64@20260402.0322 breaks .p12 certificate import / code signing for iOS builds'
+  - url: 'https://github.com/tauri-apps/tauri-action/issues/941'
+    label: 'tauri-action#941 — GitHub Action gets stuck running codesign on macOS'
+  - url: 'https://github.com/actions/runner/issues/3407'
+    label: 'actions/runner#3407 — Self-hosted macOS runner code-signing step fails as service'
+  - url: 'https://developer.apple.com/documentation/security/keychain_services/keychain_items/sharing_access_to_keychain_items_among_a_collection_of_apps'
+    label: 'Apple Docs — Sharing Access to Keychain Items (partition list)'
