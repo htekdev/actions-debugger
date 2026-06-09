@@ -1,0 +1,155 @@
+id: silent-failures-173
+title: '`actions/cache` saves cache from `pull_request_target` fork branch — silent cache poisoning'
+category: silent-failures
+severity: silent-failure
+tags:
+  - cache
+  - pull_request_target
+  - fork
+  - security
+  - cache-poisoning
+  - supply-chain
+patterns:
+  - regex: 'Cache saved successfully|cache saved|Saved cache'
+    flags: 'i'
+  - regex: 'pull_request_target.*cache|cache.*pull_request_target'
+    flags: 'is'
+error_messages:
+  - 'Cache saved successfully.'
+  - 'Cache restored successfully from key: ...'
+  - '##[warning]Cache save skipped as no changes were detected'
+root_cause: |
+  `actions/cache` and `actions/setup-*` caching (Node, Python, Go, Java, etc.) save
+  the post-job cache in a post-step that runs AFTER the workflow completes. When a
+  workflow runs on the `pull_request_target` trigger, it executes in the context of
+  the **base repository** with full secrets access — but it checks out and builds code
+  from the **fork's HEAD**.
+
+  If the workflow uses `actions/checkout` with `ref: ${{ github.event.pull_request.head.sha }}`
+  (the fork's code) and then installs dependencies, the dependency tree built from
+  the forked code is written to the shared cache under the base repository's cache
+  namespace. A subsequent workflow run in the base repo that hits the same cache key
+  will restore the **attacker-controlled** dependency cache.
+
+  This is a cache poisoning attack vector. On May 12, 2026, a real npm package cache
+  poisoning attack used exactly this `pull_request_target` workflow pattern (TanStack
+  Router, cache#1756). The attack succeeded because the cache write appeared as a
+  normal "Cache saved successfully" log line — there is no warning that the cache
+  was written from untrusted fork code.
+
+  Affected patterns:
+  - Workflows that use `on: pull_request_target` AND `actions/cache` or any
+    `actions/setup-*` action with `cache:` enabled
+  - Workflows that use `on: pull_request_target` AND check out fork code before
+    building/installing dependencies
+  - The issue is silent: the workflow log shows normal cache save messages with
+    no indication that the cached content originated from untrusted fork code
+
+  This affects all `actions/setup-*` variants that enable caching:
+  `actions/setup-node`, `actions/setup-python`, `actions/setup-java`,
+  `actions/setup-go`, `gradle/actions`, `ruby/setup-ruby`, etc.
+fix: |
+  **Option A (recommended): Do not check out or build fork code in `pull_request_target`.**
+
+  Run the build/install step in a separate `pull_request` workflow (without write
+  access). Only run privileged operations in `pull_request_target` after the PR
+  has been reviewed. Do NOT check out `github.event.pull_request.head.sha` in the
+  privileged workflow.
+
+  **Option B: Disable caching in `pull_request_target` workflows.**
+
+  If you must run `pull_request_target` and check out fork code, disable all caching
+  in that workflow:
+  - `actions/cache`: remove entirely or use `actions/cache/restore` (read-only, no save)
+  - `actions/setup-node`: set `cache: ''` (omit the cache input)
+  - `actions/setup-python`: set `cache: ''`
+  - `actions/setup-go`: set `cache: false`
+
+  **Option C: Use cache isolation per PR.**
+
+  Scope the cache key to the PR number or the fork's SHA so it never overlaps with
+  the base branch cache. This prevents poisoning the shared cache but does not
+  prevent a fork from writing its own cached entries.
+
+  **Security baseline**: Any `pull_request_target` workflow that checks out fork code
+  should be treated as equivalent to allowing arbitrary code execution with base-repo
+  secrets. The standard recommendation is to NEVER check out fork code in
+  `pull_request_target`.
+fix_code:
+  - language: yaml
+    label: 'Broken: pull_request_target checks out fork code with caching enabled'
+    code: |
+      # ❌ DANGEROUS: pulls fork code into a privileged context with caching
+      on:
+        pull_request_target:
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.pull_request.head.sha }}  # fork code!
+            - uses: actions/setup-node@v4
+              with:
+                node-version: '20'
+                cache: 'npm'   # ❌ writes npm cache from fork's package-lock.json
+            - run: npm ci
+            - run: npm test
+  - language: yaml
+    label: 'Fixed: disable caching in pull_request_target when using fork checkout'
+    code: |
+      # ✅ SAFER: disable cache writes when checking out fork code
+      on:
+        pull_request_target:
+
+      jobs:
+        lint-only:
+          runs-on: ubuntu-latest
+          permissions:
+            contents: read
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.pull_request.head.sha }}  # fork code
+            - uses: actions/setup-node@v4
+              with:
+                node-version: '20'
+                # cache: omitted — no cache writes from fork code
+            - run: npm ci --ignore-scripts  # also disable install scripts for safety
+  - language: yaml
+    label: 'Recommended: split into pull_request (build) and pull_request_target (privileged)'
+    code: |
+      # Separate workflows: untrusted build in pull_request, privileged ops in pull_request_target
+      # pull_request workflow (no write access, safe to check out fork):
+      on:
+        pull_request:
+      jobs:
+        build-and-upload:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                node-version: '20'
+                cache: 'npm'  # safe: pull_request has no write access to base cache
+            - run: npm ci && npm test
+            - uses: actions/upload-artifact@v4
+              with:
+                name: test-results
+                path: coverage/
+prevention:
+  - 'Never check out `github.event.pull_request.head.sha` (fork code) in a `pull_request_target` workflow that has caching enabled'
+  - 'Treat `pull_request_target` as equivalent to direct push access — only run trusted code from the base branch'
+  - 'Disable caching (`cache: ""` or omit cache inputs) on any `actions/setup-*` steps that run in `pull_request_target` with fork checkout'
+  - 'Read the GitHub Security Lab "Preventing pwn requests" guide before writing any `pull_request_target` workflow'
+  - 'Use `actions/cache/restore` (read-only) instead of `actions/cache` when you need restore-only behavior in sensitive contexts'
+docs:
+  - url: 'https://github.com/actions/cache/issues/1756'
+    label: 'actions/cache#1756: Cache/save should not run automatically from pull_request_target'
+  - url: 'https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/'
+    label: 'GitHub Security Lab: Preventing pwn requests (must-read for pull_request_target)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request_target'
+    label: 'GitHub Docs: pull_request_target — security considerations'
+  - url: 'https://github.com/actions/cache/tree/main/restore'
+    label: 'actions/cache/restore: read-only cache restore action'

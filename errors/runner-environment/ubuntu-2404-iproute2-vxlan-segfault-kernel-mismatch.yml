@@ -1,0 +1,109 @@
+id: runner-environment-387
+title: 'Ubuntu 24.04 `ip -d link show` SIGSEGV on VXLAN interfaces — kernel 6.14 / iproute2 6.1.0 mismatch'
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-24.04
+  - iproute2
+  - vxlan
+  - networking
+  - segfault
+  - kernel
+  - SIGSEGV
+patterns:
+  - regex: 'ip.*link.*show.*exit code.*139|ip.*link.*show.*Segmentation fault'
+    flags: 'i'
+  - regex: 'Segmentation fault.*iproute2|iproute2.*Segmentation fault'
+    flags: 'i'
+  - regex: 'ip.*vxlan.*exit code: 139|exit code.*139.*ip.*link'
+    flags: 'i'
+error_messages:
+  - 'Segmentation fault (core dumped)'
+  - 'Process completed with exit code 139.'
+  - 'ip -d link show dev vx-test (exit code: 139)'
+root_cause: |
+  On `ubuntu-24.04` runners with image version `20260209.23.1` and later (through at
+  least 2026-02), the Azure kernel was upgraded to `6.14.0-1017-azure` while
+  `iproute2` remained pinned at `6.1.0-1ubuntu6.2`. These two versions are
+  incompatible when displaying detailed VXLAN interface information.
+
+  The `ip -d link show` command queries VXLAN interfaces via Netlink. Kernel 6.14
+  emits the new `IFLA_VXLAN_FAN_MAP` Netlink attribute in VXLAN link responses.
+  iproute2 6.1.0 does not know this attribute and attempts to parse it using an
+  uninitialized handler, causing a null-pointer dereference (SIGSEGV, exit code 139).
+
+  This specifically affects:
+  - Workflows that create VXLAN interfaces (e.g., container networking tests,
+    Kubernetes CNI tests, SDN/network emulation CI)
+  - The `ip -d link show dev <vxlan-if>` command pattern
+  - Plain `ip link show` (without `-d`) is NOT affected
+
+  The issue was reported by the containerlab project (srl-labs/containerlab#3056)
+  and filed against runner-images (#13669, assigned Feb 2026, open as of Jun 2026).
+  It is a runner image regression — working images up to `20260201.15.1` (kernel
+  `6.11.0-1018-azure`) are not affected.
+fix: |
+  **Option A (recommended): Build and install iproute2 6.18.0 from source at job start.**
+
+  The runner-images team provided this workaround. Compile iproute2 6.18.0 (Ubuntu
+  noble source) at the beginning of the job:
+
+  **Option B: Replace `ip -d link show` with `bridge fdb show` or `/sys/class/net`.**
+
+  If you only need basic interface information, avoid the `-d` flag which triggers
+  the crashing code path. Use `ip link show` (without `-d`) or inspect via sysfs.
+
+  **Option C: Pin the runner image version.**
+
+  Use a specific image version that pre-dates the regression. Note: this is a
+  temporary workaround as pinned images eventually become unavailable.
+fix_code:
+  - language: yaml
+    label: 'Build iproute2 6.18.0 from source at job start (official workaround)'
+    code: |
+      jobs:
+        vxlan-test:
+          runs-on: ubuntu-24.04
+          steps:
+            - name: Upgrade iproute2 to fix VXLAN segfault (ubuntu-24.04 kernel/iproute2 mismatch)
+              run: |
+                wget https://launchpad.net/ubuntu/+archive/primary/+sourcefiles/iproute2/6.18.0-1ubuntu1/iproute2_6.18.0.orig.tar.xz
+                wget https://launchpad.net/ubuntu/+archive/primary/+sourcefiles/iproute2/6.18.0-1ubuntu1/iproute2_6.18.0-1ubuntu1.debian.tar.xz
+                wget https://launchpad.net/ubuntu/+archive/primary/+sourcefiles/iproute2/6.18.0-1ubuntu1/iproute2_6.18.0-1ubuntu1.dsc
+                sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+                sudo apt-get update -qq
+                sudo apt-get install -y dh-package-notes libnsl-dev
+                sudo apt-get build-dep -y iproute2
+                dpkg-source -x iproute2_6.18.0-1ubuntu1.dsc
+                cd iproute2-6.18.0
+                dpkg-buildpackage -us -uc
+                sudo dpkg -i ../iproute2_6.18.0-1ubuntu1_amd64.deb
+            - name: Create VXLAN interface
+              run: |
+                sudo ip link add vx-test type vxlan id 101 remote 172.20.25.23 dstport 14788
+                ip -d link show dev vx-test   # now works correctly
+  - language: yaml
+    label: 'Use ip link show (no -d flag) to avoid the crash path'
+    code: |
+      # If detailed VXLAN attributes are not needed, drop the -d flag
+      - name: Check VXLAN interface
+        run: |
+          # ❌ Crashes on affected images:
+          # ip -d link show dev vx-test
+          #
+          # ✅ Safe — basic info without the crashing VXLAN attribute parsing:
+          ip link show dev vx-test
+          # Or inspect via sysfs:
+          cat /sys/class/net/vx-test/type
+prevention:
+  - 'If your CI tests VXLAN networking on ubuntu-24.04, add the iproute2 6.18.0 source build step at the top of the job'
+  - 'Only use `ip -d link show` when detailed attributes are required; use `ip link show` (no -d) otherwise'
+  - 'Watch actions/runner-images#13669 for when a fixed ubuntu-24.04 image version ships with a matching iproute2'
+  - 'Test networking CI on a matrix of runner image versions to catch regressions early'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/13669'
+    label: 'actions/runner-images#13669: ip -d link show segfaults on vxlan — kernel 6.14 / iproute2 mismatch'
+  - url: 'https://github.com/srl-labs/containerlab/issues/3056'
+    label: 'srl-labs/containerlab#3056: VXLAN tests failing because of Ubuntu kernel upgrade'
+  - url: 'https://launchpad.net/ubuntu/+archive/primary/+sourcefiles/iproute2/6.18.0-1ubuntu1/'
+    label: 'iproute2 6.18.0 Ubuntu source files (build workaround)'
