@@ -1,0 +1,127 @@
+id: triggers-098
+title: 'Push Commit Using GITHUB_TOKEN From Within a Workflow Does Not Trigger Downstream Workflow Runs'
+category: triggers
+severity: silent-failure
+tags:
+  - triggers
+  - GITHUB_TOKEN
+  - push
+  - git-push
+  - downstream
+  - silent-failure
+  - loop-prevention
+patterns:
+  - regex: 'No runs found for this workflow'
+    flags: 'i'
+  - regex: 'Skipping workflow .* because it was triggered by the Actions bot'
+    flags: 'i'
+error_messages:
+  - "No runs found for this workflow"
+  - "Skipping since this workflow was triggered by GitHub Actions"
+root_cause: |
+  GitHub deliberately prevents workflows from triggering other workflows when the
+  triggering push or API call uses the built-in `GITHUB_TOKEN`. This is a by-design
+  loop-prevention mechanism: if Actions could trigger itself with the default token,
+  automated pipelines could create infinite recursive loops that exhaust minutes and
+  quota.
+
+  Specifically:
+  - A `git push` authenticated with `GITHUB_TOKEN` (the token injected by checkout
+    or persisted via `persist-credentials: true`) will NOT fire `on: push` triggers
+    in any other workflow in the same repository.
+  - Tags pushed with `GITHUB_TOKEN` will NOT fire `on: push: tags:` triggers.
+  - Releases created with `GITHUB_TOKEN` via the API will NOT fire `on: release`
+    triggers in other workflows.
+  - A `repository_dispatch` event sent to the same repo using `GITHUB_TOKEN` WILL
+    work (this is explicitly allowed), but a raw `git push` will not.
+
+  This silently fails — the push succeeds, GitHub shows the commit, but the
+  downstream CI/CD workflow simply never runs. There is no error in the log.
+
+  Common real-world scenarios that hit this:
+  - Auto-commit workflows (e.g., bumping a version file, updating a CHANGELOG,
+    running code formatters and committing the result) expect to trigger the main
+    CI workflow on the committed change.
+  - Tag-on-release workflows that push a version tag and expect a publish workflow
+    to fire on `on: push: tags: ['v*']`.
+  - Renovate or Dependabot-like bots that self-commit updates.
+
+  Reference: GitHub Community Discussion #25702 (hundreds of responses),
+  ad-m/github-push-action#32, anothrNick/github-tag-action#110.
+fix: |
+  Use a Personal Access Token (PAT) or GitHub App token for the git push step.
+  Workflows triggered by a PAT or App installation token are treated as a normal
+  user push and DO trigger downstream workflow runs.
+
+  Option A — PAT (fine-grained, with contents:write and metadata:read):
+    Use a fine-grained PAT stored as a repository secret. Pass it to checkout
+    so subsequent git operations use the PAT, not GITHUB_TOKEN.
+
+  Option B — GitHub App token (recommended for orgs):
+    Use actions/create-github-app-token to mint a short-lived installation token.
+    This avoids storing long-lived PATs.
+
+  Option C — workflow_run chaining:
+    Instead of relying on the push trigger, use `on: workflow_run` to chain
+    workflows explicitly. This works even with GITHUB_TOKEN.
+fix_code:
+  - language: yaml
+    label: 'Option A: Use a fine-grained PAT for checkout so git push triggers downstream'
+    code: |
+      - name: Checkout with PAT (enables downstream trigger on push)
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT_TRIGGER_WORKFLOWS }}
+          # With this token, any git push in subsequent steps will trigger on: push
+
+      - name: Auto-commit changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "chore: auto-update [skip ci]" || exit 0
+          git push
+  - language: yaml
+    label: 'Option B: GitHub App token for org-scale workflows'
+    code: |
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout with App token
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Push changes (will trigger downstream workflows)
+        run: |
+          git config user.name "my-bot[bot]"
+          git config user.email "my-bot[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "chore: auto-update" || exit 0
+          git push
+  - language: yaml
+    label: 'Option C: workflow_run chaining instead of relying on push trigger'
+    code: |
+      # In downstream workflow — trigger off the upstream workflow completing
+      # rather than off the push event. Works even with GITHUB_TOKEN.
+      on:
+        workflow_run:
+          workflows: ["Auto Commit"]
+          types: [completed]
+          branches: [main]
+prevention:
+  - 'When a workflow step pushes commits or tags, assume GITHUB_TOKEN will NOT trigger downstream on: push or on: push: tags: workflows — plan accordingly'
+  - 'Use [skip ci] in auto-commit messages to prevent the current workflow from re-triggering itself, but note that downstream trigger blocking is separate from skip-ci'
+  - 'Audit workflows that use stefanzweifel/git-auto-commit-action, ad-m/github-push-action, or any git push step — verify whether downstream triggering is required and use PAT/App token if so'
+  - 'Prefer workflow_run chaining for pipeline orchestration — it is explicit and works regardless of token type'
+docs:
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#using-the-github_token-in-a-workflow'
+    label: 'GitHub Docs: Using GITHUB_TOKEN — automatic token authentication'
+  - url: 'https://github.com/orgs/community/discussions/25702'
+    label: 'Community Discussion #25702: Push from Action does not trigger subsequent action'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#triggering-a-workflow-from-a-workflow'
+    label: 'GitHub Docs: Triggering a workflow from a workflow'

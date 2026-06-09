@@ -1,0 +1,91 @@
+id: concurrency-timing-088
+title: 'cancel-in-progress Expression Returning String ''false'' Is Truthy — Always Cancels In-Progress Jobs'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - cancel-in-progress
+  - expression
+  - string-coercion
+  - boolean
+  - silent-failure
+patterns:
+  - regex: 'Canceling since a higher priority waiting run was found for the concurrency group'
+    flags: 'i'
+  - regex: 'Canceling since a higher priority waiting request for'
+    flags: 'i'
+error_messages:
+  - "Canceling since a higher priority waiting run was found for the concurrency group"
+  - "This run has been canceled"
+root_cause: |
+  GitHub Actions expression contexts coerce non-empty strings to boolean `true`.
+  When `cancel-in-progress` is set to an expression that evaluates to the STRING
+  `'false'` (rather than the boolean `false`), the value is treated as truthy and
+  cancel-in-progress effectively becomes `true`, silently canceling in-progress runs.
+
+  The most common cause is the Actions "ternary" pattern combined with concurrency:
+
+    cancel-in-progress: ${{ github.ref == 'refs/heads/main' && 'false' || 'true' }}
+
+  This expression appears to return 'false' (do not cancel) for main branch and
+  'true' (do cancel) for other branches. But both `'false'` and `'true'` are
+  non-empty STRINGS — both are truthy — so cancel-in-progress is ALWAYS true
+  on every branch. In-progress runs are always cancelled.
+
+  A subtler variant uses a step output:
+
+    cancel-in-progress: ${{ steps.check.outputs.should_cancel }}
+
+  If the step outputs the string `'false'`, the in-progress job is still cancelled.
+
+  The correct approach is to use a BOOLEAN expression — comparing refs, checking
+  conditions with `==`, `!=`, `startsWith()` — that returns a boolean result, not
+  a string that happens to spell out "false".
+
+  Reference: github/docs PR#30647 (clarification of cancel-in-progress expression
+  behavior), GitHub Actions expression coercion documentation.
+fix: |
+  Use a boolean expression that evaluates to actual `false`, not the string `'false'`.
+
+  Replace string-returning ternary patterns with direct boolean comparisons:
+    cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+  If you need complex logic, chain boolean operators:
+    cancel-in-progress: ${{ !startsWith(github.ref, 'refs/heads/release/') && github.ref != 'refs/heads/main' }}
+
+  Do NOT use `&& 'false' || 'true'` — these return strings, not booleans.
+fix_code:
+  - language: yaml
+    label: 'WRONG: string ternary — both branches are truthy strings'
+    code: |
+      # BUG: both 'false' and 'true' are non-empty strings → always truthy
+      # cancel-in-progress is ALWAYS true regardless of branch
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: ${{ github.ref == 'refs/heads/main' && 'false' || 'true' }}
+  - language: yaml
+    label: 'CORRECT: boolean expression that returns actual false on main'
+    code: |
+      # Use a boolean comparison — evaluates to actual boolean false/true
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+      # More complex conditions — chain boolean operators
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: >-
+          ${{ !startsWith(github.ref, 'refs/heads/release/') &&
+              github.ref != 'refs/heads/main' }}
+prevention:
+  - 'Always write cancel-in-progress as a boolean expression (using ==, !=, startsWith(), etc.) — never as a string-returning ternary using && ''value'' || ''value'''
+  - 'Verify with actionlint — it can catch some expression type mismatches in concurrency blocks'
+  - 'Test your concurrency configuration by pushing to both protected and non-protected branches and confirming in-progress runs are cancelled only when expected'
+  - 'Audit any cancel-in-progress that uses steps.X.outputs.Y — step outputs are always strings; compare with == ''true'' instead of treating as boolean'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs'
+    label: 'GitHub Docs: Control concurrency of workflows and jobs'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions'
+    label: 'GitHub Docs: Evaluate expressions — type coercion rules'
+  - url: 'https://github.com/github/docs/pull/30647'
+    label: 'github/docs PR#30647: Clarify cancel-in-progress expression behaviour'
