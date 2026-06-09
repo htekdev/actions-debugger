@@ -1,0 +1,133 @@
+id: silent-failures-170
+title: 'create-github-app-token permission-* Inputs Were Silently Ignored Before v2.0.4 — Token Always Had Full Installation Scope'
+category: silent-failures
+severity: silent-failure
+tags:
+  - create-github-app-token
+  - github-app
+  - permissions
+  - token-scope
+  - silent-failure
+  - breaking-change
+  - least-privilege
+patterns:
+  - regex: 'Error: (?:Unprocessable Entity|Validation Failed).+permission'
+    flags: 'i'
+  - regex: 'RequestError\[HttpError\]: .*422'
+    flags: 'i'
+  - regex: 'resource not accessible by integration'
+    flags: 'i'
+error_messages:
+  - "Error: Unprocessable Entity"
+  - "RequestError[HttpError]: 422 Unprocessable Entity"
+  - "Error: resource not accessible by integration"
+  - "HttpError: 403 Forbidden"
+root_cause: |
+  `actions/create-github-app-token` added `permission-*` inputs (e.g.,
+  `permission-contents`, `permission-pull-requests`) to allow workflows to request
+  a GitHub App installation token with a restricted subset of permissions — the
+  principle of least-privilege.
+
+  However, in all versions prior to v2.0.4, these `permission-*` inputs had
+  **absolutely no effect**. The generated token always received the full set of
+  permissions granted to the GitHub App installation, regardless of what was
+  specified in the `permission-*` inputs. Workflows that set
+  `permission-contents: read` thinking they were running with restricted scope
+  were actually receiving a token with write access (and all other permissions).
+
+  In `actions/create-github-app-token` v2.0.4 (released via PR#168), the
+  permission enforcement was actually implemented. After this release:
+
+  - The `permission-*` inputs are genuinely passed to the GitHub API when
+    requesting the installation access token.
+  - Tokens are now scoped to exactly the permissions specified.
+  - Any permission your workflow's downstream steps need that is NOT listed in
+    the `permission-*` inputs will result in 403 or 422 errors.
+
+  This means workflows that had previously listed some `permission-*` inputs
+  (even as documentation or with incorrect values) will silently break on upgrade
+  to v2.0.4+ because the token is now actually restricted.
+
+  Common symptoms after upgrading to v2.0.4+:
+  - `git push` fails with 403 (missing `permission-contents: write`)
+  - Creating PRs via API fails with 422 (missing `permission-pull-requests: write`)
+  - Cross-repo operations fail with "resource not accessible by integration"
+
+  Reference: actions/create-github-app-token#237 (permission-* inputs no effect,
+  confirmed by maintainer), #248 (post-v2.0.4 breakage report, May 2025),
+  implementing PR#168.
+fix: |
+  If you are upgrading to create-github-app-token v2.0.4+ and have existing
+  `permission-*` inputs in your workflows, audit each step that uses the generated
+  token and add all required permissions explicitly.
+
+  Step-by-step:
+  1. Remove all `permission-*` inputs temporarily — with no restrictions, the token
+     inherits all installation permissions and the workflow should pass.
+  2. Add back `permission-*` inputs one by one with the minimum required values,
+     re-running the workflow after each addition to validate.
+  3. Verify the GitHub App's settings include each permission you are requesting
+     (https://github.com/settings/apps/YOUR_APP/permissions).
+
+  Common permissions needed for typical operations:
+  - `permission-contents: write` — git push, creating commits, releases
+  - `permission-pull-requests: write` — creating/updating PRs
+  - `permission-issues: write` — creating/updating issues
+  - `permission-workflows: write` — pushing .github/workflows/ changes
+fix_code:
+  - language: yaml
+    label: 'SILENT FAILURE (pre-v2.0.4): permission-* inputs had no effect'
+    code: |
+      # BUG: In create-github-app-token < v2.0.4, this permission-contents: read
+      # had NO effect. The token still had contents: write (and all other permissions).
+      # Workflows relying on this for security were unknowingly running with full scope.
+      - uses: actions/create-github-app-token@v1
+        id: app-token
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-contents: read    # Was silently ignored — token got full scope
+  - language: yaml
+    label: 'CORRECT (v2.0.4+): list every permission the token needs explicitly'
+    code: |
+      # In v2.0.4+, permission-* inputs ARE enforced.
+      # List EVERY permission your downstream steps require.
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-contents: write        # Required for git push
+          permission-pull-requests: write   # Required for creating PRs
+          # permission-issues: write        # Add if you create/update issues
+          # permission-workflows: write     # Add if pushing .github/workflows/ changes
+
+      - name: Push changes
+        run: git push   # Now uses token restricted to contents:write only
+  - language: yaml
+    label: 'Diagnostic: temporarily remove all permission-* inputs to confirm token scope issue'
+    code: |
+      # If your workflow breaks after upgrading, temporarily remove all permission-* inputs
+      # to confirm the token is the cause. If the workflow passes without restrictions,
+      # add them back one by one with the minimum required values.
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          # No permission-* inputs: token inherits ALL installation permissions
+          # Use this ONLY for diagnosis — then narrow down with explicit permissions
+prevention:
+  - 'After upgrading to create-github-app-token v2.0.4+, audit all workflows that use permission-* inputs and verify each downstream step has its required permission listed'
+  - 'Pin to a specific version tag (e.g., @v2.0.4) and test in a non-production branch before rolling out upgrades to critical workflows'
+  - 'After fixing, ensure each permission-* input has the minimum required level (read vs write) — do not just remove all restrictions to make it work'
+  - 'Review the GitHub App settings page to ensure the permissions requested in the workflow are actually granted to the App installation'
+docs:
+  - url: 'https://github.com/actions/create-github-app-token/issues/237'
+    label: 'actions/create-github-app-token#237: permission-* inputs have no effect (confirmed)'
+  - url: 'https://github.com/actions/create-github-app-token/issues/248'
+    label: 'actions/create-github-app-token#248: workflows break after permission enforcement in v2.0.4'
+  - url: 'https://github.com/actions/create-github-app-token/pull/168'
+    label: 'actions/create-github-app-token PR#168: implement permission-* inputs enforcement'
+  - url: 'https://docs.github.com/en/rest/apps/apps?apiVersion=2022-11-28#create-an-installation-access-token-for-an-app'
+    label: 'GitHub Docs: Create installation access token — permissions parameter'
