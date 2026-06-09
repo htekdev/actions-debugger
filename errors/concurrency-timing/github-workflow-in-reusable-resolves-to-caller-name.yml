@@ -1,0 +1,120 @@
+id: concurrency-timing-087
+title: "github.workflow in a reusable workflow resolves to the caller's workflow name — causes unintended cross-job concurrency collisions"
+category: concurrency-timing
+severity: error
+tags:
+  - reusable-workflow
+  - concurrency
+  - github-workflow-context
+  - workflow_call
+  - cancellation
+  - group
+patterns:
+  - regex: 'github\.workflow'
+    flags: 'i'
+  - regex: 'concurrency.*github\.workflow'
+    flags: 'i'
+error_messages:
+  - 'Unexpected workflow cancelled by unrelated concurrent run'
+  - 'Reusable workflow concurrency group collides with caller workflow'
+  - 'Jobs from different reusable workflows cancelled unexpectedly'
+root_cause: |
+  In GitHub Actions, github.workflow evaluates to the NAME property (the name: field
+  at the top of the workflow file) of the CURRENTLY-EXECUTING workflow. Inside a
+  reusable workflow (one called via workflow_call), github.workflow does NOT resolve
+  to the reusable workflow's own name — it resolves to the NAME of the CALLER'S
+  workflow file.
+
+  This means that if multiple reusable workflows share the same caller, and those
+  reusable workflows each define a concurrency group using github.workflow, they ALL
+  evaluate the same string (the caller's name) and compete for a single concurrency
+  slot. Any new run of Reusable Workflow B will cancel in-progress runs of Reusable
+  Workflow A if they were both called from the same parent — even though the developer
+  intended each reusable workflow to have its own isolated concurrency scope.
+
+  This is a subtle context evaluation rule: inside a workflow_call invocation, the
+  github context reflects the CALLER's properties, not the called workflow's. The
+  same issue affects github.workflow_sha (evaluates to caller's sha) and
+  github.workflow_ref (evaluates to the CALLEE's full path, making it the correct
+  alternative to use).
+
+  The correct context value to use in a reusable workflow's own concurrency group is
+  github.workflow_ref, which returns the full ref of the current workflow file (e.g.,
+  "owner/repo/.github/workflows/reusable-deploy.yml@refs/heads/main"). This is unique
+  per workflow file and does not collide across different reusable workflows.
+
+  Source: actions/runner#2534, GitHub Community Discussions thread on reusable
+  workflow context evaluation.
+fix: |
+  Replace github.workflow with github.workflow_ref in concurrency group definitions
+  inside reusable workflow files. github.workflow_ref returns the full path and ref
+  of the currently-running workflow file and is unique per reusable workflow.
+
+  If you want to scope concurrency to a specific run rather than all runs of the same
+  reusable workflow, combine github.workflow_ref with github.run_id or the triggering
+  event data.
+fix_code:
+  - language: yaml
+    label: 'Reusable workflow: use github.workflow_ref instead of github.workflow'
+    code: |
+      # In your reusable workflow file (e.g., .github/workflows/deploy.yml):
+      on:
+        workflow_call:
+          inputs:
+            environment:
+              type: string
+
+      # WRONG: github.workflow resolves to the CALLER's workflow name — all reusable
+      # workflows called from the same caller share one concurrency slot and cancel
+      # each other unexpectedly.
+      # concurrency:
+      #   group: ${{ github.workflow }}-${{ github.ref }}
+      #   cancel-in-progress: true
+
+      # CORRECT: github.workflow_ref is unique per reusable workflow file.
+      concurrency:
+        group: ${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.environment }}
+        cancel-in-progress: true
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying ${{ inputs.environment }}"
+  - language: yaml
+    label: 'Caller workflow: pass explicit identifier to reusable for scoped concurrency'
+    code: |
+      # Alternative: pass a unique identifier from the caller instead of using context
+      on:
+        push:
+          branches: [main]
+
+      jobs:
+        deploy-staging:
+          uses: ./.github/workflows/deploy.yml
+          with:
+            environment: staging
+          concurrency:
+            # Define concurrency at the caller level, not inside the reusable workflow
+            group: deploy-staging-${{ github.ref }}
+            cancel-in-progress: true
+
+        deploy-prod:
+          uses: ./.github/workflows/deploy.yml
+          with:
+            environment: production
+          concurrency:
+            group: deploy-prod-${{ github.ref }}
+            cancel-in-progress: true
+prevention:
+  - 'Never use github.workflow in a reusable workflow concurrency group — use github.workflow_ref which is unique per workflow file'
+  - 'When debugging unexpected cancellations in reusable workflows, check whether concurrency groups share the same github.workflow string'
+  - 'Prefer defining concurrency at the caller level (on the uses: job) rather than inside the reusable workflow itself to maintain explicit control'
+  - 'Test reusable workflow concurrency by triggering two concurrent runs from different callers and verifying they do not cancel each other'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context'
+    label: 'github context — github.workflow vs github.workflow_ref'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#concurrency'
+    label: 'Concurrency — GitHub Actions workflow syntax'
+  - url: 'https://docs.github.com/en/actions/sharing-automations/reusing-workflows'
+    label: 'Reusing workflows — GitHub Docs'

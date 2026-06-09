@@ -1,0 +1,123 @@
+id: runner-environment-363
+title: "github.event.before is the null SHA on first push to a new branch — git diff commands fail with 'fatal: ambiguous argument'"
+category: runner-environment
+severity: error
+tags:
+  - push-event
+  - github-event-before
+  - null-sha
+  - git-diff
+  - new-branch
+  - first-push
+patterns:
+  - regex: 'fatal: ambiguous argument .{0,5}0{30,40}.{0,5}'
+    flags: 'i'
+  - regex: 'unknown revision or path not in the working tree'
+    flags: 'i'
+  - regex: 'fatal: bad object\s+0{30,40}'
+    flags: 'i'
+error_messages:
+  - "fatal: ambiguous argument '0000000000000000000000000000000000000000': unknown revision or path not in the working tree"
+  - "fatal: ambiguous argument '0000000000000000000000000000000000000000^': unknown revision"
+  - "error: pathspec '0000000000000000000000000000000000000000' did not match any file(s) known to git"
+root_cause: |
+  When a push event triggers a GitHub Actions workflow on the FIRST push to a newly
+  created branch (a branch that did not previously exist), the github.event.before
+  context value is set to the null SHA: "0000000000000000000000000000000000000000"
+  (40 zeros). This is the conventional git representation for "no previous commit"
+  (an empty ref), used when a branch is created for the first time.
+
+  Workflows that use github.event.before in git commands to compute a diff or log
+  range — patterns like:
+    git diff ${{ github.event.before }} ${{ github.sha }}
+    git log ${{ github.event.before }}..HEAD
+    git show ${{ github.event.before }}
+
+  will fail with "fatal: ambiguous argument '000000...': unknown revision or path not
+  in the working tree" because the null SHA does not correspond to any commit object
+  in the repository.
+
+  This is a common pattern in workflows that detect changed files, generate changelogs,
+  or enforce commit message policies on push. It works correctly on subsequent pushes
+  to an existing branch but silently breaks on the first push that creates the branch.
+
+  The null SHA (000...0) is also emitted on github.event.before for force-pushes that
+  rewrite history all the way back to the initial commit, though this is less common.
+
+  Source: GitHub Actions documentation on the push event payload; consistently
+  reported in GitHub Community Discussions and Stack Overflow under tags
+  [github-actions] and [git].
+fix: |
+  Guard git diff/log commands with a check that github.event.before is not the null
+  SHA before executing them. Use the null SHA constant directly in the comparison:
+
+  Option 1 (workflow if: condition): Skip the step on first branch push.
+  Option 2 (shell check): Fall back to a safe alternative command.
+  Option 3 (git rev-parse): Validate the commit exists before using it.
+
+  For changed-file detection, consider using actions/changed-files which handles the
+  first-push / null-before case automatically.
+fix_code:
+  - language: yaml
+    label: 'Option 1: skip diff step on first branch push using if: condition'
+    code: |
+      on:
+        push:
+
+      jobs:
+        lint-changed:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                fetch-depth: 0
+
+            - name: Get changed files (skip on first branch push)
+              id: diff
+              # Skip when github.event.before is the null SHA (first push to new branch)
+              if: github.event.before != '0000000000000000000000000000000000000000'
+              run: |
+                echo "files=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} | tr '\n' ' ')" >> $GITHUB_OUTPUT
+
+            - name: Lint changed files
+              if: steps.diff.outputs.files != ''
+              run: npx eslint ${{ steps.diff.outputs.files }}
+  - language: yaml
+    label: 'Option 2: shell fallback — diff HEAD~1 when before is null SHA'
+    code: |
+      - name: Get changed files with null-SHA fallback
+        run: |
+          BEFORE="${{ github.event.before }}"
+          NULL_SHA="0000000000000000000000000000000000000000"
+
+          if [ "$BEFORE" = "$NULL_SHA" ]; then
+            # First push to new branch — diff against parent of HEAD
+            echo "First push to this branch; diffing HEAD~1..HEAD"
+            CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || git diff --name-only HEAD)
+          else
+            CHANGED=$(git diff --name-only "$BEFORE" "${{ github.sha }}")
+          fi
+
+          echo "Changed files: $CHANGED"
+  - language: yaml
+    label: 'Option 3: use actions/changed-files which handles null SHA automatically'
+    code: |
+      - name: Get changed files
+        id: changed
+        uses: tj-actions/changed-files@v44
+        # actions/changed-files handles github.event.before=null SHA gracefully;
+        # on first-push it diffs HEAD~1..HEAD or reports all files depending on config
+
+      - name: Lint changed files
+        if: steps.changed.outputs.any_changed == 'true'
+        run: npx eslint ${{ steps.changed.outputs.all_changed_files }}
+prevention:
+  - 'Never use github.event.before directly in git commands without guarding against the null SHA (40 zeros)'
+  - 'Check github.event.before != "0000000000000000000000000000000000000000" before any git diff or git log range command'
+  - 'Consider using a dedicated changed-files action (tj-actions/changed-files, dorny/paths-filter) which handle first-push edge cases internally'
+  - 'Test your push-triggered workflows by creating a new branch and pushing to it — this is the trigger path most developers skip when testing'
+docs:
+  - url: 'https://docs.github.com/en/webhooks/webhook-events-and-payloads#push'
+    label: 'Push event payload — before field — GitHub Docs'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#push'
+    label: 'Events that trigger workflows: push — GitHub Docs'
