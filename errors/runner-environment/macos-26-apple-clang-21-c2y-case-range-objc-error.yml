@@ -1,0 +1,104 @@
+id: runner-environment-359
+title: 'macOS 26 Apple Clang 21 rejects Objective-C case ranges as C2y extension'
+category: runner-environment
+severity: error
+tags:
+  - macos-26
+  - macos-latest
+  - apple-clang
+  - clang-21
+  - xcode-26
+  - objective-c
+  - c2y-extensions
+  - breaking-change
+  - ios-ci
+patterns:
+  - regex: 'case ranges are a C2y extension \[-Werror,-Wc2y-extensions\]'
+    flags: 'i'
+  - regex: 'error:.*-Wc2y-extensions'
+    flags: 'i'
+  - regex: 'case \d+ \.\.\. \d+.*C2y extension'
+    flags: 'i'
+error_messages:
+  - "error: case ranges are a C2y extension [-Werror,-Wc2y-extensions]"
+  - "OIDTokenUtilities.m:64:12: error: case ranges are a C2y extension [-Werror,-Wc2y-extensions]"
+  - "note: use -Wno-c2y-extensions to suppress this warning"
+root_cause: |
+  Apple Clang 21 (shipped with Xcode 26.4.1 on macOS 26) reclassifies GNU
+  case range extensions — `case X ... Y:` in Objective-C or C — as a C2y
+  (next C standard draft) extension and emits a new warning
+  -Wc2y-extensions for each occurrence.
+
+  When code is compiled with -Werror (common in iOS/macOS CI), this new
+  warning is promoted to a fatal error, breaking builds that previously
+  compiled cleanly on Xcode 16.4 (Clang 17).
+
+  The macos-latest label switches from macOS 15 (Xcode 16.4, Clang 17) to
+  macOS 26 (Xcode 26.4.1, Clang 21) in a staged rollout starting June 15,
+  2026. Workflows that don't pin their macOS version will be silently upgraded.
+
+  Affected code pattern:
+    switch (value) {
+      case 1 ... 8:   // <-- GNU case range, now a C2y extension
+        doSomething();
+        break;
+    }
+
+  Libraries known affected: AppAuth-iOS 2.0.0 (OIDTokenUtilities.m).
+fix: |
+  Option 1 — Suppress the warning for the affected target:
+    Add `-Wno-c2y-extensions` to COMPILER_FLAGS in Xcode or OTHER_CFLAGS in
+    build settings. In a Podfile: `pod_target_xcconfig = { 'OTHER_CFLAGS' => '$(inherited) -Wno-c2y-extensions' }`.
+
+  Option 2 — Rewrite the case range as individual cases:
+    // Before (case range — now C2y extension)
+    case 1 ... 8:
+      break;
+    // After (explicit cases)
+    case 1: case 2: case 3: case 4:
+    case 5: case 6: case 7: case 8:
+      break;
+
+  Option 3 — Pin runner to macos-15 temporarily while upstream libraries
+    add Clang 21 compatibility:
+      runs-on: macos-15
+
+  Option 4 — Upgrade to a patched library version (e.g. AppAuth-iOS >2.0.0
+    once a fix is released).
+fix_code:
+  - language: yaml
+    label: 'Suppress -Wc2y-extensions in Podfile to unblock CI'
+    code: |
+      # ios/Podfile
+      post_install do |installer|
+        installer.pods_project.targets.each do |target|
+          target.build_configurations.each do |config|
+            # Suppress Clang 21 C2y extension warning treated as error
+            flags = config.build_settings['OTHER_CFLAGS'] || '$(inherited)'
+            config.build_settings['OTHER_CFLAGS'] = "#{flags} -Wno-c2y-extensions"
+          end
+        end
+      end
+  - language: yaml
+    label: 'Pin macos version temporarily in workflow'
+    code: |
+      jobs:
+        build-ios:
+          # Pin to macos-15 until upstream libraries support Clang 21
+          runs-on: macos-15
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build
+              run: xcodebuild build ...
+prevention:
+  - "Test on macos-26 preview image before the macos-latest migration (June 15, 2026)."
+  - "Audit Objective-C code and dependencies for GNU case range syntax (case X ... Y:) before migrating to Xcode 26."
+  - "Avoid -Werror in CI for third-party CocoaPod targets that you do not control."
+  - "Monitor macOS runner migration announcements (actions/runner-images#14167)."
+docs:
+  - url: 'https://github.com/openid/AppAuth-iOS/issues/947'
+    label: 'AppAuth-iOS #947: Build fails with Xcode 26.4 due to -Wc2y-extensions'
+  - url: 'https://github.com/actions/runner-images/issues/14167'
+    label: 'macOS: macos-latest label will use macos-26 in June 2026'
+  - url: 'https://releases.llvm.org/21.1.0/tools/clang/docs/ReleaseNotes.html'
+    label: 'Clang 21.1.0 Release Notes — new diagnostics and language extensions'
