@@ -1,0 +1,102 @@
+id: runner-environment-384
+title: 'ubuntu-26.04 Helm 4 — helm registry login fails with https:// URL scheme'
+category: runner-environment
+severity: error
+tags:
+  - helm
+  - helm-4
+  - ubuntu-26
+  - oci-registry
+  - tool-upgrade
+  - breaking-change
+patterns:
+  - regex: 'invalid reference: invalid registry "https://'
+    flags: 'i'
+  - regex: 'registry login currently only supports registry hostname, not a repository path'
+    flags: 'i'
+  - regex: 'Error: invalid reference.*https://'
+    flags: 'i'
+  - regex: 'helm registry login.*https://.*invalid'
+    flags: 'i'
+error_messages:
+  - 'Error: invalid reference: invalid registry "https://europe-west1-docker.pkg.dev"'
+  - 'level=WARN msg="registry login currently only supports registry hostname, not a repository path" host=https://...'
+  - 'Error: invalid reference: invalid registry "https://ghcr.io"'
+  - 'Error: invalid reference: invalid registry "https://<account>.azurecr.io"'
+root_cause: |
+  Helm 4.1.0 changed the internal OCI registry reference handling by adopting `oras-go/v2`,
+  which validates registry references strictly. The `Login` method now uses
+  `remote.NewRegistry` from the ORAS project, which calls `ValidateRegistry`. That
+  function prepends `dummy://` before calling `url.ParseRequestURI` — meaning any URL
+  that already includes `https://` becomes `dummy://https://my-registry.com`, which fails
+  the URI validation and surfaces as `invalid reference: invalid registry "https://..."`.
+
+  In Helm 3, `helm registry login` accepted full URLs with `https://` or `oci://` schemes
+  and silently stripped them. In Helm 4, only bare hostnames (and optional ports) are
+  accepted. Official documentation from major cloud providers uses the `https://` format:
+
+  - **Google Artifact Registry**: docs show `helm registry login https://...docker.pkg.dev`
+  - **JFrog Artifactory**: docs show `helm registry login https://...jfrog.io`
+
+  GitHub Actions workflows on `ubuntu-26.04` encounter this because the image pre-installs
+  Helm 4 exclusively (via `get-helm-4` installer script), while `ubuntu-24.04` still ships
+  Helm 3. Tracked in helm/helm#31962 (March 2026, open) — the intentional design change
+  from helm/helm#30873 in Helm 4.
+fix: |
+  Remove the `https://` (or `http://`) scheme from all `helm registry login` calls. Use
+  only the registry hostname and optional port:
+
+  ```bash
+  # Helm 3 (works) → Helm 4 (breaks)
+  helm registry login https://europe-west1-docker.pkg.dev \
+    -u oauth2accesstoken --password-stdin
+
+  # Helm 4 (correct) — hostname only, no scheme
+  helm registry login europe-west1-docker.pkg.dev \
+    -u oauth2accesstoken --password-stdin
+  ```
+
+  Common registry conversions:
+  - `https://ghcr.io`                      → `ghcr.io`
+  - `https://europe-west1-docker.pkg.dev`  → `europe-west1-docker.pkg.dev`
+  - `https://<account>.azurecr.io`         → `<account>.azurecr.io`
+  - `https://registry.gitlab.com`          → `registry.gitlab.com`
+fix_code:
+  - language: yaml
+    label: 'Fix helm registry login for Helm 4 on ubuntu-26.04'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-26.04   # Helm 4 pre-installed
+          steps:
+            - name: Authenticate to Google Artifact Registry
+              run: |
+                # Helm 3 style — BREAKS on Helm 4 (ubuntu-26.04):
+                # gcloud auth print-access-token | helm registry login -u oauth2accesstoken \
+                #   --password-stdin https://europe-west1-docker.pkg.dev
+
+                # Helm 4 fix — hostname only, no scheme:
+                gcloud auth print-access-token | helm registry login -u oauth2accesstoken \
+                  --password-stdin europe-west1-docker.pkg.dev
+
+            - name: Authenticate to GHCR
+              run: |
+                # Helm 3 style — BREAKS on Helm 4:
+                # helm registry login https://ghcr.io \
+                #   -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
+
+                # Helm 4 fix:
+                helm registry login ghcr.io \
+                  -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
+prevention:
+  - 'Always use registry hostname only (no https:// scheme) in helm registry login commands when using Helm 4.'
+  - 'Before migrating workflows to ubuntu-26.04, grep for `helm registry login https://` and strip the scheme.'
+  - 'Pin to ubuntu-24.04 if your team has not yet audited Helm 4 compatibility.'
+  - 'When following Google Artifact Registry or JFrog documentation for Helm, drop the URL scheme — their docs predate Helm 4.'
+docs:
+  - url: 'https://github.com/helm/helm/issues/31962'
+    label: 'helm/helm #31962 — Registry Login with HTTPS URL (March 2026)'
+  - url: 'https://helm.sh/docs/overview/#registry-login-does-not-accept-full-urls'
+    label: 'Helm docs — registry login does not accept full URLs'
+  - url: 'https://github.com/actions/runner-images/commit/9e3319d6b4acc306925295853d0ff41ddd5c40f0'
+    label: 'runner-images commit 9e3319d — ubuntu-26.04 installs Helm 4 (get-helm-4 installer)'

@@ -1,0 +1,117 @@
+id: runner-environment-386
+title: 'ubuntu-26.04 Helm 4 — --post-renderer executable path removed, must register as named plugin'
+category: runner-environment
+severity: error
+tags:
+  - helm
+  - helm-4
+  - ubuntu-26
+  - post-renderer
+  - plugin
+  - tool-upgrade
+  - breaking-change
+patterns:
+  - regex: 'post-renderer.*not.*registered|post-renderer.*plugins must be registered'
+    flags: 'i'
+  - regex: 'helm.*post-renderer.*executable|post.renderer.*plugin.*install'
+    flags: 'i'
+  - regex: 'Error:.*post-renderer.*not a registered plugin|unknown post-renderer'
+    flags: 'i'
+error_messages:
+  - 'Error: post-renderer: plugins must be registered via helm plugin install'
+  - 'Error: post-renderer ./scripts/kustomize.sh: not a registered plugin'
+  - 'Error: post-renderer: executable paths are no longer supported; register as a named plugin'
+root_cause: |
+  Helm 4 redesigned the plugin architecture around OCI distribution and optional
+  WebAssembly (Wasm) sandboxing via the Extism runtime. As part of this redesign, the
+  `--post-renderer` flag was changed to only accept **named Helm plugins** (registered via
+  `helm plugin install`). In Helm 3, `--post-renderer` could point directly to any
+  executable file path on disk:
+
+  ```bash
+  # Helm 3 — accepted any executable path
+  helm upgrade myapp ./chart --post-renderer ./scripts/mutate.sh
+  helm upgrade myapp ./chart --post-renderer /usr/local/bin/kustomize
+  ```
+
+  In Helm 4, the `--post-renderer` value must be a plugin name. The script itself does not
+  need to change — it only needs to be wrapped in a `plugin.yaml` manifest and installed
+  via `helm plugin install`.
+
+  Workflows using custom mutation scripts, kustomize wrappers, or envsubst pipelines as
+  post-renderers are affected. ubuntu-26.04 pre-installs Helm 4 exclusively, triggering
+  this error for any workflow using the direct executable path form.
+fix: |
+  Wrap your post-renderer script as a Helm plugin:
+
+  1. Create a directory for the plugin
+  2. Add a `plugin.yaml` manifest referencing the script
+  3. Run `helm plugin install <dir>` to register it
+  4. Reference it by name in `--post-renderer`
+
+  Example `plugin.yaml`:
+  ```yaml
+  name: "my-renderer"
+  version: "0.1.0"
+  usage: "Post-renderer for Helm chart mutations"
+  description: "Applies custom YAML mutations after Helm rendering"
+  command: "$HELM_PLUGIN_DIR/mutate.sh"
+  ```
+
+  Then in your workflow:
+  ```bash
+  # Helm 3 style — BREAKS on Helm 4:
+  helm upgrade myapp ./chart --post-renderer ./scripts/mutate.sh
+
+  # Helm 4 — register once, then reference by name:
+  helm plugin install ./my-post-renderer
+  helm upgrade myapp ./chart --post-renderer my-renderer
+  ```
+fix_code:
+  - language: yaml
+    label: 'Migrate --post-renderer from executable path to named Helm plugin on ubuntu-26.04'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-26.04
+          steps:
+            - uses: actions/checkout@v6
+
+            - name: Register post-renderer as Helm plugin
+              run: |
+                # Create plugin manifest alongside the existing script
+                mkdir -p .helm-plugins/my-renderer
+                cp scripts/mutate.sh .helm-plugins/my-renderer/mutate.sh
+                chmod +x .helm-plugins/my-renderer/mutate.sh
+                cat > .helm-plugins/my-renderer/plugin.yaml << 'EOF'
+                name: "my-renderer"
+                version: "0.1.0"
+                usage: "Custom post-renderer"
+                description: "Applies YAML mutations after Helm template rendering"
+                command: "$HELM_PLUGIN_DIR/mutate.sh"
+                EOF
+                helm plugin install .helm-plugins/my-renderer
+
+            - name: Deploy with post-renderer
+              run: |
+                # Helm 3 style — BREAKS on Helm 4 (ubuntu-26.04):
+                # helm upgrade --install myapp ./chart \
+                #   --post-renderer ./scripts/mutate.sh
+
+                # Helm 4 — use registered plugin name:
+                helm upgrade --install myapp ./chart \
+                  --post-renderer my-renderer
+prevention:
+  - 'Audit all --post-renderer usage in workflows before migrating to ubuntu-26.04 (Helm 4).'
+  - 'Wrap post-renderer scripts as Helm plugins with a plugin.yaml manifest — the script code itself needs no changes.'
+  - 'Pre-register post-renderer plugins in a workflow setup step so they are available for later helm upgrade commands.'
+  - 'Pin to ubuntu-24.04 if post-renderer plugin migration is disruptive before your next maintenance window.'
+docs:
+  - url: 'https://byteiota.com/helm-4-migration-guide/'
+    label: 'Helm 4.2 Migration Guide — post-renderers must be registered as plugins'
+  - url: 'https://helm.sh/docs/topics/plugins/'
+    label: 'Helm docs — Plugins'
+  - url: 'https://helm.sh/docs/topics/advanced/#post-rendering'
+    label: 'Helm docs — Post Rendering'
+  - url: 'https://github.com/actions/runner-images/commit/9e3319d6b4acc306925295853d0ff41ddd5c40f0'
+    label: 'runner-images commit 9e3319d — ubuntu-26.04 installs Helm 4 (get-helm-4 installer)'
