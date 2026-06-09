@@ -1,0 +1,102 @@
+id: runner-environment-362
+title: 'ARC Kubernetes Scaleset Long Name Causes Workflow Pod Naming Collision — Parallel Jobs Fail with "pod already exists"'
+category: runner-environment
+severity: error
+tags:
+  - arc
+  - kubernetes
+  - scaleset
+  - pod-naming
+  - parallel-jobs
+  - container-mode
+  - runner-container-hooks
+patterns:
+  - regex: 'failed to create job pod.*already exists'
+    flags: 'i'
+  - regex: 'pods ".*-runn-workflow" already exists'
+    flags: 'i'
+  - regex: 'EphemeralRunner.*Failed to create pod resource'
+    flags: 'i'
+error_messages:
+  - 'Error: failed to create job pod: pods "arc-prd-my-scaleset-name-q5nb5-runn-workflow" already exists'
+  - 'ERROR EphemeralRunner Failed to create pod resource for ephemeral runner. {"error": "pods \"...-runn-workflow\" already exists"}'
+root_cause: |
+  ARC (Actions Runner Controller) in Kubernetes container mode generates workflow pod
+  names by concatenating the EphemeralRunnerSet name with a suffix for each job. The
+  runner-container-hooks code truncates this generated name at a fixed character
+  boundary (currently 45 characters) to stay within Kubernetes' 63-character object
+  name limit.
+
+  When the scaleset name itself is 40 or more characters long, the truncation removes
+  part of the unique per-job suffix that differentiates pods for concurrent jobs. All
+  parallel jobs end up attempting to create a pod with the SAME truncated name
+  (e.g., `my-scaleset-q5nb5-runn-workflow`). The first job succeeds; every subsequent
+  parallel job fails with "pods ... already exists".
+
+  The root is in runner-container-hooks
+  `packages/k8s/src/hooks/constants.ts` where `MAX_RESOURCE_NAME_LENGTH` (45) leaves
+  insufficient room for the unique EphemeralRunner suffix when scalesets have long names.
+
+  Example: Scaleset `arc-prd-my-awesome-continuous-integration-1` (44 chars) +
+  EphemeralRunnerSet suffix `-q5nb5r` → the workflow pod for BOTH parallel jobs becomes
+  `arc-prd-my-awesome-continuous-integration-1-q5nb5-runn-workflow` (same name).
+
+  Symptoms:
+  - Matrix jobs work fine when parallelism = 1 but fail at parallelism ≥ 2
+  - The FIRST job succeeds; every subsequent concurrent job fails immediately at setup
+  - ARC controller logs show "Failed to create pod resource for ephemeral runner"
+  - The GitHub Actions UI shows those jobs as failed at the "Set up job" phase
+fix: |
+  1. **Shorten the scaleset installation name** to fewer than 40 characters. This is
+     the most reliable fix. Rename the Helm release and update any `runs-on:` labels
+     in your workflows.
+
+  2. **Upgrade runner-container-hooks** to a version that fixes the truncation logic
+     (track the upstream fix in
+     actions/runner-container-hooks).
+
+  3. **Workaround: reduce max-parallel** — set `strategy.max-parallel: 1` in matrix
+     jobs to serialize execution and avoid pod name collisions. Not suitable for large
+     matrices.
+fix_code:
+  - language: yaml
+    label: "Short-term workaround: serialize matrix jobs to avoid collision (not recommended for large matrices)"
+    code: |
+      jobs:
+        build:
+          runs-on: arc-prd-my-awesome-continuous-integration-1  # long name triggers bug
+          strategy:
+            matrix:
+              target: [amd64, arm64, windows]
+            max-parallel: 1  # serialize jobs — workaround for pod name collision
+          steps:
+            - uses: actions/checkout@v4
+  - language: yaml
+    label: "Recommended fix: rename scaleset to fewer than 40 characters in Helm values"
+    code: |
+      # values.yaml for ARC Helm chart — keep installation name short
+      githubConfigUrl: "https://github.com/my-org"
+      githubConfigSecret: arc-secret
+
+      # Before (too long — causes collision):
+      # Installation name: arc-prd-my-awesome-continuous-integration-1  (44 chars)
+      #
+      # After (safe — <40 chars):
+      # Installation name: arc-prd-ci-1  (12 chars)
+
+      minRunners: 0
+      maxRunners: 10
+      containerMode:
+        type: kubernetes
+prevention:
+  - "Keep ARC scaleset installation names (Helm release names) under 40 characters when using Kubernetes container mode"
+  - "Test parallel job execution before deploying to production by running a matrix workflow with `max-parallel: 2+` against the new scaleset"
+  - "Monitor ARC controller logs for 'Failed to create pod resource' errors when adding new scalesets — this indicates a naming collision before jobs visibly fail"
+  - "Prefer short, descriptive scaleset names: `arc-prod`, `arc-arm64`, `arc-gpu` rather than `arc-prd-my-org-awesome-integration-runner`"
+docs:
+  - url: "https://github.com/actions/actions-runner-controller/issues/4368"
+    label: "ARC#4368: Cannot run jobs in parallel in a scaleset with a long name in kubernetes mode"
+  - url: "https://github.com/actions/runner-container-hooks/blob/main/packages/k8s/src/hooks/constants.ts"
+    label: "runner-container-hooks: MAX_RESOURCE_NAME_LENGTH constant"
+  - url: "https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners-with-actions-runner-controller/deploying-runner-scale-sets-with-actions-runner-controller"
+    label: "GitHub Docs: Deploying runner scale sets with ARC"
