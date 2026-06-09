@@ -1,0 +1,104 @@
+id: known-unsolved-104
+title: 'Required Status Checks Not Satisfied by Reusable Workflow Jobs — Check Name Includes Caller Context'
+category: known-unsolved
+severity: limitation
+tags:
+  - reusable-workflows
+  - required-status-checks
+  - branch-protection
+  - workflow-call
+  - pull-request
+  - status-checks
+patterns:
+  - regex: 'Some checks haven.t completed yet'
+    flags: 'i'
+  - regex: 'Required status check .[\w\s/]+-. hasn.t run'
+    flags: 'i'
+  - regex: 'Waiting for status to be reported'
+    flags: 'i'
+error_messages:
+  - "Some checks haven't completed yet"
+  - "Required check hasn't run"
+  - "Merging is blocked"
+root_cause: |
+  When a job inside a reusable workflow runs, GitHub reports the status check under
+  a qualified name that includes the CALLER workflow context, not the bare job name.
+  The reported check name format is:
+    "{caller-workflow-display-name} / {job-id}"
+  or in some configurations:
+    "{org}/{repo}/.github/workflows/{called-file}.yml / {job-id}"
+
+  Branch protection rules require you to specify the EXACT status check name as it
+  appears in the Checks UI. If you configure the required check as just `pipeline`
+  (the job-id in the reusable workflow), it will never be satisfied because GitHub
+  never reports a check named exactly `pipeline` — it reports one named
+  `my-caller-workflow / pipeline`.
+
+  This creates a catch-22: the GitHub UI for configuring required status checks only
+  shows check names that have run in the last 7 days, and the full qualified name
+  that appears in the Checks tab cannot be selected or used reliably because it
+  changes if the caller workflow is renamed. Calling the reusable workflow from an
+  external repository makes it worse, as the reported name includes the external
+  repo path.
+
+  The issue has been open since May 2022 (actions/runner#1917, 36+ reactions) with
+  no resolution from GitHub.
+fix: |
+  The recommended workaround is to add a mirror/sentinel job in the CALLER workflow
+  that:
+  1. Depends on the reusable workflow job via `needs:`
+  2. Always runs via `if: always()`
+  3. Exits 0 if the upstream succeeded, exits 1 if it failed or was cancelled
+
+  Configure THIS sentinel job's name as the required status check. The sentinel job
+  runs in the caller workflow (not the reusable one), so its name is stable and
+  predictable.
+fix_code:
+  - language: yaml
+    label: 'Add a sentinel/mirror job to expose a stable required status check name'
+    code: |
+      name: CI Pipeline
+
+      on:
+        pull_request:
+          branches: [main]
+
+      jobs:
+        run-reusable-ci:
+          uses: myorg/shared-workflows/.github/workflows/ci.yaml@main
+          secrets: inherit
+
+        # Add this sentinel job — configure "ci-gate" as the required status check
+        ci-gate:
+          needs: run-reusable-ci
+          if: always()
+          runs-on: ubuntu-latest
+          steps:
+            - name: Check CI result
+              run: |
+                result="${{ needs.run-reusable-ci.result }}"
+                if [[ "$result" != "success" && "$result" != "skipped" ]]; then
+                  echo "CI failed with result: $result"
+                  exit 1
+                fi
+  - language: yaml
+    label: 'Alternative: configure required check using the full qualified caller/job name'
+    code: |
+      # In GitHub branch protection settings, after the reusable workflow has run at least once,
+      # search for the qualified name in the "Status checks that are required" dropdown.
+      # The format will be: "CI Pipeline / run-reusable-ci" — use this exact string.
+      #
+      # WARNING: This name changes if you rename the caller workflow or job. The sentinel
+      # job approach above is more robust.
+prevention:
+  - 'Design reusable workflows with the sentinel/mirror pattern from the start rather than trying to use the reusable job name as a required check'
+  - 'Keep the caller workflow file name and job names stable — renaming either breaks the configured required status check name'
+  - 'Document that required checks using reusable workflows require a sentinel job pattern in your team CI/CD guidelines'
+  - 'Monitor actions/runner#1917 for a native GitHub fix that allows reusable workflow jobs to be directly referenced in branch protection'
+docs:
+  - url: 'https://github.com/actions/runner/issues/1917'
+    label: 'Required checks not passing for reusable workflows (GitHub Issue — 36+ reactions, open since 2022)'
+  - url: 'https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/managing-a-branch-protection-rule'
+    label: 'GitHub Docs: Managing a branch protection rule'
+  - url: 'https://docs.github.com/en/actions/sharing-automations/reusing-workflows'
+    label: 'GitHub Docs: Reusing workflows'

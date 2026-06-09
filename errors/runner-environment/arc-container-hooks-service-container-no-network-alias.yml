@@ -1,0 +1,115 @@
+id: runner-environment-373
+title: 'ARC Container Hooks Missing Service Container Network Alias — Service Hostname Unresolvable in Job Container'
+category: runner-environment
+severity: error
+tags:
+  - arc
+  - container-hooks
+  - service-containers
+  - network-alias
+  - dns
+  - self-hosted
+  - docker
+patterns:
+  - regex: 'could not translate host name .[\w-]+. to address: Temporary failure in name resolution'
+    flags: 'i'
+  - regex: 'psql: error: could not translate host name'
+    flags: 'i'
+  - regex: 'Executing the custom container implementation failed'
+    flags: 'i'
+  - regex: 'curl.*Could not resolve host: \w+'
+    flags: 'i'
+error_messages:
+  - "psql: error: could not translate host name 'postgres' to address: Temporary failure in name resolution"
+  - "curl: (6) Could not resolve host: postgres"
+  - "getaddrinfo: Temporary failure in name resolution"
+  - "##[error]Executing the custom container implementation failed. Please contact your self hosted runner administrator."
+root_cause: |
+  When using Actions Runner Container Hooks (the custom Docker implementation used
+  by Actions Runner Controller / ARC), service containers defined in `services:` are
+  created without a `--network-alias` flag. This means the service container joins the
+  shared Docker network but has no DNS alias entry, so the job container cannot
+  resolve the service by its configured name (e.g., `postgres`, `redis`, `mysql`).
+
+  The root cause is in the runner's `prepare_job` hook input: the JSON payload sent
+  to the container hooks script is missing the `contextName` field for service
+  containers (ContainerInfo.ContainerNetworkAlias). Without this field, the
+  actions/runner-container-hooks package's `docker create` command for service
+  containers omits `--network-alias {service_name}`.
+
+  The standard GitHub-hosted runner implementation (non-hooks path) correctly passes
+  `--network-alias` when creating service containers, so this issue is exclusive to
+  ARC deployments using container hooks. The bug has been open since August 2023
+  (actions/runner#2783) and remains unresolved as of mid-2026.
+
+  Affected configuration: ARC with container hooks enabled via RUNNER_CONTAINER_HOOKS
+  environment variable or equivalent configuration, where the workflow has both a
+  `container:` job block and a `services:` block.
+fix: |
+  There is no direct fix — the runner must be patched to include `contextName` in the
+  hook payload. Use one of these workarounds:
+
+  1. **Run the service directly in the job container** instead of as a service
+     container — install and start the service (e.g., postgres) as part of job steps.
+     This avoids the container-hooks service networking entirely.
+
+  2. **Use localhost + port mapping** — run without a job-level `container:` block
+     so the job steps run on the runner host. Service containers then expose ports
+     on localhost. Reference the service via `localhost:{port}` instead of the
+     service name.
+
+  3. **Add a custom /etc/hosts entry** in the job container pointing to the service
+     container's IP — retrieve the IP via `docker inspect` in a setup step and inject
+     it. This is fragile but functional.
+fix_code:
+  - language: yaml
+    label: 'Workaround 1: Install and start service inline (no service container)'
+    code: |
+      jobs:
+        test:
+          runs-on: arc-container-runner
+          container: node:latest
+          # Remove services: block — start postgres inside job steps instead
+          steps:
+            - name: Start PostgreSQL
+              run: |
+                apt-get update -qq
+                apt-get install -y postgresql
+                service postgresql start
+                su postgres -c "psql -c \"ALTER USER postgres PASSWORD 'postgres';\""
+            - name: Run tests
+              run: npm test
+              env:
+                DATABASE_URL: postgresql://postgres:postgres@localhost/testdb
+  - language: yaml
+    label: 'Workaround 2: Run without container block, use localhost for service access'
+    code: |
+      jobs:
+        test:
+          runs-on: arc-runner   # no container: block
+          services:
+            postgres:
+              image: postgres:15
+              env:
+                POSTGRES_PASSWORD: postgres
+              options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+              ports:
+                - 5432:5432
+          steps:
+            - name: Run tests
+              run: npm test
+              env:
+                # Use localhost + port — NOT postgres hostname
+                DATABASE_URL: postgresql://postgres:postgres@localhost:5432/testdb
+prevention:
+  - 'When deploying ARC with container hooks, validate that service containers are reachable by hostname before relying on them in CI tests'
+  - 'Add a smoke-test step (e.g., `nc -z postgres 5432 || exit 1`) early in jobs that use service containers to surface this failure clearly'
+  - 'Prefer running without a job-level container block when service hostname resolution is needed, to avoid the container hooks code path'
+  - 'Monitor actions/runner#2783 for a fix that includes contextName in the hook payload'
+docs:
+  - url: 'https://github.com/actions/runner/issues/2783'
+    label: 'Runner Container Hooks cannot resolve service container by name (GitHub Issue)'
+  - url: 'https://github.com/actions/runner-container-hooks'
+    label: 'actions/runner-container-hooks repository'
+  - url: 'https://docs.github.com/en/actions/how-tos/hosting-your-own-runners/managing-self-hosted-runners/customizing-the-containers-used-by-jobs'
+    label: 'GitHub Docs: Customizing the containers used by jobs'
