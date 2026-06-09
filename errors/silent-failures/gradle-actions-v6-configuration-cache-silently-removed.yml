@@ -1,0 +1,142 @@
+id: silent-failures-172
+title: '`gradle/actions@v6` Silently Drops Configuration-Cache Caching — Builds Slower After Upgrade from v5'
+category: silent-failures
+severity: silent-failure
+tags:
+  - gradle
+  - gradle-actions
+  - configuration-cache
+  - caching
+  - upgrade
+  - v5-to-v6
+  - build-performance
+patterns:
+  - regex: 'gradle/actions@v6'
+    flags: 'i'
+  - regex: 'setup-gradle.*v6|gradle/actions.*v6'
+    flags: 'i'
+  - regex: 'configuration.cache.*disabled|cache-cleanup.*disabled'
+    flags: 'i'
+error_messages:
+  - 'Configuration cache entry stored.'
+  - 'Reusing configuration cache.'
+  - 'Configuration cache is an incubating feature.'
+root_cause: |
+  `gradle/actions@v6` (released March 2026) removed configuration-cache support
+  from the action. The release notes explicitly state:
+
+  > "Existing, rudimentary, configuration-cache support has been removed,
+  >  pending a fully functional implementation in `gradle-actions-caching`."
+
+  In `gradle/actions@v5`, the action saved and restored Gradle's configuration
+  cache (stored in `.gradle/configuration-cache/`) between CI runs using
+  GitHub Actions cache. This significantly reduced build times for large Gradle
+  projects using `--configuration-cache` because the expensive configuration
+  phase was cached across runs.
+
+  After upgrading to `gradle/actions@v6`:
+  1. The configuration cache is never saved to GitHub Actions cache between runs
+  2. Each run fully re-executes the configuration phase — adding 30–90+ seconds
+     to build time for large projects
+  3. NO warning, error, or annotation is emitted to indicate that configuration
+     caching has stopped working
+  4. The Gradle build log still shows "Configuration cache is an incubating feature"
+     and may show "Reusing configuration cache" WITHIN a single run (in-process
+     cache), but the cache is NOT persisted between CI runs
+
+  This makes it a silent performance regression: builds succeed, configuration
+  caching appears to work during local development, but CI runs are measurably
+  slower with no diagnostic output to explain why.
+
+  Additionally, `gradle/actions@v6` introduced a new proprietary
+  `gradle-actions-caching` component that replaces the open-source caching in v5.
+  This component requires acceptance of Gradle's Terms of Use, and when caching
+  is disabled to avoid the ToS, the lack of configuration-cache support is
+  permanent until the new component is available and accepted.
+
+  References:
+  - gradle/actions v6.0.0 release notes (March 2026): "configuration-cache support
+    removed, pending fully functional implementation in gradle-actions-caching"
+  - gradle/actions#917 (March 2026, open): community discussion on v6 caching
+    changes and ToS concerns
+  - Gradle blog: https://blog.gradle.org/github-actions-for-gradle-v6
+
+fix: |
+  **Option A (recommended): Pin to gradle/actions@v5 until v6 restores config-cache support**
+  The v5 branch remains maintained. Continue using v5 to retain configuration-cache
+  caching while Gradle finalizes the v6 caching implementation.
+
+  **Option B: Add a manual cache step for configuration cache in v6 workflows**
+  Explicitly use `actions/cache` to save and restore the Gradle configuration cache
+  directory (`.gradle/configuration-cache/`) while using gradle/actions@v6 for
+  the rest of the build process.
+
+  **Option C: Accept the ToS and use gradle-actions-caching**
+  If your organization is comfortable with Gradle's Terms of Use, upgrade to v6
+  and accept the license for the `gradle-actions-caching` component. This may
+  restore caching functionality (including configuration cache) when the component
+  is fully implemented.
+
+  **Option D: Disable `--configuration-cache` flag**
+  If the performance impact is acceptable and you don't want to pin v5 or accept
+  the ToS, remove `--configuration-cache` from your Gradle commands. This ensures
+  consistent behavior between v5 and v6.
+fix_code:
+  - language: yaml
+    label: 'Pin to gradle/actions@v5 to retain configuration-cache caching'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-java@v4
+              with:
+                distribution: 'temurin'
+                java-version: '21'
+            # Pin to v5 to retain configuration-cache support
+            # v6 removed configuration-cache caching (March 2026)
+            - uses: gradle/actions@v5
+              with:
+                gradle-version: wrapper
+            - run: ./gradlew build --configuration-cache
+  - language: yaml
+    label: 'Manual cache step for configuration cache when using gradle/actions@v6'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-java@v4
+              with:
+                distribution: 'temurin'
+                java-version: '21'
+            # Manually cache the Gradle configuration cache directory
+            # because gradle/actions@v6 no longer handles this
+            - name: Restore Gradle configuration cache
+              uses: actions/cache@v4
+              with:
+                path: .gradle/configuration-cache
+                key: gradle-config-cache-${{ runner.os }}-${{ hashFiles('**/*.gradle*', 'gradle/wrapper/gradle-wrapper.properties') }}
+                restore-keys: |
+                  gradle-config-cache-${{ runner.os }}-
+            - uses: gradle/actions@v6
+              with:
+                gradle-version: wrapper
+            - run: ./gradlew build --configuration-cache
+prevention:
+  - 'Before upgrading from `gradle/actions@v5` to `v6`, read the v6 release notes — configuration-cache caching was removed.'
+  - 'Compare build times before and after upgrading gradle/actions to detect silent performance regressions.'
+  - 'If you rely on `--configuration-cache` for build speed, pin to `gradle/actions@v5` until v6 restores configuration-cache support via `gradle-actions-caching`.'
+  - 'Add a build time annotation or step summary entry recording Gradle build duration so regressions are immediately visible in PR checks.'
+  - 'Monitor gradle/actions release notes and issue tracker for when full configuration-cache support is re-added in v6.'
+docs:
+  - url: 'https://github.com/gradle/actions/releases/tag/v6.0.0'
+    label: 'gradle/actions v6.0.0 release notes — configuration-cache support removed'
+  - url: 'https://github.com/gradle/actions/issues/917'
+    label: 'gradle/actions#917 — Clarification on new v6 caching changes (community discussion)'
+  - url: 'https://blog.gradle.org/github-actions-for-gradle-v6'
+    label: 'Gradle Blog — GitHub Actions for Gradle v6 (caching architecture changes)'
+  - url: 'https://docs.gradle.org/current/userguide/configuration_cache.html'
+    label: 'Gradle Docs — Configuration Cache'
