@@ -1,0 +1,96 @@
+id: runner-environment-375
+title: "actions/github-script v9 — require('@actions/github') fails and const getOctokit causes SyntaxError"
+category: runner-environment
+severity: error
+tags:
+  - github-script
+  - v9
+  - require
+  - esm
+  - octokit
+  - breaking-change
+  - getOctokit
+  - node24
+patterns:
+  - regex: 'Cannot find module.*@actions/github'
+    flags: 'i'
+  - regex: "Identifier 'getOctokit' has already been declared"
+    flags: ''
+error_messages:
+  - "Error: Cannot find module '@actions/github'"
+  - "SyntaxError: Identifier 'getOctokit' has already been declared"
+root_cause: |
+  actions/github-script v9.0.0 (released April 9, 2026) upgraded @actions/github from v8 to v9
+  (ESM-only) and injected getOctokit as a first-class parameter in the script's async function
+  wrapper. This created two distinct breakage patterns for anyone upgrading from v8:
+
+  1. require('@actions/github') fails with "Cannot find module '@actions/github'".
+     In v8, users could call require('@actions/github') to obtain a secondary Octokit client
+     (e.g., const { getOctokit } = require('@actions/github')). In v9, @actions/github v9 is
+     ESM-only and is compiled into dist/index.js — it is not resolvable via Node.js CommonJS
+     module resolution from within scripts. The error is identical in appearance to trying to
+     require a third-party npm package that isn't installed.
+
+  2. const getOctokit = ... or let getOctokit = ... causes a SyntaxError.
+     In v9, getOctokit is injected as a named parameter into the implicit async function that
+     wraps the script. JavaScript does not allow a const or let declaration to shadow a function
+     parameter in the same block scope. Scripts that previously declared const getOctokit = ...
+     as a local alias will fail immediately with a SyntaxError before any script logic runs.
+fix: |
+  For pattern 1: Replace require('@actions/github') with the injected getOctokit factory
+  available directly in the v9 script context. No import or require is needed.
+
+  For pattern 2: Delete the const getOctokit or let getOctokit declaration. The injected
+  getOctokit is already in scope. Call getOctokit(token) directly. If you must alias it,
+  use var (var declarations are function-scoped and do not conflict with the parameter).
+fix_code:
+  - language: yaml
+    label: "v8 → v9: replace require('@actions/github') with injected getOctokit"
+    code: |
+      # v8 (breaks in v9 with "Cannot find module '@actions/github'"):
+      - uses: actions/github-script@v8
+        with:
+          script: |
+            const { getOctokit } = require('@actions/github')
+            const client = getOctokit(process.env.MY_TOKEN)
+            const { data } = await client.rest.repos.get({ owner: 'org', repo: 'repo' })
+
+      # v9 fix — getOctokit is injected directly, no require needed:
+      - uses: actions/github-script@v9
+        env:
+          MY_TOKEN: ${{ secrets.MY_TOKEN }}
+        with:
+          script: |
+            const client = getOctokit(process.env.MY_TOKEN)
+            const { data } = await client.rest.repos.get({ owner: 'org', repo: 'repo' })
+
+  - language: yaml
+    label: "v9: avoid const/let redeclaration of the injected getOctokit parameter"
+    code: |
+      # v9 error — const redeclaration of the injected getOctokit parameter:
+      - uses: actions/github-script@v9
+        with:
+          script: |
+            const getOctokit = github.getOctokit  # SyntaxError!
+
+      # v9 fix — use the injected getOctokit directly:
+      - uses: actions/github-script@v9
+        env:
+          MY_TOKEN: ${{ secrets.MY_TOKEN }}
+        with:
+          script: |
+            const client = getOctokit(process.env.MY_TOKEN)
+            await client.rest.issues.create({ owner: context.repo.owner, repo: context.repo.repo, title: 'Hello' })
+
+prevention:
+  - "When upgrading from actions/github-script v8 to v9, grep scripts for require('@actions/github') and replace with the injected getOctokit"
+  - "Do not declare const getOctokit or let getOctokit in v9 scripts — getOctokit is already injected as a function parameter"
+  - "Read the v9.0.0 release notes before upgrading: https://github.com/actions/github-script/releases/tag/v9.0.0"
+  - "Run Dependabot PRs for actions/github-script through CI before auto-merging — the v8→v9 bump is a breaking change for scripts that use require"
+docs:
+  - url: "https://github.com/actions/github-script/releases/tag/v9.0.0"
+    label: "actions/github-script v9.0.0 release notes (breaking changes listed)"
+  - url: "https://github.com/actions/github-script?tab=readme-ov-file#creating-additional-clients-with-getoctokit"
+    label: "actions/github-script README: Creating additional clients with getOctokit (v9+)"
+  - url: "https://github.com/coder/coder/pull/24479"
+    label: "Real-world example: coder/coder PR fixing 'Cannot find module @actions/github' after v9 upgrade"
