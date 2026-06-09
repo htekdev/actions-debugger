@@ -1,0 +1,100 @@
+id: runner-environment-392
+title: "checkout@v6 + peter-evans/create-pull-request <v7.0.9 — Duplicate Authorization Header Causes 400"
+category: runner-environment
+severity: error
+tags:
+  - checkout
+  - checkout-v6
+  - create-pull-request
+  - authorization-header
+  - credentials
+  - git
+  - push
+patterns:
+  - regex: 'remote: Duplicate header: .Authorization'
+    flags: 'i'
+  - regex: 'fatal: unable to access .+: The requested URL returned error: 400'
+    flags: 'i'
+  - regex: 'Duplicate header.*Authorization.*400|400.*Duplicate header.*Authorization'
+    flags: 'i'
+error_messages:
+  - "remote: Duplicate header: \"Authorization\""
+  - "fatal: unable to access 'https://github.com/org/repo/': The requested URL returned error: 400"
+  - "Error: The process '/usr/bin/git' failed with exit code 128"
+root_cause: |
+  `actions/checkout@v6` changed how it stores and configures git credentials.
+  In v6, credentials are written to a credential helper file in
+  `$RUNNER_TEMP/_github_home/.gitconfig` (outside the workspace), using a new
+  helper-based approach. Previous versions (v3–v5) stored credentials in the
+  workspace `.git/config`.
+
+  Third-party actions that interact with git — in particular,
+  `peter-evans/create-pull-request@v7.0.1` through `v7.0.8` — still use the
+  older credential injection technique. When they run after checkout@v6, they
+  add another `Authorization` header on top of the one already injected by
+  checkout@v6's new mechanism. The remote receives **two** `Authorization`
+  headers on the same request and responds with HTTP 400.
+
+  The symptom appears during the `git remote prune origin` or `git push` step
+  inside `create-pull-request`:
+  ```
+  /usr/bin/git remote prune origin
+  remote: Duplicate header: "Authorization"
+  fatal: unable to access 'https://github.com/org/repo/': The requested URL returned error: 400
+  ```
+
+  This only affects workflows that combine checkout@v6 (or later) with an
+  incompatible version of a third-party git action.
+fix: |
+  **Preferred fix**: Upgrade `peter-evans/create-pull-request` to **v7.0.9 or
+  later**. The fix in v7.0.9 (PR #4230) temporarily hides checkout@v6's
+  credential files before running git commands, then restores them afterward.
+
+  **Alternative fix**: If you cannot immediately upgrade `create-pull-request`,
+  add `persist-credentials: false` to your `actions/checkout@v6` step. This
+  prevents checkout from setting up credential helpers entirely. You must then
+  provide a PAT or app token for any git push/PR-creation steps via the
+  `token:` input of each action.
+fix_code:
+  - language: yaml
+    label: 'Preferred: upgrade to create-pull-request v7.0.9+'
+    code: |
+      - uses: actions/checkout@v6
+        # no special options needed
+
+      # ... your build/change steps ...
+
+      - uses: peter-evans/create-pull-request@v7   # v7.0.9+ is compatible with checkout@v6
+        with:
+          title: 'Automated changes'
+          body: 'Changes applied by workflow'
+  - language: yaml
+    label: 'Alternative: persist-credentials: false + explicit token'
+    code: |
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false   # disable checkout@v6 credential helper
+          token: ${{ secrets.PAT }}    # still needed for checkout itself
+
+      # ... your build/change steps ...
+
+      - uses: peter-evans/create-pull-request@v7.0.1  # old version still works
+        with:
+          token: ${{ secrets.PAT }}   # provide token explicitly
+          title: 'Automated changes'
+prevention:
+  - 'Pin third-party git-interacting actions (create-pull-request, auto-commit,
+    etc.) to their latest major version tag (`@v7` not `@v7.0.1`) so you
+    automatically receive compatibility fixes.'
+  - 'When upgrading `actions/checkout` to a new major version, check all
+    downstream git-interacting actions for compatibility — credential storage
+    mechanisms change between major versions.'
+  - 'Use Dependabot or Renovate to keep action versions current and receive
+    upstream compatibility patches promptly.'
+docs:
+  - url: 'https://github.com/peter-evans/create-pull-request/issues/4228'
+    label: 'peter-evans/create-pull-request #4228 — Duplicate Authorization header with checkout@v6'
+  - url: 'https://github.com/peter-evans/create-pull-request/pull/4230'
+    label: 'peter-evans/create-pull-request PR #4230 — Fix: compatibility with checkout@v6'
+  - url: 'https://github.com/actions/checkout/issues/2299'
+    label: 'actions/checkout #2299 — Duplicate header: Authorization'
