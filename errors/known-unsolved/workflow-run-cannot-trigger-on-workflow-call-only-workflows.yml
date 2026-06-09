@@ -1,0 +1,142 @@
+id: known-unsolved-107
+title: '`workflow_run` Cannot Trigger on Workflows That Only Have `on: workflow_call`'
+category: known-unsolved
+severity: limitation
+tags:
+  - workflow_run
+  - workflow_call
+  - reusable-workflow
+  - triggers
+  - chaining
+  - event-trigger
+patterns:
+  - regex: 'workflow_run.*workflows.*workflow.call'
+    flags: 'is'
+  - regex: 'on:\s+workflow_run.*workflows:.*- "[^"]*"'
+    flags: 'is'
+error_messages:
+  - 'Workflow does not trigger when the target workflow only has on: workflow_call'
+  - 'workflow_run event never fires for reusable workflow'
+root_cause: |
+  `workflow_run` fires when a GitHub Actions workflow run is **requested or completed**.
+  A reusable workflow (one that only has `on: workflow_call` in its `on:` block) is never
+  scheduled as a standalone workflow run — it executes as a **job** within the caller's
+  workflow run. Therefore it does not generate its own `workflow_run` event.
+
+  Attempting to chain:
+  ```yaml
+  on:
+    workflow_run:
+      workflows: ["My Reusable Deploy"]   # <-- only has on: workflow_call
+      types: [completed]
+  ```
+
+  will **never trigger** because "My Reusable Deploy" (with only `on: workflow_call`) has
+  no standalone runs to emit `workflow_run` events from. GitHub evaluates `workflow_run`
+  against the workflow's name, but only considers runs from workflows that executed as
+  top-level runs — not reusable workflow invocations embedded inside another run.
+
+  This is a design constraint: reusable workflows share the caller's run context. They are
+  conceptually equivalent to a subroutine call, not a new workflow run, so they cannot be
+  observed through `workflow_run`.
+
+  This trips up developers who:
+  1. Refactor a large workflow into reusable sub-workflows
+  2. Try to keep an existing `workflow_run` chaining pattern that worked with the original
+     top-level workflow
+  3. Assume `workflow_run: workflows: ["Deploy"]` will fire for any workflow named "Deploy",
+     regardless of how it is triggered
+
+  There is no direct fix — this is a platform-level limitation. GitHub has not announced
+  plans to add `workflow_run` support for embedded reusable workflow completions.
+fix: |
+  **Option A (recommended): Listen for the CALLER workflow's completion, not the reusable workflow's.**
+
+  If `caller.yml` calls `reusable-deploy.yml`, trigger on `caller.yml` completing:
+
+  ```yaml
+  on:
+    workflow_run:
+      workflows: ["Caller CI"]          # <-- the top-level workflow that calls the reusable one
+      types: [completed]
+  ```
+
+  **Option B: Use `workflow_call` outputs + `needs` inside a single top-level workflow.**
+
+  Instead of chaining via `workflow_run`, add the downstream job directly to the caller
+  workflow using `needs:` and `if: needs.deploy.result == 'success'`.
+
+  **Option C: Add a standalone trigger to the reusable workflow.**
+
+  If you need `workflow_run` to be able to target "Deploy", the reusable workflow must
+  also have a direct trigger (e.g., `push`, `workflow_dispatch`) so it can run as a
+  standalone workflow and emit `workflow_run` events. The reusable aspects can remain.
+
+  **Option D: Emit a `repository_dispatch` event from the reusable workflow step.**
+
+  Add a step at the end of the reusable workflow that calls the GitHub API to emit a
+  `repository_dispatch` event. The downstream workflow listens on `repository_dispatch`
+  instead of `workflow_run`.
+fix_code:
+  - language: yaml
+    label: 'Broken: trying to listen for a reusable workflow completion via workflow_run'
+    code: |
+      # ❌ BROKEN: .github/workflows/notify.yml
+      # "My Reusable Deploy" only has on: workflow_call — this will NEVER trigger
+      on:
+        workflow_run:
+          workflows: ["My Reusable Deploy"]
+          types: [completed]
+      jobs:
+        notify:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploy finished"
+  - language: yaml
+    label: 'Fixed: listen for the CALLER workflow that invokes the reusable workflow'
+    code: |
+      # ✅ FIXED: .github/workflows/notify.yml
+      # Listen for the caller workflow (which runs as a top-level workflow run)
+      on:
+        workflow_run:
+          workflows: ["CI / Deploy"]    # the top-level workflow that calls the reusable one
+          types: [completed]
+      jobs:
+        notify:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Caller workflow (which called the reusable deploy) finished"
+  - language: yaml
+    label: 'Alternative: chain via repository_dispatch from the reusable workflow'
+    code: |
+      # In the reusable workflow (.github/workflows/reusable-deploy.yml):
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Run deploy steps
+              run: ./deploy.sh
+            - name: Emit completion event for downstream listeners
+              if: always()
+              uses: peter-evans/repository-dispatch@v3
+              with:
+                token: ${{ secrets.DISPATCH_TOKEN }}
+                event-type: reusable-deploy-finished
+                client-payload: '{"result": "${{ job.status }}"}'
+
+      # In the consuming workflow (.github/workflows/notify.yml):
+      # on:
+      #   repository_dispatch:
+      #     types: [reusable-deploy-finished]
+prevention:
+  - 'When refactoring monolithic workflows into reusable sub-workflows, update any downstream workflow_run listeners to target the caller workflow instead'
+  - 'Use `needs:` dependency chains within a single workflow for sequential job execution where possible'
+  - 'If cross-workflow chaining is required, prefer `repository_dispatch` over `workflow_run` for reusable workflow completion notification'
+  - 'Document which workflow name should be used in `workflow_run.workflows` when exposing a reusable workflow for callers'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run'
+    label: 'GitHub Docs: workflow_run event — triggers only for top-level workflow runs'
+  - url: 'https://docs.github.com/en/actions/sharing-automations/reusing-workflows'
+    label: 'GitHub Docs: Reusing workflows — reusable workflows run as jobs, not standalone runs'
+  - url: 'https://stackoverflow.com/questions/77237289/workflow-run-was-not-triigered-in-github-actions'
+    label: 'Stack Overflow: workflow_run was not triggered in github actions'
