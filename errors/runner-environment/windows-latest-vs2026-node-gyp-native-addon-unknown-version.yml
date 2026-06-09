@@ -1,0 +1,137 @@
+id: runner-environment-394
+title: 'node-gyp < 12.1.0 Cannot Detect Visual Studio 2026 (v18.x) — Native Addon npm install Fails'
+category: runner-environment
+severity: error
+tags:
+  - windows
+  - node-gyp
+  - visual-studio-2026
+  - native-addons
+  - npm
+  - windows-latest
+  - vs2026
+  - better-sqlite3
+  - bcrypt
+patterns:
+  - regex: 'gyp ERR! find VS unknown version .undefined. found at'
+    flags: 'i'
+  - regex: 'gyp ERR! find VS could not find a version of Visual Studio 2017 or newer'
+    flags: 'i'
+  - regex: 'node-gyp.*Visual Studio.*18\.[0-9]|node-gyp.*VS 2026'
+    flags: 'i'
+  - regex: 'gyp ERR! build error.*msvs_version.*2026|MSVS_VERSION.*2026.*not found'
+    flags: 'i'
+error_messages:
+  - 'npm error gyp ERR! find VS unknown version "undefined" found at "C:\Program Files\Microsoft Visual Studio\18\Community"'
+  - 'npm error gyp ERR! find VS could not find a version of Visual Studio 2017 or newer to use'
+  - 'npm error prebuild-install warn install No prebuilt binaries found (target=20.x.x runtime=node arch=x64 libc= platform=win32)'
+  - 'gyp ERR! stack Error: Could not find any Visual Studio installation to use'
+root_cause: |
+  Visual Studio 2026 uses internal version 18.x. node-gyp versions prior to 12.1.0
+  contain a hardcoded version map that only recognises VS 2017 (15.x), VS 2019 (16.x),
+  and VS 2022 (17.x). When node-gyp calls vswhere.exe and receives version 18.x, it
+  returns "unknown version" and fails to locate any usable Visual Studio installation.
+
+  The error occurs during npm install when a package falls back to building a native
+  C++ addon from source — typically because no prebuilt binary matches the current
+  Node.js version or platform. Common packages affected include:
+    - better-sqlite3
+    - bcrypt / bcryptjs (native)
+    - canvas
+    - sharp
+    - sqlite3
+    - argon2
+
+  This breaks on any Windows runner (windows-latest, windows-2025, windows-2022)
+  after the windows-latest migration to VS 2026 beginning June 8, 2026.
+
+  npm 11.6.3+ bundles node-gyp 12.1.0, which added VS 18.x detection. Older npm
+  versions (including npm 10.x which ships with Node.js 20) use node-gyp versions
+  that do not recognise VS 18.x.
+
+  Additionally, even with node-gyp 12.x, you may need to set the MSVS_VERSION
+  environment variable to "2026" if the default version detection is ambiguous.
+
+  Sources: byteiota.com VS 2026 migration guide; context-mode#566; ggfevans/tree-sitter-hujson PR #22;
+  openpi commit 5d7b626 (May 2026).
+fix: |
+  Option 1 — Upgrade npm before native addon install (recommended):
+    - run: npm install -g npm@latest
+    This upgrades npm to 11.6.3+ which bundles node-gyp 12.1.0 with VS 2026 support.
+
+  Option 2 — Set MSVS_VERSION=2026 environment variable:
+    - name: Install deps
+      env:
+        MSVS_VERSION: '2026'
+      run: npm install
+
+  Option 3 — Pin to windows-2022 for immediate rollback:
+    runs-on: windows-2022
+    VS 2022 (17.x) is fully supported by all node-gyp versions.
+
+  Option 4 — Upgrade node-gyp explicitly:
+    - run: npm install -g node-gyp@latest
+    Installs the latest node-gyp which recognises VS 18.x.
+fix_code:
+  - language: yaml
+    label: 'Upgrade npm to get bundled node-gyp 12.1.0+ (VS 2026 support)'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-latest   # VS 2026 from June 8, 2026
+          steps:
+            - uses: actions/checkout@v4
+
+            - uses: actions/setup-node@v4
+              with:
+                node-version: '22'
+
+            # Upgrade npm to 11.6.3+ which bundles node-gyp 12.1.0 (VS 2026 aware)
+            - name: Upgrade npm for VS 2026 node-gyp support
+              run: npm install -g npm@latest
+
+            - name: Install dependencies (builds native addons with VS 2026)
+              run: npm install
+  - language: yaml
+    label: 'Set MSVS_VERSION environment variable'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                node-version: '22'
+            - name: Install dependencies
+              env:
+                MSVS_VERSION: '2026'   # tell node-gyp to target VS 2026
+              run: npm ci
+  - language: yaml
+    label: 'Pin to windows-2022 for immediate rollback (VS 2022 compatible)'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-2022   # VS 2022 (17.x) — fully recognised by all node-gyp versions
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                node-version: '22'
+            - run: npm ci
+prevention:
+  - 'After any windows-latest Visual Studio migration, immediately test workflows that
+    build native addons (packages using node-gyp) to catch version detection failures.'
+  - 'Use npm 11.x (bundled node-gyp 12.1.0+) in all Windows CI workflows that install
+    native addons — node-gyp 12.1.0 adds VS 2026 (18.x) support.'
+  - 'For packages with prebuilt binaries, ensure prebuilds exist for the current
+    Node.js version and platform to avoid triggering the from-source fallback path.'
+  - 'Subscribe to actions/runner-images announcements for windows-latest VS migration
+    notices — they give approximately 1 month of advance warning.'
+docs:
+  - url: 'https://github.com/nodejs/node-gyp'
+    label: 'node-gyp — Build tool for native Node.js addons'
+  - url: 'https://byteiota.com/github-actions-windows-vs2026-migration/'
+    label: 'byteiota: GitHub Actions windows-latest Moves to VS 2026 — node-gyp breakage section'
+  - url: 'https://github.com/actions/runner-images/issues/14017'
+    label: 'runner-images#14017: windows-latest migrates to Visual Studio 2026 (June 8, 2026)'
