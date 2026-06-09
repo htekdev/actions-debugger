@@ -1,0 +1,108 @@
+id: silent-failures-176
+title: 'actions/checkout sparse-checkout silently performs full REST API checkout when git < 2.28 — sparse filter ignored'
+category: silent-failures
+severity: silent-failure
+tags:
+  - checkout
+  - sparse-checkout
+  - git-version
+  - rest-api-fallback
+  - self-hosted
+  - silent-failure
+patterns:
+  - regex: 'Minimum Git version required for sparse checkout is 2\.28'
+    flags: 'i'
+  - regex: 'Failed to initialize CommandManager.*sparse.*checkout'
+    flags: 'i'
+error_messages:
+  - 'Minimum Git version required for sparse checkout is 2.28. Your git (/usr/bin/git) is 2.23'
+  - 'Failed to initialize CommandManager: Minimum Git version required for sparse checkout is 2.28'
+root_cause: |
+  When actions/checkout is configured with sparse-checkout inputs and the git binary on a
+  self-hosted runner is older than 2.28, the action encounters an initialization error in
+  getGitCommandManager: "Minimum Git version required for sparse checkout is 2.28."
+
+  This error is silently swallowed in checkout's catch block. Because sparse-checkout is not
+  guarded by the LFS re-throw condition, the action silently falls back to downloading the
+  full repository via the GitHub REST API. The REST API path does NOT apply sparse-checkout
+  filters — every file in the repository is checked out into the workspace.
+
+  There is NO error message or warning in the workflow logs. The step shows green and
+  subsequent steps see the full repository instead of the expected filtered subset. This is
+  particularly dangerous for monorepos or large repositories where only a subdirectory was
+  expected to be present.
+
+  Source: actions/checkout#2435 (May 19, 2026). The fix proposed: print the swallowed
+  error as an info message and re-throw when sparse-checkout settings are configured.
+
+  Affected: self-hosted runners with git < 2.28 (CentOS 7, Debian 10, Ubuntu 18.04 ship
+  git 2.17–2.23). GitHub-hosted runners (ubuntu-latest, ubuntu-24.04, macos-latest,
+  windows-latest) all ship git >= 2.43 and are unaffected.
+fix: |
+  Option 1 (recommended): Upgrade git on the self-hosted runner to 2.28 or later.
+  On Ubuntu older LTS: sudo add-apt-repository ppa:git-core/ppa && sudo apt-get install git
+  On CentOS/RHEL: install from the IUS repository (https://ius.io)
+
+  Option 2: Add a pre-checkout guard step that fails fast with a clear error if git < 2.28:
+
+    - name: Guard — git must be >= 2.28 for sparse checkout
+      run: |
+        GIT_VER=$(git --version | grep -oP '[\d]+\.[\d]+\.[\d]+')
+        if [ "$(printf '%s\n%s' "2.28.0" "$GIT_VER" | sort -V | head -n1)" != "2.28.0" ]; then
+          echo "::error::git $GIT_VER < 2.28.0 — sparse-checkout silently falls back to full REST API."
+          exit 1
+        fi
+
+  Option 3: Switch to GitHub-hosted runners (ubuntu-latest, ubuntu-24.04) which ship
+  git >= 2.43 and fully support sparse checkout.
+
+  Option 4 (detection): After checkout, run:
+    git sparse-checkout list
+  If the output lists all repository files (not your sparse paths), the fallback occurred
+  and sparse-checkout is not working.
+fix_code:
+  - language: yaml
+    label: 'Guard — fail fast if git < 2.28 (required for sparse-checkout)'
+    code: |
+      steps:
+        - name: Verify git >= 2.28 for sparse-checkout
+          run: |
+            GIT_VER=$(git --version | grep -oP '[\d]+\.[\d]+\.[\d]+')
+            if [ "$(printf '%s\n%s' "2.28.0" "$GIT_VER" | sort -V | head -n1)" != "2.28.0" ]; then
+              echo "::error::git $GIT_VER < 2.28.0. sparse-checkout silently falls back to full checkout."
+              exit 1
+            fi
+            echo "git $GIT_VER OK"
+
+        - uses: actions/checkout@v6
+          with:
+            sparse-checkout: |
+              src
+              tests
+            sparse-checkout-cone-mode: true
+  - language: yaml
+    label: 'Upgrade git in-workflow before checkout (Ubuntu git-core PPA)'
+    code: |
+      steps:
+        - name: Upgrade git to 2.28+
+          run: |
+            sudo add-apt-repository -y ppa:git-core/ppa
+            sudo apt-get update -qq
+            sudo apt-get install -y git
+
+        - uses: actions/checkout@v6
+          with:
+            sparse-checkout: src
+            sparse-checkout-cone-mode: true
+prevention:
+  - 'Check git --version on all self-hosted runners — must be >= 2.28.0 for sparse-checkout to work (not silently fall back).'
+  - 'Add git version validation to runner provisioning scripts and fail the runner setup if git < 2.28.'
+  - 'After a sparse checkout, verify git sparse-checkout list shows only your expected paths, not all repository files.'
+  - 'Use GitHub-hosted runners (ubuntu-24.04+) for sparse-checkout jobs when managing git version on self-hosted runners is impractical.'
+docs:
+  - url: 'https://github.com/actions/checkout/issues/2435'
+    label: 'actions/checkout#2435 — Errors from getGitCommandManager silently ignored (sparse-checkout falls back to REST API when git < 2.28)'
+  - url: 'https://git-scm.com/docs/git-sparse-checkout'
+    label: 'Git docs: git sparse-checkout (requires git >= 2.28)'
+  - url: 'https://github.com/actions/checkout#sparse-checkout'
+    label: 'actions/checkout README — sparse-checkout inputs and git version requirements'
