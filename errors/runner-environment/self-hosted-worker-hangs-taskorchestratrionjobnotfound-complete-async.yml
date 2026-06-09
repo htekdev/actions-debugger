@@ -1,0 +1,124 @@
+id: runner-environment-388
+title: 'Self-hosted Runner.Worker Hangs Indefinitely After TaskOrchestrationJobNotFoundException
+  in CompleteJobAsync'
+category: runner-environment
+severity: error
+tags:
+  - self-hosted
+  - worker-hang
+  - TaskOrchestrationJobNotFoundException
+  - CompleteJobAsync
+  - runner-slot
+  - busy-state
+  - V2-flow
+patterns:
+  - regex: 'TaskOrchestrationJobNotFoundException.*workflow instance not found'
+    flags: 'i'
+  - regex: 'JobRunner.*CompleteJobAsync.*Job not found'
+    flags: 'i'
+  - regex: 'Job not found:.*workflow instance not found'
+    flags: 'i'
+error_messages:
+  - 'GitHub.DistributedTask.WebApi.TaskOrchestrationJobNotFoundException: Job not found:
+    99e3e9b6-22cb-535b-b919-c97958bc7899. workflow instance not found'
+  - '[ERR  JobRunner] GitHub.DistributedTask.WebApi.TaskOrchestrationJobNotFoundException:
+    Job not found: ... workflow instance not found'
+  - '[ERR  Worker] System.AggregateException: One or more errors occurred. (Job not
+    found: ...)'
+root_cause: |
+  On self-hosted runners using the V2 RunService path (`useV2Flow: true`), the
+  `Runner.Worker` process can fail to exit after a completed job when `JobRunner.CompleteJobAsync`
+  throws `TaskOrchestrationJobNotFoundException: workflow instance not found`.
+
+  This exception means the GitHub Actions orchestrator has lost track of the job
+  (e.g., due to a server-side GC, restart, or transient orchestrator failure). The
+  exception is **not recoverable** — the server cannot be retried into restoring a
+  job it has forgotten. However, `RetryRequest` does not treat this error as terminal:
+  it exhausts all configured `maxAttempts`, logs an `AggregateException`, prints the
+  `#####` separator line, and then the Worker ceases all progress **without exiting**.
+
+  The parent `Runner.Listener` tracks the Worker slot as `busy=true` because the
+  Worker process is still alive. The Listener will not spawn a new Worker until the
+  old one exits. The GitHub Actions API also reports the runner as busy. The result:
+  the entire runner's queue stalls indefinitely — no new jobs are picked up — until
+  an operator manually kills the hung Worker process or restarts the runner service.
+
+  Observed at a 32.8% rate on affected Apple Silicon macOS runner pools running
+  v2.334.0 with `useV2Flow: true`. Also reproduced on earlier versions (v2.333.1)
+  and referenced in runner#3862 (closed May 2025).
+fix: |
+  There is no configuration option to prevent this hang — it is a runner bug awaiting
+  an upstream fix. Mitigations:
+
+  1. **Deploy an external watchdog** that monitors for Worker processes that have been
+     alive for longer than your typical job duration with no active build-tool descendants,
+     and kills them:
+     - Elapsed > 20 min AND no active build-tool child processes (xcodebuild, swift, etc.)
+     - Elapsed > 10 min AND all network/tool children have been running with near-zero CPU
+
+  2. **Wrap the runner service in a restart-on-exit supervisor** (systemd `Restart=always`,
+     launchd `KeepAlive`, NSSM on Windows) so that when the stalled Worker is killed by
+     a watchdog, the Listener restarts automatically.
+
+  3. **Pin to the last unaffected runner version** if 2.334.0 is consistently problematic
+     in your environment. Check the runner RELEASES for the version before `useV2Flow`
+     was enabled by default.
+
+  4. **Monitor runner busy-state duration** using the GitHub REST API
+     (`GET /orgs/{org}/actions/runners`) and alert when a runner stays `busy=true` for
+     longer than your maximum expected job runtime.
+fix_code:
+  - language: yaml
+    label: 'Systemd unit with auto-restart for self-hosted runner'
+    code: |
+      # /etc/systemd/system/actions-runner.service
+      [Unit]
+      Description=GitHub Actions Runner
+      After=network.target
+
+      [Service]
+      User=actions-runner
+      WorkingDirectory=/opt/actions-runner
+      ExecStart=/opt/actions-runner/run.sh
+      # Automatically restart if the process exits (catches watchdog kills)
+      Restart=always
+      RestartSec=10
+
+      [Install]
+      WantedBy=multi-user.target
+  - language: bash
+    label: 'Minimal watchdog script to kill hung Worker processes (Linux/macOS)'
+    code: |
+      #!/bin/bash
+      # Kill Runner.Worker processes that have been alive > 30 min
+      # with no active build-tool descendants
+      MAX_AGE_SECONDS=1800
+      for pid in $(pgrep -f "Runner.Worker"); do
+        elapsed=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
+        [ -z "$elapsed" ] && continue
+        if [ "$elapsed" -gt "$MAX_AGE_SECONDS" ]; then
+          child_count=$(pgrep -P "$pid" 2>/dev/null | wc -l)
+          if [ "$child_count" -eq 0 ]; then
+            echo "Killing hung Runner.Worker PID $pid (${elapsed}s, no children)"
+            kill -9 "$pid"
+          fi
+        fi
+      done
+prevention:
+  - 'Run the GitHub Actions runner service under a supervisor with automatic restart
+    (systemd Restart=always, launchd KeepAlive, or NSSM on Windows).'
+  - 'Monitor runner busy-state duration via the GitHub REST API and alert when a runner
+    stays busy longer than your maximum job runtime.'
+  - 'Deploy a watchdog process that kills Worker processes with no active children
+    after a configurable maximum idle age.'
+  - 'Follow actions/runner#4418 for the upstream fix; upgrade as soon as a patched
+    release is available.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4418'
+    label: 'actions/runner#4418 — Self-hosted Worker hangs after CompleteJobAsync hits
+      workflow instance not found (May 2026, open)'
+  - url: 'https://github.com/actions/runner/issues/3862'
+    label: 'actions/runner#3862 — Earlier "lost communication: NotFound" report (May
+      2025)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/monitoring-and-troubleshooting-self-hosted-runners'
+    label: 'GitHub Docs — Monitoring and troubleshooting self-hosted runners'

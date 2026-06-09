@@ -1,0 +1,135 @@
+id: triggers-099
+title: 'workflow_dispatch-Only Workflow Triggered by Push Events — Phantom Failure Runs'
+category: triggers
+severity: error
+tags:
+  - workflow-dispatch
+  - push
+  - phantom-failure
+  - incorrect-trigger
+  - required-inputs
+  - event-mismatch
+  - runner-bug
+patterns:
+  - regex: '"event":\s*"push".*"conclusion":\s*"failure"'
+    flags: 'i'
+  - regex: 'on:\s*\n\s*workflow_dispatch:'
+    flags: 'im'
+  - regex: 'Workflow ran unexpectedly.*push.*workflow_dispatch'
+    flags: 'i'
+error_messages:
+  - '{"conclusion":"failure","event":"push"}'
+  - 'Run failed (event: push) — workflow has only workflow_dispatch trigger'
+  - 'Workflow failed with 0 jobs executed on push event'
+root_cause: |
+  In certain circumstances, GitHub Actions incorrectly triggers workflows that have
+  **only** a `workflow_dispatch` trigger when a push event occurs. The affected workflow
+  runs immediately fail with `conclusion: failure` and an empty jobs array, because the
+  GitHub Actions engine attempts to evaluate `required` inputs from the `workflow_dispatch`
+  configuration but those inputs do not exist in the push event context.
+
+  The pattern observed (runner#4001, Aug 2025):
+  1. A push event occurs on any branch.
+  2. GitHub's workflow evaluation engine incorrectly matches a `workflow_dispatch`-only
+     workflow against the push event.
+  3. The engine validates `required` inputs — which don't exist in the push context —
+     and fails at the parsing/validation stage before any jobs execute.
+  4. The workflow run appears in the Actions tab with `event: push` and `conclusion: failure`.
+
+  This creates persistent noise in the Actions runs list and breaks CI/CD dashboards
+  that treat any failure as an alert. The phantom runs appear with a 1-second timing
+  pattern — triggered immediately before or after the legitimate push-triggered workflow.
+
+  This is a GitHub Actions platform bug in the workflow evaluation/trigger-matching
+  layer. It is intermittent on most repositories but was observed at 100% reproduction
+  on some repos. It remains an open platform issue as of May 2026, with multiple
+  real-world reports referencing runner#4001.
+fix: |
+  **Workaround 1 — Add an explicit event guard step:**
+  Add a step or job-level `if:` condition that verifies the event is truly
+  `workflow_dispatch` before doing any work. This does not prevent the phantom run
+  but ensures it fails gracefully rather than executing unintended logic:
+
+  **Workaround 2 — Split the workflow_dispatch trigger into a companion file:**
+  Move the `workflow_dispatch` trigger to a separate, minimal "caller" workflow that
+  then calls the main workflow via `workflow_call`. The `workflow_dispatch`-only
+  companion file has no logic itself, so phantom runs from push events have no impact.
+
+  **Workaround 3 — Move the workflow_dispatch inputs to a workflow_call wrapper:**
+  Use `on: [workflow_call, workflow_dispatch]` with a guard job. The `workflow_call`
+  variant can be called safely by other workflows; the `workflow_dispatch` variant
+  is guarded by an `if: github.event_name == 'workflow_dispatch'` check.
+fix_code:
+  - language: yaml
+    label: 'Workaround 1 — Guard every job with event_name check'
+    code: |
+      name: Manual Deploy
+      on:
+        workflow_dispatch:
+          inputs:
+            environment:
+              description: 'Target environment'
+              required: true
+              type: choice
+              options: [staging, production]
+
+      jobs:
+        deploy:
+          # Guard against phantom push-event triggers
+          if: github.event_name == 'workflow_dispatch'
+          runs-on: ubuntu-latest
+          steps:
+            - name: Deploy
+              run: echo "Deploying to ${{ inputs.environment }}"
+  - language: yaml
+    label: 'Workaround 2 — Companion caller file (manual-deploy-trigger.yml)'
+    code: |
+      # File: .github/workflows/manual-deploy-trigger.yml
+      # Thin caller: only triggered manually, delegates to main workflow
+      name: Manual Deploy (trigger)
+      on:
+        workflow_dispatch:
+          inputs:
+            environment:
+              description: 'Target environment'
+              required: true
+              type: choice
+              options: [staging, production]
+
+      jobs:
+        call-deploy:
+          uses: ./.github/workflows/deploy-core.yml
+          with:
+            environment: ${{ inputs.environment }}
+
+      # File: .github/workflows/deploy-core.yml
+      # The actual logic — uses workflow_call only, no phantom trigger exposure
+      name: Deploy Core
+      on:
+        workflow_call:
+          inputs:
+            environment:
+              required: true
+              type: string
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying to ${{ inputs.environment }}"
+prevention:
+  - 'Always add `if: github.event_name == ''workflow_dispatch''` guards on jobs in
+    workflows with only a workflow_dispatch trigger until the platform bug is resolved.'
+  - 'Monitor your Actions runs list for unexpected `event: push` runs on workflows
+    that should only run manually; use `gh run list --workflow=<file>` to identify them.'
+  - 'Consider splitting workflow_dispatch triggers into thin caller files that delegate
+    to workflow_call-based core workflows, reducing exposure to this bug.'
+  - 'Follow actions/runner#4001 and GitHub platform release notes for a permanent fix.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4001'
+    label: 'actions/runner#4001 — workflow_dispatch-only workflow incorrectly triggered
+      by push events (Aug 2025)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_dispatch'
+    label: 'GitHub Docs — workflow_dispatch event'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#onworkflow_dispatchinputs'
+    label: 'GitHub Docs — workflow_dispatch inputs syntax'
