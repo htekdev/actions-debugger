@@ -1,0 +1,135 @@
+id: runner-environment-393
+title: 'Ubuntu 24.04 phantom disk usage during high-output jobs — runner agent log buffering causes ghost 12-15 GB ENOSPC'
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-24
+  - disk-space
+  - enospc
+  - runner-agent
+  - log-buffering
+  - high-output
+  - browser-testing
+  - phantom-disk
+patterns:
+  - regex: 'ENOSPC.*no space left.*device'
+    flags: 'i'
+  - regex: 'du.*sum.*does not match.*df|disk.*usage.*unaccounted'
+    flags: 'i'
+  - regex: 'No space left on device.*ubuntu.*24'
+    flags: 'i'
+error_messages:
+  - 'ENOSPC: no space left on device'
+  - 'No space left on device'
+  - 'OSError: [Errno 28] No space left on device'
+root_cause: |
+  On ubuntu-24.04 GitHub-hosted runners, workflows that generate very high volumes of
+  stdout/stderr output (e.g. browser test suites, Playwright, Puppeteer, or Chromium-
+  based test runners with many short-lived child processes) can trigger ghost disk usage
+  of 12-15 GB that cannot be accounted for by any standard diagnostic tool.
+
+  Characteristics of the phantom usage:
+  - df / reports 12-15 GB more used than the sum of all top-level directory sizes (du -shx)
+  - lsof +L1 (deleted-but-open files) only shows kernel /memfd:* entries (in-RAM tmpfs)
+  - /proc/<pid>/maps and /proc/<pid>/io for all processes shows single-digit MB write bytes
+  - The phantom usage recovers gradually (~40 seconds) AFTER the test driver process exits
+  - The same workload on a local ubuntu 24 machine does NOT reproduce
+
+  The suspected root cause is the runner agent's diagnostic/log buffer flushing on a
+  ~40-second periodic cycle during high-output jobs. The agent appears to buffer captured
+  stdout from processes, inflating /proc reporting in a way that df sees as disk-backed
+  storage but du and lsof cannot trace to specific files. This is not visible from inside
+  the runner's PID namespace.
+
+  Specifically reported with:
+  - Playwright WebKit browser test suites (~30 min, many concurrent browser child processes)
+  - Any workflow generating sustained high-volume stdout/stderr from subprocesses
+  - Reproduced on ubuntu-24.04 hosted runners running kernel 6.17.0-1015-azure
+
+  Source: actions/runner#4448 (May 22, 2026) — filed by @yury-s from the Playwright team
+  with detailed per-test df/du/lsof/io instrumentation.
+fix: |
+  There is no confirmed fix — this is an open runner-agent-side issue (actions/runner#4448).
+
+  Workarounds:
+
+  Option 1 (most effective): Use a GitHub larger runner with more disk space.
+  The ubuntu-latest runner has ~14 GB free root partition. The phantom usage can consume
+  all of it. Larger runners (ubuntu-latest-4-cores, 8-cores, etc.) have more disk.
+
+  Option 2: Suppress subprocess stdout/stderr to reduce log buffering pressure.
+  Route verbose output to /dev/null or a log file, especially for browser subprocesses:
+    npx playwright test --quiet 2>/dev/null
+
+  Option 3: Add periodic disk cleanup steps between test batches (reduces other disk
+  usage to leave headroom for the phantom usage).
+
+  Option 4: Use jlumbroso/free-disk-space at job start to reclaim pre-installed tool
+  space, providing more headroom before the phantom usage causes ENOSPC.
+fix_code:
+  - language: yaml
+    label: 'Use a larger runner with more disk space'
+    code: |
+      jobs:
+        browser-tests:
+          runs-on: ubuntu-latest-4-cores   # More disk; reduces ENOSPC risk
+          steps:
+            - uses: actions/checkout@v6
+            - name: Install browsers
+              run: npx playwright install --with-deps chromium
+            - name: Run tests
+              run: npx playwright test
+  - language: yaml
+    label: 'Free pre-installed tool space at job start for headroom'
+    code: |
+      jobs:
+        browser-tests:
+          runs-on: ubuntu-24.04
+          steps:
+            - name: Free disk space (pre-installed tools)
+              uses: jlumbroso/free-disk-space@v1.3.1
+              with:
+                android: true
+                dotnet: true
+                haskell: true
+                large-packages: true
+
+            - uses: actions/checkout@v6
+            - name: Run browser tests
+              run: npx playwright test
+  - language: yaml
+    label: 'Monitor disk during job to detect phantom usage'
+    code: |
+      jobs:
+        browser-tests:
+          runs-on: ubuntu-24.04
+          steps:
+            - uses: actions/checkout@v6
+
+            # Background disk monitor — samples df every 10s during test run
+            - name: Start disk monitor
+              run: |
+                (while true; do
+                  echo "$(date -u +%T) $(df -h / | tail -1)"
+                  sleep 10
+                done) &
+                echo "DISK_MONITOR_PID=$!" >> $GITHUB_ENV
+
+            - name: Run browser tests
+              run: npx playwright test
+
+            - name: Stop disk monitor
+              if: always()
+              run: kill $DISK_MONITOR_PID 2>/dev/null || true
+prevention:
+  - 'Use GitHub larger runners (4-core or higher) for workflows that run browser test suites with many concurrent subprocesses.'
+  - 'Free pre-installed tool disk space with jlumbroso/free-disk-space at job start to provide ENOSPC headroom.'
+  - 'Add df / monitoring at the start of disk-intensive jobs to detect when phantom usage appears before it causes ENOSPC.'
+  - 'Track actions/runner#4448 for an upstream fix from the GitHub runner team.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4448'
+    label: 'actions/runner#4448 — df reports 12-15 GB ghost disk usage unaccounted for by du/lsof on ubuntu-24.04 (filed by Playwright team)'
+  - url: 'https://github.com/jlumbroso/free-disk-space'
+    label: 'jlumbroso/free-disk-space — reclaim pre-installed tool disk space on GitHub-hosted runners'
+  - url: 'https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners/about-github-hosted-runners#supported-runners-and-hardware-resources'
+    label: 'GitHub Docs: Hosted runner hardware resources and disk space'
