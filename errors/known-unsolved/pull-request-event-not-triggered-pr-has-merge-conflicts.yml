@@ -1,0 +1,97 @@
+id: known-unsolved-101
+title: 'pull_request Event Does Not Fire When PR Has Merge Conflicts — Required Status Checks Can Never Pass'
+category: known-unsolved
+severity: limitation
+tags:
+  - pull_request
+  - merge-conflict
+  - required-status-check
+  - triggers
+  - branch-protection
+  - temporary-merge-commit
+  - ci-blocked
+patterns:
+  - regex: 'pull.request.*merge.conflict|conflict.*pull.request.*not.*trigger'
+    flags: 'i'
+error_messages:
+  - '(no error shown — the pull_request workflow simply does not run; PR stays stuck with "Expected — Waiting for status to be reported" on required checks)'
+root_cause: |
+  When a `pull_request` event fires, GitHub Actions does NOT check out the PR head commit
+  (`github.sha` / `github.event.pull_request.head.sha`). Instead, it checks out a
+  **temporary merge commit** — an ephemeral commit that GitHub creates by automatically
+  merging the PR branch into the base branch, representing what the merged result would
+  look like.
+
+  When a PR has merge conflicts, GitHub cannot create this temporary merge commit
+  because the merge cannot be completed automatically. As a result:
+  - The `pull_request` trigger event is **never emitted**
+  - The workflow does **not run at all**
+  - Any required status checks configured on the branch protection rule or ruleset for
+    that workflow remain in a "Waiting for status to be reported" state indefinitely
+  - The PR cannot be merged because required checks never pass
+
+  This is by design — it would be contradictory for CI to run against a merge commit
+  that cannot be automatically constructed. GitHub has acknowledged this limitation
+  since 2019 in community/discussions/26304, which remains open and unresolved as of 2026.
+
+  The same limitation applies to `pull_request_target` when using the `pull_request`
+  temporary merge commit context.
+fix: |
+  There is no workaround that preserves the exact `pull_request` event semantics. Options:
+
+  1. **Resolve the merge conflict** — the most straightforward solution. Reverse-integrate
+     the base branch into the feature branch (create a merge commit) or rebase. Once
+     conflicts are resolved, the `pull_request` event fires normally on the next push.
+
+  2. **Use `push` events instead** — triggers on every push regardless of conflict state.
+     Use `github.ref` to check the branch and `github.base_ref` (available via the push
+     payload) to approximate the PR base context.
+
+  3. **Decouple required status checks from `pull_request`** — configure branch protection
+     to require a check that CAN run (e.g., a `push`-triggered check) rather than
+     specifically requiring the `pull_request` workflow's check.
+
+  4. **Require conflict resolution before merge** (GitHub default) — GitHub's UI prevents
+     merging conflicted PRs anyway; treating missing CI as a secondary indicator is
+     redundant.
+fix_code:
+  - language: yaml
+    label: 'LIMITATION — pull_request event silently absent when conflicts exist'
+    code: |
+      # This workflow DOES NOT fire when the PR branch has merge conflicts
+      on:
+        pull_request:
+          branches: [main]
+      # The required status check "ci / test" will show "Waiting..." forever
+      # if there are conflicts, blocking the PR from merging.
+  - language: yaml
+    label: 'WORKAROUND — add push trigger as a fallback (non-exact equivalent)'
+    code: |
+      on:
+        pull_request:
+          branches: [main]
+        push:
+          # Trigger on the feature branch directly so CI runs even when conflicted
+          branches-ignore: [main, develop]
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run tests
+              run: make test
+      # Note: with push trigger, github.sha is the HEAD commit, NOT the merge commit.
+      # The workflow runs against the unconflicted feature branch code.
+prevention:
+  - 'Require developers to resolve merge conflicts before running CI — make conflict resolution a PR hygiene expectation enforced by the team process.'
+  - 'Configure required status checks to use push-triggered workflows rather than pull_request workflows to avoid CI gaps from conflicts.'
+  - 'Add a GitHub Actions workflow that posts a PR comment when no CI results are present, prompting the developer to resolve conflicts.'
+  - 'Use Merge Queue (merge_group trigger) to avoid the conflict problem entirely — the queue serializes merges and always has a valid merge base.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request'
+    label: 'GitHub Docs — pull_request event (note on temporary merge commit and conflicts)'
+  - url: 'https://github.com/orgs/community/discussions/26304'
+    label: 'GitHub Community #26304 — pull_request workflow not triggered when merge conflicts exist (open since 2019)'
+  - url: 'https://stackoverflow.com/questions/79211532/is-there-a-proper-way-to-run-a-github-action-pull_request-event-when-there-are-conflicts'
+    label: 'Stack Overflow — pull_request event when PR has conflicts (Score 4, Views 502)'

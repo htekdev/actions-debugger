@@ -1,0 +1,107 @@
+id: yaml-syntax-101
+title: 'GitHub Actions Has No Ternary Operator — The && || Workaround Silently Returns the False Branch When True-Value Is Empty'
+category: yaml-syntax
+severity: silent-failure
+tags:
+  - expression
+  - ternary
+  - and-or-shortcircuit
+  - empty-string
+  - run-name
+  - env
+  - yaml-expression
+  - silent-failure
+patterns:
+  - regex: '\$\{\{[^}]*&&[^}]+\|\|[^}]*\}\}'
+    flags: 'i'
+error_messages:
+  - '(no error — expression evaluates to the false-branch value when the true-branch value is empty string, 0, false, or null)'
+root_cause: |
+  GitHub Actions expressions do not have a ternary (`?:`) operator. The widely used
+  workaround is the short-circuit pattern:
+
+    ${{ condition && 'true-value' || 'false-value' }}
+
+  This works identically to the ternary operator **only when `true-value` is truthy**.
+  However, if `true-value` evaluates to a falsy value (empty string `''`, `0`, `false`,
+  or `null`), JavaScript short-circuit evaluation skips the true-branch result and falls
+  through to evaluate the false-branch instead — silently returning the wrong value.
+
+  Common real-world cases where this silently misfires:
+  - `condition && '' || 'fallback'` → always returns `'fallback'` regardless of condition
+  - `condition && 0 || 42` → always returns `42`
+  - `inputs.flag == 'true' && steps.x.outputs.result || 'default'` → falls through to
+    `'default'` whenever `steps.x.outputs.result` is an empty string (e.g. skipped step)
+
+  This is a particularly confusing silent failure in `run-name:`, `env:` blocks, and
+  step `name:` fields where there is no warning at all.
+
+  GitHub Actions runner issue: actions/runner#409 (original feature request for ternary,
+  open since 2020, community workaround widely recommended despite the falsy pitfall).
+fix: |
+  Option 1 — Use `format()` to build a conditional string (safe, no falsy pitfall):
+    ${{ inputs.flag == 'true' && format('(with {0})', inputs.label) || '' }}
+    → Still has the pitfall if format() produces empty string; use Option 2 instead.
+
+  Option 2 — Capture the conditional value via a preceding step output:
+    - id: set-label
+      run: |
+        if [[ "${{ inputs.flag }}" == 'true' ]]; then
+          echo "value=(with cache-retain)" >> $GITHUB_OUTPUT
+        else
+          echo "value=" >> $GITHUB_OUTPUT
+        fi
+    # Then reference ${{ steps.set-label.outputs.value }} directly
+
+  Option 3 — Wrap in a shell step using $GITHUB_ENV to avoid the expression entirely.
+
+  Option 4 — Accept the workaround only when `true-value` is guaranteed non-empty and
+  non-zero (e.g. a hardcoded non-empty string).
+fix_code:
+  - language: yaml
+    label: 'WRONG — && || ternary where true-value may be empty string'
+    code: |
+      # Silent failure: if steps.build.outputs.image is '' (skipped step),
+      # the expression evaluates to 'none' regardless of the condition.
+      run-name: Deploy ${{ github.event_name == 'push' && steps.build.outputs.image || 'none' }}
+
+      # Also wrong: secrets are masked to *** → treated as empty → falls through
+      env:
+        TAG: ${{ inputs.use_tag == 'true' && inputs.tag_value || 'latest' }}
+        # If inputs.tag_value is empty string, TAG is always 'latest'
+  - language: yaml
+    label: 'RIGHT — use a preceding step to compute conditional value safely'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - id: label
+              run: |
+                if [[ "${{ inputs.cache_retain }}" == 'true' ]]; then
+                  echo "suffix=(with forced cache-retain)" >> $GITHUB_OUTPUT
+                else
+                  echo "suffix=" >> $GITHUB_OUTPUT
+                fi
+            - run: echo "Deploying Something Running ${{ steps.label.outputs.suffix }}"
+  - language: yaml
+    label: 'RIGHT — safe use of && || only when true-value is guaranteed non-empty'
+    code: |
+      # Safe: hardcoded non-empty strings are never falsy
+      run-name: ${{ inputs.debug == 'true' && '[DEBUG] Deploy' || 'Deploy' }}
+
+      # Safe: non-zero numbers
+      env:
+        TIMEOUT: ${{ inputs.quick == 'true' && '30' || '300' }}
+prevention:
+  - 'Never use `${{ condition && trueVal || falseVal }}` when `trueVal` can be empty string, 0, false, or null — use a shell step with $GITHUB_OUTPUT instead.'
+  - 'Be especially careful with step outputs that may be empty when the producing step was skipped or did not set the output.'
+  - 'Secrets in expressions are masked to `***` which evaluates as truthy, not the original value; avoid using secrets as the true-branch of && ||.'
+  - 'Use actionlint to detect complex expression patterns that may have falsy-true-branch issues at lint time.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions'
+    label: 'GitHub Docs — Evaluate expressions in workflows and actions'
+  - url: 'https://github.com/actions/runner/issues/409'
+    label: 'actions/runner#409 — Feature request: ternary operator in expressions (open since 2020)'
+  - url: 'https://stackoverflow.com/questions/79541731/what-is-the-ternary-operator-equivalent-in-github-actions'
+    label: 'Stack Overflow — What is the ternary operator equivalent in GitHub Actions? (Score 6, Views 3.8k)'
