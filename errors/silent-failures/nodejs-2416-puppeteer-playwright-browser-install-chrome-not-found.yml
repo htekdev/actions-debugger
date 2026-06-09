@@ -1,0 +1,155 @@
+id: silent-failures-177
+title: 'Node.js 24.16.0 Breaks `@puppeteer/browsers install` — Browser Binary Missing After Successful Install'
+category: silent-failures
+severity: error
+tags:
+  - nodejs
+  - node24
+  - puppeteer
+  - playwright
+  - cypress
+  - extract-zip
+  - browser-testing
+  - runner-image
+  - ubuntu
+  - chrome
+patterns:
+  - regex: 'Could not find Chrome \(ver\. [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\)'
+    flags: 'i'
+  - regex: 'your cache path is incorrectly configured.*\.cache.puppeteer|puppeteer.*Could not find.*chrome'
+    flags: 'i'
+  - regex: 'Executable doesn.t exist at.*\.cache.ms-playwright.*chrome|playwright.*browser.*not.*found.*executable'
+    flags: 'i'
+  - regex: 'npx puppeteer browsers install.*error|@puppeteer.browsers.*Failed to extract'
+    flags: 'i'
+error_messages:
+  - "Error: Could not find Chrome (ver. 146.0.7680.153). This can occur if either 1. you did not perform an installation before running the script (e.g. `npx puppeteer browsers install chrome-headless-shell`) or 2. your cache path is incorrectly configured (which is: /home/runner/work/.../.../.cache/puppeteer)."
+  - "Executable doesn't exist at /home/runner/.cache/ms-playwright/chromium-1169/chrome-linux/chrome"
+  - "Error: Could not find a browser executable. Please re-run playwright install."
+  - "browserType.launch: Executable doesn't exist at /home/runner/.cache/ms-playwright/chromium-XXXX/chrome-linux/chrome"
+root_cause: |
+  GitHub Actions runner images updated their cached Node.js toolcache from 24.15.0 to
+  24.16.0 in the ubuntu24/20260525.161.1, ubuntu22/20260525.161.1, and win25/20260525.149.1
+  image updates (released May 25-26, 2026). Node.js 24.16.0 introduced an internal change
+  to the `readable-stream.destroy()` lifecycle that broke the `extract-zip` npm package.
+
+  `@puppeteer/browsers` (used internally by `npx puppeteer browsers install`) and Playwright's
+  browser installer both use `extract-zip` to unpack downloaded browser ZIP archives. With
+  Node.js 24.16.0, `extract-zip` exits 0 (success) but produces no output — the browser ZIP
+  is silently partially extracted and the Chrome/Chromium binary is never written to disk.
+
+  Because the install step exits 0 (success) even though the browser binary was not extracted,
+  this is a **silent failure**: the CI step passes, but the binary is absent. The failure only
+  manifests at runtime when the browser is launched and cannot be found.
+
+  Workflows using `actions/setup-node` with `node-version: "24"` or `node-version: "latest"`
+  started resolving to Node.js 24.16.0 after the May 25 runner image update. Previously the
+  same floating pin resolved to Node.js 24.15.0, which is unaffected.
+
+  Same root cause also affects:
+  - Puppeteer < 25.1.0 (uses @puppeteer/browsers with extract-zip)
+  - Playwright < 1.60.0 (has its own browser downloader based on extract-zip)
+  - Cypress browser installation
+  - jsvu (JavaScript engine version updater)
+  - Any npm package that calls extract-zip on Node.js 24.16.0
+
+  Upstream issues: nodejs/node#63487 (yauzl/extract-zip hang / partial extraction),
+  nodejs/node#63581 (readable-stream.destroy() lifecycle change).
+
+  Source: runner-images#14173 (closed May 2026), runner-images#14174.
+fix: |
+  Option 1 — Update Puppeteer to v25.1.0+ (recommended for Puppeteer users):
+  Puppeteer 25.1.0 replaced its use of extract-zip and is unaffected on Node.js 24.16.0+.
+    npm install puppeteer@latest  (or pin >= 25.1.0 in package.json)
+
+  Option 2 — Update Playwright to v1.60.0+ (recommended for Playwright users):
+  Playwright 1.60.0 includes a fix for the extract-zip regression on Node.js 24.16.0.
+    npm install @playwright/test@latest
+
+  Option 3 — Pin Node.js to 24.15.0 (last unaffected 24.x release):
+  If upgrading Puppeteer or Playwright is not immediately feasible, pin the Node.js
+  version used during browser installation. Remove the pin after upgrading.
+
+  Option 4 — Switch to Node.js 22 LTS (unaffected):
+  Node.js 22 is not affected by this regression and is a safe fallback.
+fix_code:
+  - language: yaml
+    label: 'Upgrade Puppeteer to 25.1.0+ (permanent fix)'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-24.04
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v6
+              with:
+                node-version: '24'
+                cache: 'npm'
+
+            # package.json must pin puppeteer >= 25.1.0 to avoid extract-zip breakage
+            - run: npm ci
+
+            - name: Install Puppeteer browsers
+              run: npx puppeteer browsers install chrome-headless-shell
+
+            - name: Run tests
+              run: npm test
+
+  - language: yaml
+    label: 'Pin Node.js 24.15.0 as workaround (temporary)'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-24.04
+          steps:
+            - uses: actions/checkout@v4
+
+            # Pin 24.15.0 — last unaffected Node.js 24.x before extract-zip breakage
+            # Remove pin after upgrading to Puppeteer >= 25.1.0 or Playwright >= 1.60.0
+            - uses: actions/setup-node@v6
+              with:
+                node-version: '24.15.0'
+                cache: 'npm'
+
+            - run: npm ci
+
+            - name: Install Puppeteer Chrome
+              run: npx puppeteer browsers install chrome-headless-shell
+
+            - name: Run E2E tests
+              run: npm test
+
+  - language: yaml
+    label: 'Playwright — update to 1.60.0+ or pin Node 24.15.0'
+    code: |
+      jobs:
+        playwright:
+          runs-on: ubuntu-24.04
+          steps:
+            - uses: actions/checkout@v4
+            # Option A: Use Node 24.15.0 workaround
+            - uses: actions/setup-node@v6
+              with:
+                node-version: '24.15.0'
+            - run: npm ci
+            - name: Install Playwright browsers
+              run: npx playwright install --with-deps chromium
+            - name: Run tests
+              run: npx playwright test
+
+prevention:
+  - 'Pin explicit minor.patch Node.js versions in browser-test workflows (e.g. `node-version: "24.15.0"`) instead of floating major pins — runner image toolcache bumps silently change the active Node.js version.'
+  - 'Pin Puppeteer (>= 25.1.0) and Playwright (>= 1.60.0) in package.json to avoid extract-zip-based browser installer regressions.'
+  - 'Add a post-install assertion that verifies the browser binary exists before running tests — converts a silent install failure into a visible early error.'
+  - 'When runner image release notes list a Node.js toolcache bump, run a Puppeteer/Playwright smoke test on the new image before relying on it for production CI.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14173'
+    label: 'runner-images#14173: Puppeteer broken on Ubuntu 24.04 20260525 — root cause Node.js 24.16.0 extract-zip'
+  - url: 'https://github.com/nodejs/node/issues/63487'
+    label: 'nodejs/node#63487: extract-zip/yauzl partial extraction on Node.js 24.16.0'
+  - url: 'https://github.com/nodejs/node/issues/63581'
+    label: 'nodejs/node#63581: readable-stream.destroy() lifecycle change in Node.js 24.16.0'
+  - url: 'https://pptr.dev/guides/configuration'
+    label: 'Puppeteer configuration guide — PUPPETEER_CACHE_DIR and browser installation'
+  - url: 'https://playwright.dev/docs/browsers'
+    label: 'Playwright — Installing browsers documentation'

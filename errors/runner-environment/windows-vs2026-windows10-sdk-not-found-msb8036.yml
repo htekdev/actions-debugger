@@ -1,0 +1,132 @@
+id: runner-environment-396
+title: 'Windows 10 SDK Not Pre-installed on VS 2026 Runner — MSB8036 When Project Targets 10.0.19041.0 or Earlier'
+category: runner-environment
+severity: error
+tags:
+  - windows
+  - visual-studio-2026
+  - vs2026
+  - windows-sdk
+  - windows-10-sdk
+  - msbuild
+  - windows-latest
+  - cpp
+  - breaking-change
+  - uwp
+patterns:
+  - regex: 'MSB8036.*Windows SDK version.*was not found'
+    flags: 'i'
+  - regex: 'Windows SDK version 10\.0\.(19041|18362|17763|17134|16299|15063|14393|10586|10240)\.0 was not found'
+    flags: 'i'
+  - regex: 'error MSB8036.*Install the required version of Windows SDK'
+    flags: 'i'
+  - regex: 'WindowsTargetPlatformVersion.*10\.0\.(19041|18362|17763)\.0.*not found|WindowsKits\\10\\Include\\10\.0\.(19041|18362|17763)\.0.*not found'
+    flags: 'i'
+error_messages:
+  - "error MSB8036: The Windows SDK version 10.0.19041.0 was not found. Install the required version of Windows SDK or change the SDK version in the project property pages or by right-clicking the solution and selecting \"Retarget solution\"."
+  - "error MSB8036: The Windows SDK version 10.0.17763.0 was not found."
+  - "error MSB8036: The Windows SDK version 10.0.18362.0 was not found. Install the required version of Windows SDK or change the SDK version in the project property pages or by right-clicking the solution and selecting \"Retarget solution\"."
+  - "The Windows SDK version '10.0.19041.0' could not be found in the Windows SDK installation directory."
+root_cause: |
+  Visual Studio 2026 does not bundle the Windows 10 SDK (10.0.19041.0 and earlier).
+  The VS 2026 runner image ships with only the Windows 11 SDK (10.0.26100.x) pre-installed.
+
+  GitHub Actions migrated `windows-latest` and `windows-2025` to use VS 2026 starting
+  June 8, 2026 (completing June 15, 2026). VS 2022 included the Windows 10 SDK
+  (10.0.19041.0 was the default in VS 2022 installer workloads). VS 2026 removed it.
+
+  Any C++, UWP, or Win32 project that explicitly specifies a Windows 10 SDK version via:
+    <WindowsTargetPlatformVersion>10.0.19041.0</WindowsTargetPlatformVersion>
+  or via CMake `CMAKE_SYSTEM_VERSION 10.0.19041.0` will receive MSB8036 because the
+  required SDK headers and libraries are not present in the runner image.
+
+  Commonly affected SDK versions that trigger MSB8036 on VS 2026 runners:
+  - 10.0.19041.0 (Windows 10 2004 / May 2020 Update — most common default in VS 2022)
+  - 10.0.18362.0 (Windows 10 1903 / May 2019 Update)
+  - 10.0.17763.0 (Windows 10 1809 / October 2018 Update)
+  - 10.0.17134.0 and earlier
+
+  This is distinct from the general VS component removal covered in runner-environment-020.
+  MSB8036 is a build-time SDK lookup failure, not a missing VS workload component.
+
+  Source: runner-images#14017, CommunityToolkit/Windows#852 (May 2026), byteiota.com
+  VS 2026 migration guide (Windows 10 SDK removal section).
+fix: |
+  Option 1 — Let MSBuild auto-select the latest available SDK (recommended):
+  Change `<WindowsTargetPlatformVersion>10.0.19041.0</WindowsTargetPlatformVersion>` to
+  `<WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>` (no trailing version).
+  MSBuild will pick the highest installed SDK (Windows 11 SDK 10.0.26100.x on VS 2026 runner).
+  The Windows 11 SDK headers are backward-compatible with Windows 10 API surface.
+
+  Option 2 — Install the Windows 10 SDK explicitly in a workflow step:
+  Use winget to install the SDK before building. This adds ~2-5 min to the workflow.
+
+  Option 3 — Pin to windows-2022 for immediate rollback:
+  `windows-2022` includes VS 2022 with Windows 10 SDK pre-installed.
+
+  Option 4 — Retarget to Windows 11 SDK in project files:
+  Update `.vcxproj` files to target `10.0.26100.0` explicitly for deterministic builds.
+fix_code:
+  - language: yaml
+    label: 'Install Windows 10 SDK explicitly before building'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-latest   # VS 2026 — Windows 11 SDK only
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Install Windows 10 SDK 10.0.19041.0
+              shell: pwsh
+              run: |
+                winget install --id Microsoft.WindowsSDK.10.0.19041 --silent `
+                  --accept-package-agreements --accept-source-agreements
+                # Allow winget to complete and registry to settle
+                Start-Sleep -Seconds 5
+
+            - name: Build
+              run: msbuild MyProject.sln /p:Configuration=Release /p:Platform=x64
+
+  - language: yaml
+    label: 'Use floating `10.0` SDK version to auto-select latest'
+    code: |
+      # In your .vcxproj, change:
+      #   <WindowsTargetPlatformVersion>10.0.19041.0</WindowsTargetPlatformVersion>
+      # To:
+      #   <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+      # MSBuild then selects the highest installed SDK automatically.
+      #
+      # After updating the project file, no workflow changes needed:
+      jobs:
+        build:
+          runs-on: windows-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build (Windows 11 SDK auto-selected via floating 10.0)
+              run: msbuild MyProject.sln /p:Configuration=Release /p:Platform=x64
+
+  - language: yaml
+    label: 'Pin to windows-2022 as immediate rollback (VS 2022 + Windows 10 SDK)'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-2022   # VS 2022 with Windows 10 SDK 10.0.19041.0 pre-installed
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build
+              run: msbuild MyProject.sln /p:Configuration=Release /p:Platform=x64
+
+prevention:
+  - 'Avoid pinning a specific `<WindowsTargetPlatformVersion>` patch version in project files — use `10.0` (without the trailing .0.0.0) to let MSBuild pick the latest installed SDK.'
+  - 'Test Windows builds on `windows-2025-vs2026` before the `windows-latest` migration date to catch SDK version mismatches early.'
+  - 'Add the Windows SDK version to your build log output to detect unexpected SDK selection changes between runner image updates.'
+  - 'Subscribe to runner-images announcements (OS: Windows, Announcement labels) for advance notice of `windows-latest` migrations that may change pre-installed SDK versions.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14017'
+    label: 'runner-images#14017: windows-latest migration to VS 2026 — component comparison table'
+  - url: 'https://github.com/CommunityToolkit/Windows/pull/852'
+    label: 'CommunityToolkit/Windows#852: Upgrade to windows-2025 + install Windows SDKs step'
+  - url: 'https://byteiota.com/github-actions-windows-vs2026-migration/'
+    label: 'byteiota.com: GitHub Actions Windows VS 2026 migration guide — Windows 10 SDK removal'
+  - url: 'https://developer.microsoft.com/en-us/windows/downloads/sdk-archive/'
+    label: 'Microsoft Windows SDK archive — download older Windows SDK versions'

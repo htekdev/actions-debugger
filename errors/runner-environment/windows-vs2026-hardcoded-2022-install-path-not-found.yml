@@ -1,0 +1,142 @@
+id: runner-environment-395
+title: 'Hardcoded VS 2022 Install Path (`\2022\Enterprise\`) Breaks on VS 2026 Runner'
+category: runner-environment
+severity: error
+tags:
+  - windows
+  - visual-studio-2026
+  - vs2026
+  - windows-latest
+  - windows-2025
+  - msbuild
+  - breaking-change
+  - paths
+  - vswhere
+patterns:
+  - regex: 'Cannot find path .C:\\Program Files\\Microsoft Visual Studio\\2022\\.*because it does not exist'
+    flags: 'i'
+  - regex: 'C:\\Program Files\\Microsoft Visual Studio\\2022.*does not exist|\\\\2022\\\\Enterprise.*does not exist'
+    flags: 'i'
+  - regex: 'Test-Path.*\\\\2022\\\\Enterprise.*False|gi.*Visual Studio\\\\2022.*not found'
+    flags: 'i'
+  - regex: 'VS2022INSTALLDIR.*not.*set|env.*VS2022.*undefined.*windows.*latest'
+    flags: 'i'
+error_messages:
+  - "Cannot find path 'C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\MSBuild\\Microsoft\\VC' because it does not exist."
+  - "Get-Item : Cannot find path 'C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\Common7\\Tools\\VsDevCmd.bat' because it does not exist."
+  - "VERBOSE: Cannot find path 'C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\MSBuild\\Microsoft\\VC\\v170\\BuildCustomizations'"
+  - "The system cannot find the path specified: C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise"
+root_cause: |
+  Visual Studio 2026 (version 18.x) installs to
+  `C:\Program Files\Microsoft Visual Studio\18\Enterprise\` instead of the VS 2022
+  path `C:\Program Files\Microsoft Visual Studio\2022\Enterprise\`.
+
+  GitHub Actions migrated `windows-latest` and `windows-2025` to use VS 2026 starting
+  June 8, 2026 (completing June 15, 2026, per runner-images#14017). Additionally,
+  `windows-2025` began serving the `windows-2025-vs2026` image prematurely around
+  May 5, 2026 (runner-images#14004, 7 reactions).
+
+  Many CI workflows hardcode the VS 2022 install path. The most common pattern is
+  copying NVIDIA CUDA's MSBuildExtensions into the VS BuildCustomizations directory
+  so MSBuild can compile CUDA projects:
+
+    $vsPath = 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise'
+    Copy-Item -Path 'cuda\extras\visual_studio_integration\MSBuildExtensions\*' `
+              -Destination "$vsPath\MSBuild\Microsoft\VC\v170\BuildCustomizations"
+
+  On VS 2026 runners, the `\2022\Enterprise\` directory does not exist. VS is installed at
+  `\18\Enterprise\`. Any `Get-Item`, `Copy-Item`, `Test-Path`, or shell command referencing
+  the old path fails with "Cannot find path ... because it does not exist."
+
+  Also broken: the environment variable `$env:VS2022INSTALLDIR` is not set in VS 2026 images.
+
+  Real-world impact: MeshLib PR#6049 and #6050 (CUDA MSBU extensions), openjdk/jdk PR#31093
+  (downgrade to windows-2022 as workaround), cppcheck PR#8532 (remove explicit VS generator),
+  Quantinuum/tket PR#2163 (pin to windows-2022), openJDK jdk17u-dev PR#4451.
+
+  Source: runner-images#14004 (7 reactions, May 2026).
+fix: |
+  Option 1 — Use vswhere to discover the VS install path at runtime (recommended):
+
+    $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    $vsInstallPath = & $vswhere -latest -products * -property installationPath
+
+  This works with VS 2022 (`\2022\Enterprise`), VS 2026 (`\18\Enterprise`), and
+  any future VS version — no hardcoded paths needed.
+
+  Option 2 — Use `microsoft/setup-msbuild` action instead of VsDevCmd.bat:
+  The setup-msbuild action handles VS discovery internally and works with both VS 2022
+  and VS 2026, eliminating the need to call VsDevCmd.bat via a hardcoded path.
+
+  Option 3 — Pin to windows-2022 for immediate rollback:
+  `runs-on: windows-2022` still provides VS 2022 at the `\2022\Enterprise\` path.
+  Not a long-term fix as windows-2022 will eventually be retired.
+fix_code:
+  - language: yaml
+    label: 'Discover VS install path dynamically via vswhere (replaces hardcoded \2022\ path)'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-latest   # now VS 2026 (\18\Enterprise)
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Install CUDA BuildCustomizations via vswhere
+              shell: pwsh
+              run: |
+                $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+                $vsInstallPath = & $vswhere -latest -products * -property installationPath
+                if (-not $vsInstallPath) {
+                  Write-Error 'Could not find Visual Studio installation via vswhere'
+                  exit 1
+                }
+                Write-Output "VS install path: $vsInstallPath"
+
+                $dest = "$vsInstallPath\MSBuild\Microsoft\VC\v170\BuildCustomizations"
+                New-Item -ItemType Directory -Force -Path $dest | Out-Null
+                Copy-Item -Path 'cuda\extras\visual_studio_integration\MSBuildExtensions\*' `
+                          -Destination $dest
+
+  - language: yaml
+    label: 'Use microsoft/setup-msbuild to avoid path issues entirely'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            # setup-msbuild finds VS and adds MSBuild to PATH automatically
+            # Works with VS 2022 and VS 2026
+            - name: Add MSBuild to PATH
+              uses: microsoft/setup-msbuild@v2
+
+            - name: Build
+              run: msbuild MyProject.sln /p:Configuration=Release /p:Platform=x64
+
+  - language: yaml
+    label: 'Pin to windows-2022 as immediate rollback'
+    code: |
+      jobs:
+        build:
+          # Temporary pin to VS 2022 while updating hardcoded paths
+          runs-on: windows-2022
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build
+              run: msbuild MyProject.sln /p:Configuration=Release
+
+prevention:
+  - 'Never hardcode the VS install path as a string literal — always use vswhere.exe (-latest -property installationPath) to discover it at runtime.'
+  - 'Avoid referencing year-specific VS environment variables like `$env:VS2022INSTALLDIR`, `$env:VS140COMNTOOLS`, or `$env:VS160COMNTOOLS` — these are not set in VS 2026 images.'
+  - 'Use `microsoft/setup-msbuild` action instead of calling `VsDevCmd.bat` directly — it handles VS discovery and version changes automatically.'
+  - 'Subscribe to runner-images announcements (labels: OS: Windows, Announcement) to know when windows-latest migrations happen and test with `windows-2025-vs2026` in advance.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14004'
+    label: 'runner-images#14004: windows-2025 serving VS 2026 image prematurely — breaks hardcoded VS 2022 paths'
+  - url: 'https://github.com/actions/runner-images/issues/14017'
+    label: 'runner-images#14017: windows-latest migration to VS 2026 (June 8-15, 2026)'
+  - url: 'https://github.com/microsoft/vswhere'
+    label: 'microsoft/vswhere — Dynamic Visual Studio installation discovery'
+  - url: 'https://github.com/marketplace/actions/setup-msbuild'
+    label: 'microsoft/setup-msbuild — Sets up MSBuild for GitHub Actions workflows'
