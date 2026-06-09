@@ -1,0 +1,165 @@
+id: runner-environment-370
+title: 'macOS 26 + Xcode 26 Swift 6 Actor Isolation Compilation Errors — Code That Built on macos-15/Xcode 16 Fails'
+category: runner-environment
+severity: error
+tags:
+  - macos-26
+  - xcode-26
+  - swift-6
+  - actor-isolation
+  - concurrency
+  - breaking-change
+  - ios
+  - macos-latest
+patterns:
+  - regex: 'error: call to main actor-isolated .* in a synchronous nonisolated context'
+    flags: 'i'
+  - regex: 'error: main actor-isolated .* cannot be referenced from a nonisolated context'
+    flags: 'i'
+  - regex: 'error: sending value of non-Sendable type .* risks causing data races'
+    flags: 'i'
+  - regex: 'error: .* is not sendable|error: actor-isolated .* can not be sent'
+    flags: 'i'
+  - regex: 'error: expression is ''async'' but is not marked with ''await'''
+    flags: 'i'
+error_messages:
+  - 'error: call to main actor-isolated initializer ''init()'' in a synchronous nonisolated context'
+  - 'error: main actor-isolated property ''delegate'' cannot be referenced from a nonisolated context'
+  - 'error: sending value of non-Sendable type ''() async -> ()'' risks causing data races'
+  - 'error: main actor-isolated class ''TypingOperationQueue'' cannot be used to satisfy nonisolated protocol requirement'
+  - 'error: actor-isolated instance method cannot be used to satisfy a nonisolated requirement from protocol ''SomeProtocol'''
+root_cause: |
+  Xcode 26 (which ships as the default toolchain on the macOS 26 runner image)
+  enforces stricter Swift actor isolation rules compared to Xcode 16.x (the default
+  on macOS 15). When `macos-latest` migrates from macOS 15 → macOS 26 (beginning
+  June 15, 2026), CI workflows building Swift/iOS/macOS projects encounter new
+  compilation errors that were not raised by Xcode 16.
+
+  **Why Xcode 26 is stricter:**
+
+  1. **Xcode 26 ships Swift 6.3** — which tightens actor isolation analysis in both
+     Swift 5 compatibility mode and Swift 6 mode. Code that Xcode 16.x accepted with
+     a warning (or silently accepted) now produces a hard error under the Xcode 26
+     Swift compiler.
+
+  2. **`@concurrent` function closures**: Passing an async closure isolated to a
+     `@MainActor` function to a `@concurrent` function is now a hard error: "sending
+     value of non-Sendable type '() async -> ()' risks causing data races"
+     (swiftlang/swift#88724). The workaround in Xcode 16 was implicit and is now
+     rejected.
+
+  3. **Nonisolated protocol conformance**: Classes annotated with `@MainActor` that
+     conform to protocols expecting nonisolated method implementations now produce
+     "actor-isolated instance method cannot be used to satisfy nonisolated protocol
+     requirement." Adding `@MainActor` to the protocol method or using `nonisolated`
+     on the implementation is required.
+
+  4. **Swift 6 language mode + macos-26**: Projects that have already set
+     `SWIFT_VERSION = 6` in their Xcode project AND migrate to macos-26 encounter
+     all of Swift 6's strict concurrency checks, not just Xcode 26's incremental
+     ones. Most notably, `deinit` of a `@MainActor` class can no longer call
+     MainActor-isolated methods without `isolated deinit` (Xcode 26 feature).
+
+  **Affected project types:**
+  - iOS apps with custom `OperationQueue`-based classes not annotated with `@MainActor`
+  - Frameworks conforming to `URLSessionDelegate`, `UIApplicationDelegate`, or other
+    UI-tier protocols from nonisolated contexts
+  - Any class that mixes `@MainActor` isolation with nonisolated protocol requirements
+
+  **Real-world example:** ably/ably-chat-swift#482 (April 2026) — Xcode 26.4 refused
+  to compile `TypingOperationQueue` until `@MainActor` was added. The fix was one
+  annotation.
+fix: |
+  **Option 1 — Pin to macos-15 until your project is migrated:**
+  ```yaml
+  runs-on: macos-15  # Xcode 16.x; reverts to pre-26 Swift compiler
+  ```
+  This buys time to fix actor isolation issues without blocking CI.
+
+  **Option 2 — Add `@MainActor` annotation to the affected class/method:**
+  The most common fix. If a class is only ever used from the main thread, annotating
+  it with `@MainActor` resolves both the property access and the nonisolated protocol
+  conformance errors.
+
+  **Option 3 — Add `nonisolated` to an isolated method when conforming to a protocol:**
+  If the protocol requires a nonisolated implementation and the method is safe to
+  call from any isolation context, mark it `nonisolated`:
+  ```swift
+  nonisolated func urlSession(_ session: URLSession, ...) { ... }
+  ```
+
+  **Option 4 — Use `isolated deinit` for `@MainActor` classes that call self in deinit:**
+  Swift 6.3 (Xcode 26) stabilised `isolated deinit`. Add it to your deinit to retain
+  isolation:
+  ```swift
+  @MainActor class MyController {
+      isolated deinit { stop() }  // safe to call @MainActor methods here
+  }
+  ```
+  This feature is stable on Xcode 26 (Swift 6.3) but requires a deployment target
+  that supports Swift 6.3 runtime. Use `#if swift(>=6.3)` guards for backward compat.
+fix_code:
+  - language: yaml
+    label: 'Immediate rollback — pin to macos-15 until actor isolation is fixed'
+    code: |
+      jobs:
+        build:
+          runs-on: macos-15   # Xcode 16.x; avoids Xcode 26 strict concurrency errors
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build
+              run: xcodebuild -scheme MyApp -destination 'platform=iOS Simulator,name=iPhone 16' build
+  - language: yaml
+    label: 'Fix — add @MainActor annotation and use isolated deinit on macos-26'
+    code: |
+      # In your Swift source file:
+      # Before (breaks on Xcode 26):
+      # class TypingOperationQueue: OperationQueueDelegate {
+      #     func onComplete() { updateUI() }  // error: main actor-isolated cannot satisfy nonisolated
+      # }
+      #
+      # After (compiles on Xcode 26):
+      # @MainActor
+      # class TypingOperationQueue: OperationQueueDelegate {
+      #     @MainActor func onComplete() { updateUI() }
+      #     isolated deinit { cancel() }
+      # }
+
+      # CI workflow — migrate to macos-26 once source is fixed:
+      jobs:
+        build:
+          runs-on: macos-26   # Xcode 26.4.1 default
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build
+              run: xcodebuild -scheme MyApp -destination 'platform=iOS Simulator,name=iPhone 16' build
+  - language: yaml
+    label: 'Matrix strategy to catch actor isolation errors before macos-latest migrates'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              runner: [macos-15, macos-26]
+          runs-on: ${{ matrix.runner }}
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build and test
+              run: xcodebuild test -scheme MyApp -destination 'platform=iOS Simulator,name=iPhone 16'
+prevention:
+  - 'Audit all `@MainActor` classes and their protocol conformances before migrating from macos-15 to macos-26.'
+  - 'Run `xcodebuild -scheme MyApp -destination generic/platform=iOS` locally with Xcode 26 before the macos-latest migration date (June 15, 2026) to catch actor isolation errors early.'
+  - 'For classes that exist only to run on the main thread, add `@MainActor` proactively — it is semantically accurate and forward-compatible with Swift 6.'
+  - 'Subscribe to actions/runner-images#14167 for the official macos-latest → macos-26 rollout timeline.'
+  - 'Use `maxim-lobanov/setup-xcode@v1` to pin Xcode 16.4 explicitly if you need to stay on Xcode 16.x during the transition period.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14167'
+    label: 'runner-images#14167: macos-latest label will use macos-26 in June 2026'
+  - url: 'https://github.com/swiftlang/swift/issues/88724'
+    label: 'swiftlang/swift#88724: Incorrect non-Sendable error with isolated async closure and @concurrent (Swift 6.3)'
+  - url: 'https://github.com/ably/ably-chat-swift/pull/482'
+    label: 'ably-chat-swift#482: Real-world fix for Xcode 26.4 actor isolation compilation error'
+  - url: 'https://developer.apple.com/documentation/swift/updating-an-app-to-use-swift-concurrency'
+    label: 'Apple Docs: Updating an app to use Swift concurrency'
+  - url: 'https://swift.org/migration/documentation/migrationguide/'
+    label: 'Swift 6 migration guide — actor isolation and Sendable'
