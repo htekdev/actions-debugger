@@ -1,0 +1,134 @@
+id: runner-environment-368
+title: 'CodeQL Code Scanning Fails with Kotlin 2.4.0 — "Kotlin version 2.4.0 is too recent. CodeQL currently supports versions below 2.3.30"'
+category: runner-environment
+severity: error
+tags:
+  - codeql
+  - kotlin
+  - code-scanning
+  - kotlin-2.4
+  - runner-image
+  - breaking-change
+  - android
+  - github-advanced-security
+patterns:
+  - regex: 'Kotlin version [0-9]+\.[0-9]+\.[0-9]+ is too recent\. CodeQL currently supports'
+    flags: 'i'
+  - regex: 'CodeQL currently supports versions? below 2\.3\.30'
+    flags: 'i'
+  - regex: 'codeql.*kotlin.*unsupported|kotlin.*too recent.*codeql'
+    flags: 'i'
+error_messages:
+  - 'Kotlin version 2.4.0 is too recent. CodeQL currently supports versions below 2.3.30'
+  - 'Error: SARIF results file is empty or failed to generate — CodeQL Kotlin extraction failed'
+root_cause: |
+  **Kotlin 2.4.0** was released on June 3, 2026. This release drops support for K1
+  compiler API and language levels below 1.9, which substantially changes the compiler
+  internals. CodeQL's Kotlin extractor (which uses the K1 compiler plugin API) does
+  not yet support Kotlin 2.4.0 — the current CodeQL ceiling is **Kotlin < 2.3.30**.
+
+  **Why this breaks GitHub Actions workflows:**
+
+  1. **Runner image update**: The VS 2026 image (`windows-2025-vs2026`, now the default
+     for `windows-latest`/`windows-2025`) upgraded Kotlin from 2.3.21 → 2.4.0 as part
+     of the Android Command Line Tools bump. On Ubuntu, `kotlinc` is also updated.
+
+  2. **Gradle project upgrade**: Many Android and Kotlin projects have Dependabot or
+     automated PRs bumping the Kotlin Gradle Plugin from 2.3.x → 2.4.0.
+
+  3. **CodeQL analysis step fails**: When `actions/codeql-action/analyze@v3` runs
+     after the project has been built with Kotlin 2.4.0, it emits the version check
+     error and fails the job. The SARIF output is empty, causing the code scanning
+     step to fail or produce no results.
+
+  The issue was filed at github/codeql#21938 (June 4, 2026, 20 👍) and is actively
+  tracked. CodeQL intends to add Kotlin 2.4.0 support but it requires migration to
+  the Analysis API (which IntelliJ, Dokka, and Detekt use) rather than the current
+  K1 IR plugin.
+
+  **Affected workflow step:**
+  - `uses: github/codeql-action/analyze@v3` with `language: kotlin` (or `java-kotlin`)
+  - `uses: github/codeql-action/init@v3` followed by Gradle/Maven Kotlin builds
+
+  **This affects any project** that has upgraded to Kotlin 2.4.0, whether via
+  direct `kotlinVersion = "2.4.0"` setting or via a dependency that pulls it in.
+fix: |
+  **Option 1 — Pin Kotlin below 2.3.30 (immediate fix):**
+  In your `build.gradle.kts` (or `build.gradle`), set the Kotlin version to
+  the last supported version:
+  ```
+  plugins {
+    kotlin("android") version "2.3.21"  // Pin below 2.4.0
+  }
+  ```
+  This lets CodeQL continue to analyze without changes to the workflow.
+
+  **Option 2 — Disable CodeQL for Kotlin temporarily:**
+  Remove `kotlin` (or `java-kotlin`) from CodeQL's language list in your
+  workflow until CodeQL adds support for Kotlin 2.4.0. Keep other language
+  scans active.
+
+  **Option 3 — Wait for CodeQL update:**
+  Track github/codeql#21938 for official support. Once CodeQL adds Kotlin 2.4.0
+  support, no workflow changes are needed — just let Dependabot upgrade normally.
+fix_code:
+  - language: yaml
+    label: 'Option 1 — Pin Kotlin version to < 2.3.30 in workflow env'
+    code: |
+      # In build.gradle.kts — pin until CodeQL supports 2.4.0
+      # plugins {
+      #     kotlin("android") version "2.3.21"
+      # }
+
+      # Alternatively, override in the workflow via environment variable:
+      jobs:
+        codeql-scan:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - uses: github/codeql-action/init@v3
+              with:
+                languages: java-kotlin
+
+            # Pass Kotlin version override to Gradle to pin below 2.4.0
+            - name: Build with pinned Kotlin
+              run: ./gradlew compileDebugKotlin
+              env:
+                KOTLIN_VERSION_OVERRIDE: '2.3.21'
+
+            - uses: github/codeql-action/analyze@v3
+  - language: yaml
+    label: 'Option 2 — Disable Kotlin in CodeQL scan temporarily'
+    code: |
+      jobs:
+        codeql-scan:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            # Exclude kotlin/java-kotlin until CodeQL supports 2.4.0
+            # Track: https://github.com/github/codeql/issues/21938
+            - uses: github/codeql-action/init@v3
+              with:
+                # Changed from 'java-kotlin' to 'java' to skip Kotlin extraction
+                languages: java
+
+            - name: Build
+              run: ./gradlew assembleDebug
+
+            - uses: github/codeql-action/analyze@v3
+prevention:
+  - 'Track github/codeql#21938 to know when CodeQL adds Kotlin 2.4.0 support before upgrading your project.'
+  - 'When upgrading the Kotlin Gradle Plugin major version, run CodeQL locally with `codeql database create` before merging to catch version incompatibilities.'
+  - 'Add a comment in your CodeQL workflow next to the language list explaining which Kotlin version ceiling applies, so the team knows when to safely un-pin.'
+  - 'Configure Dependabot to skip Kotlin Gradle Plugin upgrades until CodeQL support is confirmed: add a `ignore` rule for `org.jetbrains.kotlin.*` versions >= 2.4.0.'
+docs:
+  - url: 'https://github.com/github/codeql/issues/21938'
+    label: 'github/codeql#21938: Support Kotlin 2.4.0'
+  - url: 'https://github.com/JetBrains/kotlin/releases/tag/v2.4.0'
+    label: 'Kotlin 2.4.0 Release Notes'
+  - url: 'https://docs.github.com/en/code-security/code-scanning/creating-an-advanced-setup-for-code-scanning/customizing-your-advanced-setup-for-code-scanning#changing-the-languages-that-are-analyzed'
+    label: 'GitHub Docs: Customizing CodeQL language analysis'
+  - url: 'https://github.com/actions/runner-images/issues/14016'
+    label: 'runner-images#14016: Windows Server 2025 with VS 2026 GA (includes Kotlin 2.4.0)'

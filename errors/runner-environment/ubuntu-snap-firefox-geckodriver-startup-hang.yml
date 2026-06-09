@@ -1,0 +1,151 @@
+id: runner-environment-369
+title: 'Ubuntu 22.04/24.04 Snap-Packaged Firefox + geckodriver Startup Hang — Profile Directory Outside Snap Sandbox'
+category: runner-environment
+severity: error
+tags:
+  - ubuntu
+  - firefox
+  - snap
+  - geckodriver
+  - selenium
+  - webdriver
+  - browser-testing
+  - profile
+  - hang
+patterns:
+  - regex: 'failed to start browser.*geckodriver|geckodriver.*failed to start.*Firefox'
+    flags: 'i'
+  - regex: 'WebDriverException.*failed to.*start.*Firefox|firefox.*timed out.*start'
+    flags: 'i'
+  - regex: 'Profile dir.*snap.*cannot access|snap.*profile.*outside.*home'
+    flags: 'i'
+  - regex: 'error: could not connect to Firefox.*timed out'
+    flags: 'i'
+error_messages:
+  - 'WebDriverException: Message: Failed to start browser: failed to start Marionette listener'
+  - 'error: could not connect to Firefox on localhost:4444 (timed out after 60 seconds)'
+  - 'selenium.common.exceptions.WebDriverException: Message: Failed to start Firefox'
+  - 'Error: Timeout waiting for Firefox to start'
+  - 'TimeoutException: Timed out waiting for driver server to start.'
+root_cause: |
+  On **ubuntu-22.04** and **ubuntu-24.04** GitHub-hosted runner images, Firefox is
+  installed as a **Snap package** (the default since Ubuntu 22.04 replaced the APT
+  Firefox with a Snap). The Snap Firefox runs in an isolated sandbox with a different
+  filesystem view from the host.
+
+  **The core problem:**
+  geckodriver creates a temporary Firefox profile directory in `/tmp` by default (e.g.
+  `/tmp/geckodriver-profile-XXXXXX`). However, the Snap Firefox sandbox cannot access
+  `/tmp` on the host filesystem — it sees a different (empty) `/tmp` scoped to the
+  snap's container. As a result:
+
+  1. geckodriver launches Firefox pointing to the `/tmp/...` profile path
+  2. Snap Firefox starts but cannot find the profile directory — it sees an empty `/tmp`
+  3. Firefox silently fails to load the profile and does not open the Marionette port
+  4. geckodriver waits for the Marionette listener to start, which never happens
+  5. The geckodriver / Selenium client times out after 30-60 seconds
+
+  This hangs the workflow step, often without a clear error message. The failure
+  looks like a generic Firefox startup timeout rather than a filesystem access issue.
+
+  **Documented as a known problem in geckodriver** since the snap Firefox rollout
+  (bugzilla.mozilla.org #1819377, open since 2023). Listed as a "Known problem" in
+  geckodriver 0.36.0 and 0.37.0 release notes. geckodriver 0.37.0 improves Linux Snap
+  compatibility by launching Firefox via the direct binary path, but the profile
+  directory issue remains.
+
+  **Affected runner images:**
+  - `ubuntu-22.04` (Firefox snap, geckodriver 0.36+ preinstalled)
+  - `ubuntu-24.04` (Firefox snap, geckodriver 0.37 as of June 7, 2026 image update)
+  - `ubuntu-latest` (points to ubuntu-24.04)
+
+  **Not affected:** `ubuntu-20.04` (APT Firefox), macOS, or Windows runner images.
+fix: |
+  **Option 1 — Replace snap Firefox with APT Firefox (most reliable for CI):**
+  Remove the snap Firefox and install the APT version from Mozilla's PPA. This gives
+  a non-sandboxed Firefox that can access `/tmp` like any other process.
+
+  **Option 2 — Set `--profile-root` to a snap-accessible path:**
+  Override geckodriver's profile root to a directory within the snap sandbox's
+  accessible filesystem (the user's home directory). Pass `--profile-root` to
+  geckodriver, or set `moz:firefoxOptions.prefs` in the WebDriver capabilities.
+
+  **Option 3 — Use `browser-actions/setup-firefox@v1`:**
+  This action handles Firefox snap removal and installs the non-snap binary
+  automatically, making geckodriver work normally.
+
+  **Option 4 — Use `--headless` mode via capabilities (partial fix):**
+  Headless mode alone does not fix the profile issue, but combined with Option 2
+  it reduces other CI-related browser issues.
+fix_code:
+  - language: yaml
+    label: 'Option 1 — Replace snap Firefox with APT Firefox before running tests'
+    code: |
+      jobs:
+        browser-test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            # Remove snap Firefox and install non-snap version
+            - name: Replace snap Firefox with APT Firefox
+              run: |
+                sudo snap remove firefox
+                sudo add-apt-repository -y ppa:mozillateam/ppa
+                sudo apt-get update
+                sudo apt-get install -y firefox
+
+            - name: Run Selenium tests
+              run: pytest tests/browser/
+
+  - language: yaml
+    label: 'Option 2 — Use browser-actions/setup-firefox to handle snap removal automatically'
+    code: |
+      jobs:
+        browser-test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            # This action removes snap Firefox and installs the binary version
+            - uses: browser-actions/setup-firefox@v1
+              with:
+                firefox-version: 'latest'
+
+            - name: Run Selenium tests
+              run: pytest tests/browser/
+
+  - language: python
+    label: 'Option 3 — Set profile-root to home directory in WebDriver/Selenium'
+    code: |
+      import os
+      from selenium import webdriver
+      from selenium.webdriver.firefox.options import Options
+      from selenium.webdriver.firefox.service import Service
+
+      options = Options()
+      options.headless = True  # optional
+
+      # Point profile root to home directory (accessible inside snap sandbox)
+      service = Service(
+          service_args=[
+              '--profile-root',
+              os.path.expanduser('~/.mozilla/geckodriver-profiles')
+          ]
+      )
+
+      driver = webdriver.Firefox(service=service, options=options)
+prevention:
+  - 'On ubuntu-22.04 and ubuntu-24.04 runners, always use `browser-actions/setup-firefox` or manually replace snap Firefox before running browser tests with geckodriver.'
+  - 'Consider switching to Chrome/ChromeDriver for CI browser testing on Ubuntu runners — Chrome is not installed as a snap and does not have this profile access issue.'
+  - 'Test locally on Ubuntu 22.04+ before running browser tests in CI to catch snap-related issues early.'
+  - 'Set the `--profile-root` to a path within the home directory (`~/.mozilla/test-profiles`) as a safety net even when using non-snap Firefox, to avoid `/tmp` cleanup edge cases.'
+docs:
+  - url: 'https://bugzilla.mozilla.org/show_bug.cgi?id=1819377'
+    label: 'Mozilla Bugzilla #1819377: Snap-packaged Firefox fails unless --profile-root is specified'
+  - url: 'https://github.com/mozilla/geckodriver/releases/tag/v0.37.0'
+    label: 'geckodriver 0.37.0 Release Notes (Known Problems section)'
+  - url: 'https://github.com/browser-actions/setup-firefox'
+    label: 'browser-actions/setup-firefox: GitHub Action to install Firefox without snap issues'
+  - url: 'https://github.com/mozilla/geckodriver/issues/2010'
+    label: 'mozilla/geckodriver#2010: geckodriver does not work with snap packaged firefox'

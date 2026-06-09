@@ -1,0 +1,118 @@
+id: runner-environment-367
+title: 'Rust 1.96 Removes `--allow-undefined` from WASM Linker — `wasm-ld: error: undefined symbol` on WebAssembly Targets'
+category: runner-environment
+severity: error
+tags:
+  - rust
+  - wasm
+  - webassembly
+  - wasm-ld
+  - linker
+  - undefined-symbol
+  - rust-1.96
+  - breaking-change
+patterns:
+  - regex: 'wasm-ld: error: .*undefined symbol'
+    flags: 'i'
+  - regex: 'error: linking with `wasm-ld` failed'
+    flags: 'i'
+  - regex: 'wasm-ld: error: .+\.o: undefined symbol:'
+    flags: 'i'
+  - regex: 'Uncaught TypeError: Failed to resolve module specifier "env"'
+    flags: 'i'
+error_messages:
+  - 'wasm-ld: error: path/to/lib.o: undefined symbol: my_function'
+  - 'error: linking with `wasm-ld` failed: exit status: 1'
+  - 'wasm-ld: error: undefined symbol: __wasm_call_ctors'
+  - '>>> referenced by src/lib.rs'
+  - 'Uncaught TypeError: Failed to resolve module specifier "env". Relative references must start with either "/", "./", or "../".'
+root_cause: |
+  Starting with **Rust 1.96.0** (released May 28, 2026), all WebAssembly targets no
+  longer pass `--allow-undefined` to `wasm-ld` by default. Previously this flag caused
+  undefined symbols to be silently converted into WebAssembly imports from the `"env"`
+  module rather than raising a linker error.
+
+  **Why this breaks workflows:**
+
+  Any Rust WASM project that uses `extern "C"` blocks to declare external symbols
+  without the `#[link(wasm_import_module = "...")]` attribute now fails at link time.
+  Previously these symbols silently became `(import "env" "symbol_name" ...)` in the
+  final `.wasm` binary; now they are a fatal linker error.
+
+  **Common scenarios that break:**
+  - Projects calling JavaScript functions from Rust via `extern "C"` without explicit
+    `#[link(wasm_import_module)]` annotations
+  - Projects linking against C libraries that have intentional undefined symbols
+  - Projects using `wasm-bindgen`, `wasm-pack`, or `napi-rs` for JS interop that relied
+    on implicit `"env"` imports
+  - CI workflows using `dtolnay/rust-toolchain@stable` which now resolves to Rust 1.96+
+
+  **Downstream symptom (web):** Before this change, undefined symbols silently leaked
+  as `"env"` imports. If the embedding JS code doesn't provide those symbols, browsers
+  throw `Uncaught TypeError: Failed to resolve module specifier "env"` — a confusing
+  error that now becomes a clear linker error at build time.
+
+  Announced in advance on the Rust blog (April 4, 2026) and formally released in
+  Rust 1.96.0 via rust-lang/rust#149868.
+fix: |
+  **Option 1 — Add explicit `#[link]` attribute (recommended):**
+  For `extern "C"` blocks that intentionally import from the JS/host embedding, add
+  the `#[link(wasm_import_module = "...")]` attribute to declare the import module name.
+  This makes the import explicit and works with both old and new Rust versions.
+
+  **Option 2 — Use `RUSTFLAGS` to restore old behavior (quick fix):**
+  Set `RUSTFLAGS=-Clink-arg=--allow-undefined` in your workflow environment variable
+  to restore the pre-1.96 behavior. Use this as a temporary workaround while migrating
+  to explicit `#[link]` attributes.
+
+  **Option 3 — Pin Rust to pre-1.96 (not recommended long-term):**
+  Use `dtolnay/rust-toolchain@1.95` to pin to the last version before this change.
+  This should only be a short-term workaround.
+fix_code:
+  - language: yaml
+    label: 'Option 1 — Add RUSTFLAGS as a quick fix'
+    code: |
+      jobs:
+        build-wasm:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - uses: dtolnay/rust-toolchain@stable
+              with:
+                targets: wasm32-unknown-unknown
+
+            # Quick fix: restore --allow-undefined while migrating to explicit #[link]
+            - name: Build WASM
+              env:
+                RUSTFLAGS: '-Clink-arg=--allow-undefined'
+              run: cargo build --target wasm32-unknown-unknown --release
+  - language: rust
+    label: 'Option 2 — Fix source: add explicit #[link(wasm_import_module)] attribute'
+    code: |
+      // Before (breaks in Rust 1.96):
+      extern "C" {
+          fn js_log(n: u32);
+          fn js_alert(ptr: *const u8, len: usize);
+      }
+
+      // After (correct for all Rust versions):
+      #[link(wasm_import_module = "env")]
+      extern "C" {
+          fn js_log(n: u32);
+          fn js_alert(ptr: *const u8, len: usize);
+      }
+prevention:
+  - 'Audit all `extern "C"` blocks in WASM-targeted Rust code and add `#[link(wasm_import_module = "...")]` attributes before upgrading to Rust 1.96+.'
+  - 'Use `wasm-bindgen` or `wasm-pack` for JS interop instead of raw `extern "C"` blocks — these tools handle the import module annotation automatically.'
+  - 'Test WASM builds locally on Rust nightly before a stable release to catch breaking changes early: `rustup default nightly && cargo build --target wasm32-unknown-unknown`.'
+  - 'Check the Rust blog (blog.rust-lang.org) before running on `dtolnay/rust-toolchain@stable` when your workflow builds for WASM targets.'
+docs:
+  - url: 'https://blog.rust-lang.org/2026/04/04/changes-to-webassembly-targets-and-handling-undefined-symbols/'
+    label: 'Rust Blog: Changes to WebAssembly targets and handling undefined symbols'
+  - url: 'https://blog.rust-lang.org/2026/05/28/Rust-1.96.0/'
+    label: 'Rust 1.96.0 Release Notes'
+  - url: 'https://github.com/rust-lang/rust/pull/149868'
+    label: 'rust-lang/rust#149868: Stop passing --allow-undefined on wasm targets'
+  - url: 'https://doc.rust-lang.org/reference/items/external-blocks.html#the-link-attribute'
+    label: 'Rust Reference: The link attribute (#[link(wasm_import_module)])'
