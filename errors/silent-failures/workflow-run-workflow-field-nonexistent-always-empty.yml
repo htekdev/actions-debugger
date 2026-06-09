@@ -1,0 +1,127 @@
+id: silent-failures-175
+title: 'github.event.workflow_run.workflow field does not exist — always evaluates to empty string'
+category: silent-failures
+severity: silent-failure
+tags:
+  - workflow_run
+  - event-context
+  - workflow-name
+  - wrong-field
+  - empty-string
+  - silent-failure
+  - if-condition
+patterns:
+  - regex: 'github\.event\.workflow_run\.workflow\s*(==|!=|contains)'
+    flags: 'i'
+  - regex: 'workflow_run\.workflow\s*==\s*[''"]'
+    flags: 'i'
+  - regex: 'if:.*github\.event\.workflow_run\.workflow'
+    flags: 'i'
+error_messages:
+  - 'github.event.workflow_run.workflow is always empty string — no such field exists'
+  - 'Step skipped — if: github.event.workflow_run.workflow == ''CI Build'' is always false'
+root_cause: |
+  When accessing the workflow_run event context, developers sometimes try to access
+  github.event.workflow_run.workflow to identify which workflow triggered the run.
+  However, the workflow_run event object does NOT have a direct .workflow string field.
+
+  The correct field to access the triggering workflow's display name is:
+    github.event.workflow_run.name
+
+  The workflow_run event object has these relevant fields:
+  - .name — the display name of the triggering workflow (e.g., "CI Build")
+  - .id — the numeric run ID
+  - .event — the event that triggered the upstream workflow
+  - .status — completed, in_progress, queued
+  - .conclusion — success, failure, cancelled, etc.
+  - .head_branch — the branch the upstream workflow ran on
+  - .head_sha — the commit SHA
+
+  While the workflow_run object DOES have a nested .workflow object (which is the
+  Workflow metadata object), this is NOT a string. Accessing .workflow directly in
+  an expression like github.event.workflow_run.workflow == 'CI Build' compares a
+  Workflow object to a string, which always evaluates to false.
+
+  This causes a silent failure where:
+  - An if: condition using .workflow is always false
+  - Steps gated on that condition are silently skipped
+  - The workflow completes successfully with a green checkmark
+  - No error or warning is shown in the logs for the skipped steps
+
+  This is most commonly encountered when developers want to run different steps
+  based on which workflow triggered the workflow_run event, for example to handle
+  separate post-CI and post-deploy processing in a single consumer workflow.
+
+  Source: SO#79515421 (March 2025), community/discussions#...
+fix: |
+  Use github.event.workflow_run.name instead of .workflow to access the display
+  name of the triggering workflow. The name field is a string and can be compared
+  directly with string literals.
+fix_code:
+  - language: yaml
+    label: 'WRONG — .workflow field does not yield a string, always evaluates false'
+    code: |
+      on:
+        workflow_run:
+          workflows: ['CI Build', 'Deploy Staging']
+          types: [completed]
+      jobs:
+        report:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Download staging artifact
+              # BROKEN: .workflow is not a string field — always false/empty
+              if: github.event.workflow_run.workflow == 'Deploy Staging'
+              run: echo "Downloading staging artifact"
+            - name: Post CI results
+              # BROKEN: same issue — use .name instead
+              if: github.event.workflow_run.workflow == 'CI Build'
+              run: echo "Posting CI results"
+  - language: yaml
+    label: 'CORRECT — use .name to get the triggering workflow display name'
+    code: |
+      on:
+        workflow_run:
+          workflows: ['CI Build', 'Deploy Staging']
+          types: [completed]
+      jobs:
+        report:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Download staging artifact
+              # CORRECT: .name is the workflow display name string
+              if: github.event.workflow_run.name == 'Deploy Staging'
+              run: echo "Downloading staging artifact"
+            - name: Post CI results
+              if: github.event.workflow_run.name == 'CI Build'
+              run: echo "Posting CI results"
+  - language: yaml
+    label: 'Pattern: separate jobs per triggering workflow using needs and if'
+    code: |
+      on:
+        workflow_run:
+          workflows: ['CI Build', 'Deploy Staging']
+          types: [completed]
+      jobs:
+        handle-ci:
+          runs-on: ubuntu-latest
+          if: github.event.workflow_run.name == 'CI Build'
+          steps:
+            - run: echo "Handling CI completion"
+        handle-deploy:
+          runs-on: ubuntu-latest
+          if: github.event.workflow_run.name == 'Deploy Staging'
+          steps:
+            - run: echo "Handling deployment completion"
+prevention:
+  - 'Use github.event.workflow_run.name (not .workflow) to check the triggering workflow display name.'
+  - 'The display name must match the name: field in the upstream workflow YAML exactly (case-sensitive).'
+  - 'Add workflow_run.name to if: conditions with == or != and verify both sides are strings before comparing.'
+  - 'Use the expression debugger (Jan 2026 GitHub Actions feature) to inspect github.event.workflow_run context at runtime.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run'
+    label: 'GitHub Docs — workflow_run event payload reference'
+  - url: 'https://docs.github.com/en/webhooks/webhook-events-and-payloads#workflow_run'
+    label: 'GitHub Docs — webhook event payload: workflow_run object fields'
+  - url: 'https://stackoverflow.com/questions/79515421'
+    label: 'SO#79515421 — workflow_run step skipped with if condition using .workflow'

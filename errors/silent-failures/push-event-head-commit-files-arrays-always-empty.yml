@@ -1,0 +1,131 @@
+id: silent-failures-174
+title: 'push event github.event.head_commit.added/modified/removed always empty — removed from Actions payload in 2019'
+category: silent-failures
+severity: silent-failure
+tags:
+  - push-event
+  - head-commit
+  - modified-files
+  - added-files
+  - removed-files
+  - payload-change
+  - file-detection
+patterns:
+  - regex: 'github\.event\.head_commit\.(added|modified|removed)\b'
+    flags: 'i'
+  - regex: 'github\.event\.commits\[\*\]\.(added|modified|removed)\b'
+    flags: 'i'
+  - regex: 'contains\(github\.event\.head_commit\.(modified|added|removed)'
+    flags: 'i'
+error_messages:
+  - 'github.event.head_commit.modified evaluates to empty array'
+  - "contains(github.event.head_commit.modified, 'frontend/') is always false"
+  - 'github.event.head_commit.added is blank'
+root_cause: |
+  In October 2019, GitHub removed the added, modified, and removed arrays from
+  the GitHub Actions push event payload. These arrays, which listed the files changed
+  in the pushed commit(s), were present in standard GitHub webhook push payloads but
+  were explicitly stripped from the Actions push event payload.
+
+  As a result, in GitHub Actions workflows:
+  - github.event.head_commit.added is always an empty array []
+  - github.event.head_commit.modified is always an empty array []
+  - github.event.head_commit.removed is always an empty array []
+  - github.event.commits[*].added, .modified, and .removed are all always empty
+
+  Developers who attempt to use these arrays to detect which files changed and
+  conditionally run workflow steps will find that their conditions are always false.
+  For example, contains(github.event.head_commit.modified, 'frontend/') always
+  returns false regardless of what files were actually changed in the push.
+
+  This is a silent failure because:
+  1. The workflow step with the failing condition is simply skipped with no error
+  2. The workflow itself completes successfully with a green checkmark
+  3. The expression contains([], 'something') silently returns false
+  4. There is no warning that the arrays were removed from the payload
+
+  This is frequently encountered when developers write workflows that attempt to
+  conditionally build or deploy specific parts of a monorepo based on which files
+  changed in a push. The same monorepo pattern works in standard webhook consumers
+  (where the arrays are populated) but silently breaks in GitHub Actions.
+
+  Source: GitHub Changelog (Oct 16, 2019). Referenced in SO#78231009, SO#77897670.
+fix: |
+  Use workflow-level paths: and paths-ignore: filters to detect file changes,
+  or use a third-party path-filter action that uses the GitHub Compare API.
+
+  Option 1 — paths: filter at the workflow trigger level (recommended for simple cases).
+  Option 2 — Separate workflow files per component with their own paths: triggers.
+  Option 3 — Use dorny/paths-filter action which queries the GitHub Compare API.
+  Option 4 — Use git diff with fetch-depth: 2 to detect changes in a run step.
+fix_code:
+  - language: yaml
+    label: 'WRONG — head_commit.modified always empty, condition always false'
+    code: |
+      # This pattern is broken — head_commit.modified removed from Actions payloads
+      on:
+        push:
+          branches: [main]
+      jobs:
+        deploy-frontend:
+          runs-on: ubuntu-latest
+          # BROKEN: contains() of empty array is always false
+          if: contains(github.event.head_commit.modified, 'frontend/')
+          steps:
+            - run: ./deploy-frontend.sh
+  - language: yaml
+    label: 'CORRECT — use paths: filter to limit when workflow triggers'
+    code: |
+      # Separate workflow: .github/workflows/deploy-frontend.yml
+      on:
+        push:
+          branches: [main]
+          paths:
+            - 'frontend/**'   # Only runs when frontend/ files change
+      jobs:
+        deploy-frontend:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./deploy-frontend.sh
+  - language: yaml
+    label: 'CORRECT — use dorny/paths-filter action for programmatic detection'
+    code: |
+      on:
+        push:
+          branches: [main]
+      jobs:
+        detect-changes:
+          runs-on: ubuntu-latest
+          outputs:
+            frontend: ${{ steps.filter.outputs.frontend }}
+            backend: ${{ steps.filter.outputs.backend }}
+          steps:
+            - uses: actions/checkout@v4
+            - uses: dorny/paths-filter@v3
+              id: filter
+              with:
+                filters: |
+                  frontend:
+                    - 'frontend/**'
+                  backend:
+                    - 'backend/**'
+        deploy-frontend:
+          needs: detect-changes
+          if: needs.detect-changes.outputs.frontend == 'true'
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./deploy-frontend.sh
+prevention:
+  - 'Never use github.event.head_commit.added/modified/removed in GitHub Actions — these arrays are always empty.'
+  - 'Use workflow-level paths: filters for simple monorepo triggers; use dorny/paths-filter for programmatic detection.'
+  - 'For PRs, use the same paths: filter on the pull_request trigger.'
+  - 'Add a comment in your workflow explaining why paths: is used instead of checking head_commit fields.'
+docs:
+  - url: 'https://github.blog/changelog/2019-10-16-changes-in-github-actions-push-event-payload/'
+    label: 'GitHub Changelog — Changes in GitHub Actions push event payload (Oct 2019)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#onpushpull_requestpull_request_targetpathspaths-ignore'
+    label: 'GitHub Docs — on.push.paths filter'
+  - url: 'https://github.com/dorny/paths-filter'
+    label: 'dorny/paths-filter — Conditionally run actions based on modified files'
