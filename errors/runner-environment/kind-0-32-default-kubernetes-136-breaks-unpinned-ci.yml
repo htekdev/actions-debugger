@@ -1,0 +1,118 @@
+id: runner-environment-379
+title: "kind 0.32.0 bumps default Kubernetes to 1.36.1 — unpinned clusters break + kubeadm v1beta4 required"
+category: runner-environment
+severity: error
+tags:
+  - kind
+  - kubernetes
+  - k8s-136
+  - kubeadm
+  - runner-image-update
+  - breaking-change
+  - envoy
+  - ha-cluster
+patterns:
+  - regex: 'kind.*create.*cluster.*failed|ERROR.*creating.*cluster'
+    flags: 'i'
+  - regex: 'unknown field.*v1beta3|no kind.*KubeadmConfigTemplate.*v1beta3'
+    flags: 'i'
+  - regex: 'kubeadm.*v1beta3.*not.*supported|v1beta3.*dropped.*1\.3[6-9]'
+    flags: 'i'
+  - regex: 'ERROR.*LoadBalancer.*HAProxy.*not.*found|envoy.*proxy.*unexpected'
+    flags: 'i'
+error_messages:
+  - "ERROR: failed to create cluster: command \"docker run\" failed with error"
+  - "error: unknown field \"v1beta3\""
+  - "no kind \"KubeadmConfigTemplate\" is registered for version \"kubeadm.k8s.io/v1beta3\""
+root_cause: |
+  kind v0.32.0 was deployed to ubuntu-24.04 runner images on 2026-06-07 (from 0.31.0). It
+  introduces several breaking changes:
+
+  1. Default node image changed to kindest/node:v1.36.1.
+     Workflows that omit an explicit `image:` in their kind config silently get Kubernetes
+     1.36.1 instead of the previous default 1.35.x. Kubernetes 1.36 requires kubeadm
+     v1beta4 config format; v1beta3 is no longer accepted.
+
+  2. kubeadm v1beta4 is required for Kubernetes 1.36.0+.
+     Workflows using versioned kubeadm patches (e.g. `version: kubeadm.k8s.io/v1beta3`) in
+     their kind ClusterConfig or using `extraArgs` in the old map-based format will fail to
+     create clusters on Kubernetes 1.36+. Unversioned patches are automatically converted by
+     kind, but versioned v1beta3 patches are rejected by the kubeadm binary.
+
+  3. HAProxy replaced by Envoy for multi-control-plane (HA) clusters.
+     kind now uses docker.io/envoyproxy/envoy:v1.36.2 as the load balancer instead of
+     HAProxy. Workflows that reference custom HAProxy images or configure the loadbalancer
+     section with HAProxy-specific settings will fail.
+
+  4. kind load requires upgrading to 0.32.0 for new node images.
+     Node images published for Kubernetes 1.36+ contain a containerd upgrade that requires
+     kind 0.32.0 or newer for `kind load docker-image`. Caching node images from a prior
+     kind version and using `kind load` on the new images will fail.
+
+fix: |
+  For the default node image change: pin an explicit node image in your kind config to
+  avoid implicit Kubernetes version bumps. Use the v1.35.x digest for stability, or
+  explicitly test with v1.36.x when ready to migrate.
+
+  For kubeadm v1beta4: update any versioned kubeadm patches from
+  "version: kubeadm.k8s.io/v1beta3" to "version: kubeadm.k8s.io/v1beta4". Remove
+  map-based extraArgs and use the new list-based format required by v1beta4.
+
+  For HA clusters: remove any custom HAProxy load balancer references; the new Envoy
+  load balancer is configured differently.
+
+fix_code:
+  - language: yaml
+    label: "Pin kind node image to avoid implicit Kubernetes version bump"
+    code: |
+      # Without pinning — broken after kind 0.32 deploys Kubernetes 1.36.1 by default:
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: test-cluster
+          # (no node_image specified → gets 1.36.1, breaks v1beta3 patches)
+
+      # Fixed — pin to a specific Kubernetes version:
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: test-cluster
+          node_image: kindest/node:v1.35.3@sha256:1a357b40afdb30e04d25e4a1b7e88af61bb6a4ef48ae4df18ac27fb2cf1e3e60
+
+  - language: yaml
+    label: "Update kubeadm patch format from v1beta3 to v1beta4 in kind config"
+    code: |
+      # Broken: v1beta3 patch rejected by kubeadm when using Kubernetes 1.36+
+      kind: Cluster
+      apiVersion: kind.x-k8s.io/v1alpha4
+      kubeadmConfigPatches:
+        - |
+          version: kubeadm.k8s.io/v1beta3
+          kind: ClusterConfiguration
+          apiServer:
+            extraArgs:
+              audit-log-path: /var/log/kubernetes/audit.log
+
+      # Fixed: use v1beta4 for Kubernetes 1.36+
+      kind: Cluster
+      apiVersion: kind.x-k8s.io/v1alpha4
+      kubeadmConfigPatches:
+        - |
+          version: kubeadm.k8s.io/v1beta4
+          kind: ClusterConfiguration
+          apiServer:
+            extraArgs:
+              - name: audit-log-path
+                value: /var/log/kubernetes/audit.log
+
+prevention:
+  - "Always specify an explicit node_image in kind configs — never rely on the default Kubernetes version"
+  - "Pin kind action version (e.g. helm/kind-action@v1.10.0) to prevent implicit tool upgrades on runner image updates"
+  - "Subscribe to kubernetes-sigs/kind releases to learn about default node image bumps before they reach runner images"
+  - "Use unversioned kubeadm patches where possible — kind auto-converts them between v1beta3/v1beta4 as needed"
+  - "Test with the preview kind version by pinning kind_version before runner image updates roll out"
+docs:
+  - url: "https://github.com/kubernetes-sigs/kind/releases/tag/v0.32.0"
+    label: "kind v0.32.0 release notes: default node image, kubeadm v1beta4, HAProxy→Envoy"
+  - url: "https://kubernetes.io/docs/reference/config-api/kubeadm-config.v1beta4/"
+    label: "Kubernetes kubeadm v1beta4 config API reference"
+  - url: "https://github.com/helm/kind-action"
+    label: "helm/kind-action: node_image and kind_version inputs for pinning"
