@@ -1,0 +1,103 @@
+id: runner-environment-389
+title: 'Windows Self-hosted Runner Listener Stops Polling Broker After First Job Completes
+  (V2 Flow, v2.334.0)'
+category: runner-environment
+severity: error
+tags:
+  - self-hosted
+  - windows
+  - listener
+  - broker
+  - V2-flow
+  - polling-stop
+  - idle-but-unresponsive
+  - v2-334
+patterns:
+  - regex: 'Get messages has been cancelled using local token source\. Continue to get
+      messages with new status\.'
+    flags: 'i'
+  - regex: 'BrokerMessageListener.*cancelled using local token source'
+    flags: 'i'
+  - regex: 'Received job status event\. JobState: Online'
+    flags: 'i'
+error_messages:
+  - '[INFO BrokerMessageListener] Get messages has been cancelled using local token
+    source. Continue to get messages with new status.'
+  - '[INFO BrokerMessageListener] Received job status event. JobState: Online'
+  - '[INFO JobDispatcher] Worker finished for job ... Code: 100'
+root_cause: |
+  On self-hosted Windows runners running v2.334.0 with the V2 broker flow enabled
+  (`useV2Flow: true`, `serverUrlV2: https://broker.actions.githubusercontent.com/`),
+  the `BrokerMessageListener` stops sending `GET /message` requests to the broker
+  permanently after the **first job** following a service start completes.
+
+  The sequence is:
+  1. Runner starts, creates a session, and begins polling normally.
+  2. First job is dispatched — `JobState: Busy` event received.
+  3. Job completes — `JobState: Online` event received.
+  4. Listener logs "Get messages has been cancelled using local token source.
+     Continue to get messages with new status." — and then **stops polling entirely**.
+  5. OAuth token refreshes continue on schedule (credentials are valid), so there is
+     no authentication failure logged.
+  6. The runner appears "Idle" in the GitHub Actions UI but never picks up queued jobs.
+
+  This appears to be a race condition or cancellation-token mishandling in the
+  Busy→Online state transition path of the V2 broker flow introduced or regressed in
+  v2.334.0. The "Continue to get messages" message implies the listener expects to
+  resume, but the polling loop never restarts. First reported mid-May 2026;
+  does not affect earlier versions or runners where `useV2Flow: false`.
+fix: |
+  Restart the runner service. The listener will start polling correctly on the
+  next service start and will pick up queued jobs. However, the hang will recur
+  after every completed job until the runner is upgraded to a version where this
+  is fixed.
+
+  **Automated mitigation:**
+  Wrap the runner service in a supervisor that monitors the `Idle` state and
+  restarts if no job has been picked up within N minutes despite jobs being queued.
+  On Windows this can be done with NSSM or a Task Scheduler watchdog:
+
+  **Workaround (pin runner version):**
+  Downgrade to a version of the runner that predates the V2 broker flow default
+  enablement if the issue is critical. Monitor actions/runner#4444 for a fix release.
+fix_code:
+  - language: powershell
+    label: 'NSSM service wrapper to auto-restart the runner on failure (Windows)'
+    code: |
+      # Install NSSM (https://nssm.cc/) then configure the runner service with restart:
+      # nssm install "GitHub Actions Runner" "C:\actions-runner\run.cmd"
+      # nssm set "GitHub Actions Runner" AppExit Default Restart
+      # nssm set "GitHub Actions Runner" AppRestartDelay 10000
+      # nssm start "GitHub Actions Runner"
+      #
+      # With NSSM restart on exit, the runner will be restarted whenever it stalls
+      # and is killed by a watchdog. Combine with a scheduled task watchdog that
+      # checks the listener log for silence and kills the service if needed.
+
+      $LogPath = "C:\actions-runner\_diag\Listener_*.log"
+      $LatestLog = Get-ChildItem $LogPath | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+      $LastLogLine = Get-Content $LatestLog -Tail 1
+      $LastWriteAge = (Get-Date) - $LatestLog.LastWriteTime
+
+      # If the listener log hasn't been written to in 15 minutes, restart the service
+      if ($LastWriteAge.TotalMinutes -gt 15) {
+        Write-Host "Runner listener appears stalled — restarting service"
+        Restart-Service "actions.runner.*" -Force
+      }
+prevention:
+  - 'Monitor the runner Listener log file for write-time staleness and restart the
+    service if it has not written to the log in more than 15 minutes while jobs are
+    expected to be running.'
+  - 'Run the runner service under a restart-on-exit supervisor (NSSM on Windows,
+    systemd Restart=always on Linux) so that manual kills (by a watchdog) automatically
+    trigger a service restart.'
+  - 'Follow actions/runner#4444 for the upstream fix and upgrade as soon as a patch
+    is released.'
+  - 'If upgrading is not immediately possible, verify the issue by checking whether
+    ``useV2Flow: true`` is set in the ``.runner`` config file in the runner root.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4444'
+    label: 'actions/runner#4444 — Listener stops polling broker after first job Busy→Online
+      transition (May 2026, open)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/monitoring-and-troubleshooting-self-hosted-runners'
+    label: 'GitHub Docs — Monitoring and troubleshooting self-hosted runners'
