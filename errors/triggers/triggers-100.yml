@@ -1,0 +1,121 @@
+id: triggers-100
+title: 'push paths Filter Fires When Renamed File Deletion Matches Filter — Unexpected Trigger on Rename-Out of Watched Path'
+category: triggers
+severity: silent-failure
+tags:
+  - push
+  - paths-filter
+  - rename
+  - file-rename
+  - trigger
+  - silent
+  - unexpected
+patterns:
+  - regex: 'on:\s*\n\s*push:\s*\n\s*paths:'
+    flags: 'i'
+  - regex: "on:\s*push:\s*paths:"
+    flags: 'i'
+error_messages:
+  - "Workflow triggered unexpectedly — commit only renamed a file, no matching files were added or modified"
+  - "CI ran on a rename-only commit that moved files out of the watched path"
+  - "Workflow skipped unexpectedly — file was renamed into the watched path but workflow did not trigger"
+root_cause: |
+  GitHub evaluates `on: push: paths:` by comparing the filter patterns against the
+  complete set of changed files in the push event. For a commit that renames a file,
+  Git (and GitHub) record the rename as TWO discrete file changes:
+  - A DELETION of the old path (the file was removed from the old location)
+  - An ADDITION of the new path (the file appeared at the new location)
+
+  The paths filter matches against BOTH the old (deleted) path and the new (added) path.
+  This produces two classes of surprising behavior:
+
+  1. UNEXPECTED TRIGGER (false positive):
+     A workflow with `paths: ['src/**']` fires when a commit renames
+     `src/api.ts` → `lib/api.ts`, because the DELETION of `src/api.ts` matches
+     `src/**`. The workflow runs even though no file inside `src/` was added or
+     modified — it was only removed as part of the rename.
+     Example: TypeScript build workflow triggers when a .ts file is renamed to .js,
+     because the deleted old .ts path matches the `**/*.ts` filter.
+
+  2. MISSED TRIGGER (false negative):
+     A workflow with `paths: ['src/**']` does NOT fire when a commit renames
+     `docs/readme.md` → `docs/new-readme.md` — neither the old path
+     (`docs/readme.md`) nor the new path (`docs/new-readme.md`) matches `src/**`.
+     This is expected behavior but surprises developers who expected any file
+     addition anywhere to trigger the workflow.
+
+  The practical consequence: **paths filter means "a matching path appears in the
+  commit diff (added, modified, deleted, OR renamed-from)" — not just "a matching
+  file was changed."** Developers commonly assume paths filter only matches
+  added/modified files, not the deleted-old-path half of a rename.
+
+  Source: GitHub Community discussion #164673; Ned Batchelder blog post
+  "Filtering GitHub Actions by changed files" (May 2025).
+fix: |
+  If you need to prevent triggering when only the deleted (old) path of a rename
+  matches your filter (i.e., the file was moved OUT of your watched path), the native
+  `paths:` filter alone cannot help — it will always match the deletion.
+
+  Options:
+  1. Use dorny/paths-filter action with explicit change-type constraints to only
+     trigger on 'added' or 'modified' changes, excluding 'deleted':
+       - added|modified: 'src/**'
+
+  2. Add a workflow step early in the job that inspects the commit to detect if it
+     is a rename-only operation and conditionally skip downstream steps.
+
+  3. Accept the trigger — for many build workflows, triggering when a file leaves
+     the watched path is correct (the build should verify the removal is valid).
+
+  4. Use paths-ignore instead: watch everything EXCEPT the paths you want to ignore.
+fix_code:
+  - language: yaml
+    label: 'Using dorny/paths-filter to exclude deleted-only changes from renames'
+    code: |
+      on:
+        push:
+          # Native paths filter still acts as a first-pass gate
+          paths: ['src/**']
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - uses: dorny/paths-filter@v3
+              id: changes
+              with:
+                filters: |
+                  src_modified:
+                    # Only trigger on files added or modified inside src/
+                    # Does NOT trigger when src/ files are only deleted (rename-out)
+                    - added|modified: 'src/**'
+
+            - name: Build TypeScript
+              # Skip if only src/ files were deleted (e.g., renamed out of src/)
+              if: steps.changes.outputs.src_modified == 'true'
+              run: npm run build
+  - language: yaml
+    label: 'Debugging rename trigger — detect if commit is rename-only'
+    code: |
+      - name: Check changed file types
+        run: |
+          # List changed files with their status (A=added, M=modified, D=deleted, R=renamed)
+          git --no-pager diff --name-status HEAD~1 HEAD
+          # R100 entries are renames; D entries are deletes from renames
+          # If all changes are D or R, the commit was likely a rename/move operation
+prevention:
+  - "Be aware that on: push: paths: matches deleted files — when a commit renames a file, the deleted old path is included in the match set."
+  - "Use dorny/paths-filter with added|modified change-type qualifiers when you only want to trigger on new or changed content."
+  - "After large codebase reorganizations (bulk file renames), expect paths-filtered workflows to fire for each renamed file's deleted path."
+  - "Document your paths filter intent — note whether it should trigger on deletions (including rename-outs) or only on additions/modifications."
+docs:
+  - url: 'https://github.com/orgs/community/discussions/164673'
+    label: 'GitHub Community: push paths filter triggers on deleted path of renamed file'
+  - url: 'https://nedbatchelder.com/blog/202505/filtering_github_actions_by_changed_files'
+    label: 'Ned Batchelder: Filtering GitHub Actions by changed files (May 2025)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#onpushpull_requestpull_request_targetpathspaths-ignore'
+    label: 'GitHub Docs: on.push.paths filter — evaluated against changed files'
+  - url: 'https://github.com/dorny/paths-filter'
+    label: 'dorny/paths-filter: Change-type-aware path filtering action'

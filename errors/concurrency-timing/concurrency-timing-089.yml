@@ -1,0 +1,122 @@
+id: concurrency-timing-089
+title: 'concurrency.group Using github.event.pull_request Properties Returns Empty String on Non-PR Events — All Non-PR Runs Share One Slot'
+category: concurrency-timing
+severity: error
+tags:
+  - concurrency
+  - pull_request
+  - push
+  - concurrency-group
+  - expression
+  - event-context
+  - empty-string
+patterns:
+  - regex: 'github\.event\.pull_request\.[a-zA-Z_][a-zA-Z0-9_.]*'
+    flags: 'i'
+  - regex: 'Canceling since a higher priority waiting request for .{0,5}[''"]?\s*[''"]? exists'
+    flags: 'i'
+error_messages:
+  - "Canceling since a higher priority waiting request for '' exists"
+  - "Canceling since a higher priority waiting request for 'deploy-' exists"
+  - "Workflow cancelled unexpectedly — concurrent push to a different branch cancelled this run"
+  - "All non-PR workflow runs are serializing behind each other with no apparent reason"
+root_cause: |
+  The `github.event.pull_request` context object is populated ONLY when the workflow
+  is triggered by `pull_request` or `pull_request_target` events. For all other events
+  (push, schedule, workflow_dispatch, repository_dispatch, workflow_run, etc.), the
+  entire `github.event.pull_request` object is null/undefined.
+
+  Any expression accessing a nested property of `github.event.pull_request` in these
+  other events evaluates to an empty string:
+  - `github.event.pull_request.base.ref`  → "" on push
+  - `github.event.pull_request.head.sha`  → "" on push
+  - `github.event.pull_request.number`    → "" on push (distinct from github.event.number)
+  - `github.event.pull_request.head.ref`  → "" on push (distinct from github.head_ref)
+
+  When such an expression appears in a `concurrency.group` key without a fallback
+  value, ALL non-PR workflow runs share the same empty or incomplete concurrency key
+  (e.g., `""`, `"deploy-"`, `"build-"`). This causes:
+  - Every new push to ANY branch to cancel every other running push
+  - Scheduled runs to cancel concurrent push-triggered runs
+  - `cancel-in-progress: true` to kill unrelated workflows across different branches
+  - Deployments to be cancelled by unrelated CI runs on other branches
+
+  This is distinct from related entries:
+  - github.head_ref is empty on push (separate entry) — `github.head_ref` is a
+    top-level context shorthand that evaluates to "" on non-PR events
+  - github.event.number is empty on push (separate entry) — covers issue/PR `number`
+    accessed via the shorter path, not via `github.event.pull_request.number`
+
+  The `github.event.pull_request.*` nested access pattern is commonly introduced when
+  a developer copies concurrency group configuration from a `pull_request`-only workflow
+  into a multi-event workflow without adding fallback expressions.
+fix: |
+  Add a fallback expression (||) after every github.event.pull_request.* reference to
+  ensure non-PR events get a meaningful, unique concurrency group key.
+
+  Common fallback patterns by use case:
+  - For branch isolation: use github.ref_name as fallback
+    ${{ github.event.pull_request.base.ref || github.ref_name }}
+  - For PR/run uniqueness: use github.run_id as fallback (each run gets own slot)
+    ${{ github.event.pull_request.number || github.run_id }}
+  - For commit SHA: use github.sha as fallback
+    ${{ github.event.pull_request.head.sha || github.sha }}
+  - For head branch: use github.head_ref (already handles non-PR as "")
+    but still add || github.ref_name for push:
+    ${{ github.event.pull_request.head.ref || github.ref_name }}
+fix_code:
+  - language: yaml
+    label: 'Fix — add fallback for non-PR events in concurrency.group'
+    code: |
+      # BEFORE (broken on push/schedule/dispatch):
+      # concurrency:
+      #   group: deploy-${{ github.event.pull_request.base.ref }}
+      #   cancel-in-progress: true
+      # Problem: deploy- on push events → ALL pushes share "deploy-" slot
+
+      # AFTER (correct — fallback to ref_name for non-PR events):
+      concurrency:
+        group: deploy-${{ github.event.pull_request.base.ref || github.ref_name }}
+        cancel-in-progress: true
+
+      # For PR number (use run_id to make each non-PR run independent):
+      # concurrency:
+      #   group: build-${{ github.event.pull_request.number || github.run_id }}
+      #   cancel-in-progress: true
+  - language: yaml
+    label: 'Multi-event workflow with safe per-branch concurrency isolation'
+    code: |
+      on:
+        push:
+          branches: ['main', 'develop', 'release/**']
+        pull_request:
+        schedule:
+          - cron: '0 2 * * *'
+
+      concurrency:
+        # Scope by workflow name + branch/PR to isolate each workflow independently
+        # github.event.pull_request.number is null on push/schedule → fallback to ref_name
+        # github.ref_name gives the branch name on push (e.g., "main", "develop")
+        # github.run_id on schedule ensures each nightly run is independent
+        group: >-
+          ${{ github.workflow }}-${{
+            github.event.pull_request.number ||
+            github.ref_name ||
+            github.run_id
+          }}
+        cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+prevention:
+  - "Always add a || fallback to any concurrency.group expression referencing github.event.pull_request.* properties."
+  - "Test concurrency behavior explicitly on push, pull_request, and schedule events when a workflow uses multiple triggers."
+  - "Use github.ref_name as the standard branch fallback — it returns the short branch name (e.g., 'main') without the refs/heads/ prefix."
+  - "Include ${{ github.workflow }} in concurrency group names to prevent cross-workflow cancellations from unrelated jobs."
+  - "Audit existing workflows after adding new event triggers — a concurrency group safe for pull_request-only workflows may break when push is added."
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency'
+    label: 'GitHub Docs: Using concurrency'
+  - url: 'https://github.com/orgs/community/discussions/27100'
+    label: 'GitHub Community: Concurrency group not working as expected for push events'
+  - url: 'https://github.com/orgs/community/discussions/63136'
+    label: 'GitHub Community: Concurrency group with mixed triggers — PR context empty on push'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#github-context'
+    label: 'GitHub Docs: github context — pull_request properties availability by event'
