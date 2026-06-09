@@ -1,0 +1,151 @@
+id: known-unsolved-105
+title: 'OIDC id-token Unavailable in pull_request Workflows from Forks — Unable to get ACTIONS_ID_TOKEN_REQUEST_URL'
+category: known-unsolved
+severity: limitation
+tags:
+  - oidc
+  - id-token
+  - fork
+  - pull_request
+  - ACTIONS_ID_TOKEN_REQUEST_URL
+  - permissions
+  - attestation
+patterns:
+  - regex: 'Unable to get ACTIONS_ID_TOKEN_REQUEST_URL env variable'
+    flags: 'i'
+  - regex: 'Error: Failed to get ID token.*Unable to get ACTIONS_ID_TOKEN_REQUEST_URL'
+    flags: 'i'
+  - regex: 'ACTIONS_ID_TOKEN_REQUEST_URL.*not set'
+    flags: 'i'
+error_messages:
+  - "Error message: Unable to get ACTIONS_ID_TOKEN_REQUEST_URL env variable"
+  - "Error: Failed to get ID token with url: https://codecov.io./ Error message: Unable to get ACTIONS_ID_TOKEN_REQUEST_URL env variable"
+  - "Unable to exchange GitHub OIDC token for temporary Depot token: Error: Error message: Unable to get ACTIONS_ID_TOKEN_REQUEST_URL env variable"
+  - "OpenID Connect token retrieval failed: Unable to get ACTIONS_ID_TOKEN_REQUEST_URL env variable"
+root_cause: |
+  GitHub enforces a security restriction: when a workflow is triggered by a `pull_request`
+  event from a **fork repository**, the `id-token: write` permission is forced to `none`
+  regardless of what the workflow's `permissions:` block declares.
+
+  This is a deliberate design decision to prevent malicious fork contributors from obtaining
+  OIDC tokens that could authenticate against cloud providers (AWS, GCP, Azure), publish
+  packages (PyPI, npm), or create attestations. The OIDC endpoint environment variable
+  `ACTIONS_ID_TOKEN_REQUEST_URL` is simply not set in these workflow runs.
+
+  Affected actions include:
+  - `actions/attest-build-provenance` (attest-build-provenance#99, open since 2024-06)
+  - `aws-actions/configure-aws-credentials` (configure-aws-credentials#373)
+  - `codecov/codecov-action` with `use_oidc: true` (codecov-action#1435)
+  - `pypa/gh-action-pypi-publish` with Trusted Publishing
+  - Any action calling `core.getIDToken()` from `@actions/core`
+
+  This affects workflows from **external forks** (different repo/owner). It does NOT
+  affect PRs from branches within the same repository, or fork workflows triggered by
+  their own `push` events (only cross-repo fork-to-upstream `pull_request` events).
+
+  The issue has been open since mid-2024 with no GitHub-provided fix, as it is
+  intentional security architecture.
+fix: |
+  There is no direct fix. Three mitigations are available:
+
+  **Option A (Recommended): Skip OIDC steps for fork PRs**
+  Check whether the PR comes from a fork and conditionally skip steps that require OIDC.
+
+  **Option B: Move attestation/OIDC steps to a push/release trigger**
+  Attestations and cloud publishing should only happen after merge to main, not on
+  every PR. Restructure the workflow so OIDC-requiring steps only run on push events.
+
+  **Option C: Use pull_request_target (EXTREME CAUTION — security risk)**
+  `pull_request_target` runs in the context of the base repository with full permissions,
+  so OIDC tokens work. However, this event has WRITE ACCESS to the base repo even when
+  triggered by fork PRs, creating serious security risks if the workflow runs untrusted
+  PR code. Read all security references in docs: before using this approach.
+fix_code:
+  - language: yaml
+    label: 'Option A: Skip OIDC step if the PR comes from a fork'
+    code: |
+      jobs:
+        build-and-attest:
+          runs-on: ubuntu-latest
+          permissions:
+            id-token: write
+            attestations: write
+            contents: read
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Build
+              run: make build
+
+            - name: Attest build provenance
+              # Skip attestation for PRs from forks — OIDC is unavailable there
+              if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+              uses: actions/attest-build-provenance@v2
+              with:
+                subject-path: dist/
+  - language: yaml
+    label: 'Option B: Move OIDC steps to push trigger only'
+    code: |
+      on:
+        push:
+          branches: [main]
+        pull_request:
+          branches: [main]
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: make build
+            - uses: actions/upload-artifact@v4
+              with:
+                name: dist
+                path: dist/
+
+        attest:
+          # Only runs on push to main, where OIDC tokens are available
+          if: github.event_name == 'push'
+          needs: build
+          runs-on: ubuntu-latest
+          permissions:
+            id-token: write
+            attestations: write
+          steps:
+            - uses: actions/download-artifact@v4
+              with:
+                name: dist
+                path: dist/
+            - uses: actions/attest-build-provenance@v2
+              with:
+                subject-path: dist/
+  - language: yaml
+    label: 'Detect fork PR in run: step using pypa/gh-action-pypi-publish pattern'
+    code: |
+      - name: Check if OIDC is available
+        id: oidc-check
+        run: |
+          if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_URL}" ]]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::OIDC not available (fork PR) — skipping trusted publishing"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to PyPI (trusted publishing)
+        if: steps.oidc-check.outputs.available == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+prevention:
+  - 'Never put attestation, cloud auth, or package publishing steps in a workflow that fires on pull_request from forks — move them to push/release events'
+  - 'Guard all OIDC-requiring steps with: if: github.event.pull_request.head.repo.full_name == github.repository'
+  - 'Check ACTIONS_ID_TOKEN_REQUEST_URL env var emptiness as a runtime guard before calling OIDC-dependent tools'
+  - 'Prefer pull_request over pull_request_target for CI steps; never checkout fork code in a pull_request_target workflow without strict isolation'
+docs:
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions#understanding-the-risk-of-script-injections'
+    label: 'GitHub Docs — Security hardening for GitHub Actions'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/assigning-permissions-to-jobs#changing-the-permissions-in-a-forked-repository'
+    label: 'GitHub Docs — Permissions in forked repositories'
+  - url: 'https://github.com/actions/attest-build-provenance/issues/99'
+    label: 'actions/attest-build-provenance#99 — Unable to get ACTIONS_ID_TOKEN_REQUEST_URL on fork PR'
+  - url: 'https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/'
+    label: 'GitHub Security Lab — Preventing pwn requests (pull_request_target risks)'

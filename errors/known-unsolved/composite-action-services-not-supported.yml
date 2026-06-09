@@ -1,0 +1,163 @@
+id: known-unsolved-106
+title: 'services: Block Not Supported Inside Composite Actions — Use a Reusable Workflow Instead'
+category: known-unsolved
+severity: limitation
+tags:
+  - services
+  - service-containers
+  - composite-action
+  - reusable-workflow
+  - limitation
+  - action-yml
+patterns:
+  - regex: 'Unrecognized named-value.*services'
+    flags: 'i'
+  - regex: 'Unexpected value.*services'
+    flags: 'i'
+  - regex: 'using:\s*composite'
+    flags: 'im'
+error_messages:
+  - "Unexpected value 'services'"
+  - "Unrecognized named-value: 'services'"
+  - "The workflow is not valid. .github/workflows/ci.yml (Line: N, Col: N): Unexpected value 'services'"
+root_cause: |
+  Composite actions (`action.yml` with `runs.using: composite`) do not support the
+  `services:` block. The `services:` key is a **job-level** construct available only
+  in workflow YAML (`.github/workflows/*.yml`) — it cannot be used inside a composite
+  action definition.
+
+  This is a fundamental architectural limitation: composite actions are a collection of
+  steps that run inside an existing job. They do not create their own job runtime, cannot
+  allocate network namespaces, and cannot start Docker service containers alongside
+  their execution. The runner processes composite action steps as if they were inline
+  steps in the calling job.
+
+  Consequences:
+  1. **If you add `services:` to `action.yml`**: GitHub parses the action and either
+     throws "Unexpected value 'services'" at workflow parse time, or silently ignores
+     the block (depending on which validation layer catches it first).
+  2. **If you call a composite action and expect it to bring up a database/Redis/etc.**:
+     The service containers will not be started. The composite action's steps that try
+     to connect to those services will fail with connection-refused errors.
+  3. **No workaround within composite actions**: The limitation is intrinsic to how
+     composite actions are executed and will not be fixed, as it would require a
+     fundamentally different execution model.
+
+  The correct solution is to use a **reusable workflow** (`workflow_call`) instead of a
+  composite action when service containers are needed. Reusable workflows are full
+  workflows with their own jobs, which CAN include `services:`.
+
+  References:
+  - github/docs PR#14915 (Feb 2022): Added explicit docs note "service containers
+    should not be used in composite actions"
+  - actions/runner#1526: Confirms service containers not supported in composite actions
+  - GitHub Community Discussion #26671: "Creating and using service containers [is one
+    of the things] you can do from a reusable workflow that you can't do from a
+    composite action."
+fix: |
+  **Option A (Recommended): Convert to a reusable workflow**
+  If you need service containers in a shareable unit, use `workflow_call` instead of
+  a composite action. Reusable workflows fully support `services:` and all other
+  job-level features.
+
+  **Option B: Define services in the calling workflow**
+  Keep your composite action, but define the `services:` block in the calling workflow
+  job. The composite action's steps will have access to those services automatically
+  (same network namespace as the calling job's other steps).
+
+  **Option C: Start services manually in a run: step**
+  Use `docker run -d` commands in a step (before calling the composite action) to
+  start service containers manually. This is less clean but works without a reusable
+  workflow.
+fix_code:
+  - language: yaml
+    label: 'Wrong — services: defined inside composite action (silently ignored or error)'
+    code: |
+      # action.yml  ← WRONG: services: is not valid here
+      name: 'My Test Action'
+      description: 'Runs tests with a database'
+      runs:
+        using: composite
+        # services:            # ← NOT SUPPORTED — will be silently ignored or error
+        #   postgres:
+        #     image: postgres:15
+        steps:
+          - name: Run tests
+            run: pytest tests/
+            shell: bash
+  - language: yaml
+    label: 'Fix Option A — convert to reusable workflow to get services: support'
+    code: |
+      # .github/workflows/test-with-db.yml  ← CORRECT: reusable workflow
+      name: Test with Database
+      on:
+        workflow_call:
+          inputs:
+            test-path:
+              type: string
+              default: 'tests/'
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          services:
+            postgres:
+              image: postgres:15
+              env:
+                POSTGRES_PASSWORD: postgres
+              ports:
+                - 5432:5432
+              options: --health-cmd pg_isready --health-interval 10s
+          steps:
+            - uses: actions/checkout@v4
+            - run: pytest ${{ inputs.test-path }}
+  - language: yaml
+    label: 'Fix Option B — define services in the calling workflow, call composite action as a step'
+    code: |
+      # .github/workflows/ci.yml  ← CORRECT: services defined here, not in composite action
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          services:
+            postgres:              # ← services defined at job level in calling workflow
+              image: postgres:15
+              env:
+                POSTGRES_PASSWORD: postgres
+              ports:
+                - 5432:5432
+              options: --health-cmd pg_isready --health-interval 10s
+          steps:
+            - uses: actions/checkout@v4
+            - uses: ./.github/actions/run-tests     # composite action called as a step
+              # steps in this composite action can connect to postgres at localhost:5432
+  - language: yaml
+    label: 'Fix Option C — start Docker services manually in a run: step'
+    code: |
+      # .github/workflows/ci.yml  (or inside a composite action's steps)
+      steps:
+        - name: Start PostgreSQL
+          run: |
+            docker run -d \
+              --name postgres \
+              -e POSTGRES_PASSWORD=postgres \
+              -p 5432:5432 \
+              postgres:15
+            # Wait for postgres to be ready
+            until docker exec postgres pg_isready; do sleep 1; done
+          shell: bash
+
+        - uses: ./.github/actions/run-tests    # composite action can now connect
+prevention:
+  - 'Composite actions cannot have services: — design shared CI units that need databases as reusable workflows (workflow_call) instead'
+  - 'If a composite action needs service containers, move the services: definition to the calling workflow job'
+  - 'Check whether you need a composite action (no services, no environment:) or a reusable workflow (full job features) before choosing the abstraction'
+  - 'Document service container dependencies in composite action README so callers know to define services: in their job'
+docs:
+  - url: 'https://docs.github.com/en/actions/sharing-automations/creating-actions/creating-a-composite-action'
+    label: 'GitHub Docs — Creating a composite action'
+  - url: 'https://docs.github.com/en/actions/sharing-automations/reusing-workflows'
+    label: 'GitHub Docs — Reusing workflows (supports services:)'
+  - url: 'https://github.com/orgs/community/discussions/26671'
+    label: 'GitHub Community — Service containers in composite action vs reusable workflow'
+  - url: 'https://github.com/actions/runner/issues/1526'
+    label: 'actions/runner#1526 — Service containers not supported in composite actions'
