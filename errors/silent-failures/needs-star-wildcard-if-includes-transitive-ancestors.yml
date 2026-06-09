@@ -1,0 +1,179 @@
+id: silent-failures-171
+title: 'needs.* Wildcard in job-level if: Silently Includes Transitive Ancestor Jobs — Evaluates Differently from env: Context'
+category: silent-failures
+severity: silent-failure
+tags:
+  - needs
+  - wildcard
+  - if-condition
+  - transitive
+  - ancestor
+  - job-dependency
+  - silent-failure
+  - expression
+patterns:
+  - regex: 'contains\(needs\.\*\.result'
+    flags: 'i'
+  - regex: 'needs\.\*\.result\s*==\s*[''"]'
+    flags: 'i'
+  - regex: 'needs\.\*\.outputs\.'
+    flags: 'i'
+error_messages:
+  - ''
+root_cause: |
+  The `needs.*` wildcard behaves **asymmetrically** depending on where in a workflow it
+  is used:
+
+  - **In a job-level `if:` condition**: Evaluated server-side by GitHub. The wildcard
+    expands to ALL ancestor jobs in the dependency chain — both direct dependencies and
+    their upstream dependencies (transitive ancestors). A job C that `needs: [B]` where
+    B `needs: [A]` will see A's result in `needs.*.result` when evaluating the `if:`.
+
+  - **In a job-level `env:` or step expression**: Evaluated runner-side. The wildcard
+    only expands to the jobs listed directly in the job's `needs:` array. The same
+    expression `${{ contains(needs.*.result, 'failure') }}` returns only direct deps.
+
+  This discrepancy means a job's `if:` condition can produce a different boolean result
+  than the same expression evaluated in `env:` context — silently causing jobs to run
+  when they shouldn't, or skip when they should run.
+
+  **Common symptom**: A workflow shaped like prep → [job1, job2, job3] → final:
+  - `final` needs [job1, job2, job3]
+  - `if: always() && contains(needs.*.result, 'success')` in `final`
+  - If job1/2/3 are all skipped (e.g., `if: false`), the condition should be `false`
+  - But `prep` succeeded, and `needs.*` in `if:` includes `prep`
+  - So the condition evaluates to `true` and `final` runs unexpectedly
+
+  This behavior was reported in actions/runner#2356 (Jan 2023, closed as documented).
+  GitHub confirmed it is a server-side vs runner-side evaluation difference and provided
+  no fix — only a workaround to enumerate jobs explicitly.
+
+  **Confirming the asymmetry**: To observe the discrepancy, set:
+  ```
+  env:
+    NEEDS_JSON: ${{ toJSON(needs) }}           # Runner-side: only direct deps
+    CONDITION: ${{ contains(needs.*.result, 'success') }}  # Runner-side: only direct
+  ```
+  The `env:` evaluation of `needs.*` will show only direct dependencies and return a
+  different result than the `if:` condition evaluated the same expression.
+fix: |
+  Replace `needs.*` wildcard with explicit job name enumeration in `if:` conditions:
+
+  Instead of:
+    if: always() && contains(needs.*.result, 'success')
+
+  Use:
+    if: always() && (needs.job1.result == 'success' || needs.job2.result == 'success' || needs.job3.result == 'success')
+
+  This forces consistent server-side and runner-side evaluation by referencing specific
+  job names rather than the wildcard glob.
+
+  For large workflows with many jobs (10+) where listing all is impractical:
+  - Add a sentinel aggregator job that explicitly `needs: [job1, job2, ..., jobN]`
+  - Give it `if: always()` and compute the needed condition as an output
+  - Downstream jobs can then check `needs.sentinel.outputs.any_success == 'true'`
+fix_code:
+  - language: yaml
+    label: 'Bug — needs.* in if: includes transitive prep job, final runs unexpectedly'
+    code: |
+      jobs:
+        prep:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "preparing"
+
+        job1:
+          needs: prep
+          if: false   # ← skip this job
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "job1"
+
+        job2:
+          needs: prep
+          if: false   # ← skip this job
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "job2"
+
+        # BUG: this job runs even though job1 and job2 were skipped
+        # because needs.* in if: includes prep (which succeeded)
+        final:
+          needs: [job1, job2]
+          if: always() && contains(needs.*.result, 'success')
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Unexpected run — no jobs succeeded!"
+  - language: yaml
+    label: 'Fix — enumerate direct deps explicitly instead of using needs.* wildcard'
+    code: |
+      jobs:
+        prep:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "preparing"
+
+        job1:
+          needs: prep
+          if: false
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "job1"
+
+        job2:
+          needs: prep
+          if: false
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "job2"
+
+        # FIXED: explicitly check only direct dependencies
+        final:
+          needs: [job1, job2]
+          if: always() && (needs.job1.result == 'success' || needs.job2.result == 'success')
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Only runs if job1 or job2 succeeded"
+  - language: yaml
+    label: 'Fix for large fan-out — use a sentinel aggregator job'
+    code: |
+      jobs:
+        # ... many parallel jobs ...
+
+        aggregate:
+          needs: [job1, job2, job3, job4, job5]
+          if: always()
+          runs-on: ubuntu-latest
+          outputs:
+            any_success: ${{ steps.check.outputs.any_success }}
+          steps:
+            - id: check
+              run: |
+                # Explicit check of direct deps only
+                if [[ "${{ contains(needs.*.result, 'success') }}" == "true" ]]; then
+                  echo "any_success=true" >> "$GITHUB_OUTPUT"
+                else
+                  echo "any_success=false" >> "$GITHUB_OUTPUT"
+                fi
+              env:
+                # Force runner-side evaluation for accurate direct-deps-only check
+                NEEDS: ${{ toJSON(needs) }}
+
+        deploy:
+          needs: [aggregate]
+          if: always() && needs.aggregate.outputs.any_success == 'true'
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying"
+prevention:
+  - 'Avoid needs.* wildcard in job-level if: conditions — always enumerate job names explicitly'
+  - 'Use toJSON(needs) in env: to debug what needs.* actually contains at runtime (only direct deps)'
+  - 'If needs.* in if: returns unexpected true/false, inspect whether transitive ancestor jobs may be influencing the result'
+  - 'For complex fan-out workflows, use an aggregator job pattern with explicit direct-dep checks'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#needs-context'
+    label: 'GitHub Docs — needs context'
+  - url: 'https://github.com/actions/runner/issues/2356'
+    label: 'actions/runner#2356 — needs.* includes implicitly dependent jobs in job level if'
+  - url: 'https://github.com/actions/runner/issues/1540'
+    label: 'actions/runner#1540 — needs.* behavior asymmetry reference'
