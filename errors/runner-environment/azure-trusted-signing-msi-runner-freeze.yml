@@ -1,0 +1,104 @@
+id: runner-environment-380
+title: "Azure Trusted Signing Client Tools MSI installation freezes Windows runner indefinitely"
+category: runner-environment
+severity: error
+tags:
+  - windows
+  - trusted-signing
+  - msiexec
+  - winget
+  - code-signing
+  - timeout
+  - freeze
+patterns:
+  - regex: 'TrustedSigningClientTools|Microsoft\.Azure\.TrustedSigningClientTools'
+    flags: 'i'
+  - regex: 'msiexec.*TrustedSigning|TrustedSigning.*msiexec'
+    flags: 'i'
+  - regex: 'The job running on runner.*has exceeded the maximum execution time'
+    flags: 'i'
+error_messages:
+  - "The job running on runner Hosted Agent has exceeded the maximum execution time of 360 minutes."
+  - "Process 'msiexec.exe' failed with exit code — (hung, no exit)"
+  - "winget install -e --id Microsoft.Azure.TrustedSigningClientTools — (no output, hangs)"
+root_cause: |
+  Installing the Microsoft Azure Trusted Signing Client Tools on Windows runners either via
+  direct MSI download + msiexec.exe, or via winget, causes the runner process to hang
+  indefinitely. The runner never receives a completion signal from the installer, and the
+  workflow eventually hits the job timeout.
+
+  Two installation methods both exhibit the freeze:
+  1. Direct MSI: `Start-Process msiexec.exe -Wait -ArgumentList '/I TrustedSigningClientTools.msi /quiet'`
+     The `-Wait` flag blocks PowerShell. msiexec.exe starts the MSI installation process
+     but does not exit. The exact cause is unclear but appears related to a conflicting
+     Windows Installer service state or a post-install dialog that cannot be rendered
+     in the headless runner environment.
+
+  2. winget: `winget install -e --id Microsoft.Azure.TrustedSigningClientTools --disable-interactivity`
+     Even with `--disable-interactivity` and `--accept-source-agreements`, the winget
+     process hangs waiting for the same MSI installer subsystem.
+
+  This was first reported on windows-server-2022 image version 20260105.167.1 and
+  continues to affect current Windows runner images (windows-2022, windows-2025,
+  windows-latest).
+
+fix: |
+  Install the Trusted Signing client tools using the official NuGet package
+  (Microsoft.Azure.SignTool) or via dotnet tool install rather than the MSI.
+  Alternatively, use the azure/trusted-signing-action GitHub Action, which handles
+  the tool installation internally without the MSI hang.
+
+  If you must use the MSI, add a timeout to the Start-Process call and detect hangs:
+
+fix_code:
+  - language: yaml
+    label: "Use azure/trusted-signing-action instead of manual MSI installation"
+    code: |
+      # Instead of manually installing and calling signtool, use the official action:
+      - name: Sign files with Trusted Signing
+        uses: azure/trusted-signing-action@v0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: https://wus.codesigning.azure.net/
+          trusted-signing-account-name: my-signing-account
+          certificate-profile-name: my-cert-profile
+          files-folder: ${{ github.workspace }}\dist
+          files-folder-filter: exe,dll
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+  - language: yaml
+    label: "Install via dotnet tool as alternative to the MSI"
+    code: |
+      # The azure/trusted-signing-action installs Microsoft.Azure.SignTool via NuGet.
+      # If you need the tool directly, use dotnet tool install instead of the MSI:
+      - name: Install Azure Sign Tool
+        shell: pwsh
+        run: |
+          dotnet tool install --global AzureSignTool
+          # Use azuresigntool instead of the MSI-based client tools:
+          azuresigntool sign `
+            -kvu "https://my-vault.vault.azure.net" `
+            -kvi "$env:AZURE_CLIENT_ID" `
+            -kvs "$env:AZURE_CLIENT_SECRET" `
+            -kvt "$env:AZURE_TENANT_ID" `
+            -kvc "my-cert" `
+            -tr "http://timestamp.acs.microsoft.com" `
+            -td sha256 `
+            "dist\myapp.exe"
+
+prevention:
+  - "Use azure/trusted-signing-action@v0 which handles tool installation without MSI interaction"
+  - "Avoid msiexec.exe -Wait and winget for Trusted Signing tools on Windows runners — both hang"
+  - "If you must use the MSI, add a job timeout_minutes and monitor for the freeze with retry logic"
+  - "Test new code signing workflows on feature branches before merging — the freeze hits the job timeout (360 min default)"
+docs:
+  - url: "https://github.com/actions/runner-images/issues/13538"
+    label: "actions/runner-images#13538: Installation of Azure Trusted Signing Tools freezes runner"
+  - url: "https://github.com/azure/trusted-signing-action"
+    label: "azure/trusted-signing-action: official GitHub Action for Azure Trusted Signing"
+  - url: "https://learn.microsoft.com/en-us/azure/trusted-signing/how-to-signing-integrations"
+    label: "Azure Trusted Signing: signing integrations (GitHub Actions recommended path)"
