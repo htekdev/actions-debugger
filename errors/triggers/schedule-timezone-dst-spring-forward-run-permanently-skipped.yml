@@ -1,0 +1,74 @@
+id: triggers-097
+title: 'schedule timezone: spring-forward DST gap permanently skips cron run — no reschedule'
+category: triggers
+severity: silent-failure
+tags:
+  - schedule
+  - cron
+  - timezone
+  - dst
+  - daylight-saving
+  - spring-forward
+  - silent-failure
+  - skipped-run
+patterns:
+  - regex: 'timezone:\s*[''"]?(America/New_York|America/Chicago|America/Denver|America/Los_Angeles|Europe/London|Europe/Paris|Europe/Berlin|Australia/Sydney)'
+    flags: 'i'
+  - regex: 'on:\s*[\r\n]+\s*schedule:[\s\S]*?timezone:'
+    flags: 'is'
+error_messages:
+  - "(no error emitted — the scheduled run is silently absent from the workflow history for the affected date)"
+root_cause: |
+  GitHub Actions uses the IANA timezone database to translate the cron schedule's local time to UTC before
+  queuing runs. During a daylight-saving spring-forward transition, one hour is skipped entirely (e.g., clocks
+  jump from 01:59 to 03:00 in the US Eastern time zone on the second Sunday of March). Any cron job scheduled
+  to fire during that non-existent hour (e.g., `cron: '30 2 * * *'` with `timezone: "America/New_York"`)
+  has no valid UTC mapping on that day. GitHub does not re-schedule the missed run at the start or end of the
+  gap — it is permanently lost. There is no annotation, warning, or failed run created in the workflow history.
+  The behavior is symmetric with other cron schedulers that rely on wall-clock to UTC conversion.
+
+  Similarly, during autumn fall-back transitions, a one-hour window is repeated. Cron jobs targeting the
+  repeated hour (e.g., 01:30) may fire twice — once before the clock rolls back and once after — or exactly
+  once depending on GitHub's internal scheduling window. The double-fire case produces two distinct workflow
+  runs with identical `github.event.schedule` values, which can cause duplicate deployments or notifications.
+
+  The `timezone:` field was added to GitHub Actions scheduled workflows in the March 2026 changelog.
+fix: |
+  Schedule cron jobs outside the DST transition window to guarantee consistent execution:
+
+  1. **Avoid the 01:00–03:59 window** (for US timezones) and the 01:00–02:59 window (for European timezones)
+     for any job that must run reliably every day without skips.
+
+  2. **Use UTC** (`timezone: "UTC"` or omit the timezone field) and accept that the local wall-clock time of
+     the run shifts by one hour twice a year instead of risking a permanently missed run.
+
+  3. **Add a canary / alerting job** in a separate workflow scheduled just after the expected run time that
+     checks whether the primary job ran (e.g., via an artifact or a commit sentinel) and alerts if absent.
+fix_code:
+  - language: yaml
+    label: "Safe: schedule cron outside the 02:00–02:59 window to avoid spring-forward loss"
+    code: |
+      on:
+        schedule:
+          # Safe: 04:00 local time is never in a DST gap window
+          - cron: '0 4 * * *'
+            timezone: "America/New_York"
+  - language: yaml
+    label: "Safest: use UTC and accept the 1-hour wall-clock shift on DST change days"
+    code: |
+      on:
+        schedule:
+          # UTC — no DST; 09:00 UTC = 05:00 EST / 04:00 EDT
+          - cron: '0 9 * * *'
+prevention:
+  - "Avoid scheduling cron jobs in the 01:00–02:59 local window for US/EU timezones."
+  - "Prefer UTC for any workflow where consistent daily execution is a hard requirement."
+  - "Use a separate canary/monitoring workflow to detect silently-skipped runs."
+  - "Document the expected UTC time alongside the local-time schedule comment so DST shifts are visible."
+docs:
+  - url: "https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions#onschedule"
+    label: "GitHub Actions — on.schedule syntax (timezone field)"
+  - url: "https://github.blog/changelog/2026-03-19-github-actions-late-march-2026-updates"
+    label: "GitHub Changelog: Late March 2026 — Timezone support for scheduled workflows"
+  - url: "https://data.iana.org/time-zones/tz-link.html"
+    label: "IANA Time Zone Database"
