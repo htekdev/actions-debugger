@@ -1,0 +1,119 @@
+id: runner-environment-391
+title: 'actions/checkout Fails on Windows When Repository Contains Branch Names That
+  Differ Only by Case in a Path Component'
+category: runner-environment
+severity: error
+tags:
+  - checkout
+  - windows
+  - case-insensitive
+  - git
+  - branch
+  - refs
+  - filesystem
+  - fetch-fail
+patterns:
+  - regex: 'cannot lock ref.*exists; cannot create'
+    flags: 'i'
+  - regex: 'error: cannot lock ref.*refs/remotes/origin/.*already exists'
+    flags: 'i'
+  - regex: 'fatal: refusing to merge unrelated histories|error: Your local changes
+      to the following files would be overwritten'
+    flags: 'i'
+  - regex: 'failed to run git: error: cannot lock ref'
+    flags: 'i'
+  - regex: 'git.*fetch.*error.*cannot lock ref'
+    flags: 'i'
+error_messages:
+  - "error: cannot lock ref 'refs/remotes/origin/feature/manu': 'refs/remotes/origin/Feature' exists; cannot create 'refs/remotes/origin/feature'"
+  - "fatal: cannot lock ref 'refs/remotes/origin/feature/branch-a': unable to create 'C:\\\\...\\\\objects\\\\refs\\\\remotes\\\\origin\\\\feature\\\\branch-a': Cannot create a file when that file already exists."
+  - "Error: The process '/usr/bin/git' failed with exit code 128"
+  - "error: cannot create directory 'refs/remotes/origin/feature': A file with that name already exists"
+root_cause: |
+  On Windows, the NTFS filesystem is case-insensitive: path components that differ
+  only by case (e.g., `feature/` and `Feature/`) are treated as the same directory.
+  Git on Windows inherits this behavior.
+
+  When a repository contains two or more branches whose **path prefix** (the part
+  before the final `/`) differs only by case — for example:
+  - `feature/branch-a`
+  - `Feature/branch-b`
+
+  Git on Linux creates two separate directories (`refs/remotes/origin/feature/` and
+  `refs/remotes/origin/Feature/`) without conflict. On Windows, Git cannot create
+  both because the OS conflates them into a single directory: creating
+  `refs/remotes/origin/feature/branch-a` after `refs/remotes/origin/Feature/branch-b`
+  already exists fails with "cannot lock ref" or "cannot create directory".
+
+  `actions/checkout@v6` (and earlier) calls `git fetch --prune` to synchronize
+  all remote refs. If the remote has case-conflicting branch namespaces, the fetch
+  command fails with exit code 128 and the checkout step errors out.
+
+  This is ultimately a Git-for-Windows limitation, not a bug in `actions/checkout`
+  itself. It affects all `windows-latest`, `windows-2025`, and `windows-2022` runners
+  whenever the upstream repository has branches with case-only prefix differences.
+fix: |
+  **Root fix:** Rename branches in the remote repository so no two branches share
+  a path prefix that differs only by case. For example, rename `Feature/branch-b`
+  to `feature/branch-b` or `feat/branch-b` to eliminate the conflict.
+
+  **Workflow workarounds (if you cannot rename the remote branches):**
+
+  1. **Use `fetch-depth: 1` and disable `--prune`** — fetching only the specific
+     ref you need avoids fetching the conflicting branches entirely:
+     ```yaml
+     - uses: actions/checkout@v4
+       with:
+         ref: feature/branch-a
+         fetch-depth: 1
+         # fetch-tags: false (avoids additional conflict surface)
+     ```
+     Note: This does not work if your workflow needs the full history or other branches.
+
+  2. **Switch to a Linux runner** — if the task being tested does not require Windows,
+     run on `ubuntu-latest` where the case conflict does not arise.
+
+  3. **Add a pre-checkout step to purge conflicting packed-refs** — as a last
+     resort on self-hosted Windows runners with a persistent workspace, manually
+     prune the conflicting ref before checkout:
+     ```bash
+     git -C "${{ github.workspace }}" remote prune origin || true
+     ```
+fix_code:
+  - language: yaml
+    label: 'Fetch only the target branch to avoid case-conflicting refs'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-latest
+          steps:
+            - name: Checkout (targeted fetch — avoids case-conflict fetch --prune)
+              uses: actions/checkout@v4
+              with:
+                ref: ${{ github.ref }}
+                fetch-depth: 1
+                fetch-tags: false
+  - language: yaml
+    label: 'Run on Linux to avoid NTFS case-insensitivity entirely'
+    code: |
+      jobs:
+        build:
+          # Switch to ubuntu-latest if Windows is not required for this job
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+prevention:
+  - 'Enforce a branch naming convention that avoids path prefixes differing only by
+    case (e.g., always use lowercase `feature/`, `fix/`, `chore/` prefixes).'
+  - 'Add a branch-name linting step or a repo branch protection rule to reject
+    branches whose prefix would collide case-insensitively with an existing branch.'
+  - 'When designing multi-platform CI, be aware that Windows runner Git behavior
+    is case-insensitive and branch naming conventions must account for this.'
+docs:
+  - url: 'https://github.com/actions/checkout/issues/2448'
+    label: 'actions/checkout#2448 — checkout fails on Windows when repository contains
+      branch prefixes differing only by case (Jun 2026)'
+  - url: 'https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#jobsjob_idstepsuses'
+    label: 'GitHub Docs — actions/checkout usage'
+  - url: 'https://gitforwindows.org/'
+    label: 'Git for Windows — case-insensitivity behavior on NTFS'
