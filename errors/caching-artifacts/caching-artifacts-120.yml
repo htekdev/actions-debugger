@@ -1,0 +1,117 @@
+id: caching-artifacts-120
+title: 'download-artifact Downloads Corrupt or Truncated File Due to Network Interruption — No Error or Silent Exit'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - download-artifact
+  - artifact
+  - corrupt
+  - truncated
+  - zip
+  - network
+  - silent-failure
+  - arm64
+patterns:
+  - regex: 'Failed to download artifact after \d+ retr(?:y|ies) due to Not a valid zip file'
+    flags: 'i'
+  - regex: 'Unable to download and extract artifact: Artifact download failed after \d+ retries'
+    flags: 'i'
+  - regex: 'Unexpected end of (?:archive|data)'
+    flags: 'i'
+error_messages:
+  - "Failed to download artifact after 1 retries due to Not a valid zip file."
+  - "Error: Unable to download artifact(s): Unable to download and extract artifact: Artifact download failed after 5 retries."
+  - "Unexpected end of archive"
+  - "unexpected EOF"
+root_cause: |
+  `actions/download-artifact` downloads artifacts as zip files from Azure Blob Storage.
+  A network interruption or timeout during the download can silently produce a truncated
+  (incomplete) zip file without the download step reporting an error or non-zero exit code.
+
+  There are two failure manifestations from the same root cause:
+
+  1. **Silent truncation**: The download step completes with exit 0 and shows
+     "Downloading single artifact" but the resulting file is an incomplete zip. The
+     failure is only discovered by the next step that attempts to extract or read the file
+     (e.g., `unexpected EOF`, `Unexpected end of archive`, CRC errors).
+
+  2. **Explicit error after retries**: Newer versions attempt up to N retries and
+     eventually emit `Failed to download artifact after N retries due to Not a valid
+     zip file` — but the retry loop itself can hang or all retries can be exhausted.
+
+  Root cause in toolkit: The download timeout did not reject the underlying promise,
+  allowing a partial download to be treated as complete. This was fixed in
+  `@actions/artifact` via `actions/toolkit` PR#2124 (merged Sep 2025) by rejecting
+  the download promise on timeout, but network-level truncations without a timeout
+  signal can still slip through.
+
+  The issue is disproportionately reported on:
+  - `ubuntu-24.04-arm` / ARM64 runners (parallel downloads of large artifacts)
+  - Workflows downloading multiple large (≥500MB) artifacts in parallel
+
+  Reference: actions/download-artifact#454 (Dec 2025), #475 (Apr 2026, 9 reactions),
+  #377 (Feb 2025), #375 (Feb 2025, ARM64-specific),
+  actions/toolkit PR#2124 (fix for timeout case, Sep 2025).
+fix: |
+  Workarounds (no complete fix exists for all cases):
+
+  Option A: Enable digest verification — use `digest-mismatch: error` (available in
+  download-artifact@v8+). This validates the downloaded artifact's digest against the
+  server-reported value and fails fast on mismatch rather than silently passing a corrupt file.
+
+  Option B: Add a retry wrapper around the download step using a GitHub Actions retry
+  action (e.g., `nick-fields/retry@v3`). This allows automatic re-download if the
+  extraction step fails.
+
+  Option C: Serialize large parallel downloads — if multiple jobs download the same
+  large artifact concurrently on ARM64, stagger the downloads to reduce network pressure.
+
+  Option D: Upgrade `actions/download-artifact` to v8+ which includes the toolkit
+  PR#2124 fix for the timeout-based truncation.
+fix_code:
+  - language: yaml
+    label: 'Option A: Enable digest verification to detect corrupt downloads early'
+    code: |
+      - name: Download artifact
+        uses: actions/download-artifact@v8    # v8+ supports digest-mismatch
+        with:
+          name: my-artifact
+          path: dist/
+          digest-mismatch: error             # Fails immediately if digest doesn't match
+  - language: yaml
+    label: 'Option B: Retry wrapper for download + extraction'
+    code: |
+      - name: Download artifact with retry
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          command: |
+            # Download step
+            gh run download ${{ github.run_id }} --name my-artifact --dir dist/
+            # Validate immediately so retry fires on corrupt file
+            unzip -t dist/my-artifact.zip
+  - language: yaml
+    label: 'Option C: Serialize parallel downloads on ARM64'
+    code: |
+      # Instead of downloading in all matrix jobs simultaneously:
+      - name: Download artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: build-output-${{ matrix.platform }}
+          path: artifacts/
+        # Consider using needs: or a dedicated download job to serialize large downloads
+prevention:
+  - 'Use download-artifact@v8+ which includes fixes for timeout-based truncation (toolkit PR#2124)'
+  - 'Enable digest-mismatch: error to catch corrupt downloads before downstream steps fail with confusing errors'
+  - 'Avoid downloading multiple large (500MB+) artifacts in parallel on ARM64 runners — serialize if possible'
+  - 'If using artifacts for build-to-test hand-off, validate the archive immediately after download before running tests'
+docs:
+  - url: 'https://github.com/actions/download-artifact/issues/454'
+    label: 'actions/download-artifact#454: download incomplete but no error reported'
+  - url: 'https://github.com/actions/download-artifact/issues/475'
+    label: 'actions/download-artifact#475: action failed without any error message'
+  - url: 'https://github.com/actions/toolkit/pull/2124'
+    label: 'actions/toolkit PR#2124: Reject download promise if timeout was reached'
+  - url: 'https://github.com/actions/download-artifact'
+    label: 'actions/download-artifact README'
