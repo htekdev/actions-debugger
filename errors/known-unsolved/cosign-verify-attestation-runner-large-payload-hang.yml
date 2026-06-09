@@ -1,0 +1,122 @@
+id: known-unsolved-102
+title: '`cosign verify-attestation` hangs indefinitely in GitHub Actions on large attestation payloads — requires stdout redirect workaround'
+category: known-unsolved
+severity: limitation
+tags:
+  - cosign
+  - verify-attestation
+  - sigstore
+  - attestation
+  - slsa
+  - supply-chain
+  - performance
+  - hang
+  - stdout-redirect
+patterns:
+  - regex: 'cosign\s+verify-attestation\b(?!.*>\s*\S)'
+    flags: 'i'
+  - regex: 'sigstore/cosign-installer'
+    flags: 'i'
+error_messages:
+  - "(no error — the step appears to hang and produces no further log output; job eventually times out)"
+  - "Error: The operation was canceled."
+root_cause: |
+  `cosign verify-attestation` outputs the verified attestation payload as a single JSON object to stdout,
+  formatted as one extremely long line (typically 100 000–500 000 characters for an SBOM or SLSA provenance
+  attestation). The GitHub Actions runner's secret-masking pipeline scans every stdout line character by
+  character before forwarding it to the log service. A 300 000-character line causes 8–15 minutes of
+  processing delay even though cosign itself has already exited successfully.
+
+  This is a platform-level limitation: the runner's log pipeline cannot be disabled or bypassed per-step,
+  and GitHub has not fixed the root-cause performance issue in actions/runner#1031 as of June 2026. The
+  cosign issue tracker (sigstore/cosign#3602) confirmed the root cause and documented the stdout-redirect
+  workaround; the issue was closed "not planned" on the cosign side because the fix must come from the
+  GitHub Actions runner.
+
+  Practical impact: a `cosign verify-attestation` step that should complete in < 1 second hangs for
+  8–15 minutes per invocation. Jobs with default `timeout-minutes: 360` silently waste runner hours;
+  jobs with short timeouts (< 15 min) may fail with "The operation was canceled."
+
+  The same root cause affects any step that prints very long single lines: security scanners (trivy, grype)
+  with `--format json` piped to stdout, `jq -c .`, base64-encoded blobs, etc. See the companion entry
+  `runner-large-output-line-secret-scan-slowdown` for the general pattern.
+fix: |
+  Redirect `cosign verify-attestation` stdout to a file instead of letting it print to the runner's log
+  pipeline. The step completes instantly, and the payload is preserved for downstream use.
+
+  Two options:
+
+  **Option A — redirect to file + upload as artifact (recommended):**
+  ```yaml
+  - run: |
+      cosign verify-attestation ... > attestation.json
+  - uses: actions/upload-artifact@v4
+    with:
+      name: attestation
+      path: attestation.json
+  ```
+
+  **Option B — use `--output-file` flag (cosign 2.x+):**
+  ```yaml
+  - run: |
+      cosign verify-attestation \
+        --output-file attestation.json \
+        ...
+  ```
+
+  Both approaches complete in < 1 second versus the 8–15 minute hang.
+
+  Note: this does NOT skip verification — cosign still performs the full cryptographic check and exits
+  non-zero on failure. Only the payload *printing* is redirected.
+fix_code:
+  - language: yaml
+    label: "Redirect verify-attestation stdout to file (avoids runner log-scan hang)"
+    code: |
+      jobs:
+        verify:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Install cosign
+              uses: sigstore/cosign-installer@v3
+
+            - name: Verify attestation (stdout redirected to avoid runner hang)
+              run: |
+                cosign verify-attestation \
+                  --type slsaprovenance \
+                  --certificate-identity-regexp 'https://github.com/.*' \
+                  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+                  ghcr.io/${{ github.repository }}@${{ github.sha }} \
+                  > attestation.json   # REQUIRED: redirect prevents 8-15 min runner hang
+              env:
+                COSIGN_EXPERIMENTAL: "1"
+
+            - name: Upload attestation payload
+              uses: actions/upload-artifact@v4
+              with:
+                name: attestation-payload
+                path: attestation.json
+  - language: yaml
+    label: "Alternative: use --output-file flag (cosign 2.x+)"
+    code: |
+            - name: Verify attestation
+              run: |
+                cosign verify-attestation \
+                  --output-file attestation.json \
+                  --type slsaprovenance \
+                  --certificate-identity-regexp 'https://github.com/.*' \
+                  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+                  ghcr.io/${{ github.repository }}@${{ github.sha }}
+prevention:
+  - "Always redirect `cosign verify-attestation` stdout to a file — treat this as a required pattern, not optional."
+  - "Add job-level `timeout-minutes: 15` to bound the hang if you forget the redirect."
+  - "Add a step-level check: if the step takes > 60 seconds, it is almost certainly hung on the log pipeline."
+  - "Pin to a cosign version that documents `--output-file` support (v2.x and later)."
+docs:
+  - url: "https://github.com/sigstore/cosign/issues/3602"
+    label: "sigstore/cosign#3602 — cosign verify-attestation hangs indefinitely in GitHub Actions (root cause identified)"
+  - url: "https://github.com/actions/runner/issues/1031"
+    label: "actions/runner#1031 — Long log lines cause performance degradation in GitHub Actions runner (unfixed)"
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/using-artifact-attestations-to-establish-provenance-for-builds"
+    label: "GitHub Docs — Using artifact attestations to establish provenance for builds"
+  - url: "https://github.com/sigstore/cosign-installer"
+    label: "sigstore/cosign-installer — Official GitHub Action for installing cosign"
