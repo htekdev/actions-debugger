@@ -1,0 +1,167 @@
+id: runner-environment-372
+title: 'ubuntu-26.04 Runner $JAVA_HOME Defaults to Java 25 — Workflows Expecting Java 21 LTS Get Wrong Version'
+category: runner-environment
+severity: silent-failure
+tags:
+  - ubuntu-26.04
+  - java-25
+  - java-21
+  - java-home
+  - runner-image
+  - breaking-change
+  - gradle
+  - maven
+  - setup-java
+patterns:
+  - regex: 'JAVA_HOME.*temurin-25|java\.home.*jdk-25'
+    flags: 'i'
+  - regex: 'java version "25\.|openjdk version "25\.'
+    flags: 'i'
+  - regex: 'Unsupported class file major version 69|target release: 21.*source.*25'
+    flags: 'i'
+  - regex: 'expected.*java.*21.*found.*25|require.*jdk.21.*got.*jdk.25'
+    flags: 'i'
+  - regex: 'Java.*25.*is not supported|java\.runtime\.version.*25'
+    flags: 'i'
+error_messages:
+  - 'openjdk version "25.0.1" 2026-10-20'
+  - 'JAVA_HOME=/usr/lib/jvm/temurin-25-amd64'
+  - 'Unsupported class file major version 69'
+  - 'error: Source option 25 is not supported. Use 21 or later.'
+  - 'Java 21 required but found Java 25'
+  - 'java.lang.UnsupportedClassVersionError: Unsupported major.minor version 69.0'
+root_cause: |
+  The `ubuntu-26.04` GitHub Actions runner image ships with **Java 25** (Temurin 25) as
+  the default JDK, with `$JAVA_HOME` pointing to `temurin-25`. On `ubuntu-22.04` and
+  `ubuntu-24.04`, the default was **Java 21 LTS** (Temurin 21, `$JAVA_HOME` =
+  `temurin-21`).
+
+  **Why this silently breaks workflows:**
+
+  Workflows that do **not** use `actions/setup-java` rely on the runner's pre-installed
+  Java. If those workflows assume Java 21 (the LTS baseline), they now get Java 25, a
+  non-LTS feature release with:
+  - Preview features that differ from Java 21 previews
+  - Different internal module access patterns (`--add-opens` flags may need updating)
+  - Class file major version 69 (Java 25) vs 65 (Java 21) — bytecode produced on Java
+    25 will fail to load on Java 21 runtimes (if the project ships jars consumed by
+    Java 21 services)
+
+  **Concrete failure scenarios:**
+
+  1. **Scripts with explicit Java version checks:**
+     ```bash
+     JAVA_VER=$(java -version 2>&1 | head -1 | awk -F '"' '{print $2}' | cut -d'.' -f1)
+     [[ "$JAVA_VER" == "21" ]] || { echo "Java 21 required"; exit 1; }
+     ```
+     This exits with failure because `JAVA_VER` is now `25`.
+
+  2. **Quarkus / Micronaut native builds** specifying `quarkus.native.java-home-override`
+     or `GRAALVM_HOME` pointing to the default `$JAVA_HOME` will get Java 25 behavior
+     instead of the expected Java 21 ABI.
+
+  3. **Maven Enforcer Plugin** with `<requireJavaVersion><version>[21,22)</version>`:
+     ```
+     Enforcer rule 'org.apache.maven.plugins.enforcer.RequireJavaVersion' failed:
+     Detected JDK Version: 25.0.1 is not in the allowed range [21,22).
+     ```
+
+  4. **Cross-compilation artifacts**: Running `javac --release 25` produces bytecode
+     with class file version 69, which cannot be loaded by JVMs running Java 21 or
+     earlier. Workflows that archive JARs without explicitly specifying `--release 21`
+     will silently produce Java 25 bytecode.
+
+  The change is documented in the ubuntu-26.04 software manifest
+  (runner-images commit 9e3319d, May 2026). The environment variables available on
+  ubuntu-26.04 include both `JAVA_HOME_21_X64` (pointing to temurin-21) and
+  `JAVA_HOME_25_X64` (pointing to temurin-25, and also the value of `JAVA_HOME`).
+fix: |
+  **Recommended fix: always use `actions/setup-java` with an explicit version.**
+  This is the only reliable way to get a specific Java version regardless of the
+  runner image default.
+
+  **Quick workaround on ubuntu-26.04 without setup-java:**
+  Use the `JAVA_HOME_21_X64` (or `JAVA_HOME_21_ARM64`) environment variable, which
+  is pre-set on ubuntu-26.04 to point to the Temurin 21 installation:
+  ```bash
+  export JAVA_HOME="$JAVA_HOME_21_X64"
+  export PATH="$JAVA_HOME/bin:$PATH"
+  ```
+
+  **For Maven Enforcer:** Update the version range to accept Java 25, or add
+  `actions/setup-java` to pin Java 21.
+
+  **For cross-compilation:** Always pass `--release 21` (or your minimum target) to
+  `javac` to ensure the output bytecode is compatible with Java 21 runtimes.
+fix_code:
+  - language: yaml
+    label: 'Use actions/setup-java to pin Java 21 LTS explicitly'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-26.04   # or ubuntu-latest when it aliases ubuntu-26.04
+          steps:
+            - uses: actions/checkout@v4
+
+            # Always pin Java version — do not rely on runner image default
+            - uses: actions/setup-java@v4
+              with:
+                distribution: 'temurin'
+                java-version: '21'   # pin to Java 21 LTS
+
+            - name: Build with Maven
+              run: mvn -B package --no-transfer-progress
+
+            - name: Build with Gradle
+              run: ./gradlew build
+  - language: yaml
+    label: 'Quick fix — use JAVA_HOME_21_X64 without setup-java'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-26.04
+          steps:
+            - uses: actions/checkout@v4
+
+            # Use pre-installed Java 21 via env var (available on ubuntu-26.04)
+            - name: Set Java 21 as active JDK
+              run: |
+                echo "JAVA_HOME=$JAVA_HOME_21_X64" >> $GITHUB_ENV
+                echo "$JAVA_HOME_21_X64/bin" >> $GITHUB_PATH
+
+            - name: Verify Java version
+              run: java -version  # should print openjdk version "21..."
+
+            - name: Build
+              run: ./gradlew build
+  - language: yaml
+    label: 'Matrix build across Java 21 and 25 for explicit compatibility testing'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              java: ['21', '25']
+          runs-on: ubuntu-26.04
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-java@v4
+              with:
+                distribution: 'temurin'
+                java-version: ${{ matrix.java }}
+            - run: ./gradlew test
+prevention:
+  - 'Always use `actions/setup-java` with an explicit `java-version` instead of relying on the runner image default Java — the default has changed across every Ubuntu LTS generation.'
+  - 'Audit all Maven pom.xml files for `<requireJavaVersion>` enforcer rules and update version ranges to include Java 25 if `ubuntu-26.04` is in your matrix.'
+  - 'For JARs that must run on Java 21 runtimes, always compile with `--release 21` (Gradle: `java.targetCompatibility = JavaVersion.VERSION_21`; Maven: `<release>21</release>`).'
+  - 'Log `java -version` and `echo $JAVA_HOME` as early steps in workflows to catch unexpected Java version changes at diagnosis time.'
+  - 'Review the ubuntu-26.04 software manifest before migrating from ubuntu-24.04 to understand which tool versions changed.'
+docs:
+  - url: 'https://github.com/actions/runner-images/commit/9e3319d6b4acc306925295853d0ff41ddd5c40f0'
+    label: 'runner-images commit 9e3319d — [ubuntu-26] Adjust installed software (May 2026)'
+  - url: 'https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2604-Readme.md'
+    label: 'ubuntu-26.04 image README — full software list including Java 25 default'
+  - url: 'https://github.com/actions/setup-java'
+    label: 'actions/setup-java — pin Java version in GitHub Actions'
+  - url: 'https://adoptium.net/support/'
+    label: 'Eclipse Temurin support roadmap — Java 21 LTS vs Java 25 non-LTS'
