@@ -1,0 +1,138 @@
+id: silent-failures-176
+title: 'Node.js 24.16.0/26.1.0 Breaks extract-zip — electron-forge make Exits 0 With No Artifact'
+category: silent-failures
+severity: silent-failure
+tags:
+  - electron-forge
+  - extract-zip
+  - nodejs
+  - node24
+  - windows
+  - silent-failure
+  - packaging
+  - native-modules
+patterns:
+  - regex: 'Finalizing package\s*$'
+    flags: 'im'
+  - regex: 'electron-forge.*make.*exit.*0|forge.*make.*no.*output'
+    flags: 'i'
+  - regex: 'Invalid input file path.*\.exe|Expected.*\.exe.*not found'
+    flags: 'i'
+  - regex: 'extract-zip.*Error|unzip.*unexpected.*EOF.*node.*2[4-9]'
+    flags: 'i'
+error_messages:
+  - 'Finalizing package'
+  - 'Error: Invalid input file path - apps\desktop\out\AppName-win32-x64\App.exe'
+  - 'npm error code 1'
+  - 'jsvu --os=default --engines=v8'
+root_cause: |
+  Node.js 24.16.0 and 26.1.0+ introduced an internal change to zip-file handling
+  that broke the `extract-zip` npm package (last maintained ~6 years ago). The
+  `extract-zip` package silently fails to extract its zip archive — it exits with
+  code 0 and produces no output, no error message, and no extracted files.
+
+  `electron-forge` uses `extract-zip` internally during its packaging phase to
+  extract Electron binaries. When the extraction silently fails:
+  - The forge progress spinner runs through all phases (Packaging, Copying,
+    Native deps, Finalizing) in milliseconds with no checkmarks
+  - The step exits 0 (success), masking the failure
+  - No .exe, .dmg, or installer is produced in the output directory
+  - A downstream step that references the expected file path then fails with
+    "Invalid input file path" or "file not found"
+
+  Affected workflows are those that use:
+    - @electron-forge/maker-squirrel (Squirrel.Windows installer)
+    - @electron-forge/maker-zip
+    - Any electron-forge make command for win32/x64 target
+    - jsvu (JavaScript engine version updater)
+    - Any package that depends on the `extract-zip` npm package
+
+  GitHub Actions runner images cached Node.js 24.16.0 starting May 25, 2026
+  (win25/20260525.149.1, win22/20260525.178.1, ubuntu24/20260525.161.1). Before
+  that image update, the toolcache had Node.js 24.15.0 which is unaffected.
+
+  Using `actions/setup-node` with `node-version: "24"` resolves to 24.16.0 on
+  images from May 25 onward.
+
+  Root issue tracked in: nodejs/node#63581, nodejs/node#63487.
+  Electron forge upstream fix: electron/forge#4277.
+fix: |
+  Option 1 — Pin Node.js to 24.15.0 (last unaffected 24.x release):
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '24.15.0'
+
+  Option 2 — Switch to Node.js 22 LTS (unaffected):
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+
+  Option 3 — Wait for electron-forge fix:
+    Follow electron/forge#4277 for the migration away from extract-zip.
+    Once a new electron-forge version is released with the fix, upgrade
+    and unpin your Node.js version.
+
+  Option 4 — Patch extract-zip dependency (advanced):
+    Use npm overrides to force a version of extract-zip with the fix,
+    if one is released by the community.
+fix_code:
+  - language: yaml
+    label: 'Pin Node.js 24.15.0 to bypass extract-zip breakage'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            # Pin 24.15.0 — last unaffected 24.x before the extract-zip breakage
+            # Unpin once electron/forge#4277 is resolved and released
+            - uses: actions/setup-node@v4
+              with:
+                node-version: '24.15.0'
+
+            - run: npm ci
+
+            - name: Build Electron app
+              run: npx electron-forge make --platform win32 --arch x64
+
+            - name: Upload installer
+              uses: actions/upload-artifact@v4
+              with:
+                name: installer
+                path: out/make/**/*.exe
+  - language: yaml
+    label: 'Switch to Node.js 22 LTS (fully unaffected)'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                node-version: '22'   # 22 LTS is unaffected by the extract-zip breakage
+            - run: npm ci
+            - run: npx electron-forge make
+prevention:
+  - 'Never use floating major version pins (node-version: "24") in packaging workflows
+    that depend on electron-forge or other packages using extract-zip — always pin
+    an explicit minor.patch version so runner image toolcache updates do not
+    silently change the Node.js version mid-cycle.'
+  - 'Add a post-forge step that asserts the expected output file exists before
+    uploading artifacts — this converts the silent failure into an explicit error.'
+  - 'Monitor electron/forge#4277 and subscribe to @electron/forge release notes to
+    know when extract-zip is replaced and the Node.js 24.16+ pin can be lifted.'
+  - 'When runner images update cached Node.js toolcache versions (visible in release
+    notes), run a smoke test of your packaging workflow before the image fully deploys.'
+docs:
+  - url: 'https://github.com/electron/forge/issues/4277'
+    label: 'electron/forge#4277: Node.js 24.16.0 breaks extract-zip / packaging silently exits 0'
+  - url: 'https://github.com/nodejs/node/issues/63581'
+    label: 'nodejs/node#63581: Node.js 24.16.0 zip extraction API change breaks extract-zip'
+  - url: 'https://github.com/nodejs/node/issues/63487'
+    label: 'nodejs/node#63487: Related upstream zip handling change'
+  - url: 'https://github.com/actions/runner-images/issues/14174'
+    label: 'runner-images#14174: electron-forge make exits silently after cached Node.js 24.15→24.16 bump'
+  - url: 'https://github.com/max-mapper/extract-zip/issues/154'
+    label: 'extract-zip#154: Node.js 24.16.0 compatibility issue'

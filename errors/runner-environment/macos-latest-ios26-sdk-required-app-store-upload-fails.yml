@@ -1,0 +1,138 @@
+id: runner-environment-393
+title: 'macos-latest (macOS 15) Ships Xcode 16.4/iOS 18.5 SDK — App Store Requires iOS 26 SDK'
+category: runner-environment
+severity: error
+tags:
+  - macos
+  - xcode
+  - ios
+  - app-store
+  - ios-sdk
+  - macos-latest
+  - apple
+  - upload
+patterns:
+  - regex: 'built with the iOS 1[0-8]\.[0-9]+ SDK.*must be built with the iOS 26 SDK'
+    flags: 'i'
+  - regex: 'This app was built with the iOS [0-9]+\.[0-9]+ SDK.*App Store'
+    flags: 'i'
+  - regex: 'All iOS and iPadOS apps must be built with the iOS 26 SDK or later'
+    flags: 'i'
+  - regex: 'xcrun altool.*ERROR ITMS-90[0-9]+.*SDK.*required'
+    flags: 'i'
+error_messages:
+  - "This app was built with the iOS 18.5 SDK. All iOS and iPadOS apps must be built with the iOS 26 SDK or later in order to be uploaded to App Store Connect."
+  - "ERROR ITMS-90725: SDK Version Issue - This app was built with the iOS 18.5 SDK."
+  - "error: exportArchive: The iOS Deployment Target is set to 18.5"
+root_cause: |
+  Apple enforced a mandatory iOS 26 SDK requirement for all new App Store Connect
+  submissions as of April 28, 2026. Any iOS or iPadOS app uploaded with an older
+  SDK (18.x or earlier) is rejected at the App Store Connect upload step.
+
+  macOS-latest in GitHub Actions currently resolves to macOS 15 (Sonoma). The
+  macOS-15 runner ships with Xcode 16.4 as the default, which targets the iOS 18.5
+  SDK. When workflows use macOS-latest without explicitly switching to Xcode 26,
+  the built app is stamped with the iOS 18.5 SDK and is rejected by App Store Connect.
+
+  The macOS-latest migration to macOS-26 (which ships Xcode 26.x and the iOS 26 SDK)
+  begins June 15, 2026 and will complete approximately mid-July 2026. Until the
+  migration completes, macOS-latest continues to resolve to macOS-15 for existing
+  workflows.
+
+  macOS-15 does not include Xcode 26 in its image, so there is no way to use
+  xcode-select to switch to Xcode 26 on a macOS-15 runner — the Xcode version
+  must come from the runner image.
+
+  Source: runner-images#14165 (May 27, 2026). Apple iOS 26 SDK deadline: Apr 28, 2026.
+fix: |
+  Switch from macOS-latest (= macOS-15 + Xcode 16.4) to macos-26, which ships
+  Xcode 26.x with the required iOS 26 SDK.
+
+  Option 1 — Use macos-26 directly (recommended):
+    runs-on: macos-26
+    # Xcode 26.x is the default; iOS 26 SDK is included
+
+  Option 2 — Use macos-26 with explicit Xcode pin for reproducibility:
+    runs-on: macos-26
+    steps:
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.5'   # pin to a specific stable Xcode 26 release
+
+  Option 3 — Wait for the macOS-latest migration (completes mid-July 2026):
+    When macOS-latest begins resolving to macOS-26 in your region, the default
+    Xcode will be 26.x and App Store submissions will succeed without changes.
+    To track the migration status: https://github.com/actions/runner-images/issues/14163
+fix_code:
+  - language: yaml
+    label: 'Switch to macos-26 with explicit Xcode 26.5 pin'
+    code: |
+      jobs:
+        build-and-upload:
+          runs-on: macos-26          # macos-26 ships Xcode 26.x (iOS 26 SDK)
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Select Xcode 26.5 (pinned for reproducibility)
+              uses: maxim-lobanov/setup-xcode@v1
+              with:
+                xcode-version: '26.5'
+
+            - name: Build and Archive
+              run: |
+                xcodebuild archive \
+                  -project MyApp.xcodeproj \
+                  -scheme MyApp \
+                  -destination 'generic/platform=iOS' \
+                  -archivePath MyApp.xcarchive
+
+            - name: Export and Upload to App Store
+              run: |
+                xcodebuild -exportArchive \
+                  -archivePath MyApp.xcarchive \
+                  -exportOptionsPlist ExportOptions.plist \
+                  -exportPath ./build
+
+                xcrun altool --upload-app \
+                  -f ./build/MyApp.ipa \
+                  -t ios \
+                  --apiKey ${{ secrets.APP_STORE_CONNECT_API_KEY }} \
+                  --apiIssuer ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+  - language: yaml
+    label: 'Test matrix — validate on both macOS 15 (dev) and macOS 26 (App Store)'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              runner: [macos-15, macos-26]
+              include:
+                - runner: macos-15
+                  xcode: '16.4'    # local dev / regression test only
+                - runner: macos-26
+                  xcode: '26.5'    # App Store submission target
+          runs-on: ${{ matrix.runner }}
+          steps:
+            - uses: actions/checkout@v4
+            - uses: maxim-lobanov/setup-xcode@v1
+              with:
+                xcode-version: ${{ matrix.xcode }}
+            - run: xcodebuild -scheme MyApp build
+prevention:
+  - 'Always pin a specific Xcode version with maxim-lobanov/setup-xcode to make
+    SDK version changes visible in git diff and catch regressions early.'
+  - 'Monitor runner-images announcements and the macos-latest migration tracker
+    (runner-images#14163) so you know when macOS-latest changes its Xcode default.'
+  - 'Include xcodebuild -version in your workflow to log the active Xcode and SDK
+    version on each run, making it easy to spot unexpected version changes.'
+  - 'Subscribe to App Store Connect release notes — Apple enforces SDK requirements
+    with limited advance notice; staying on a recent runner image protects you.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14165'
+    label: 'runner-images#14165: macOS-latest defaults to Xcode 16.4 instead of Xcode 26, breaking App Store submissions'
+  - url: 'https://developer.apple.com/ios/submit/'
+    label: 'Apple Developer — App Store submission requirements (iOS 26 SDK minimum)'
+  - url: 'https://github.com/maxim-lobanov/setup-xcode'
+    label: 'maxim-lobanov/setup-xcode — pin Xcode version in GitHub Actions'
+  - url: 'https://github.com/actions/runner-images/issues/14163'
+    label: 'runner-images#14163: macos-latest migration to macOS 26 tracker'
