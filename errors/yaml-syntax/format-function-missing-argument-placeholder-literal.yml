@@ -1,0 +1,111 @@
+id: yaml-syntax-100
+title: 'format() Expression With Fewer Arguments Than Placeholders Renders {N} Literally'
+category: yaml-syntax
+severity: silent-failure
+tags:
+  - format-function
+  - expression
+  - placeholder
+  - string-interpolation
+  - silent-failure
+patterns:
+  - regex: 'format\s*\(\s*[''"][^''"]*\{[0-9]+\}[^''"]*[''"]'
+    flags: 'i'
+  - regex: '\$\{\{[^}]*format\s*\('
+    flags: 'i'
+error_messages:
+  - "(step name or output contains literal {1} or {2} text instead of the expected value)"
+  - "(commit message or annotation displays '{1}' as a raw string)"
+  - "(Slack/Teams notification body contains unsubstituted {0} placeholder)"
+root_cause: |
+  The `format()` expression function takes a format string and positional arguments:
+  `format('{0} deployed to {1}', 'my-app', 'production')` → `'my-app deployed to production'`.
+
+  When the format string contains more `{N}` placeholders than there are arguments
+  provided, the **extra placeholders are rendered as their literal text** — for example
+  `{1}`, `{2}` — with no error, no warning, and no step failure.
+
+  Common causes:
+  - Removing an argument from a `format()` call without updating the format string
+  - Copy-pasting a format string with a different number of placeholders than the
+    argument list
+  - Off-by-one indexing: placeholders start at `{0}` but developer wrote `{1}` for the
+    first argument
+
+  Examples of silent failure:
+  ```
+  # Placeholders {0}=ok, but {1} has no argument — renders literally
+  format('Deploying {0} to {1}', github.repository)
+  → "Deploying owner/repo to {1}"
+
+  # Off-by-one: developer used {1} thinking it is 1-indexed
+  format('Branch: {1}', github.ref_name)
+  → "Branch: {1}"   (should be {0})
+
+  # Extra placeholder left after refactoring
+  format('[{0}] {1} — {2}', github.event_name, github.actor)
+  → "[push] octocat — {2}"
+  ```
+
+  This is a silent failure because GitHub Actions evaluates expressions without type
+  checking the argument count; out-of-range `{N}` references are treated as unresolved
+  and emitted verbatim.
+fix: |
+  Ensure the number of `{N}` placeholders in the format string exactly matches the
+  number of arguments after the format string. Placeholders are zero-indexed: `{0}` for
+  the first argument, `{1}` for the second, and so on.
+
+  Use GitHub's expression context directly in `${{ }}` for simple substitutions and
+  reserve `format()` for cases where you need padding (`format('{0,-10}', value)`) or
+  true positional composition.
+fix_code:
+  - language: yaml
+    label: 'Wrong: fewer arguments than placeholders — {1} renders literally'
+    code: |
+      - name: Notify
+        run: echo "${{ format('Deploying {0} to {1}', github.repository) }}"
+        # Output: "Deploying owner/repo to {1}"  ← {1} is a literal string
+
+      - name: Tag message
+        run: echo "${{ format('[{0}] by {1} on {2}', github.event_name, github.actor) }}"
+        # Output: "[push] by octocat on {2}"  ← {2} renders as text
+
+      - name: Off-by-one
+        run: echo "${{ format('Branch: {1}', github.ref_name) }}"
+        # Output: "Branch: {1}"  ← should be {0}, not {1}
+  - language: yaml
+    label: 'Correct: argument count matches placeholder count'
+    code: |
+      - name: Notify
+        run: echo "${{ format('Deploying {0} to {1}', github.repository, 'production') }}"
+        # Output: "Deploying owner/repo to production"
+
+      - name: Tag message
+        run: echo "${{ format('[{0}] by {1} on {2}', github.event_name, github.actor, github.ref_name) }}"
+        # Output: "[push] by octocat on main"
+
+      - name: Zero-indexed (correct)
+        run: echo "${{ format('Branch: {0}', github.ref_name) }}"
+        # Output: "Branch: feature/my-feature"
+  - language: yaml
+    label: 'Alternative: use string concatenation for simple cases'
+    code: |
+      # For simple cases, direct expression concatenation is clearer than format()
+      - name: Simple message
+        run: echo "Deploying ${{ github.repository }} to production"
+
+      - name: Concat in expression
+        env:
+          MSG: ${{ github.event_name }} by ${{ github.actor }} on ${{ github.ref_name }}
+        run: echo "$MSG"
+prevention:
+  - "Count {N} placeholders in your format string and verify you have exactly that many arguments (zero-indexed starting at {0})."
+  - "Use linters like actionlint which can catch mismatched format() argument counts in some configurations."
+  - "Prefer direct ${{ }} expression interpolation over format() unless you need its padding or alignment features."
+  - "When refactoring — removing or adding arguments — update the format string placeholders at the same time."
+  - "Test format() expressions with act or by checking the step name/output in a test workflow run before merging."
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#format'
+    label: 'GitHub Docs: format() expression function'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions'
+    label: 'GitHub Docs: Expressions in GitHub Actions'

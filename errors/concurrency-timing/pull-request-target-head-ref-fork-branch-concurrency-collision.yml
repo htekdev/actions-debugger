@@ -1,0 +1,123 @@
+id: concurrency-timing-086
+title: 'pull_request_target github.head_ref in Concurrency Group — Fork PRs From Same-Named Branch Cancel Each Other'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - pull_request_target
+  - github-head-ref
+  - fork
+  - cancel-in-progress
+  - external-contributors
+patterns:
+  - regex: 'pull_request_target'
+    flags: 'i'
+  - regex: 'group:.*github\.head_ref'
+    flags: 'i'
+error_messages:
+  - 'This run was automatically cancelled because another run with the same concurrency group key is in progress'
+  - 'This run was cancelled because a more recent run with the same concurrency key is in progress'
+root_cause: |
+  On `pull_request_target` events, `github.head_ref` contains the **fork contributor's
+  branch name** — the short name of the branch in the fork repository (e.g., `main`,
+  `feature`, `fix-typo`, `patch-1`).
+
+  When a workflow uses `github.head_ref` in its concurrency group key for a
+  `pull_request_target`-triggered workflow, two or more external contributors who happen
+  to open PRs from branches with the **same name** in their respective forks will share
+  the identical concurrency slot. The result:
+
+  - Contributor A's PR from `main` → concurrency key `check-main`
+  - Contributor B's PR from `main` → concurrency key `check-main`
+  - One of their CI runs is cancelled by the other's, with no indication that a
+    completely unrelated PR was the cause.
+
+  This is especially common because:
+  - Many contributors branch from `main` in their forks (GitHub's default)
+  - GitHub's Dependabot opens PRs from branches like `dependabot/npm_and_yarn/...` which
+    are unique, but many humans use generic names like `fix`, `patch`, `docs-update`
+  - The GitHub-created fork PR branches (`patch-1`, `patch-2`) are sequential but can
+    reset across forks
+
+  Note the difference from concurrency-timing-046 (`pull_request_target` + `github.ref`):
+  - `github.ref` on `pull_request_target` = the **base** branch ref (e.g., `refs/heads/main`)
+    → all PRs targeting the same base branch serialize
+  - `github.head_ref` on `pull_request_target` = the **fork's** branch name
+    → PRs from different forks with the same branch name cancel each other
+
+  Both are footguns; the fix for each is to use `github.event.pull_request.number`
+  which is unique per PR regardless of branch names or target branch.
+fix: |
+  Replace `github.head_ref` (or `github.ref`) with `github.event.pull_request.number`
+  in the concurrency group key for `pull_request_target` workflows. The PR number is
+  always unique within a repository and does not depend on branch naming in forks.
+
+  Add a fallback for events where `pull_request_target` is not the sole trigger to avoid
+  the group key becoming empty (which would collapse all runs into a single slot).
+fix_code:
+  - language: yaml
+    label: 'Wrong: github.head_ref causes fork branch name collision'
+    code: |
+      on:
+        pull_request_target:
+          types: [opened, synchronize]
+
+      concurrency:
+        group: check-${{ github.head_ref }}   # WRONG: collides across forks with same branch name
+        cancel-in-progress: true
+
+      jobs:
+        ci:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.pull_request.head.sha }}
+  - language: yaml
+    label: 'Correct: use PR number for unique per-PR concurrency'
+    code: |
+      on:
+        pull_request_target:
+          types: [opened, synchronize]
+
+      concurrency:
+        # PR number is unique per repo regardless of fork branch names
+        group: check-pr-${{ github.event.pull_request.number }}
+        cancel-in-progress: true
+
+      jobs:
+        ci:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.pull_request.head.sha }}
+  - language: yaml
+    label: 'Correct: multi-event workflow with safe fallback'
+    code: |
+      on:
+        pull_request_target:
+          types: [opened, synchronize]
+        push:
+          branches: [main]
+
+      concurrency:
+        # For PRs: unique per PR number; for push: unique per branch
+        group: >-
+          check-${{
+            github.event.pull_request.number ||
+            github.ref_name
+          }}
+        cancel-in-progress: true
+prevention:
+  - "Never use github.head_ref or github.ref in concurrency groups for pull_request_target workflows — both produce values that collide across unrelated forks."
+  - "Use github.event.pull_request.number as the unique identifier for PR-scoped concurrency."
+  - "Audit all pull_request_target workflows for concurrency group keys and test with two simultaneous fork PRs from same-named branches."
+  - "Remember: github.head_ref is the fork contributor's branch name; github.ref is always the base branch ref on pull_request_target (unlike pull_request where it is the head branch ref)."
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/controlling-concurrency'
+    label: 'GitHub Docs: Controlling concurrency'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request_target'
+    label: 'GitHub Docs: pull_request_target event'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#about-pull_request_target'
+    label: 'GitHub Docs: Security considerations for pull_request_target'

@@ -1,0 +1,107 @@
+id: triggers-096
+title: 'issue_comment Default Types Include edited and deleted — Bot Commands Re-fire on Edits'
+category: triggers
+severity: silent-failure
+tags:
+  - issue_comment
+  - event-types
+  - bot-command
+  - edited
+  - deleted
+  - default-types
+patterns:
+  - regex: 'issue_comment:\s*\n(?!\s+types:)'
+    flags: 'm'
+  - regex: 'on:\s*\n\s+issue_comment:\s*$'
+    flags: 'm'
+error_messages:
+  - "(workflow triggers when a comment is edited or deleted, not just on new comments)"
+  - "(duplicate CI run on PR; reviewer edited a comment triggering a second workflow run)"
+  - "(workflow ran on issue_comment event with github.event.action == 'edited')"
+root_cause: |
+  When `on.issue_comment` is listed without a `types:` filter, GitHub Actions fires the
+  workflow for ALL three default activity types: `created`, `edited`, and `deleted`.
+
+  This surprises most developers because:
+
+  1. **Bot command workflows** — a `/deploy` or `/approve` slash-command bot should only
+     react to newly created comments. Without `types: [created]`, the workflow also runs
+     when a reviewer later edits a typo in their command comment (re-triggering the bot
+     command), or when any comment in the issue is deleted.
+
+  2. **Duplicate CI runs** — PR comment-triggered workflows (like previews or integration
+     tests) can accumulate multiple redundant runs when reviewers edit their comments.
+
+  3. **Unexpected deletions** — `github.event.action == 'deleted'` is rarely handled by
+     the workflow body; accessing `github.event.comment.body` on a deleted comment returns
+     the now-missing text, and subsequent steps that parse it for commands behave
+     unpredictably.
+
+  The issue_comment event has the same behaviour as other events like `pull_request_review`
+  (which defaults to submitted/edited/dismissed) — but developers notice the PR review
+  behaviour less because reviews are explicitly submitted, while comment edits happen
+  casually and frequently.
+
+  Note: `issue_comment` fires for comments on both Issues AND Pull Requests. The
+  `github.event.issue.pull_request` field is populated only when the comment is on a PR;
+  check it in your job condition to restrict to PR comments only.
+fix: |
+  Add `types: [created]` to only trigger on new comments. This is the correct default
+  for the vast majority of bot command and CI trigger use cases.
+
+  If your workflow needs to react to edits (e.g., re-running if someone corrects a
+  command typo), add `edited` explicitly and handle the `github.event.action` value in
+  your job conditions.
+fix_code:
+  - language: yaml
+    label: 'Wrong: fires on created, edited, AND deleted by default'
+    code: |
+      on:
+        issue_comment:      # triggers on created, edited, AND deleted — usually wrong
+      jobs:
+        handle-command:
+          if: contains(github.event.comment.body, '/deploy')
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./deploy.sh  # runs again when someone edits their /deploy comment
+  - language: yaml
+    label: 'Correct: restrict to new comments only'
+    code: |
+      on:
+        issue_comment:
+          types: [created]  # only new comments; not edits or deletions
+      jobs:
+        handle-command:
+          if: contains(github.event.comment.body, '/deploy')
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./deploy.sh
+  - language: yaml
+    label: 'Advanced: allow created and edited but check action type'
+    code: |
+      on:
+        issue_comment:
+          types: [created, edited]
+      jobs:
+        handle-command:
+          # Only react to PR comments (not issue comments)
+          if: >-
+            github.event.issue.pull_request != null &&
+            contains(github.event.comment.body, '/deploy')
+          runs-on: ubuntu-latest
+          steps:
+            - name: Handle command
+              run: |
+                echo "Action: ${{ github.event.action }}"
+                echo "Comment: ${{ github.event.comment.body }}"
+prevention:
+  - "Always specify types: [created] for issue_comment unless you explicitly need edited or deleted."
+  - "Check github.event.action in job conditions when multiple types are needed."
+  - "Add github.event.issue.pull_request != null to restrict to PR comments only."
+  - "Be aware that editing a comment re-sends the full comment body — parse-and-execute bots must be idempotent or deduplicate by comment ID."
+  - "Consider using repository_dispatch or workflow_dispatch for complex command patterns to avoid accidental re-triggers."
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#issue_comment'
+    label: 'GitHub Docs: issue_comment event'
+  - url: 'https://docs.github.com/en/webhooks/webhook-events-and-payloads#issue_comment'
+    label: 'GitHub Docs: issue_comment webhook payload'
