@@ -1,0 +1,136 @@
+id: yaml-syntax-102
+title: 'Step Output Boolean Negation `!steps.id.outputs.value` Always Evaluates to false When Output Is String ''false'''
+category: yaml-syntax
+severity: silent-failure
+tags:
+  - expressions
+  - step-outputs
+  - boolean
+  - string-coercion
+  - if-condition
+  - silent-failure
+patterns:
+  - regex: 'steps\.[a-z_-]+\.outputs\.[a-z_-]+.*==\s*false'
+    flags: 'i'
+  - regex: '!\s*steps\.[a-z_-]+\.outputs\.[a-z_-]+'
+    flags: 'i'
+error_messages:
+  - "Step is skipped even though output should have been 'false'"
+  - "Conditional step never runs despite output being false"
+root_cause: |
+  All step outputs in GitHub Actions are strings. When a step writes:
+
+    echo "skip=false" >> $GITHUB_OUTPUT
+
+  The value of `steps.step-id.outputs.skip` is the STRING `'false'`, not the
+  boolean `false`.
+
+  GitHub Actions expression coercion rules treat non-empty strings as truthy.
+  The empty string `''` is falsy; any other string including `'false'`, `'0'`,
+  and `'no'` is TRUTHY.
+
+  This creates two common silent bugs:
+
+  Bug 1 — Boolean negation:
+    if: ${{ !steps.check.outputs.skip }}
+
+  Developer expects: if skip='false', then NOT false = true, so step runs.
+  Reality: 'false' is a non-empty string → truthy → !truthy = false → step SKIPPED.
+
+  Bug 2 — Equality with boolean literal:
+    if: steps.check.outputs.skip == false
+
+  Developer expects: 'false' == false → true → step runs.
+  Reality: GitHub Actions compares 'false' (string) to false (boolean) using
+  type coercion: false coerces to '', so this is 'false' == '' → false → step SKIPPED.
+
+  Both bugs cause the step to be silently skipped every time, regardless of the
+  output value. There is no error message — the step just shows as "skipped".
+
+  This also applies to job outputs and reusable workflow outputs, which are also
+  always strings when passed between jobs.
+
+  Reference: SO#66892911 (multiple community confirmations), actionlint#147,
+  actions/toolkit#1368 (request for setBooleanOutput), GitHub Actions expressions docs.
+fix: |
+  Compare string outputs against the string 'true' or 'false' explicitly:
+
+    if: steps.check.outputs.skip != 'true'    # run unless skip is explicitly 'true'
+    if: steps.check.outputs.skip == 'true'    # run only when skip is 'true'
+
+  Or use fromJSON() to convert the string to a boolean first:
+
+    if: fromJSON(steps.check.outputs.skip) == false
+
+  In the action/script that produces the output, prefer emitting 'true'/'false'
+  and comparing to the string 'true':
+
+    echo "enabled=true" >> $GITHUB_OUTPUT
+    if: steps.check.outputs.enabled == 'true'
+fix_code:
+  - language: yaml
+    label: 'WRONG: boolean negation and equality with boolean literal'
+    code: |
+      steps:
+        - name: Check if we should skip
+          id: check
+          run: echo "skip=false" >> $GITHUB_OUTPUT
+
+        # BUG: 'false' is a non-empty string → truthy → !truthy = false → ALWAYS SKIPPED
+        - name: This never runs
+          if: ${{ !steps.check.outputs.skip }}
+          run: echo "I should run but I never do"
+
+        # BUG: 'false' == false → 'false' == '' → false → ALWAYS SKIPPED
+        - name: This also never runs
+          if: steps.check.outputs.skip == false
+          run: echo "I should run but I never do"
+  - language: yaml
+    label: 'CORRECT: compare strings to string literals'
+    code: |
+      steps:
+        - name: Check if we should skip
+          id: check
+          run: echo "skip=false" >> $GITHUB_OUTPUT
+
+        # CORRECT: compare string output to string 'true'
+        - name: This runs when skip is not 'true'
+          if: steps.check.outputs.skip != 'true'
+          run: echo "Running because skip != 'true'"
+
+        # CORRECT: use fromJSON() to get a real boolean
+        - name: This also works
+          if: fromJSON(steps.check.outputs.skip) == false
+          run: echo "Running because fromJSON('false') == false"
+  - language: yaml
+    label: 'CORRECT: emit true/false and always compare to string true'
+    code: |
+      # Convention: always compare to == 'true', never use negation on outputs
+      steps:
+        - name: Determine if build needed
+          id: needs-build
+          run: |
+            if [[ "${{ github.event_name }}" == "push" ]]; then
+              echo "required=true" >> $GITHUB_OUTPUT
+            else
+              echo "required=false" >> $GITHUB_OUTPUT
+            fi
+
+        - name: Build
+          if: steps.needs-build.outputs.required == 'true'
+          run: make build
+prevention:
+  - 'Never use `!steps.X.outputs.Y` — step outputs are always strings; non-empty strings are truthy so negation is almost always wrong'
+  - 'Never compare step outputs to boolean literals (`== false`, `== true`) — always compare to string literals (`== ''false''`, `== ''true''`)'
+  - 'Adopt a convention: always name boolean-like outputs with positive names (enabled, required, should-run) and always check with `== ''true'''`
+  - 'Use fromJSON(steps.X.outputs.bool_output) when you need real boolean semantics in complex expressions'
+  - 'Run actionlint on your workflows — it can detect some cases of comparing outputs to boolean literals'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions'
+    label: 'GitHub Docs: Evaluate expressions — type coercion and operators'
+  - url: 'https://stackoverflow.com/questions/66892911/github-action-expression-does-not-allow-to-compare-or-use-not-operator'
+    label: 'Stack Overflow: Step output boolean negation always evaluates to false'
+  - url: 'https://github.com/rhysd/actionlint/issues/147'
+    label: 'actionlint#147: Type-check boolean expression coercion'
+  - url: 'https://github.com/actions/toolkit/issues/1368'
+    label: 'actions/toolkit#1368: Request for setBooleanOutput to avoid string coercion confusion'
