@@ -1,0 +1,136 @@
+id: silent-failures-168
+title: 'Invalid Workflow Syntax Creates No Check Run — PR Appears Mergeable Despite Required CI Being Absent'
+category: silent-failures
+severity: silent-failure
+tags:
+  - yaml-syntax
+  - required-status-checks
+  - branch-protection
+  - check-run
+  - silent
+  - pr-merge
+  - branch-protection-bypass
+patterns:
+  - regex: 'invalid workflow file'
+    flags: 'i'
+  - regex: 'The workflow is not valid'
+    flags: 'i'
+error_messages:
+  - "(no error message visible on PR) — the required check simply does not appear in the Checks tab"
+  - "invalid workflow file: .github/workflows/X.yml (Line: N, Col: N): ..."
+root_cause: |
+  When a GitHub Actions workflow file contains a YAML syntax error, a schema validation
+  error, or an expression that fails early validation, GitHub does not start the workflow
+  at all. Because the workflow never starts, no check run is created for any of its jobs.
+
+  The consequence on a Pull Request:
+  - The Checks tab does NOT show the invalid workflow's jobs as "failed" — they simply
+    do not appear.
+  - If any of those jobs were configured as "required status checks" in branch
+    protection rules, the PR may appear mergeable because GitHub evaluates required
+    checks against existing check runs. An absent check run can leave the PR in an
+    ambiguous state depending on how branch protection is configured.
+  - Developers may misread the Checks tab as "all checks passed" when in fact the
+    required workflow never ran.
+
+  This behavior differs from a workflow that is explicitly SKIPPED (e.g., due to
+  path/branch filters) — skipped workflows DO emit a neutral check run that prevents
+  merging if the check is required. An invalid workflow emits nothing.
+
+  Common root causes that trigger this silent failure:
+  1. YAML indentation error or duplicate key in the workflow file
+  2. Invalid expression inside `${{ }}` (e.g., malformed function call)
+  3. Missing required field (`runs-on`, `steps`, `on:`)
+  4. Unrecognized workflow key (typo in top-level key name)
+  5. Reusable workflow schema mismatch (undefined input, missing `on.workflow_call`)
+
+  The issue is particularly dangerous when:
+  - A developer edits a workflow file directly on a feature branch
+  - The changed workflow was a required status check
+  - The PR is reviewed and merged before anyone notices the workflow never ran
+  - Post-merge, the broken workflow file lands on the default branch, breaking CI for
+    all subsequent PRs as well
+
+  Note: GitHub DOES surface the syntax error in the Actions tab (the workflow
+  disappears from the list or shows a warning triangle), but the PR Checks tab provides
+  no corresponding alert.
+fix: |
+  1. **Add actionlint to your PR workflow** — run actionlint on `.github/workflows/**`
+     so any YAML or schema error in workflow files is caught as a workflow failure on
+     the PR BEFORE the invalid file is merged.
+
+  2. **Use the GitHub web editor** for workflow file edits — it validates YAML inline
+     and will surface syntax errors immediately.
+
+  3. **Monitor the Actions tab when Checks seem suspiciously fast** — if a PR's Checks
+     tab shows "All checks passed" but some expected workflows are missing, check the
+     repository's Actions tab for workflow validation errors.
+
+  4. **Query the Checks API to detect absent check runs** — if a required check is
+     expected but absent, the Checks API returns no entry for it; a CI gate workflow
+     can verify that all expected checks are present before allowing merge.
+
+  5. **For branch protection, prefer "Require branches to be up to date" + specific
+     check names** — this prevents merging when the required check name is absent
+     (GitHub will show the check as "pending" indefinitely, blocking merge).
+fix_code:
+  - language: yaml
+    label: "Add actionlint to PR workflow to catch invalid workflow YAML before merging"
+    code: |
+      name: Lint Workflows
+      on:
+        pull_request:
+          paths:
+            - '.github/workflows/**'
+      jobs:
+        lint:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run actionlint
+              uses: rhysd/actionlint@latest
+              # actionlint exits non-zero on YAML errors, expression errors, and schema
+              # violations — making the PR fail visibly instead of silently
+  - language: yaml
+    label: "Gate workflow that verifies required checks are present and not just absent"
+    code: |
+      name: Verify Required Checks Present
+      on:
+        pull_request:
+      jobs:
+        gate:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Check that CI workflow ran
+              env:
+                GH_TOKEN: ${{ github.token }}
+              run: |
+                # Wait for the CI check to appear (not just pass) — fail if it's absent
+                for i in {1..10}; do
+                  COUNT=$(gh api repos/${{ github.repository }}/commits/${{ github.event.pull_request.head.sha }}/check-runs \
+                    --jq '[.check_runs[] | select(.name == "build")] | length')
+                  if [ "$COUNT" -gt "0" ]; then
+                    echo "CI check run found"; exit 0
+                  fi
+                  echo "Waiting for CI check run to appear ($i/10)..."
+                  sleep 30
+                done
+                echo "ERROR: CI check run never appeared — workflow may have a syntax error"
+                exit 1
+prevention:
+  - "Install the actionlint VS Code extension to get inline validation while editing workflow files"
+  - "Treat workflow file changes in PRs the same as code changes — require a review and confirm all expected checks appeared"
+  - "Add a required status check named after your actionlint job so the PR blocks if actionlint fails on the workflow change"
+  - "After merging a PR that changed a workflow file, immediately open a new PR and verify the expected checks appear in the Checks tab"
+  - "Use GitHub's branch protection 'Require status checks to pass' with the EXACT names of all required CI jobs — a missing check run will leave the check in 'pending' and block merge"
+docs:
+  - url: "https://github.com/actions/runner/issues/1042"
+    label: "actions/runner#1042: 'The workflow is not valid' does not result in a failure status (2021, confirmed behavior)"
+  - url: "https://github.com/orgs/community/discussions/192051"
+    label: "GitHub Community #192051: Invalid Syntax on Workflow does not show as failure in Checks tab (Apr 2026)"
+  - url: "https://github.com/pytorch/pytorch/issues/81808"
+    label: "pytorch#81808: Workflows fail silently when the workflow file is invalid"
+  - url: "https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-status-checks-before-merging"
+    label: "GitHub Docs: About protected branches — Require status checks before merging"
+  - url: "https://github.com/rhysd/actionlint"
+    label: "actionlint — Static checker for GitHub Actions workflow files"

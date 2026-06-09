@@ -1,0 +1,122 @@
+id: yaml-syntax-099
+title: 'Exceeded Max Expression Length 21000 — YAML Scalar Containing Template Expression Exceeds 21KB GitHub Limit'
+category: yaml-syntax
+severity: error
+tags:
+  - yaml-syntax
+  - expression-length
+  - run-block
+  - generated-workflow
+  - validation
+  - 21kb-limit
+patterns:
+  - regex: 'Exceeded max expression length 21000'
+    flags: 'i'
+  - regex: 'Exceeded max expression length \d{5,}'
+    flags: 'i'
+error_messages:
+  - "Exceeded max expression length 21000"
+  - "The workflow is not valid. ... Exceeded max expression length 21000"
+  - "Error from called workflow ...: Exceeded max expression length 21000"
+root_cause: |
+  GitHub Actions' YAML parser enforces a hard limit of 21,000 characters on any single
+  YAML scalar value that contains at least one `${{ }}` template expression. The limit
+  applies to the raw YAML value, not just the expression portion.
+
+  Common triggers:
+  - A `run: |` block that embeds a `${{ github.event_name }}` or similar expression AND
+    the heredoc body exceeds ~21 KB (e.g., a generated config JSON inline in the run step)
+  - A single-line `run:` value with an expression where the quoted string exceeds 21,000
+    characters
+  - Generated/compiled workflow files (e.g., from code generators, gh-aw, workflow
+    compilers) that inline large JSON configs or toolset lists containing expressions
+  - Reusable workflow with: inputs block containing an expression referencing a large
+    environment variable or computed value
+
+  The error surfaces during workflow validation before any runner picks up the job. The
+  full error message identifies the file and line/column of the offending scalar:
+    "The workflow is not valid. In path/to/workflow.yml (Line: N, Col: N):
+     Exceeded max expression length 21000"
+
+  When triggered from a called workflow, the error includes the calling chain:
+    "Error from called workflow owner/repo/.github/workflows/called.yml@ref
+     (Line: N, Col: N): Exceeded max expression length 21000"
+
+  The limit is deliberately strict — GitHub pre-processes `${{ }}` expressions inside
+  any `run:` step before the shell sees the command, meaning all expressions in a scalar
+  are evaluated regardless of where they appear in the string. Scalar values without any
+  `${{ }}` expressions are NOT subject to this limit.
+fix: |
+  Move the large content OUT of the YAML scalar and into a separate file, environment
+  variable, or artifact. Patterns:
+
+  1. **Extract inline content to a file written in a prior step** — write the JSON/config
+     to a temp file without expressions, then reference the file in subsequent steps.
+
+  2. **Use a matrix or env var for large parameterized values** — write the value to
+     `$GITHUB_ENV` (which accepts multi-line values) rather than inlining it in run:.
+
+  3. **Move expressions out of the large heredoc** — if the run block is large but only
+     a small portion needs the expression, set an env var at the job level and reference
+     it via `$VAR_NAME` (shell variable) rather than `${{ expression }}` inside the
+     run block. This removes the expression from the scalar and eliminates the size check.
+
+  4. **Split the step into smaller steps** — break the single large run block into
+     multiple smaller steps so no individual scalar exceeds 21,000 characters.
+
+  5. **Use a composite action** — move the large shell block into a composite action
+     stored in the repository; the composite action's run steps are evaluated separately
+     and each has its own 21KB limit.
+fix_code:
+  - language: yaml
+    label: "BEFORE: inline expression in large run block (fails with Exceeded max expression length)"
+    code: |
+      - name: Generate config
+        run: |
+          # This run block is >21KB and contains ${{ github.ref_name }} — FAILS
+          cat <<'EOF' > config.json
+          {
+            "branch": "${{ github.ref_name }}",
+            "data": "... 21000+ characters of content ..."
+          }
+          EOF
+  - language: yaml
+    label: "AFTER: set env var before large run block, use shell variable instead of expression"
+    code: |
+      - name: Set branch env
+        run: echo "BRANCH_NAME=${{ github.ref_name }}" >> $GITHUB_ENV
+
+      - name: Generate config
+        run: |
+          # Now uses $BRANCH_NAME (shell variable) — no ${{ }} in this scalar, no limit
+          cat <<'EOF' > config.json
+          {
+            "branch": "$BRANCH_NAME",
+            "data": "... 21000+ characters of content ..."
+          }
+          EOF
+  - language: yaml
+    label: "AFTER: write large content to file in a prior step, reference by filename"
+    code: |
+      - name: Write large config
+        run: |
+          # Write content without expressions — no limit applies
+          cat > base-config.json << 'HEREDOC'
+          { "data": "... 21000+ chars, no expressions ..." }
+          HEREDOC
+
+      - name: Inject branch into config
+        run: |
+          jq --arg branch "${{ github.ref_name }}" '.branch = $branch' base-config.json > config.json
+prevention:
+  - "Avoid inlining large content (>20KB) in `run:` blocks that also contain `${{ }}` expressions; prefer writing large content to a temp file first"
+  - "If using a workflow code generator (gh-aw, turbo-driven CI, etc.), ensure the generator validates that no emitted scalar exceeds 21KB while containing expressions"
+  - "Add actionlint to CI — as of late 2023 it can flag long expression-containing scalars (see actionlint#356)"
+  - "Review generated workflow diffs carefully before committing; the 21KB limit is invisible during local development but enforced at GitHub runtime"
+docs:
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions#multiline-strings"
+    label: "GitHub Docs: Workflow commands — multiline strings"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-syntax-for-github-actions#jobsjob_idstepsrun"
+    label: "GitHub Docs: Workflow syntax — jobs.<job_id>.steps[*].run"
+  - url: "https://github.com/rhysd/actionlint/issues/356"
+    label: "actionlint#356: Feature request: Check length of run statement"
