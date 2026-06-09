@@ -1,0 +1,123 @@
+id: runner-environment-398
+title: 'runner-container-hooks@v0.8.0 regression: GITHUB_EVENT_PATH /github/workflow/event.json missing in containers without userMountVolumes'
+category: runner-environment
+severity: error
+tags:
+  - arc
+  - actions-runner-controller
+  - runner-container-hooks
+  - kubernetes
+  - github-event-path
+  - event-json
+  - regression
+  - v080
+patterns:
+  - regex: 'GITHUB_EVENT_PATH.*does not exist|event\.json.*not found'
+    flags: 'i'
+  - regex: '/github/workflow/event\.json.*does not exist'
+    flags: 'i'
+  - regex: 'ENOENT.*github.*workflow.*event\.json'
+    flags: 'i'
+error_messages:
+  - 'GITHUB_EVENT_PATH /github/workflow/event.json does not exist'
+  - 'Error: GITHUB_EVENT_PATH /github/workflow/event.json does not exist'
+  - 'ENOENT: no such file or directory, open ''/github/workflow/event.json'''
+root_cause: |
+  actions/runner-container-hooks v0.8.0 introduced PR #244 ("Remove dependency on the
+  runner's volume") which replaced shared PersistentVolumeClaim mounts with exec-based
+  file copying. As part of this change, the prepareJobScript that copies /github/home
+  and /github/workflow into job containers was gated behind a userMountVolumes check:
+
+    if (args.container?.userMountVolumes?.length) {
+      prepareScript = prepareJobScript(args.container.userMountVolumes || [])
+    }
+
+  If the workflow has NO custom volume mounts (which is the common case), the script
+  never runs and /github/workflow/event.json is never created inside the job container.
+
+  The GITHUB_EVENT_PATH environment variable continues to point to
+  /github/workflow/event.json, but the file does not exist. Actions that read the event
+  payload fail immediately with "GITHUB_EVENT_PATH does not exist":
+
+    - dorny/paths-filter
+    - tj-actions/changed-files
+    - Any action using @actions/github context.payload
+    - Any action reading process.env.GITHUB_EVENT_PATH
+
+  This is a regression from v0.7.0, which used volume subPath mounts on every job
+  container unconditionally (no userMountVolumes guard).
+
+  Source: actions/runner-container-hooks#337 (April 15, 2026).
+  Affected versions: runner-container-hooks v0.8.0 and later.
+  Fixed in: No upstream fix merged as of June 2026.
+fix: |
+  Option 1 (recommended): Pin runner-container-hooks to v0.7.0 until the upstream fix
+  is merged. In your ARC scale set Helm values:
+
+    githubConfigUrl: "https://github.com/org/repo"
+    githubConfigSecret: "pre-defined-secret"
+    containerMode:
+      type: "kubernetes"
+      kubernetesModeWorkVolumeClaim:
+        ...
+    # Pin to last known-good version before v0.8.0 regression
+    image:
+      tag: "0.7.0"
+
+  Option 2: Use the Actions Runner image that bundles container-hooks v0.7.0:
+    image: ghcr.io/actions/actions-runner:2.333.0  # bundles hooks 0.7.0
+
+  Option 3 (workaround for current image): Add a manual step at the top of each job
+  that creates the event.json file if it doesn't exist:
+
+    - name: Ensure GITHUB_EVENT_PATH exists (workaround for container-hooks#337)
+      run: |
+        mkdir -p "$(dirname "$GITHUB_EVENT_PATH")"
+        if [ ! -f "$GITHUB_EVENT_PATH" ]; then
+          echo '{}' > "$GITHUB_EVENT_PATH"
+          echo "::warning::GITHUB_EVENT_PATH was missing (container-hooks v0.8.0 regression). Created empty placeholder."
+        fi
+fix_code:
+  - language: yaml
+    label: 'Pin ARC Helm values to container-hooks v0.7.0 (avoids regression)'
+    code: |
+      # values.yaml for ARC scale set
+      image:
+        repository: ghcr.io/actions/actions-runner
+        tag: "2.333.0"   # bundles runner-container-hooks 0.7.0 (pre-regression)
+
+      containerMode:
+        type: "kubernetes"
+        kubernetesModeServiceAccountName: "arc-runner-sa"
+  - language: yaml
+    label: 'Workaround — recreate missing event.json if GITHUB_EVENT_PATH absent'
+    code: |
+      jobs:
+        build:
+          runs-on: self-hosted-arc
+          steps:
+            # Workaround for runner-container-hooks#337 (v0.8.0 regression)
+            - name: Fix missing GITHUB_EVENT_PATH
+              run: |
+                mkdir -p "$(dirname "$GITHUB_EVENT_PATH")"
+                [ -f "$GITHUB_EVENT_PATH" ] || echo '{}' > "$GITHUB_EVENT_PATH"
+
+            - uses: actions/checkout@v6
+
+            - uses: dorny/paths-filter@v3
+              with:
+                filters: |
+                  src:
+                    - 'src/**'
+prevention:
+  - 'When upgrading runner-container-hooks past v0.7.0, verify that GITHUB_EVENT_PATH exists inside job containers using a diagnostic step.'
+  - 'Add a health check step at the top of all ARC jobs: if [ ! -f "$GITHUB_EVENT_PATH" ]; then echo "MISSING"; fi'
+  - 'Track actions/runner-container-hooks#337 for the upstream fix before upgrading to v0.8.0+.'
+  - 'Test all actions that read the event payload (paths-filter, changed-files, etc.) after any ARC upgrade.'
+docs:
+  - url: 'https://github.com/actions/runner-container-hooks/issues/337'
+    label: 'runner-container-hooks#337 — Local actions fail and event.json missing after PR #244 removed shared volume (v0.8.0 regression)'
+  - url: 'https://github.com/actions/runner-container-hooks/pull/244'
+    label: 'runner-container-hooks#244 — Remove dependency on the runner volume (introduced regression)'
+  - url: 'https://docs.github.com/en/actions/tutorials/use-actions-runner-controller/deploy-runner-scale-sets'
+    label: 'GitHub Docs: Deploy ARC runner scale sets — Kubernetes mode configuration'
