@@ -1,0 +1,94 @@
+id: silent-failures-167
+title: 'ARC Kubernetes container hook failures show opaque "{}" error — cpToPod / execCpFromPod / waitForJobToComplete / waitForPodPhases'
+category: silent-failures
+severity: silent-failure
+tags:
+  - arc
+  - kubernetes
+  - container-hooks
+  - runner-container-hooks
+  - error-serialization
+  - silent-failure
+  - opaque-error
+patterns:
+  - regex: 'cpToPod failed after \d+ attempts: \{\}'
+    flags: 'i'
+  - regex: 'execCpFromPod failed after \d+ attempts: \{\}'
+    flags: 'i'
+  - regex: 'job .+ has failed: \{\}'
+    flags: 'i'
+  - regex: 'Pod .+ is unhealthy with phase status .+: \{\}'
+    flags: 'i'
+error_messages:
+  - "cpToPod failed after 30 attempts: {}"
+  - "execCpFromPod failed after 30 attempts: {}"
+  - "job my-job has failed: {}"
+  - "Pod my-pod is unhealthy with phase status Failed: {}"
+root_cause: |
+  In runner-container-hooks versions prior to the fix merged June 3, 2026
+  (commit bcd95ae), four catch blocks in packages/k8s/src/k8s/index.ts used
+  `JSON.stringify(error)` to serialize caught errors into the thrown message:
+
+    throw new Error(`cpToPod failed after ${attempt} attempts: ${JSON.stringify(error)}`)
+
+  JavaScript's JSON.stringify() produces "{}" for Error objects because Error
+  properties (message, stack, name) are non-enumerable and are therefore skipped
+  by the serializer. This means any exception thrown inside these retry loops
+  — network timeouts, authentication failures, Kubernetes API 4xx/5xx responses —
+  produces an error message that ends with a literal "{}", giving the developer no
+  information about the actual root cause.
+
+  Affected functions:
+  - execCpToPod (after 30 retry attempts): "cpToPod failed after 30 attempts: {}"
+  - execCpFromPod (after 30 retry attempts): "execCpFromPod failed after 30 attempts: {}"
+  - waitForJobToComplete: "job <name> has failed: {}"
+  - waitForPodPhases: "Pod <name> is unhealthy with phase status <phase>: {}"
+
+  These are all Kubernetes-mode ARC container hook operations. The empty "{}" is
+  the only diagnostic information surfaced to the workflow log, making the underlying
+  cause (e.g., RBAC permission denied, pod eviction, namespace misconfiguration,
+  network policy blocking exec) invisible without manual pod inspection.
+fix: |
+  Upgrade runner-container-hooks to the version that includes the fix from commit
+  bcd95ae (June 3, 2026). The fix replaces JSON.stringify(error) with
+  `error instanceof Error ? error.message : String(error)` in all four catch blocks.
+
+  Ensure your ARC installation is using a runner-container-hooks version released
+  after June 3, 2026.
+
+  To diagnose while on an unpatched version, look at the Kubernetes pod logs directly:
+    kubectl logs <pod-name> -n <namespace>
+
+  Or check pod events and describe output for the actual error:
+    kubectl describe pod <pod-name> -n <namespace>
+    kubectl get events -n <namespace> --field-selector involvedObject.name=<pod-name>
+fix_code:
+  - language: yaml
+    label: "Diagnose underlying error while on unpatched runner-container-hooks"
+    code: |
+      # When you see "cpToPod failed after 30 attempts: {}" or similar,
+      # inspect the Kubernetes pod directly for the real error:
+      # kubectl logs <pod-name> -n <namespace>
+      # kubectl describe pod <pod-name> -n <namespace>
+      # kubectl get events -n <namespace> --sort-by='.lastTimestamp'
+  - language: yaml
+    label: "Ensure updated runner-container-hooks in ARC deployment"
+    code: |
+      # In your ARC HelmRelease / values.yaml, pin container hooks to
+      # a version released after June 3, 2026 (contains commit bcd95ae):
+      controllerManager:
+        manager:
+          image:
+            tag: "0.8.3"  # or later — check https://github.com/actions/runner-container-hooks/releases
+prevention:
+  - "Keep ARC (actions-runner-controller) and runner-container-hooks updated — the fix for opaque {} errors is in runner-container-hooks released after June 3, 2026"
+  - "When ARC Kubernetes jobs fail with no actionable error, always check pod events and logs directly via kubectl before assuming it is a workflow YAML issue"
+  - "Configure Kubernetes RBAC audit logging so authentication/authorization failures are captured even when the hooks obscure them"
+  - "Pin runner-container-hooks to a specific version in your HelmRelease to control upgrade timing and avoid regressions"
+docs:
+  - url: "https://github.com/actions/runner-container-hooks/commit/bcd95aeede16baca2c44ac0f179f4fe6f7be5cf6"
+    label: "runner-container-hooks commit bcd95ae — Fix error serialization in 4 catch blocks"
+  - url: "https://github.com/actions/runner-container-hooks/pull/341"
+    label: "runner-container-hooks PR #341 — fix: preserve error messages in k8s ops"
+  - url: "https://github.com/actions/runner-container-hooks"
+    label: "actions/runner-container-hooks repository"
