@@ -1,0 +1,134 @@
+id: permissions-auth-098
+title: '`actions/attest-build-provenance` fails on fork `pull_request` — ACTIONS_ID_TOKEN_REQUEST_URL unavailable'
+category: permissions-auth
+severity: error
+tags:
+  - attestations
+  - attest-build-provenance
+  - fork
+  - pull_request
+  - OIDC
+  - id-token
+  - supply-chain
+patterns:
+  - regex: 'Unable to get ACTIONS_ID_TOKEN_REQUEST_URL env variable'
+    flags: 'i'
+  - regex: 'Failed to get ID token.*Unable to get ACTIONS_ID_TOKEN_REQUEST_URL'
+    flags: 'is'
+  - regex: 'Error: Failed to get ID token: Error message: Unable to get ACTIONS_ID_TOKEN_REQUEST_URL'
+    flags: 'i'
+error_messages:
+  - 'Failed to get ID token: Error message: Unable to get ACTIONS_ID_TOKEN_REQUEST_URL env variable'
+  - 'Error: Failed to get ID token: Error message: Unable to get ACTIONS_ID_TOKEN_REQUEST_URL env variable'
+  - 'Unable to get ACTIONS_ID_TOKEN_REQUEST_URL env variable'
+root_cause: |
+  `actions/attest-build-provenance` (and `actions/attest`) uses OIDC to obtain an
+  identity token for signing attestations. OIDC tokens are requested via the
+  `ACTIONS_ID_TOKEN_REQUEST_URL` and `ACTIONS_ID_TOKEN_REQUEST_TOKEN` environment
+  variables, which are injected by the Actions runtime only when the `id-token: write`
+  permission is granted AND the event context supports it.
+
+  For `pull_request` events triggered from a fork repository, GitHub does NOT inject
+  the OIDC token request variables — regardless of whether `id-token: write` is
+  declared in the workflow. This is a security design decision: fork-originated code
+  runs with restricted trust, and granting OIDC tokens to arbitrary fork code would
+  allow untrusted contributors to obtain identity tokens that could be used against
+  configured cloud trust relationships.
+
+  The error `Unable to get ACTIONS_ID_TOKEN_REQUEST_URL env variable` means the
+  variable is simply absent — not that permissions are wrong. This distinguishes
+  it from the `attestations: write` missing error (which is a 403 HTTP error).
+
+  Concretely: if your repo is `upstream/myrepo` and a contributor opens a PR from
+  `contributor/myrepo` using the `pull_request` trigger, the attestation step will
+  always fail with this error. The same workflow in the upstream repo on a direct
+  push succeeds.
+
+  This is a known open limitation (actions/attest-build-provenance#99, Jun 2024,
+  still open as of 2026) with no automatic fix from GitHub.
+fix: |
+  **Option A (recommended): Condition attestation on non-fork context.**
+
+  Skip the attestation step when triggered from a fork PR. Attestation is only
+  meaningful for artifacts being published/distributed, not for PR review builds.
+
+  ```yaml
+  - uses: actions/attest-build-provenance@v2
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    with:
+      subject-path: dist/my-artifact
+  ```
+
+  **Option B: Move attestation to a push/release workflow.**
+
+  Only run attestation when merging to main or publishing a release — not on PR builds.
+  PR builds are ephemeral; only released artifacts need provenance.
+
+  **Option C: Use the `pull_request_target` + separate job pattern (advanced, security risk).**
+
+  `pull_request_target` runs in the context of the base repo and CAN obtain OIDC tokens.
+  However, this introduces serious security risks. Read the security warnings thoroughly
+  before using `pull_request_target` with any privileged operations. Separate the
+  untrusted build step (in `pull_request`) from the attestation step (in `workflow_run`
+  triggered by the PR check workflow completing).
+fix_code:
+  - language: yaml
+    label: 'Skip attestation for fork PRs with if condition'
+    code: |
+      jobs:
+        build-and-attest:
+          runs-on: ubuntu-latest
+          permissions:
+            contents: read
+            attestations: write
+            id-token: write
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build artifact
+              run: make build
+
+            - name: Attest build provenance
+              # Skip for fork PRs — OIDC is unavailable in that context
+              if: >
+                github.event_name != 'pull_request' ||
+                github.event.pull_request.head.repo.full_name == github.repository
+              uses: actions/attest-build-provenance@v2
+              with:
+                subject-path: dist/my-artifact
+  - language: yaml
+    label: 'Move attestation to release / push-to-main workflow only'
+    code: |
+      # Attestation workflow — only runs on push to main or tags
+      on:
+        push:
+          branches: [main]
+          tags: ['v*']
+
+      jobs:
+        build-attest-release:
+          runs-on: ubuntu-latest
+          permissions:
+            contents: read
+            attestations: write
+            id-token: write
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build
+              run: make build
+            - uses: actions/attest-build-provenance@v2
+              with:
+                subject-path: dist/my-artifact
+prevention:
+  - 'Never place attestation steps in PR-check workflows without a fork-guard `if` condition'
+  - 'Attestation is meaningful for published artifacts — gate it on push/release, not PR builds'
+  - 'The `Unable to get ACTIONS_ID_TOKEN_REQUEST_URL` error means the OIDC runtime is absent (fork context), not that permissions are misconfigured — check your trigger first'
+  - 'Test attestation in a push workflow; confirm it passes before adding it to PR workflows'
+docs:
+  - url: 'https://github.com/actions/attest-build-provenance/issues/99'
+    label: 'actions/attest-build-provenance#99: Unable to get ACTIONS_ID_TOKEN_REQUEST_URL on fork PRs (open)'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds'
+    label: 'GitHub Docs: Using artifact attestations to establish provenance'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/assigning-permissions-in-a-forked-repository'
+    label: 'GitHub Docs: Assigning permissions in a forked repository'
+  - url: 'https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/'
+    label: 'GitHub Security Lab: Preventing pwn requests (pull_request_target security)'
