@@ -1,0 +1,98 @@
+id: known-unsolved-110
+title: 'Scheduled Workflow Cron Drift Worsening to 3.5-4.5+ Hours in 2026'
+category: known-unsolved
+severity: limitation
+tags:
+  - cron
+  - schedule
+  - drift
+  - delay
+  - best-effort
+  - 2026
+  - reliability
+patterns:
+  - regex: 'schedule.*cron.*delay|cron.*drift|scheduled.*workflow.*late'
+    flags: 'i'
+error_messages:
+  - 'Scheduled workflows can be delayed during periods of high loads of GitHub Actions workflow runs.'
+root_cause: |
+  GitHub Actions schedule events are explicitly documented as "best effort" — the platform
+  does not guarantee precise execution time. However, starting in 2026, average delays have
+  progressively worsened from the historically typical 10-20 minutes to 1-4+ hours for many
+  repositories, making hourly jobs functionally unusable.
+
+  Specific observations documented in 2025-2026:
+  - At 00:40 UTC (a common "nightly build" time): drift grew from ~10-20 min (2024) to
+    1h40min average in 2025, then 3-4.5 hours by mid-2026.
+  - At 14:37 UTC (off-peak): 3+ hour delays still observed.
+  - Hourly jobs at peak times: ~70% of scheduled runs are skipped entirely when the
+    accumulated delay causes consecutive runs to overlap and be dropped.
+
+  Contributing factors:
+  1. Platform-wide growth in scheduled workflow volume — more repositories using cron,
+     causing queue depth to grow faster than available compute capacity.
+  2. GitHub's scheduler defers (rather than drops) events during high load, causing
+     cascading backpressure across subsequent ticks.
+  3. Very short cron intervals (*/5 or */10) on popular repos compound queue pressure
+     at common tick points, especially midnight UTC.
+
+  There is no per-user workaround that eliminates the delay. The root cause is
+  GitHub platform queue capacity. Tracked in actions/runner#4468 (Jun 2026) and
+  discussed widely in orgs/community/discussions#196910.
+fix: |
+  There is no user-side fix to eliminate the delay. Mitigation options:
+
+  1. Add workflow_dispatch as a fallback trigger so important jobs can be run manually
+     when the scheduled run is unacceptably late.
+  2. Avoid scheduling at exactly minute 0, midnight UTC, or other saturation windows.
+     Odd minute values (e.g. '17 3 * * *') experience shorter queues.
+  3. For truly time-sensitive automation, use an external scheduler (a cloud function,
+     Zapier, or repository_dispatch triggered via REST API) rather than schedule: events.
+  4. For hourly jobs: ensure individual run time is well under 60 minutes so queue
+     drift does not cause consecutive runs to overlap and skip.
+fix_code:
+  - language: yaml
+    label: 'Add workflow_dispatch fallback and use off-peak odd-minute schedule'
+    code: |
+      on:
+        schedule:
+          - cron: '17 3 * * *'   # Off-peak, odd minute -- lighter queue pressure
+        workflow_dispatch:       # Manual trigger when scheduled run is late
+
+      jobs:
+        nightly:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./scripts/nightly.sh
+  - language: yaml
+    label: 'External trigger via repository_dispatch to guarantee on-time execution'
+    code: |
+      # External cron (cloud function, EventBridge, Cloud Scheduler) calls:
+      # POST /repos/{owner}/{repo}/dispatches { "event_type": "nightly-trigger" }
+      on:
+        repository_dispatch:
+          types: [nightly-trigger]
+        workflow_dispatch:  # Keep as manual fallback
+
+      jobs:
+        nightly:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./scripts/nightly.sh
+prevention:
+  - 'Never schedule time-critical automation (deployments, certificate renewals, billing jobs) using schedule events alone'
+  - 'Avoid cron: ''0 * * * *'' or ''*/5 * * * *'' patterns which hit the highest-contention queue slots'
+  - 'Always add workflow_dispatch so critical jobs can be manually triggered when the scheduler is behind'
+  - 'Monitor actual run start times vs scheduled times via the REST API to detect worsening drift early'
+  - 'For hourly or more frequent jobs: keep individual job runtime well under 50% of the cron period'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4468'
+    label: 'actions/runner #4468: Continuously increasing drift in scheduled workflow, more than 4 hours (Jun 2026)'
+  - url: 'https://github.com/orgs/community/discussions/196910'
+    label: 'GitHub Community #196910: Worsening schedule delays discussion (ongoing)'
+  - url: 'https://www.viblo.se/posts/scheduled-gh-actions/'
+    label: 'viblo.se: Scheduled GitHub Actions are now useless (May 2026 data analysis)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#schedule'
+    label: 'GitHub Docs: schedule event — best-effort timing disclaimer'
