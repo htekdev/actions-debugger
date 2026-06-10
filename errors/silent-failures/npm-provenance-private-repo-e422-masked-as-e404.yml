@@ -1,0 +1,95 @@
+id: silent-failures-189
+title: 'npm --provenance on Private Repository Silently Fails with E422 Masked as E404 or ENEEDAUTH'
+category: silent-failures
+severity: silent-failure
+tags:
+  - npm-trusted-publishing
+  - oidc
+  - provenance
+  - private-repo
+  - npm-publish
+  - E404
+  - E422
+  - sigstore
+patterns:
+  - regex: 'npm (error|ERR!) code E404.*publish|404 Not Found - PUT.*registry\.npmjs\.org'
+    flags: 'i'
+  - regex: 'E422 Unprocessable Entity.*Unsupported GitHub Actions source repository visibility.*private'
+    flags: 'i'
+  - regex: 'Error verifying sigstore provenance bundle.*private'
+    flags: 'i'
+  - regex: 'npm (error|ERR!) code ENEEDAUTH.*need auth.*logged in.*registry\.npmjs\.org'
+    flags: 'i'
+error_messages:
+  - "npm error 404 Not Found - PUT https://registry.npmjs.org/@scope%2fpkg - Not found"
+  - "npm error 404 '@scope/pkg@x.y.z' is not in this registry."
+  - "E422 Unprocessable Entity - PUT https://registry.npmjs.org/@scope%2fpkg"
+  - "Error verifying sigstore provenance bundle: Unsupported GitHub Actions source repository visibility: \"private\". Only public source repositories are supported when publishing with provenance."
+  - "npm ERR! code ENEEDAUTH"
+  - "npm ERR! need auth This command requires you to be logged in to https://registry.npmjs.org/"
+root_cause: |
+  When `npm publish --provenance` (or `"provenance": true` in `publishConfig`) is used from
+  a **private GitHub repository**, npm attempts to generate a Sigstore provenance attestation
+  bound to the repository. The npm registry rejects this with HTTP 422 because Sigstore
+  provenance is only supported for public source repositories.
+
+  However, npm does not surface the underlying 422 error cleanly. Depending on the wrapper
+  chain (changesets, bun, leftovers from setup-node), npm reports the rejection as:
+  - `E404 Not Found` implying the package doesn't exist (it does)
+  - `ENEEDAUTH` implying missing login (it's an OIDC flow)
+
+  The 422 is only visible when running bare `npm publish --provenance` directly in the step,
+  bypassing all wrappers. The misleading E404/ENEEDAUTH causes teams to debug package
+  ownership, registry configuration, and OIDC claim matching — all of which are correct.
+
+  Source: npm/cli#8976, npm/cli#9088
+fix: |
+  Remove `--provenance` from `npm publish` and remove `"provenance": true` from
+  `publishConfig` in `package.json` while the repository is private.
+
+  If provenance is required, the repository must be public. Re-enable provenance
+  (`--provenance` or `publishConfig.provenance: true`) only after the repo is made public.
+
+  If `NPM_CONFIG_PROVENANCE=true` is set as an env var in the workflow, unset it:
+fix_code:
+  - language: yaml
+    label: Remove provenance for private repos
+    code: |
+      # WRONG: provenance fails silently on private repos
+      - run: npm publish --provenance --access public
+
+      # CORRECT: omit provenance while repo is private
+      - run: npm publish --access public
+
+  - language: yaml
+    label: Remove provenance from publishConfig (package.json)
+    code: |
+      # package.json — remove or guard the provenance flag
+      # WRONG (in private repo):
+      # "publishConfig": { "provenance": true, "access": "public" }
+
+      # CORRECT for private repos:
+      # "publishConfig": { "access": "public" }
+
+  - language: yaml
+    label: Suppress NPM_CONFIG_PROVENANCE env var if set
+    code: |
+      # If provenance was set globally via env var, unset it:
+      - name: Publish to npm (private repo — provenance disabled)
+        run: npm publish --access public
+        env:
+          NPM_CONFIG_PROVENANCE: 'false'
+prevention:
+  - "Check repository visibility before enabling `--provenance` or `publishConfig.provenance: true`."
+  - "When provenance fails, run bare `npm publish --provenance --access public` (without any wrappers like changesets or bun) to expose the raw 422 error."
+  - "If you see E404 or ENEEDAUTH during trusted publishing and the package exists and OIDC is configured correctly, check for provenance + private repo as the hidden cause."
+  - "Add a workflow check: `if [ \"$VISIBILITY\" = 'private' ]; then PUBLISH_FLAGS='--access public'; else PUBLISH_FLAGS='--access public --provenance'; fi`."
+docs:
+  - url: https://github.com/npm/cli/issues/8976
+    label: "npm/cli #8976: OIDC trusted publishing E404 when publishing scoped packages — changesets + bun analysis"
+  - url: https://github.com/npm/cli/issues/9088
+    label: "npm/cli #9088: Trusted publishing failures report misleading 404/ENEEDAUTH instead of diagnostics"
+  - url: https://docs.npmjs.com/generating-provenance-statements
+    label: "npm docs: Generating provenance statements (public repos only)"
+  - url: https://docs.npmjs.com/trusted-publishers
+    label: "npm docs: Trusted publishing overview"
