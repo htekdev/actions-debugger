@@ -1,0 +1,140 @@
+id: caching-artifacts-121
+title: 'upload-artifact@v7 archive:false + overwrite:true fails with 409 Conflict on re-upload'
+category: caching-artifacts
+severity: error
+tags:
+  - upload-artifact
+  - v7
+  - archive
+  - overwrite
+  - 409
+  - conflict
+  - artifact-name
+  - filename
+patterns:
+  - regex: 'Failed to CreateArtifact.*409.*Conflict.*artifact.*name.*already exists'
+    flags: 'i'
+  - regex: 'an artifact with this name already exists on the workflow run'
+    flags: 'i'
+  - regex: 'Received non-retryable error.*409.*Conflict'
+    flags: 'i'
+error_messages:
+  - "Failed to CreateArtifact: Received non-retryable error: Failed request: (409) Conflict: an artifact with this name already exists on the workflow run"
+  - "Error: Received non-retryable error: Failed request: (409) Conflict: an artifact with this name already exists"
+root_cause: |
+  actions/upload-artifact@v7 introduced the `archive: false` input to upload single files
+  without zipping them. When `archive: false` is set, the action registers the artifact in
+  the artifact service using the **uploaded file's filename** as the artifact name — ignoring
+  the `name:` input entirely (this behavior is documented in actions/upload-artifact#785).
+
+  When `overwrite: true` is also set, the action's deletion logic uses the `name:` input
+  parameter to find and delete the existing artifact before re-uploading. But because
+  `archive: false` registered the previous artifact under the file's actual filename (not the
+  `name:` value), the deletion step targets the wrong artifact name and fails silently or
+  deletes nothing. The re-upload then hits a 409 Conflict because the artifact (stored under
+  the filename) already exists and was never deleted.
+
+  This creates a deadlock: you cannot overwrite an `archive: false` artifact unless you also
+  know and reference its exact filename, but the `name:` field (the only deletion target
+  accepted by the API) is ignored when `archive: false` is active.
+
+  The bug affects any workflow where:
+  1. A job uploads a file with `archive: false` + `overwrite: true`
+  2. A subsequent job (or re-run) tries to upload the same filename again
+
+  Particularly impacts matrix builds where multiple jobs upload files with the same name to
+  the same workflow run (e.g., `path: app-release.apk` in three matrix entries).
+
+  Source: actions/upload-artifact#769 (February 2026, open).
+fix: |
+  Choose one of the following workarounds:
+
+  **Option 1 — Use `archive: true` (default) with `overwrite: true`** (recommended):
+  Remove `archive: false`. With the default zip behavior, `overwrite: true` correctly finds
+  and deletes the artifact by the `name:` input, then re-uploads without conflict.
+
+  **Option 2 — Use unique filenames per upload** (for matrix builds):
+  Rename the file before uploading so each matrix job uploads a uniquely named file.
+  The filename used as the artifact name will then be unique per job.
+
+  **Option 3 — Use unique `name:` values per job and separate download steps**:
+  Remove `archive: false` and give each job a distinct `name:` like
+  `${{ matrix.os }}-artifact`. Download each by name in downstream jobs.
+
+  **Option 4 — Use `upload-artifact@v4` or earlier** if v7's unarchived upload is not strictly
+  required — v4 handles overwrite correctly with the `name:` field.
+fix_code:
+  - language: yaml
+    label: 'Wrong: archive:false + overwrite:true causes 409 on second job'
+    code: |
+      jobs:
+        build1:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "build1" > output.txt
+            - uses: actions/upload-artifact@v7
+              with:
+                archive: false
+                overwrite: true
+                path: output.txt          # Registered as artifact name "output.txt"
+        build2:
+          needs: build1
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "build2" > output.txt
+            - uses: actions/upload-artifact@v7
+              with:
+                archive: false
+                overwrite: true
+                path: output.txt          # ERROR 409: "output.txt" already exists, delete by name: failed
+  - language: yaml
+    label: 'Option 1: remove archive:false (overwrite works correctly with zip)'
+    code: |
+      jobs:
+        build1:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "build1" > output.txt
+            - uses: actions/upload-artifact@v7
+              with:
+                name: my-output           # deletion target for overwrite
+                overwrite: true           # archive defaults to true
+                path: output.txt
+        build2:
+          needs: build1
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "build2" > output.txt
+            - uses: actions/upload-artifact@v7
+              with:
+                name: my-output           # correctly deletes by name, then re-uploads
+                overwrite: true
+                path: output.txt
+  - language: yaml
+    label: 'Option 2: rename file per job so each filename is unique'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest, macos-latest]
+          runs-on: ${{ matrix.os }}
+          steps:
+            - run: echo "output" > output.txt
+            - run: mv output.txt ${{ matrix.os }}-output.txt   # unique filename per job
+            - uses: actions/upload-artifact@v7
+              with:
+                archive: false
+                path: ${{ matrix.os }}-output.txt   # each artifact name is unique
+prevention:
+  - "Do not combine archive:false with overwrite:true on the same file in multi-job or re-run workflows."
+  - "When using archive:false remember that the filename (not the name: input) becomes the artifact name — design filenames accordingly."
+  - "For matrix builds uploading same-named files, use unique per-job artifact names or filenames to avoid 409 collisions."
+  - "Prefer archive:true (default) when overwrite semantics are needed — the name: input works correctly with zip artifacts."
+docs:
+  - url: 'https://github.com/actions/upload-artifact/issues/769'
+    label: 'actions/upload-artifact#769: archive:false + overwrite:true 409 Conflict (February 2026)'
+  - url: 'https://github.com/actions/upload-artifact/issues/785'
+    label: 'actions/upload-artifact#785: archive:false does not respect artifact name input'
+  - url: 'https://github.com/actions/upload-artifact/blob/main/README.md'
+    label: 'upload-artifact README: archive and overwrite inputs'
