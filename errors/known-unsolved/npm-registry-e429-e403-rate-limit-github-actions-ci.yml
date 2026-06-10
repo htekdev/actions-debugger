@@ -1,0 +1,118 @@
+id: known-unsolved-114
+title: 'npm Registry Intermittent 429/403 Rate-Limit Errors During GitHub Actions CI (E429 / E403)'
+category: known-unsolved
+severity: warning
+tags:
+  - npm
+  - registry
+  - rate-limit
+  - 429
+  - E429
+  - E403
+  - intermittent
+  - network
+patterns:
+  - regex: 'npm error code E429|npm error 429 Too Many Requests.*registry\.npmjs\.org|E429.*registry\.npmjs|registry\.npmjs.*429'
+    flags: 'i'
+  - regex: 'npm error code E403.*registry\.npmjs\.org|npm.*E403.*registry\.npmjs'
+    flags: 'i'
+  - regex: 'npm error 429.*npmjs|npmjs\.org.*429.*Too Many Requests'
+    flags: 'i'
+error_messages:
+  - 'npm error code E429'
+  - 'npm error 429 Too Many Requests - GET https://registry.npmjs.org/'
+  - 'npm error code E403'
+  - 'npm error 403 Forbidden - GET https://registry.npmjs.org/'
+root_cause: |
+  GitHub-hosted runners share IP address ranges in NAT pools. When many
+  concurrent workflows from different users trigger npm installs through the
+  same egress NAT IP, the npmjs.com registry rate-limits that IP, returning
+  HTTP 429 Too Many Requests or 403 Forbidden. This is an npm infrastructure
+  policy, not a GitHub Actions bug.
+
+  The issue manifests intermittently and typically correlates with:
+  - npm registry incident windows (npmjs status.npmjs.org)
+  - High concurrency on GitHub-hosted runners sharing IP pools
+  - Periods when npm temporarily tightens rate limits
+
+  The August 2025 outage (documented in nodejs/node#59620 with 20 reactions)
+  showed that major npm registry incidents can affect GitHub Actions runners
+  broadly. Similar E429/E403 spikes appear in GitHub Community discussion
+  #198588 (June 10, 2026) where multiple users reported simultaneous failures.
+
+  npm does not expose per-runner or per-organization quotas, and GitHub has
+  no control over npm registry rate limits. The only reliable workarounds are
+  retry logic, caching, or using an alternative registry mirror.
+
+  Source: nodejs/node#59620 (20 reactions, Aug 2025); GitHub Community #198588 (Jun 2026).
+fix: |
+  No permanent fix available — this is a rate limit imposed by npm.js external to GitHub.
+
+  Workarounds (in order of effectiveness):
+  1. **Use actions/cache to cache node_modules or npm cache** — reduces npm
+     registry hits on repeat runs.
+  2. **Add retry with --prefer-online=false** — allows npm to use cached
+     versions when registry is unavailable.
+  3. **Use npm mirror / Verdaccio proxy** — route through a self-hosted npm
+     proxy that caches packages.
+  4. **Switch to pnpm or yarn with lock file** — these package managers often
+     retry more aggressively.
+  5. **Re-run the failed job** — the rate limit window is typically short (seconds
+     to minutes).
+  6. **Monitor npmjs.org status** — check https://status.npmjs.org/ when CI
+     failures are widespread.
+fix_code:
+  - language: yaml
+    label: 'Cache npm registry to reduce rate-limit exposure'
+    code: |
+      jobs:
+        install:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Setup Node.js with npm cache
+              uses: actions/setup-node@v5
+              with:
+                node-version: '20'
+                cache: 'npm'  # caches ~/.npm — avoids re-downloading on cache hit
+
+            - name: Install with retry
+              run: |
+                for i in 1 2 3; do
+                  npm ci && break || sleep $((i * 15))
+                done
+  - language: yaml
+    label: 'Use .npmrc to configure retry and offline mode fallback'
+    code: |
+      # .npmrc in repo root
+      # fetch-retry-mintimeout=20000
+      # fetch-retry-maxtimeout=120000
+      # fetch-retries=5
+      # prefer-offline=false   # set to true after first install to use cache
+
+      jobs:
+        install:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v5
+              with:
+                node-version: '20'
+                cache: 'npm'
+            - run: npm ci --prefer-offline
+prevention:
+  - 'Always cache node_modules or npm cache in CI to reduce registry dependency'
+  - 'Monitor https://status.npmjs.org/ during widespread CI failures before investigating code'
+  - 'Implement retry loops for npm install steps — transient 429s typically resolve within seconds'
+  - 'Consider GitHub Packages or a self-hosted Verdaccio registry as a stable npm mirror'
+  - 'Use lock files (package-lock.json / yarn.lock / pnpm-lock.yaml) to ensure deterministic installs'
+docs:
+  - url: 'https://github.com/nodejs/node/issues/59620'
+    label: 'nodejs/node#59620: GitHub Actions failing due to npm 403/429 responses (20 reactions, Aug 2025)'
+  - url: 'https://github.com/orgs/community/discussions/198588'
+    label: 'GitHub Community #198588: Frequent NPM Network Errors with GitHub Actions (Jun 2026)'
+  - url: 'https://status.npmjs.org/'
+    label: 'npm registry status page'
+  - url: 'https://docs.npmjs.com/cli/v10/using-npm/config#prefer-offline'
+    label: 'npm docs: prefer-offline configuration'
