@@ -1,0 +1,113 @@
+id: silent-failures-191
+title: 'ubuntu-arm64 JAVA_HOME_*_ARM64 Env Vars Absent — Image Sets JAVA_HOME_*_X64 on ARM64 Runners'
+category: silent-failures
+severity: silent-failure
+tags:
+  - ubuntu-arm64
+  - java
+  - java-home
+  - arm64
+  - environment-variable
+  - setup-java
+  - ubuntu-22.04-arm
+  - ubuntu-24.04-arm
+patterns:
+  - regex: 'JAVA_HOME_\d+_ARM64.*unbound variable|JAVA_HOME_\d+_ARM64.*not set'
+    flags: 'i'
+  - regex: "JAVA_HOME_\\d+_ARM64['\"]?\\s*$|JAVA_HOME_\\d+_ARM64.*empty"
+    flags: 'im'
+  - regex: 'echo.*JAVA_HOME_\d+_ARM64.*\s*$'
+    flags: 'im'
+error_messages:
+  - "/usr/bin/bash: line 1: JAVA_HOME_21_ARM64: unbound variable"
+  - "Error: JAVA_HOME is not set, and no 'java' command could be found in your PATH."
+  - "JAVA_HOME_21_ARM64="
+root_cause: |
+  On GitHub Actions ubuntu-22.04-arm and ubuntu-24.04-arm hosted runners, the Java
+  provisioning script (`install-java-tools.sh`) incorrectly sets `JAVA_HOME_*_X64`
+  environment variables for all architectures — including on ARM64 images.
+
+  As a result, the arm64 runner images expose:
+  - `JAVA_HOME_11_X64=/opt/hostedtoolcache/Java_Temurin-Hotspot_jdk/11.*/arm64`
+  - `JAVA_HOME_17_X64=/opt/hostedtoolcache/Java_Temurin-Hotspot_jdk/17.*/arm64`
+  - `JAVA_HOME_21_X64=/opt/hostedtoolcache/Java_Temurin-Hotspot_jdk/21.*/arm64`
+
+  But `JAVA_HOME_11_ARM64`, `JAVA_HOME_17_ARM64`, and `JAVA_HOME_21_ARM64` are NOT set.
+
+  Workflows that reference the correct architecture-specific naming convention
+  (`JAVA_HOME_21_ARM64` or `$JAVA_HOME_${{ matrix.java }}_ARM64`) return empty strings
+  silently on arm64 runners, causing:
+  1. `JAVA_HOME` to fall back to a system default (or remain unset)
+  2. Builds that explicitly set `-Djava.home=$JAVA_HOME_21_ARM64` to use an empty value
+  3. Shell scripts using `set -u` to abort with "unbound variable"
+
+  The issue was introduced when GitHub migrated ARM64 Ubuntu images to its internal
+  pipelines (May 2026, runner-images #14100) and the build scripts were not updated
+  to account for the ARM64 architecture. On x86/x64 runners the naming convention
+  (`JAVA_HOME_*_X64`) is correct and unaffected.
+fix: |
+  **Primary fix — use JAVA_HOME_*_X64 on arm64 runners (workaround):**
+  The Java binaries ARE correctly installed on ARM64 runners; only the env var naming
+  is wrong. The `JAVA_HOME_*_X64` variables point to the ARM64 Java installation
+  (the path includes "arm64"). Use `JAVA_HOME_21_X64` until GitHub patches the runner.
+
+  **Recommended fix — use actions/setup-java:**
+  `actions/setup-java` correctly resolves `JAVA_HOME` for the running architecture
+  regardless of the env var naming bug. It sets `JAVA_HOME` and `PATH` correctly.
+  This is the most portable approach and sidesteps the env var naming issue entirely.
+
+  **Long-term — wait for runner-images fix:**
+  GitHub has acknowledged the build script issue (runner-images #14204). Once patched,
+  `JAVA_HOME_*_ARM64` vars will be correctly set and both naming conventions will work.
+fix_code:
+  - language: yaml
+    label: 'Use actions/setup-java to avoid the env var naming bug (recommended)'
+    code: |
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          # setup-java sets JAVA_HOME correctly on all architectures — no env var naming issues
+      - name: Build
+        run: mvn -B package
+  - language: yaml
+    label: 'Workaround — use JAVA_HOME_*_X64 on arm64 until runner is patched'
+    code: |
+      - name: Build (arm64 workaround)
+        run: |
+          # On ubuntu-*-arm64 runners: JAVA_HOME_21_ARM64 is NOT set; use JAVA_HOME_21_X64
+          # which actually points to the arm64 JDK installation despite the X64 suffix
+          export JAVA_HOME="${JAVA_HOME_21_X64}"
+          mvn -B package
+  - language: yaml
+    label: 'Cross-architecture matrix — handle both x64 and arm64'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              include:
+                - runs-on: ubuntu-latest           # x64
+                  java_arch_suffix: X64
+                - runs-on: ubuntu-24.04-arm         # arm64
+                  java_arch_suffix: X64             # use X64 suffix on arm64 too (bug workaround)
+          runs-on: ${{ matrix.runs-on }}
+          steps:
+            - uses: actions/checkout@v4
+            - name: Set JAVA_HOME
+              run: |
+                JAVA_HOME_VAR="JAVA_HOME_21_${{ matrix.java_arch_suffix }}"
+                echo "JAVA_HOME=${!JAVA_HOME_VAR}" >> $GITHUB_ENV
+prevention:
+  - 'Use `actions/setup-java` to set JAVA_HOME — it handles architecture detection correctly and is unaffected by the env var naming bug.'
+  - 'Avoid referencing `JAVA_HOME_*_ARM64` directly in workflows until runner-images #14204 is resolved and released.'
+  - 'When writing cross-architecture workflows that reference JAVA_HOME env vars directly, test explicitly on both ubuntu-latest (x64) and ubuntu-24.04-arm (arm64).'
+  - 'Track runner-images #14204 for when the JAVA_HOME_*_ARM64 naming is corrected in the arm64 runner images.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14204'
+    label: 'runner-images #14204 — Ubuntu arm64 incompatible build scripts (JAVA_HOME_*_X64 set on ARM64)'
+  - url: 'https://github.com/actions/runner-images/issues/14100'
+    label: 'runner-images #14100 — ARM64 runner images now maintained by GitHub (May 2026 migration)'
+  - url: 'https://github.com/actions/setup-java'
+    label: 'actions/setup-java — recommended cross-architecture Java setup'
