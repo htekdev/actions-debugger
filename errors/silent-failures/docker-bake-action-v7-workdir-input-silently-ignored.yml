@@ -1,0 +1,128 @@
+id: silent-failures-187
+title: '`docker/bake-action@v7` Silently Ignores `workdir:` Input — Build Runs Against Repository Root'
+category: silent-failures
+severity: silent-failure
+tags:
+  - docker
+  - bake-action
+  - docker-bake
+  - action-upgrade
+  - breaking-change
+  - input-removed
+  - build-context
+patterns:
+  - regex: 'docker/bake-action.*workdir|bake.*unexpected input.*workdir'
+    flags: 'i'
+  - regex: 'Warning: Unexpected input\(s\).*workdir.*docker/bake-action'
+    flags: 'i'
+  - regex: 'bake.*target.*context.*repository.*root|bake.*COPY.*no such file.*workdir'
+    flags: 'i'
+  - regex: "COPY failed:.*stat.*not found.*bake|ERROR \[.*\] COPY .* failed.*not found"
+    flags: 'i'
+error_messages:
+  - "Warning: Unexpected input(s) 'workdir', valid inputs are ['source', 'targets', 'files', 'no-cache', 'pull', 'load', 'provenance', 'sbom', 'push', 'set', 'github-token']"
+  - "COPY failed: file not found in build context or excluded by .dockerignore"
+  - "ERROR [stage] COPY ./src . # buildkit"
+root_cause: |
+  In `docker/bake-action@v7.0.0` (released March 5, 2026), the `workdir` input was **removed
+  and its functionality was merged into the `source` input**. The `source` input now accepts
+  both remote URLs (previously handled separately) and local subdirectory paths (previously
+  handled by `workdir`).
+
+  Workflows pinned to `docker/bake-action@v7` or later that still use `with: workdir: ./path`
+  will receive a "Warning: Unexpected input(s) 'workdir'" annotation at runtime. The `workdir`
+  value is silently **ignored** — the bake build runs from the repository root instead of the
+  specified directory. No hard error is thrown.
+
+  The downstream failure manifests as:
+  - `COPY` instructions in the Dockerfile that reference paths relative to the old `workdir`
+    failing with "no such file or directory"
+  - Build artifacts missing expected source files
+  - The bake HCL file in the subdirectory not being found, causing fallback to a default target
+
+  This is particularly hard to debug because the `docker/bake-action` step itself succeeds
+  with only a warning annotation; the failure appears in a later build step or produces a
+  silently wrong image.
+
+  Source: docker/bake-action v7.0.0 release notes
+  https://github.com/docker/bake-action/releases/tag/v7.0.0
+fix: |
+  Replace `workdir:` with `source:` in your workflow step. The `source` input now handles
+  both local subdirectory paths (previously `workdir`) and remote URLs.
+
+  **Before (v6 syntax):**
+  ```yaml
+  - uses: docker/bake-action@v6
+    with:
+      workdir: ./infra/docker
+      targets: app
+  ```
+
+  **After (v7 syntax):**
+  ```yaml
+  - uses: docker/bake-action@v7
+    with:
+      source: ./infra/docker
+      targets: app
+  ```
+
+  If you need to remain on v6 while migrating, pin explicitly:
+  ```yaml
+  - uses: docker/bake-action@v6.10.0
+    with:
+      workdir: ./infra/docker
+  ```
+fix_code:
+  - language: yaml
+    label: "Replace workdir with source input for docker/bake-action@v7"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - uses: docker/setup-buildx-action@v3
+
+            # WRONG — workdir is silently ignored in v7+
+            # - uses: docker/bake-action@v7
+            #   with:
+            #     workdir: ./infra/docker
+            #     targets: app
+
+            # CORRECT — use source instead of workdir
+            - uses: docker/bake-action@v7
+              with:
+                source: ./infra/docker   # was: workdir: ./infra/docker
+                targets: app
+                push: true
+
+  - language: yaml
+    label: "Pin to v6 if you cannot migrate workdir to source yet"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - uses: docker/setup-buildx-action@v3
+
+            # Pin to the last v6 release until you can migrate to source:
+            - uses: docker/bake-action@v6.10.0
+              with:
+                workdir: ./infra/docker
+                targets: app
+                push: true
+prevention:
+  - "When upgrading docker/bake-action from v6 to v7 or later, immediately search for `workdir:` in all workflow files and replace with `source:`."
+  - "Review the full v7 release notes before upgrading — multiple breaking changes were introduced (workdir removed, list-targets subaction removed, DOCKER_BUILD_NO_SUMMARY env removed)."
+  - "Add `actionlint` to your CI to catch invalid action inputs like the deprecated `workdir` key."
+  - "Use Dependabot or Renovate with changelogs enabled so breaking changes in action releases are surfaced before automated upgrades land on main."
+docs:
+  - url: "https://github.com/docker/bake-action/releases/tag/v7.0.0"
+    label: "docker/bake-action v7.0.0 release notes (full breaking changes)"
+  - url: "https://github.com/docker/bake-action/pull/365"
+    label: "PR #365: Merge workdir into source input"
+  - url: "https://github.com/docker/bake-action?tab=readme-ov-file#source-semantics"
+    label: "docker/bake-action README: source input semantics"
