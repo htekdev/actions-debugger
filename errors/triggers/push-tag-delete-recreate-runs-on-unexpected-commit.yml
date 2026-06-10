@@ -1,0 +1,130 @@
+id: triggers-104
+title: "on: push: tags: Workflow Runs on Unexpected Commit When Tag Is Deleted and Recreated"
+category: triggers
+severity: silent-failure
+tags:
+  - push
+  - tags
+  - tag-recreation
+  - release
+  - checkout
+  - wrong-commit
+patterns:
+  - regex: 'on:\s+push:\s+tags:'
+    flags: 'si'
+  - regex: 'git tag -d|git push.*--delete.*refs/tags|git push --force.*v\d'
+    flags: 'i'
+error_messages:
+  - "Workflow ran but deployed/built wrong artifact version"
+  - "github.sha does not match expected release commit"
+  - "Actions run triggered for correct tag but checked out old code"
+root_cause: |
+  When a workflow triggers on `on: push: tags:`, GitHub fires the workflow using
+  **the exact commit SHA that `refs/tags/<name>` points to at the moment of push**.
+  There is no validation that the tag points to the intended commit.
+
+  A common footgun during release fixes:
+
+  1. Developer creates tag `v1.2.0` pointing to wrong commit, pushes it.
+  2. CI runs on wrong commit, developer deletes the remote tag:
+     `git push --delete origin v1.2.0`
+  3. Developer recreates the tag **locally** with `git tag v1.2.0` — but forgets to
+     first `git tag -d v1.2.0` to delete the old local tag, or forgets to specify the
+     correct SHA: `git tag v1.2.0` tags HEAD of the **current checkout**, which may
+     still be the wrong branch or an old commit.
+  4. Developer pushes: `git push origin v1.2.0`
+  5. CI re-triggers and silently builds/deploys the **same wrong commit** — or a
+     different wrong one — with no warning.
+
+  This also occurs when using `git push --force` on a tag:
+  - The push fires the `on: push: tags:` trigger.
+  - The workflow runs with `github.sha` set to whichever commit the tag now points to.
+  - If the developer intended to point it at a new commit but the local tag was
+    stale, the build picks up the wrong code.
+
+  GitHub Actions has no mechanism to verify that a tag push reflects intentional
+  release tagging — it trusts the SHA in the push event unconditionally.
+fix: |
+  Use a deliberate tag recreation workflow to ensure the tag points to the correct
+  commit before pushing:
+
+  ```sh
+  # Delete local and remote tag
+  git tag -d v1.2.0
+  git push --delete origin v1.2.0
+
+  # Recreate tag on the EXPLICIT correct commit or current HEAD
+  git tag v1.2.0 <correct-sha>
+  # OR: git tag v1.2.0  (only if HEAD is already at the correct commit)
+
+  # Verify before pushing
+  git show v1.2.0 --no-patch --format="%H %s"
+
+  # Push
+  git push origin v1.2.0
+  ```
+
+  In the workflow itself, add a guard step that validates `github.sha` matches
+  the intended release:
+fix_code:
+  - language: yaml
+    label: 'Guard — validate git.sha matches expected commit before release steps'
+    code: |
+      on:
+        push:
+          tags:
+            - 'v*'
+
+      jobs:
+        release:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.ref }}
+                fetch-depth: 0
+
+            - name: Verify tag points to expected branch
+              run: |
+                TAG_COMMIT=$(git rev-parse "${{ github.ref }}")
+                MAIN_COMMIT=$(git rev-parse origin/main)
+                echo "Tag SHA:  $TAG_COMMIT"
+                echo "Main SHA: $MAIN_COMMIT"
+                if [ "$TAG_COMMIT" != "$MAIN_COMMIT" ]; then
+                  echo "::error::Tag ${{ github.ref_name }} does not point to main HEAD — aborting release"
+                  exit 1
+                fi
+
+            - name: Build and release
+              run: make release
+  - language: yaml
+    label: 'Prevention — use GitHub Releases UI or GitHub CLI for tags to reduce manual tagging errors'
+    code: |
+      # Create a tag and release from CI after tests pass on main
+      # — avoids manual tag recreation errors entirely
+      jobs:
+        tag-and-release:
+          runs-on: ubuntu-latest
+          if: github.ref == 'refs/heads/main'
+          steps:
+            - uses: actions/checkout@v4
+            - name: Create and push tag
+              env:
+                GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                VERSION=$(cat VERSION)
+                git tag "v${VERSION}"
+                git push origin "v${VERSION}"
+prevention:
+  - "Always specify the target SHA explicitly when recreating a tag: 'git tag v1.x.x <sha>' not just 'git tag v1.x.x'"
+  - "Run 'git show <tagname> --no-patch --format=\"%H %s\"' to verify the tag points to the correct commit before pushing"
+  - "Add a workflow guard step that validates github.sha is an ancestor of main (or the expected release branch) before proceeding"
+  - "Prefer creating releases through the GitHub Releases UI or 'gh release create' which ties the tag to the current default branch HEAD"
+  - "Use tag protection rules to prevent force-pushing tags, requiring deliberate deletion and recreation"
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#push'
+    label: 'Events that trigger workflows — push (tag filters)'
+  - url: 'https://stackoverflow.com/questions/58934903/github-action-triggered-on-push-tag-does-trigger-after-deleting-tag-and-pushing'
+    label: 'Stack Overflow — push tag trigger picks up old code after tag delete/recreate'
+  - url: 'https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/managing-repository-settings/configuring-tag-protection-rules'
+    label: 'Configuring tag protection rules — GitHub Docs'
