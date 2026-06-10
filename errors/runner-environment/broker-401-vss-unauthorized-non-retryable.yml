@@ -1,0 +1,106 @@
+id: runner-environment-414
+title: "Self-Hosted Runner Immediately Fails on Broker 401 — VssUnauthorizedException Is Non-Retryable in Runner v2.335.0+"
+category: runner-environment
+severity: error
+tags:
+  - self-hosted
+  - broker
+  - authentication
+  - expired-token
+  - registration
+  - v2.335.0
+  - VssUnauthorizedException
+patterns:
+  - regex: 'VssUnauthorizedException|TF400813.*Resource not available.*anonymous'
+    flags: 'i'
+  - regex: 'BrokerServer.*401|401.*broker.*authentication|Unauthorized.*broker'
+    flags: 'i'
+  - regex: 'runner.*authentication.*failed.*broker|broker.*auth.*expired|registration.*token.*invalid'
+    flags: 'i'
+error_messages:
+  - "VssUnauthorizedException: TF400813: Resource not available for anonymous access. Client authentication required."
+  - "Broker authentication failed: 401 Unauthorized"
+  - "Failed to create message session: Unauthorized (401)"
+root_cause: |
+  Self-hosted runners authenticate to the GitHub broker service
+  (`broker.actions.githubusercontent.com`) using a registration token or credential
+  stored at configuration time. If this token expires, is revoked, or the runner is
+  removed from GitHub (while still running locally), subsequent broker requests return
+  HTTP 401.
+
+  Before runner **v2.335.0** (released June 8, 2026), the broker polling code treated
+  401 like a transient error and retried it multiple times (using the `ShouldRetryException`
+  predicate). Each retry added delay, and runners appeared "stuck" or "hanging" for
+  minutes before eventually stopping — obscuring the root cause.
+
+  Starting with **runner v2.335.0** (PR #4445 — "BrokerServer should not retry on 401"),
+  `VssUnauthorizedException` (the exception type wrapping 401) is treated as
+  **non-retryable**. The runner immediately stops its broker polling loop and exits with
+  an authentication error rather than retrying. This means:
+
+  - Failures are visible immediately (seconds, not minutes)
+  - The error message is clearly authentication-related
+  - On-call alerts trigger faster when a runner's credentials expire
+  - Runners that were "stuck" now self-terminate cleanly
+
+  **Common causes of 401 from the broker:**
+  - The runner's registration/PAT has expired (typical with short-lived tokens in
+    ephemeral runner provisioning scripts)
+  - The runner was deleted from the GitHub UI while it was still running
+  - The organization/repo moved or was renamed, invalidating the runner's URL
+  - Ephemeral runner tokens have a 60-minute TTL — runners that take >60 min to
+    receive their first job will 401 on broker connection
+fix: |
+  **Re-register the runner** to obtain a fresh registration token:
+
+  ```
+  ./config.sh remove --token <old-removal-token>
+  ./config.sh --url <repo-or-org-url> --token <new-registration-token>
+  ./run.sh
+  ```
+
+  For **ephemeral runners** (JIT configuration): check that the ephemeral token is not
+  older than 60 minutes at the time the runner first attempts to connect to the broker.
+  If your provisioning pipeline is slow, generate the token closer to runner startup.
+
+  For **ARC (Actions Runner Controller)** deployments: check the `EphemeralRunner` pod
+  logs for `VssUnauthorizedException`. This indicates the controller's token lifecycle
+  handling should refresh or reissue tokens before they expire.
+fix_code:
+  - language: yaml
+    label: "Re-register a self-hosted runner with a fresh token"
+    code: |
+      # Remove old registration:
+      ./config.sh remove --token $(gh api -X DELETE /repos/{owner}/{repo}/actions/runners/{runner_id} | jq -r '.token')
+
+      # Register fresh:
+      REG_TOKEN=$(gh api -X POST /repos/{owner}/{repo}/actions/runners/registration-token --jq '.token')
+      ./config.sh --url https://github.com/{owner}/{repo} \
+                  --token "$REG_TOKEN" \
+                  --name "my-runner" \
+                  --unattended
+  - language: yaml
+    label: "Ephemeral runner — generate token just before runner startup"
+    code: |
+      # In your CI provisioning script, generate the JIT token
+      # immediately before starting the runner (not in a pipeline stage that
+      # runs 30-60 minutes before the runner boots):
+      JIT_CONFIG=$(gh api -X POST \
+        /repos/{owner}/{repo}/actions/runners/generate-jitconfig \
+        -f name="ephemeral-$(date +%s)" \
+        -f runner_group_id=1 \
+        -f labels='["self-hosted","linux"]' \
+        --jq '.encoded_jit_config')
+      ./run.sh --jitconfig "$JIT_CONFIG"
+prevention:
+  - "Monitor runner logs for VssUnauthorizedException — on runner v2.335.0+ this appears immediately on 401 (previously delayed by retries)"
+  - "For ephemeral runners, generate JIT tokens immediately before runner startup to avoid the 60-minute TTL expiry"
+  - "Set up alerts on runner process exit code 1 — v2.335.0+ exits promptly on auth failure instead of hanging"
+  - "For ARC deployments, verify the EphemeralRunnerSet controller version supports token refresh; upgrade to ARC v0.14.1+ for latest lifecycle fixes"
+docs:
+  - url: "https://github.com/actions/runner/pull/4445"
+    label: "runner PR #4445 — BrokerServer should not retry on 401 (shipped in v2.335.0)"
+  - url: "https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners"
+    label: "GitHub Docs — About self-hosted runners"
+  - url: "https://docs.github.com/en/rest/actions/self-hosted-runners?apiVersion=2022-11-28#create-a-registration-token-for-a-repository"
+    label: "GitHub REST API — Create a registration token for a repository"

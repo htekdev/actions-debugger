@@ -1,0 +1,105 @@
+id: runner-environment-413
+title: "ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT Adds Timestamp Prefix to Every Line of Multiline Log Messages — Breaks Log Aggregator Parsing"
+category: runner-environment
+severity: warning
+tags:
+  - self-hosted
+  - stdout-logging
+  - multiline-logs
+  - log-aggregator
+  - kubernetes
+  - fluentbit
+  - v2.335.0
+  - PRINT_LOG_TO_STDOUT
+patterns:
+  - regex: '\[RUNNER \d{4}-\d{2}-\d{2}.*INFO.*\]\s*[\{\[\{]'
+    flags: 'i'
+  - regex: '\[RUNNER.*INFO.*BrokerMessageListener\].*"AgentId":'
+    flags: 'i'
+error_messages:
+  - "[RUNNER 2026-05-06 13:23:59Z INFO BrokerMessageListener] {"
+  - "[RUNNER 2026-05-06 13:23:59Z INFO BrokerMessageListener]   \"AgentId\": 2,"
+  - "[RUNNER 2026-05-06 13:23:59Z INFO BrokerMessageListener] }"
+root_cause: |
+  When `ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT=1` is set, the runner redirects its internal
+  diagnostic log to stdout. This is commonly used in containerized self-hosted runner
+  deployments (Kubernetes, Docker) where a log-forwarding sidecar (Fluentbit, Vector,
+  OpenTelemetry Collector) is expected to read stdout and forward to a log aggregator.
+
+  The issue: `StdoutTraceListener.TraceEvent()` splits each message on newline and calls
+  `WriteHeader()` for **every line**. A multiline log entry (such as a JSON settings dump
+  or a stack trace) becomes:
+
+  ```
+  [RUNNER 2026-05-17 13:23:59Z INFO Component] {
+  [RUNNER 2026-05-17 13:23:59Z INFO Component]   "field": "value",
+  [RUNNER 2026-05-17 13:23:59Z INFO Component] }
+  ```
+
+  Log aggregators that use timestamp-based multiline parsing (Fluentbit's `multiline`,
+  Elastic Filebeat's `multiline`, OpenTelemetry Collector's `recombine`) detect a
+  *new log entry* every line because every line starts with a timestamp. This makes
+  the JSON/stack-trace appear as many separate single-line log entries rather than
+  one grouped multiline entry — breaking downstream log indexing, alerting, and
+  search that expects structured objects.
+
+  This behavior was present since the feature was added (runner PR #2291, ~2022) and
+  was fixed in runner **v2.335.0** (released June 8, 2026) via PR #4424.
+fix: |
+  **Runner v2.335.0+:** Set `ACTIONS_RUNNER_DISABLE_STDOUT_MULTILINE_LOG_PREFIXING=1`
+  in the runner's environment. This causes multiline messages to receive a prefix only
+  on the **first line**, matching the behavior of the `_diag/` file logs.
+
+  The file-based `_diag/` logs have always formatted multiline messages correctly:
+  only the first line gets a `[timestamp INFO Component]` header, and continuation
+  lines are indented without a header. Setting this env var brings stdout logs
+  in line with `_diag/` format.
+
+  **Older runners (pre-v2.335.0):** No built-in fix is available. Workarounds:
+  - Configure your log aggregator's multiline mode to join lines that do NOT start
+    with a timestamp prefix (negative lookahead parser rule).
+  - Upgrade the runner to v2.335.0 or later.
+fix_code:
+  - language: yaml
+    label: "Set env var in Kubernetes runner pod spec to disable per-line prefix"
+    code: |
+      # In your Kubernetes runner pod spec or Docker run command:
+      env:
+        - name: ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT
+          value: "1"
+        - name: ACTIONS_RUNNER_DISABLE_STDOUT_MULTILINE_LOG_PREFIXING
+          value: "1"  # Available from runner v2.335.0+ (June 8, 2026)
+  - language: yaml
+    label: "ARC (Actions Runner Controller) runner scale set env configuration"
+    code: |
+      # In your ARC HelmRelease values.yaml:
+      template:
+        spec:
+          containers:
+            - name: runner
+              env:
+                - name: ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT
+                  value: "1"
+                - name: ACTIONS_RUNNER_DISABLE_STDOUT_MULTILINE_LOG_PREFIXING
+                  value: "1"
+  - language: yaml
+    label: "Fluentbit multiline parser workaround for pre-v2.335.0 runners"
+    code: |
+      # Fluentbit multiline config to join lines NOT starting with [RUNNER timestamp]:
+      [MULTILINE_PARSER]
+          Name          runner_multiline
+          Type          regex
+          Flush_Timeout 1000
+          Rule          "start_state" "/^\[RUNNER \d{4}-\d{2}-\d{2}/" "cont"
+          Rule          "cont"       "/^(?!\[RUNNER )/"               "cont"
+prevention:
+  - "When deploying runners to Kubernetes, use runner v2.335.0+ and set ACTIONS_RUNNER_DISABLE_STDOUT_MULTILINE_LOG_PREFIXING=1 alongside ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT=1"
+  - "Test log aggregator multiline detection after any runner version upgrade"
+  - "Check _diag/ file format as a reference — stdout format should match file format when the new env var is set"
+docs:
+  - url: "https://github.com/actions/runner/pull/4424"
+    label: "runner PR #4424 — Add ACTIONS_RUNNER_DISABLE_STDOUT_MULTILINE_LOG_PREFIXING (v2.335.0)"
+  - url: "https://github.com/actions/runner/issues/4423"
+    label: "runner #4423 — Multiline runner stdout logs are extremely difficult to parse due to repeated line headers"
+  - url: "https://docs.fluentbit.io/manual/data-pipeline/parsers/multiline-parsing"
+    label: "Fluentbit multiline parsing documentation"
