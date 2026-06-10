@@ -1,0 +1,106 @@
+id: triggers-103
+title: 'workflow_dispatch Exceeding 10 Input Parameters Causes "Invalid workflow file" Validation Error'
+category: triggers
+severity: error
+tags:
+  - workflow_dispatch
+  - inputs
+  - validation-error
+  - 10-input-limit
+  - workflow-syntax
+patterns:
+  - regex: 'GitHub Actions allows a maximum of 10 inputs for workflow_dispatch'
+    flags: 'i'
+  - regex: 'invalid workflow file.*on\.workflow_dispatch\.inputs'
+    flags: 'i'
+  - regex: 'You can define up to 10 inputs for a workflow_dispatch event'
+    flags: 'i'
+error_messages:
+  - "GitHub Actions allows a maximum of 10 inputs for workflow_dispatch events."
+  - "You can define up to 10 inputs for a workflow_dispatch event."
+  - "invalid workflow file: .github/workflows/deploy.yml — too many workflow_dispatch inputs"
+root_cause: |
+  GitHub Actions enforces a hard limit of **10 input parameters** for
+  `on: workflow_dispatch: inputs:`. Defining 11 or more inputs causes the workflow
+  file to fail server-side schema validation. The "Run workflow" dispatch button
+  disappears from the GitHub Actions UI, and the workflow cannot be triggered
+  manually or via the REST API.
+
+  The limit applies to the total count of keys under `inputs:`, regardless of
+  input type (`string`, `boolean`, `choice`, `environment`). This restriction is
+  documented in the GitHub Actions workflow syntax reference and enforced at
+  workflow registration time.
+
+  Workflows co-triggering on `push:` or `schedule:` alongside `workflow_dispatch:`
+  are also blocked — a validation failure on any trigger definition prevents the
+  entire workflow from being processed.
+fix: |
+  Reduce the number of `inputs:` keys to 10 or fewer. Common consolidation
+  strategies:
+
+  1. **JSON bundle**: collapse optional or related parameters into a single
+     `string` input containing a JSON object; parse it in the workflow with
+     `fromJSON(inputs.options)`.
+  2. **Split workflows**: if inputs logically belong to separate stages, split
+     into multiple workflow files each with ≤10 inputs and chain them via
+     `workflow_run` or `repository_dispatch`.
+  3. **Environment variables**: consider moving static configuration values
+     that rarely change into repository/environment variables (`vars.*`)
+     rather than workflow inputs.
+fix_code:
+  - language: yaml
+    label: 'Wrong — 11 inputs causes validation failure'
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            environment:  { type: string }
+            region:       { type: string }
+            version:      { type: string }
+            dry_run:      { type: boolean }
+            debug:        { type: boolean }
+            branch:       { type: string }
+            deploy_tag:   { type: string }
+            notify:       { type: boolean }
+            retries:      { type: string }
+            timeout:      { type: string }
+            extra_flags:  { type: string }   # 11th input — triggers validation error
+  - language: yaml
+    label: 'Fix — consolidate extra inputs into a JSON-encoded bundle input'
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            environment:  { type: string, required: true }
+            region:       { type: string, required: true }
+            version:      { type: string, required: true }
+            dry_run:      { type: boolean, default: false }
+            debug:        { type: boolean, default: false }
+            branch:       { type: string }
+            deploy_tag:   { type: string }
+            notify:       { type: boolean, default: true }
+            retries:      { type: string, default: '3' }
+            # Bundle remaining options into a single JSON string (max 10 total)
+            options:
+              type: string
+              description: 'JSON: {"timeout":"30","extra_flags":"--verbose"}'
+              default: '{}'
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Parse bundled options
+              id: opts
+              run: |
+                echo "timeout=$(echo '${{ inputs.options }}' | jq -r '.timeout // "30"')" >> $GITHUB_OUTPUT
+                echo "extra=$(echo '${{ inputs.options }}' | jq -r '.extra_flags // ""')" >> $GITHUB_OUTPUT
+prevention:
+  - "Count your workflow_dispatch inputs before committing — the limit is exactly 10 keys under inputs:"
+  - "Use actionlint locally to catch the 10-input-limit violation before pushing to the default branch"
+  - "Bundle rarely-changed or optional parameters into a single JSON string input"
+  - "Move static config that doesn't vary per-run into repository variables (vars.*) instead of inputs"
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_dispatch'
+    label: 'Events that trigger workflows — workflow_dispatch'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#onworkflow_dispatchinputs'
+    label: 'Workflow syntax — on.workflow_dispatch.inputs (10-input limit noted)'

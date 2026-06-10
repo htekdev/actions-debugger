@@ -1,0 +1,113 @@
+id: permissions-auth-102
+title: "Fine-Grained PAT Requires 'contents: write' for repository_dispatch — Not 'actions: write'"
+category: permissions-auth
+severity: error
+tags:
+  - fine-grained-pat
+  - repository_dispatch
+  - contents-write
+  - actions-write
+  - 403
+  - REST-API
+patterns:
+  - regex: 'Resource not accessible by personal access token'
+    flags: 'i'
+  - regex: 'Must have admin rights to Repository\.|403.*repository_dispatch'
+    flags: 'i'
+  - regex: 'HTTP 422.*repository_dispatch|422.*repository.dispatch'
+    flags: 'i'
+error_messages:
+  - "Error: Resource not accessible by personal access token"
+  - "RequestError [HttpError]: Resource not accessible by personal access token"
+  - "Must have admin rights to Repository."
+  - "HttpError: Not Found"
+root_cause: |
+  Triggering a `repository_dispatch` event via the GitHub REST API
+  (`POST /repos/{owner}/{repo}/dispatches`) requires a token with
+  **`contents: write`** permission on the target repository.
+
+  This surprises developers who set `actions: write` — which is correct for
+  `workflow_dispatch` (`POST /repos/{owner}/{repo}/actions/workflows/{id}/dispatches`)
+  — but does **not** grant permission for `repository_dispatch`.
+
+  The mapping is:
+  - `workflow_dispatch` API   → fine-grained PAT scope: `actions: write`
+  - `repository_dispatch` API → fine-grained PAT scope: `contents: write`
+
+  With a fine-grained PAT that has only `actions: write`, the `repository_dispatch`
+  API call returns HTTP 403 "Resource not accessible by personal access token" or
+  HTTP 422 depending on the token type.
+
+  Classic PATs require the `repo` scope for both operations, so this distinction
+  does not surface with classic tokens — it only manifests after migrating to
+  fine-grained PATs.
+
+  Documented in peter-evans/repository-dispatch issue #208 (2023) and the GitHub
+  REST API reference for the Create a repository dispatch event endpoint.
+fix: |
+  Grant **`contents: write`** (not `actions: write`) permission to the fine-grained
+  PAT used to call the repository_dispatch API.
+
+  If the same PAT also needs to trigger `workflow_dispatch`, grant both permissions:
+  - `contents: write` — for repository_dispatch
+  - `actions: write`  — for workflow_dispatch
+
+  Update the fine-grained PAT in GitHub → Settings → Developer settings →
+  Personal access tokens → Fine-grained tokens → select the token → Permissions.
+fix_code:
+  - language: yaml
+    label: 'Wrong — actions:write alone is insufficient for repository_dispatch'
+    code: |
+      # Fine-grained PAT configured with:
+      #   actions: write      ← correct for workflow_dispatch
+      #   contents: read      ← NOT sufficient for repository_dispatch
+      #
+      # This token fails with:
+      # "Resource not accessible by personal access token"
+      - name: Trigger downstream workflow (BROKEN)
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.MY_PAT }}   # PAT has actions:write, not contents:write
+          event-type: run-integration-tests
+  - language: yaml
+    label: 'Fix — fine-grained PAT must have contents:write for repository_dispatch'
+    code: |
+      # Fine-grained PAT configured with:
+      #   contents: write     ← required for repository_dispatch
+      #   actions: write      ← optional, only if you also call workflow_dispatch
+      #
+      # Update at: GitHub → Settings → Developer settings → Fine-grained tokens
+      - name: Trigger downstream workflow
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.MY_PAT }}   # PAT has contents:write
+          event-type: run-integration-tests
+          client-payload: '{"ref": "${{ github.ref }}"}'
+  - language: yaml
+    label: 'Alternative — use a GitHub App token (no PAT permission confusion)'
+    code: |
+      jobs:
+        dispatch:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/create-github-app-token@v2
+              id: app-token
+              with:
+                app-id: ${{ vars.APP_ID }}
+                private-key: ${{ secrets.APP_PRIVATE_KEY }}
+            - uses: peter-evans/repository-dispatch@v3
+              with:
+                token: ${{ steps.app-token.outputs.token }}
+                event-type: run-integration-tests
+prevention:
+  - "Remember the mapping: repository_dispatch → 'contents: write'; workflow_dispatch → 'actions: write'"
+  - "When using fine-grained PATs for dispatch operations, always verify the exact permission required in the GitHub REST API docs for that endpoint"
+  - "Consider using a GitHub App token instead of PATs for cross-repo dispatch — App permissions are more explicit and avoid this confusion"
+  - "After migrating from classic PATs to fine-grained PATs, re-test all dispatch operations even if they worked before"
+docs:
+  - url: 'https://docs.github.com/en/rest/repos/repos#create-a-repository-dispatch-event'
+    label: 'REST API — Create a repository dispatch event (lists required fine-grained permission)'
+  - url: 'https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#fine-grained-personal-access-tokens'
+    label: 'Fine-grained personal access tokens — permission reference'
+  - url: 'https://github.com/peter-evans/repository-dispatch/issues/208'
+    label: 'peter-evans/repository-dispatch #208 — Error using fine-grained PAT'
