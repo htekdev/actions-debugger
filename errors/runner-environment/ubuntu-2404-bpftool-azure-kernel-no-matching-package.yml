@@ -1,0 +1,107 @@
+id: runner-environment-421
+title: 'ubuntu-24.04 bpftool Unavailable — Azure Custom Kernel Has No Matching linux-tools Package'
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-24.04
+  - bpftool
+  - kernel
+  - linux-tools
+  - azure-kernel
+  - ebpf
+  - ubuntu-latest
+patterns:
+  - regex: 'WARNING: bpftool not found for kernel \d+\.\d+\.\d+-\d+-azure'
+    flags: 'i'
+  - regex: 'linux-tools-[0-9.]+-[0-9]+-azure.*You may need to install'
+    flags: 'si'
+  - regex: 'bpftool not found for kernel.*azure'
+    flags: 'i'
+error_messages:
+  - "WARNING: bpftool not found for kernel 6.17.0-1015"
+  - "  You may need to install the following packages for this specific kernel:"
+  - "    linux-tools-6.17.0-1015-azure"
+  - "    linux-cloud-tools-6.17.0-1015-azure"
+  - "  You may also want to install one of the following packages to keep up to date:"
+  - "    linux-tools-azure"
+  - "    linux-cloud-tools-azure"
+root_cause: |
+  The ubuntu-24.04 GitHub Actions runner uses a custom Azure-patched kernel whose
+  version string (e.g. `6.17.0-1015-azure`) differs from the generic Ubuntu kernel
+  versions published to apt.ubuntu.com.
+
+  Installing `linux-tools-common` (or `linux-tools-$(uname -r)`) provides only a thin
+  shell-script wrapper at `/usr/sbin/bpftool`. At runtime the wrapper calls `uname -r`
+  to determine the running kernel version, then looks for the compiled bpftool binary
+  under `/usr/lib/linux-tools/<kernel-version>/bpftool`. Because the Azure custom kernel
+  version (e.g. `6.17.0-1015-azure`) does not have a matching `linux-tools-6.17.0-1015-azure`
+  package published to Ubuntu's APT repositories, the compiled binary is never installed
+  and the wrapper prints the "bpftool not found" warning and exits non-zero.
+
+  On ubuntu-22.04 the Azure kernel version historically matched an available APT package,
+  which is why the same workflow steps work on 22.04 but fail on 24.04.
+
+  Affected: ubuntu-24.04 / ubuntu-latest, image version ≥ 20260525.161.1 (kernel
+  6.17.0-1015-azure). The issue is a known gap in Ubuntu's APT packaging for Azure
+  cloud-specific kernel flavours on 24.04.
+fix: |
+  **Primary fix — install the standalone `bpftool` package (Ubuntu 24.04+):**
+  Ubuntu 24.04 ships a kernel-independent standalone `bpftool` binary in the
+  `bpftool` package. This binary does not rely on the running kernel version.
+
+    sudo apt-get update
+    sudo apt-get install -y bpftool
+
+  **Alternative — use linux-tools-generic with a symlink:**
+  Install `linux-tools-generic` (which bundles a pre-built bpftool for the
+  generic kernel) and symlink it to a PATH location:
+
+    sudo apt-get install -y linux-tools-generic
+    TOOL_DIR=$(ls /usr/lib/linux-tools/ | sort -V | tail -1)
+    sudo ln -sf /usr/lib/linux-tools/${TOOL_DIR}/bpftool /usr/local/bin/bpftool
+
+  **Workaround — pin to ubuntu-22.04:**
+  If bpftool is a minor dependency, temporarily pinning to ubuntu-22.04 restores
+  the matching linux-tools package availability.
+fix_code:
+  - language: yaml
+    label: 'Install standalone bpftool package (Ubuntu 24.04+ recommended)'
+    code: |
+      - name: Install bpftool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bpftool   # standalone, kernel-version-independent
+
+      - name: Verify bpftool
+        run: bpftool -V
+  - language: yaml
+    label: 'Alternative via linux-tools-generic symlink'
+    code: |
+      - name: Install bpftool via linux-tools-generic
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-tools-generic
+          TOOL_DIR=$(ls /usr/lib/linux-tools/ | sort -V | tail -1)
+          sudo ln -sf /usr/lib/linux-tools/${TOOL_DIR}/bpftool /usr/local/bin/bpftool
+
+      - name: Verify bpftool
+        run: bpftool -V
+  - language: yaml
+    label: 'What NOT to do — these fail on ubuntu-24.04 Azure runners'
+    code: |
+      # DO NOT use these on ubuntu-24.04 — linux-tools-$(uname -r) resolves to
+      # a package that does not exist in Ubuntu repos for the Azure kernel:
+      # sudo apt-get install -y linux-tools-$(uname -r)   # FAILS: no such package
+      # sudo apt-get install -y linux-cloud-tools-$(uname -r)  # FAILS similarly
+prevention:
+  - 'On ubuntu-24.04, never use `linux-tools-$(uname -r)` to install bpftool — the Azure kernel version has no matching APT package.'
+  - 'Prefer the standalone `bpftool` package (`sudo apt-get install -y bpftool`) which is kernel-version-independent.'
+  - 'Add a `bpftool -V` verification step immediately after installation to surface failures before they affect downstream steps.'
+  - 'If your workflow depends on bpftool and must use ubuntu-latest, test on ubuntu-24.04 explicitly rather than relying on ubuntu-22.04 behavior.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14203'
+    label: 'runner-images #14203 — Cannot install bpftool in ubuntu-latest runner'
+  - url: 'https://packages.ubuntu.com/noble/bpftool'
+    label: 'Ubuntu 24.04 (Noble) standalone bpftool package'
+  - url: 'https://manpages.ubuntu.com/manpages/noble/en/man8/bpftool.8.html'
+    label: 'bpftool manpage — Ubuntu 24.04'

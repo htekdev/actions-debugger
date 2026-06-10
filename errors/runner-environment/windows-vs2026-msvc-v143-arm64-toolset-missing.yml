@@ -1,0 +1,101 @@
+id: runner-environment-422
+title: 'windows-2025-vs2026 Runner Missing MSVC v143 ARM64 Build Tools — MSB8020 on ARM64 Targets'
+category: runner-environment
+severity: error
+tags:
+  - windows
+  - vs2026
+  - visual-studio-2026
+  - msvc
+  - v143
+  - arm64
+  - msbuild
+  - platform-toolset
+  - windows-latest
+patterns:
+  - regex: 'MSB8020.*build tools for Visual Studio 2022.*Platform Toolset.*v143.*cannot be found'
+    flags: 'i'
+  - regex: 'error MSB8020:.*v143.*build tools.*ARM64|MSB8020.*ARM64.*v143'
+    flags: 'i'
+  - regex: 'The build tools for v143.*cannot be found.*install Visual Studio 2022'
+    flags: 'i'
+error_messages:
+  - "error MSB8020: The build tools for Visual Studio 2022 (Platform Toolset = 'v143') cannot be found. To build using the v143 build tools, please install Visual Studio 2022 build tools. Alternatively, you may upgrade to the current Visual Studio tools by selecting the Project menu or right-click the solution, and then selecting \"Retarget solution\"."
+root_cause: |
+  The `windows-2025-vs2026` runner image (Windows Server 2025 with Visual Studio 2026,
+  introduced June 2026) installs MSVC v143 only as the x86/x64 compatibility component
+  (`Microsoft.VisualStudio.Component.VC.14.44.17.14.x86.x64`). This allows building
+  x86 and x64 targets with the legacy VS2022 v143 toolset for backward compatibility.
+
+  However, the ARM64 variant of the v143 toolset
+  (`Microsoft.VisualStudio.Component.VC.14.44.17.14.ARM64`) is NOT installed in the
+  VS2026 runner image. When MSBuild encounters a `.vcxproj` with
+  `<PlatformToolset>v143</PlatformToolset>` and `Platform=ARM64`, it searches for the
+  ARM64-specific v143 toolset files. When not found, it emits MSB8020 and aborts.
+
+  The `windows-2022` runner (which ships Visual Studio 2022 as its primary toolset) has
+  a complete v143 installation including both x86/x64 and ARM64 support. Workflows that
+  used `windows-latest` and targeted ARM64 with `PlatformToolset=v143` worked without
+  issue until `windows-latest` began resolving to the VS2026 image in June 2026.
+
+  The issue is currently under investigation by GitHub (runner-images #14215, filed
+  June 10, 2026). As of that date no fix has been merged into the VS2026 runner image.
+fix: |
+  **Primary workaround — pin to windows-2022:**
+  `windows-2022` ships Visual Studio 2022 as its primary toolset, which includes a
+  complete v143 installation with full ARM64 support.
+
+    runs-on: windows-2022
+
+  **Alternative — upgrade the PlatformToolset to v170 (VS2026):**
+  If the project can be retargeted, update `<PlatformToolset>v143</PlatformToolset>`
+  to `<PlatformToolset>v170</PlatformToolset>` in the `.vcxproj` file(s). VS2026's
+  v170 toolset has full ARM64 support on the VS2026 runner. Test thoroughly for
+  compatibility changes between v143 and v170.
+
+  **Avoid using windows-latest for ARM64 MSBuild targets until resolved:**
+  `windows-latest` is non-deterministic during the June-July 2026 migration window —
+  it may resolve to either VS2022 (windows-2022) or VS2026 (windows-2025-vs2026)
+  randomly, causing intermittent ARM64 build failures.
+fix_code:
+  - language: yaml
+    label: 'Pin to windows-2022 to restore v143 ARM64 toolset'
+    code: |
+      jobs:
+        build-arm64:
+          # windows-2022 ships VS2022 with full v143 ARM64 build tools
+          # Do NOT use windows-latest or windows-2025 if project uses PlatformToolset=v143 for ARM64
+          runs-on: windows-2022
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build ARM64
+              run: msbuild vs/myproject.sln -p:Configuration=Release -p:Platform=ARM64 -p:PlatformToolset=v143
+  - language: yaml
+    label: 'Matrix build with per-platform runner selection'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              include:
+                - platform: x64
+                  runs-on: windows-latest     # VS2026 handles x64 v143 fine
+                - platform: ARM64
+                  runs-on: windows-2022       # VS2022 needed for v143 ARM64
+          runs-on: ${{ matrix.runs-on }}
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build ${{ matrix.platform }}
+              run: msbuild vs/myproject.sln -p:Configuration=Release -p:Platform=${{ matrix.platform }}
+prevention:
+  - 'Before adopting windows-latest post-June 2026, audit all .vcxproj files for <PlatformToolset>v143</PlatformToolset> ARM64 platform configurations.'
+  - 'Explicitly pin ARM64 MSBuild workflows to windows-2022 until GitHub adds v143 ARM64 toolset to the VS2026 runner image.'
+  - 'Track runner-images #14215 for when the v143 ARM64 gap in VS2026 is resolved.'
+  - 'When migrating to VS2026, test ARM64 configurations explicitly rather than assuming parity with VS2022.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14215'
+    label: 'runner-images #14215 — Windows Server 2025 VS2026: v143 build tool for ARM64 is missing'
+  - url: 'https://github.com/actions/runner-images/issues/14017'
+    label: 'runner-images #14017 — windows-latest migration to VS2026 announcement (June 2026)'
+  - url: 'https://learn.microsoft.com/en-us/visualstudio/releases/2022/vs2022-release-notes'
+    label: 'Visual Studio 2022 v143 toolset release notes'
