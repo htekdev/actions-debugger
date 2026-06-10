@@ -1,0 +1,159 @@
+id: triggers-109
+title: "workflow_run branches Filter Matches head_branch (Source PR Branch), Not Target Branch — Dependabot and Fork PRs Silently Excluded"
+category: triggers
+severity: silent-failure
+tags:
+  - workflow_run
+  - branches-filter
+  - head_branch
+  - dependabot
+  - fork
+  - not-triggering
+patterns:
+  - regex: 'on:\s+workflow_run:'
+    flags: 'si'
+  - regex: 'branches:\s*\n\s*-\s*["\']?main["\']?'
+    flags: 'i'
+  - regex: 'workflow_run.*branches.*dependabot'
+    flags: 'si'
+error_messages:
+  - "Downstream workflow never fires for Dependabot PRs"
+  - "workflow_run trigger skipped — head_branch 'dependabot/npm_and_yarn/lodash-4.17.21' does not match filter"
+  - "branches filter excluded: head_branch='dependabot/...' does not match 'main'"
+root_cause: |
+  The `branches:` filter on a `workflow_run` trigger is evaluated against the triggering
+  workflow run's `head_branch` — the branch WHERE the upstream workflow ran — NOT the
+  pull request's `base_ref` (the branch the PR is targeting).
+
+  This distinction has a critical implication for Dependabot, Renovate, and fork PRs:
+
+  - A Dependabot PR targeting `main` has `head_branch = "dependabot/npm_and_yarn/lodash-4.17.21"`.
+  - A fork PR targeting `main` has `head_branch = "fork-owner:feature-branch"`.
+  - Neither matches `branches: [main]` — so a downstream `workflow_run` listener with
+    `branches: [main]` NEVER fires for these PRs, even though they target main.
+
+  **Example failure scenario:**
+  ```
+  CI workflow runs on Dependabot PR (head_branch = "dependabot/...") → completes
+  → workflow_run listener evaluates branches: [main] against "dependabot/..."
+  → no match → downstream workflow silently skipped
+  → Dependabot PR review automation never runs
+  ```
+
+  This is distinct from:
+  - `triggers-088` (chained 2nd-level workflow_run where GITHUB_REF is always the
+    default branch) — the current entry covers 1st-level triggers where `head_branch`
+    is set from the actual upstream run, but may not match the target branch.
+  - `triggers-004` (workflow file must exist on default branch) — unrelated.
+
+  The `branches:` filter is commonly used to restrict downstream deployment or review
+  automation to only fire for main-branch runs. Developers who add this filter to
+  prevent staging deploys from firing on every PR don't realize it also blocks all
+  Dependabot and fork PR automation.
+
+  Real-world documentation: microsoft/physical-ai-toolchain#584 (Apr 2026) — Dependabot
+  PR Review workflow_run stopped firing after migration to workflow_run trigger because
+  `branches: [main]` was set instead of `branches: ["dependabot/**"]`.
+fix: |
+  Replace the `branches: [main]` filter with the actual head branch patterns you want
+  to match. For Dependabot PRs, use `branches: ["dependabot/**"]`. If you need both
+  main-branch runs AND Dependabot PR runs, combine both patterns:
+
+    branches:
+      - main
+      - 'dependabot/**'
+      - 'renovate/**'
+
+  Alternatively, remove the `branches:` filter entirely from the `workflow_run` trigger
+  and use a job-level `if:` condition to route by `github.event.workflow_run.head_branch`:
+
+    jobs:
+      deploy:
+        if: github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.conclusion == 'success'
+
+  This approach gives you full control over routing logic without the silent-filter
+  problem of the `branches:` key. It works correctly for chained workflow_run triggers
+  as well (see triggers-088).
+fix_code:
+  - language: yaml
+    label: 'Broken: branches: [main] silently excludes Dependabot PRs'
+    code: |
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+          branches:
+            - main     # ← matches head_branch, not target branch!
+                       # Dependabot PRs have head_branch = "dependabot/..." → never matches
+
+      jobs:
+        review-dependabot-pr:
+          runs-on: ubuntu-latest
+          if: ${{ github.event.workflow_run.conclusion == 'success' }}
+          steps:
+            - run: echo "This never runs for Dependabot PRs"
+  - language: yaml
+    label: 'Fixed: include dependabot/** head branch pattern'
+    code: |
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+          branches:
+            - main
+            - 'dependabot/**'   # ← matches Dependabot PR head branches
+            - 'renovate/**'     # ← matches Renovate bot head branches
+
+      jobs:
+        review-dependabot-pr:
+          runs-on: ubuntu-latest
+          if: ${{ github.event.workflow_run.conclusion == 'success' }}
+          steps:
+            - name: Check if Dependabot PR
+              run: |
+                HEAD="${{ github.event.workflow_run.head_branch }}"
+                if [[ "$HEAD" == dependabot/* ]]; then
+                  echo "Running Dependabot PR review automation"
+                fi
+  - language: yaml
+    label: 'Best practice: remove branches filter; route via if condition instead'
+    code: |
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+          # No branches filter — all branches fire the trigger
+          # Route via if conditions to preserve fine-grained control
+
+      jobs:
+        deploy-production:
+          # Only deploy from main branch pushes
+          if: >-
+            github.event.workflow_run.conclusion == 'success' &&
+            github.event.workflow_run.head_branch == 'main' &&
+            github.event.workflow_run.event == 'push'
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./deploy.sh
+
+        review-dependabot:
+          # Auto-review Dependabot PRs on CI success
+          if: >-
+            github.event.workflow_run.conclusion == 'success' &&
+            startsWith(github.event.workflow_run.head_branch, 'dependabot/')
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Approve Dependabot PR"
+prevention:
+  - "Never use `branches: [main]` on a `workflow_run` trigger if you also need the listener to fire for Dependabot or Renovate PRs — those have non-main head branches."
+  - "Remember: `branches:` in `workflow_run` matches `head_branch` (the source branch), NOT `base_ref` (the PR target). These are different fields."
+  - "Prefer `if:` conditions over `branches:` filter for `workflow_run` routing — they are more explicit, testable, and consistent across 1st-level and chained (2nd-level) triggers."
+  - "After migrating from `pull_request` to `workflow_run` triggers, audit the `branches:` filter — what worked as a base branch filter in `pull_request` does NOT work the same way in `workflow_run`."
+  - "When Dependabot or Renovate PR automation stops working, check whether a `workflow_run` with `branches: [main]` is silently filtering them out."
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run'
+    label: 'GitHub Docs — workflow_run event: branches filter behavior'
+  - url: 'https://github.com/microsoft/physical-ai-toolchain/issues/584'
+    label: 'microsoft/physical-ai-toolchain#584 — workflow_run branches: [main] excludes Dependabot head branches (Apr 2026)'
+  - url: 'https://github.com/Skretzo/shortest-path/commit/8254fb476c496f533376746f911b696bd2a745c8'
+    label: 'Shortest-path: fix workflow_run by moving branch check to job-level if condition'

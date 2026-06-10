@@ -1,0 +1,164 @@
+id: concurrency-timing-092
+title: "pull_request: labeled / review_requested / assigned Events Cancel In-Progress CI via Shared Concurrency Group"
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - pull_request
+  - labeled
+  - review_requested
+  - cancel-in-progress
+  - ci-cancellation
+  - synchronize
+patterns:
+  - regex: 'on:\s+pull_request:\s+types:'
+    flags: 'si'
+  - regex: 'types:.*\blabeled\b.*\bsynchronize\b|\btypes:.*\bsynchronize\b.*\blabeled\b'
+    flags: 'si'
+  - regex: 'Canceling since a higher priority waiting run was found'
+    flags: 'i'
+  - regex: 'This run was automatically cancelled'
+    flags: 'i'
+error_messages:
+  - "This run was automatically cancelled"
+  - "Canceling since a higher priority waiting run was found"
+  - "CI cancelled by a newer queued run"
+root_cause: |
+  When a workflow subscribes to `on: pull_request` with multiple action types such as
+  `[opened, synchronize, labeled, review_requested, assigned]` and uses a concurrency
+  group keyed on `github.ref` or `github.event.pull_request.number`, all action types
+  resolve to the same concurrency group for a given PR.
+
+  GitHub's concurrency model allows at most one running and one pending run per group.
+  With `cancel-in-progress: true`, any new run in the group cancels the currently
+  running one — regardless of the action type.
+
+  **Consequence:** When a developer pushes code (synchronize) AND then immediately
+  labels the PR (labeled), the `labeled` event creates a new run in the same concurrency
+  group that cancels the still-running CI from the `synchronize` event. The PR's status
+  checks end up in "Cancelled" state even though the code was unchanged by the labeling.
+
+  Similarly, assigning a reviewer (`review_requested`), assigning a user (`assigned`),
+  or adding a label all trigger the workflow and cancel in-progress CI — even though
+  none of these actions change any code.
+
+  This is a particularly insidious pattern because:
+  - The cancellation is silent — the developer sees a "Cancelled" CI run but may not
+    realize a non-code event caused it.
+  - The pull_request event payload for all types includes `pull_request.number`, so
+    they always share the same PR-number-based concurrency key.
+  - Adding `if: github.event.action == 'synchronize'` inside jobs still starts a run
+    (consuming the concurrency slot) even if all jobs are skipped.
+
+  Real-world fix: DataDog/datadog-agent#51212 (May 2026) added explicit concurrency
+  groups to label-triggered workflows to decouple them from CI-triggered runs.
+  facebook/lexical#8494 fixed the pattern by including `github.event_name` and
+  `github.event.action` in the concurrency group.
+fix: |
+  Include `github.event.action` in the concurrency group key so that non-synchronize
+  events occupy their own independent concurrency slot, not the CI slot:
+
+    group: >-
+      ${{ github.workflow }}-${{ github.event.pull_request.number }}-
+      ${{ github.event.action == 'synchronize' && 'ci' || github.event.action }}
+
+  Alternatively — the cleanest approach — split CI into its own dedicated workflow
+  file that only listens to `synchronize` and `opened`. Put all labeling, assignment,
+  and automation responses in separate workflow files with their own concurrency
+  namespaces. This prevents any labeling or review-request event from ever touching
+  the CI concurrency group.
+
+  If the multi-type single workflow is required, use a per-action concurrency group:
+
+    group: ${{ github.workflow }}-${{ github.event.pull_request.number }}-${{ github.event.action }}
+    cancel-in-progress: ${{ github.event.action == 'synchronize' }}
+
+  This allows CI from synchronize to cancel stale runs (desired), while labeling and
+  assignment runs queue independently without cancelling each other or CI.
+fix_code:
+  - language: yaml
+    label: 'Broken: label event cancels in-progress CI run'
+    code: |
+      on:
+        pull_request:
+          types: [opened, synchronize, labeled, review_requested, assigned]
+
+      concurrency:
+        group: ci-${{ github.event.pull_request.number }}
+        cancel-in-progress: true   # ← labeled event cancels running synchronize CI!
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+  - language: yaml
+    label: 'Fixed: include event.action in concurrency group'
+    code: |
+      on:
+        pull_request:
+          types: [opened, synchronize, labeled, review_requested, assigned]
+
+      concurrency:
+        # Each action type gets its own concurrency slot — labeling never cancels CI
+        group: ${{ github.workflow }}-${{ github.event.pull_request.number }}-${{ github.event.action }}
+        cancel-in-progress: ${{ github.event.action == 'synchronize' }}
+        # cancel-in-progress=true only for synchronize (new commit cancels stale CI)
+        # cancel-in-progress=false for all other actions (don't queue up or cancel each other)
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+  - language: yaml
+    label: 'Best practice: separate CI workflow from automation workflow'
+    code: |
+      # .github/workflows/ci.yml — only triggered by code changes
+      on:
+        pull_request:
+          types: [opened, synchronize, reopened]
+
+      concurrency:
+        group: ci-${{ github.event.pull_request.number }}
+        cancel-in-progress: true  # stale CI from old commits is safely cancelled
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+
+      # .github/workflows/pr-automation.yml — non-code PR events
+      on:
+        pull_request:
+          types: [labeled, review_requested, assigned]
+
+      concurrency:
+        group: automation-${{ github.event.pull_request.number }}-${{ github.event.action }}
+        cancel-in-progress: false  # no code run in progress; never cancel CI
+
+      jobs:
+        handle-label:
+          if: ${{ github.event.action == 'labeled' }}
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Label ${{ github.event.label.name }} added to PR"
+prevention:
+  - "Audit every workflow that handles multiple pull_request action types — verify no non-synchronize type shares the CI concurrency group."
+  - "Include `${{ github.event.action }}` in concurrency group keys for multi-type pull_request workflows to prevent cross-action cancellations."
+  - "Prefer separate workflow files for CI (synchronize/opened) vs PR automation (labeled, assigned, review_requested)."
+  - "Set `cancel-in-progress: ${{ github.event.action == 'synchronize' }}` to only cancel stale code-change runs, not automation runs."
+  - "When debugging unexpected CI cancellations, filter the Actions tab by event trigger to spot if a non-synchronize event was the cancelling run."
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs'
+    label: 'GitHub Docs — Control the concurrency of workflows and jobs'
+  - url: 'https://github.com/DataDog/datadog-agent/pull/51212'
+    label: 'DataDog/datadog-agent#51212 — add concurrency groups to label-triggered workflows (May 2026)'
+  - url: 'https://github.com/facebook/lexical/pull/8494'
+    label: 'facebook/lexical#8494 — scope concurrency to synchronize events only, prevent label cancelling CI'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request'
+    label: 'GitHub Docs — pull_request event types'

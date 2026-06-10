@@ -1,0 +1,148 @@
+id: silent-failures-196
+title: "Unknown on: release types String Silently Ignored — Workflow Never Fires"
+category: silent-failures
+severity: silent-failure
+tags:
+  - release
+  - event-types
+  - typo
+  - silent-failure
+  - never-triggers
+  - published
+  - prereleased
+patterns:
+  - regex: 'on:\s+release:\s+types:.*\bpublish\b'
+    flags: 'si'
+  - regex: 'types:\s*\[\s*["\']?publish["\']?\s*\]'
+    flags: 'i'
+  - regex: 'release.*types:.*(?:publish|pre-release|pre_release|unpublish|release)\b'
+    flags: 'si'
+error_messages:
+  - "Workflow configured with release types: [publish] but never triggers on release publication"
+  - "No workflow runs visible after publishing a release"
+  - "Release published but downstream workflow never started"
+root_cause: |
+  GitHub Actions silently ignores unknown or misspelled event type strings in the `types:`
+  filter. There is no validation error, no warning annotation, and the workflow is listed
+  as active in the UI — it simply never fires because no GitHub event matches the
+  unrecognised type name.
+
+  The most common typo is `publish` instead of the correct `published`:
+
+    on:
+      release:
+        types: [publish]   # ← WRONG — this type does not exist
+
+  Valid `release` event types are:
+  - `published`     — fires when a release is published (or promoted from pre-release to release)
+  - `unpublished`   — fires when a release is unpublished
+  - `created`       — fires when a draft release is created (NOT the same as published!)
+  - `edited`        — fires when a release is edited
+  - `deleted`       — fires when a release is deleted
+  - `prereleased`   — fires when a release is marked as a pre-release
+  - `released`      — fires when a release is marked as released (separate from published)
+
+  Other common typos and near-misses:
+  - `pre-release`    → correct: `prereleased`
+  - `pre_release`    → correct: `prereleased`
+  - `unpublish`      → correct: `unpublished`
+  - `release`        → correct: `released` (or `published`, depending on intent)
+  - `release:created` (as a type string) → invalid syntax
+
+  An additional silent failure: `created` fires for draft releases (when you save a
+  draft for the first time), NOT when a release is published. Many developers use
+  `types: [created]` expecting it to fire on publication, but it fires only on initial
+  draft creation. The `published` type fires when the release is made public.
+
+  Real-world source: microsoft/wassette#394 — downstream publish workflow used
+  `types: [publish]` instead of `[published]` and never fired; only discovered after
+  debugging why the workflow wasn't running after releases.
+fix: |
+  Use the correct, case-sensitive event type string. For most "run on release" use cases:
+
+    on:
+      release:
+        types: [published]   # fires when a release is made public
+
+  For a pre-release pipeline that must fire for pre-releases AND full releases:
+
+    on:
+      release:
+        types: [published, prereleased]
+
+  After updating the type string, verify the fix by publishing a test release (or
+  pre-release) and confirming the workflow appears in the Actions tab within ~30 seconds.
+fix_code:
+  - language: yaml
+    label: 'Wrong: types: [publish] — unknown type, workflow never fires'
+    code: |
+      on:
+        release:
+          types: [publish]   # ← misspelled — should be 'published'
+
+      jobs:
+        publish-to-registry:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm publish  # This job never runs after a GitHub Release is published
+  - language: yaml
+    label: 'Correct: types: [published] — fires when a release is made public'
+    code: |
+      on:
+        release:
+          types: [published]   # ← correct: fires when the release is made public
+
+      jobs:
+        publish-to-registry:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: |
+                echo "Release: ${{ github.event.release.tag_name }}"
+                echo "Pre-release: ${{ github.event.release.prerelease }}"
+                npm publish
+  - language: yaml
+    label: 'Pre-release and full release pipeline'
+    code: |
+      on:
+        release:
+          types: [published, prereleased]   # fires for both pre-releases and releases
+
+      jobs:
+        publish:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Publish pre-release to beta channel
+              if: ${{ github.event.release.prerelease }}
+              run: npm publish --tag beta
+
+            - name: Publish stable release
+              if: ${{ !github.event.release.prerelease }}
+              run: npm publish --tag latest
+  - language: yaml
+    label: 'Common mistake: types: [created] fires on draft creation, not publication'
+    code: |
+      # WRONG for "run on publish" use cases — created fires when a DRAFT is first saved
+      on:
+        release:
+          types: [created]   # fires on draft creation, NOT on publish!
+
+      # CORRECT for "run on publish" use cases
+      on:
+        release:
+          types: [published]   # fires when the release is made public
+prevention:
+  - "Use `types: [published]` (not `publish`, `release`, or `created`) when the goal is to trigger on release publication."
+  - "Remember: `types: [created]` fires when a draft is first saved, NOT when published — use `published` for publish-time pipelines."
+  - "GitHub does not validate or warn about unknown `types:` strings — always test the trigger by publishing a real (or test) release."
+  - "Run `actionlint` on your workflows to catch invalid event type strings before they silently fail in production."
+  - "When a workflow doesn't fire after a release, check the workflow's `types:` filter first — a misspelled type is the most common cause."
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#release'
+    label: 'GitHub Docs — release event: valid types (published, prereleased, created, etc.)'
+  - url: 'https://github.com/microsoft/wassette/issues/394'
+    label: 'microsoft/wassette#394 — workflow used types: [publish] instead of [published], never fired'
+  - url: 'https://github.com/rhysd/actionlint'
+    label: 'actionlint — static checker for GitHub Actions workflow files (catches invalid event types)'
