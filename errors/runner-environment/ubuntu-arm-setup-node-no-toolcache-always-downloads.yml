@@ -1,0 +1,102 @@
+id: runner-environment-415
+title: '`ubuntu-24.04-arm` / `ubuntu-22.04-arm` — `setup-node` always downloads Node.js because ARM images have no pre-cached toolcache'
+category: runner-environment
+severity: warning
+tags:
+  - setup-node
+  - ubuntu-24.04-arm
+  - ubuntu-22.04-arm
+  - arm64
+  - toolcache
+  - node-version
+  - runner-image
+  - performance
+patterns:
+  - regex: 'Acquiring \d+\.\d+\.\d+ - arm64 from https://github\.com/actions/node-versions'
+    flags: 'i'
+  - regex: 'Adding to the cache \.\.\.$'
+    flags: 'i'
+  - regex: 'setup-node.*ubuntu-24\.04-arm|ubuntu-24\.04-arm.*setup-node'
+    flags: 'i'
+error_messages:
+  - 'Attempting to download 22...'
+  - 'Acquiring 22.13.1 - arm64 from https://github.com/actions/node-versions/releases/download/22.13.1-12900459766/node-22.13.1-linux-arm64.tar.gz'
+  - 'Adding to the cache ...'
+root_cause: |
+  The `ubuntu-24.04-arm` and `ubuntu-22.04-arm` GitHub-hosted runner images do not
+  pre-cache any Node.js versions in the toolcache directory. This is in contrast to
+  their amd64 equivalents (`ubuntu-24.04`, `ubuntu-22.04`) which pre-install several
+  LTS Node.js versions and serve them instantly from `/opt/hostedtoolcache/node/`.
+
+  As a result, every `actions/setup-node` invocation on ARM images downloads the
+  requested version from GitHub's CDN (https://github.com/actions/node-versions/),
+  triggers `Adding to the cache ...`, and takes 4–10 seconds instead of the sub-second
+  cache hit expected from parity with amd64 images.
+
+  A secondary consequence is **version divergence**: because ARM images download the
+  latest matching patch version at job runtime rather than serving a pinned cached
+  version, the installed Node.js may differ from what amd64 runners install.
+
+  Example divergence (May 2026): `ubuntu-24.04` served Node.js 24.15.0 from cache
+  while `ubuntu-24.04-arm` downloaded and installed 24.16.0. Node.js 24.16.0 contained
+  an incompatibility that broke tests on ARM while the same workflow succeeded on amd64.
+
+  This issue was reported in runner-images#14093 (February 2025) and remains open as of
+  June 2026. The ARM images were previously maintained by Arm Limited via
+  `actions/partner-runner-images` and have now transitioned to GitHub ownership
+  (announced May 14, 2026), but the toolcache gap has not yet been resolved.
+fix: |
+  1. **Pin the exact Node.js version** to avoid runtime patch differences between
+     architectures. Use `node-version: '22.13.1'` instead of `node-version: '22'` when
+     cross-architecture consistency matters.
+
+  2. **Use the `cache` input** on `actions/setup-node` so that the downloaded Node.js
+     package files are at least cached via the Actions cache backend across runs:
+
+     ```yaml
+     - uses: actions/setup-node@v6
+       with:
+         node-version: '22'
+         cache: 'npm'   # caches npm deps; Node.js binary itself still re-downloaded
+     ```
+
+  3. **Restrict version ranges** with `node-version-file: .node-version` pointing to an
+     exact pinned version so both amd64 and arm64 runners install the same semver.
+
+  4. **Use a self-hosted ARM runner** with a pre-populated toolcache if setup time is
+     critical — self-hosted runners retain their toolcache between jobs.
+
+  5. Monitor runner-images#14093 for when GitHub adds pre-cached Node.js to ARM images.
+fix_code:
+  - language: yaml
+    label: 'Pin exact Node.js version to prevent amd64/arm64 version divergence'
+    code: |
+      jobs:
+        build:
+          runs-on: ${{ matrix.os }}
+          strategy:
+            matrix:
+              os: [ubuntu-24.04, ubuntu-24.04-arm]
+          steps:
+            - uses: actions/checkout@v6
+            - uses: actions/setup-node@v6
+              with:
+                # Pin exact version to guarantee same binary on both amd64 and arm64.
+                # ubuntu-24.04-arm has no toolcache — it downloads from CDN every run.
+                node-version: '22.15.0'
+            - run: node --version
+prevention:
+  - 'Do not assume toolcache parity between ubuntu-24.04 and ubuntu-24.04-arm; ARM images have no pre-cached Node.js.'
+  - 'Pin exact Node.js patch versions in matrix workflows that span amd64 and arm64 runners.'
+  - 'Watch runner-images#14093 and the actions/runner-images announcement issues for when ARM toolcache parity is added.'
+  - 'If you see setup-node taking 4–10 seconds on ARM while taking <1 second on amd64, the toolcache miss is expected until GitHub resolves this.'
+  - 'After the ubuntu-*-arm image ownership transitioned to GitHub (May 2026), open issues should be tracked in actions/runner-images rather than actions/partner-runner-images.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14093'
+    label: 'runner-images#14093 — ubuntu-24.04-arm cache does not work with actions/setup-node@v4 (Feb 2025, open Jun 2026)'
+  - url: 'https://github.com/actions/setup-node/issues/1333'
+    label: 'setup-node#1333 — [Performance] setup-node becomes slow on ubuntu-24.04-arm (Jul 2025)'
+  - url: 'https://github.blog/changelog/2026-05-14-github-actions-upcoming-image-migrations/'
+    label: 'GitHub Changelog: Arm64 runner images now maintained by GitHub (May 14, 2026)'
+  - url: 'https://github.com/actions/partner-runner-images/blob/main/images/arm-ubuntu-24-image.md'
+    label: 'ubuntu-24.04-arm image README — Node.js toolcache not listed as pre-cached'
