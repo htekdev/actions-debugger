@@ -1,0 +1,177 @@
+id: concurrency-timing-090
+title: 'Bot comment triggers same workflow via issue_comment event — cancel-in-progress kills the primary run'
+category: concurrency-timing
+severity: error
+tags:
+  - concurrency
+  - cancel-in-progress
+  - issue-comment
+  - bot-actor
+  - self-cancellation
+  - github-actions-bot
+  - workflow-dispatch
+patterns:
+  - regex: 'cancel-in-progress:\s*true'
+    flags: 'i'
+  - regex: 'on:\s*issue_comment'
+    flags: 'si'
+  - regex: 'github\.actor.*\[bot\]|actor.*contains.*\[bot\]'
+    flags: 'i'
+error_messages:
+  - 'The operation was canceled.'
+  - 'This run was cancelled.'
+  - 'Run cancelled by a newer queued run'
+root_cause: |
+  When a GitHub Actions workflow is triggered by `on: issue_comment` (or
+  `on: pull_request_review_comment`) AND uses a static or semi-static concurrency group
+  (e.g., `group: ${{ github.workflow }}-${{ github.event.issue.number }}`)
+  with `cancel-in-progress: true`, the following self-cancellation footgun can occur:
+
+  1. A real user action (push, comment, dispatch) triggers the workflow — call it "Run A".
+  2. Run A executes a step that posts a comment via `actions/github-script` or
+     `peter-evans/create-or-update-comment` using a GitHub App token or the default
+     GITHUB_TOKEN.
+  3. The bot comment fires an `issue_comment: created` event on the repository.
+  4. GitHub evaluates the `on: issue_comment` trigger and creates "Run B" for the same
+     workflow (the event matches the trigger).
+  5. Run B is assigned to the same concurrency group as Run A.
+  6. With `cancel-in-progress: true`, GitHub cancels Run A (the currently running job) to
+     make room for Run B (the newly pending run).
+  7. Run B starts but often exits quickly (no meaningful work to do since the comment is
+     from a bot, not a user), leaving the primary workflow half-finished.
+
+  This creates a loop: every time the workflow posts a comment, it cancels itself.
+
+  The root cause is that `cancel-in-progress: true` applies to ALL actors — there is no
+  built-in exemption for bot-triggered runs. The concurrency group treats a bot comment
+  trigger identically to a human-triggered run.
+
+  Common workflows affected:
+  - PR automation bots that post status comments and also listen to issue_comment
+  - Slash command dispatchers (e.g., /deploy, /run-tests) that run and post a reply
+  - CI workflows that both post check status comments AND are triggered by PR comments
+
+  Sources:
+  - github/gh-aw#21975 (Mar 2026) — identified in gh-aw agentic workflows
+  - github/orgs/community/discussions (multiple reports of unexpected cancel)
+  - Workaround documented in GitHub Actions docs for cancel-in-progress expressions
+fix: |
+  Use a conditional `cancel-in-progress` expression that evaluates to `false` when the
+  actor is a bot. This prevents bot-triggered runs from cancelling the primary run while
+  still serializing real user-triggered runs:
+
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event.issue.number || github.run_id }}
+      cancel-in-progress: ${{ !contains(github.actor, '[bot]') }}
+
+  The `!contains(github.actor, '[bot]')` expression returns `false` for any actor whose
+  username ends with `[bot]` (GitHub App installation actors, Dependabot, Copilot, etc.),
+  preventing those runs from cancelling in-progress primary runs.
+
+  Alternative: use `github.actor_id` for more precise bot detection:
+
+    cancel-in-progress: ${{ github.triggering_actor != 'github-actions[bot]' &&
+                             github.triggering_actor != 'dependabot[bot]' }}
+
+  Alternative: run the issue_comment-triggered workflow in a separate concurrency group
+  from the main workflow so they don't compete:
+
+    # Separate the "human dispatch" group from the "bot cleanup" group:
+    concurrency:
+      group: >-
+        ${{ github.workflow }}-
+        ${{ github.event.issue.number }}-
+        ${{ contains(github.actor, '[bot]') && 'bot' || 'human' }}
+      cancel-in-progress: true
+fix_code:
+  - language: yaml
+    label: 'Conditional cancel-in-progress — bots never cancel primary runs'
+    code: |
+      on:
+        issue_comment:
+          types: [created]
+
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.event.issue.number }}
+        cancel-in-progress: ${{ !contains(github.actor, '[bot]') }}
+        # Result:
+        #   Human triggers: cancel-in-progress=true (new human run cancels old human run)
+        #   Bot triggers:   cancel-in-progress=false (bot run queues; primary run continues)
+
+      jobs:
+        handle-comment:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Check for slash command
+              run: |
+                echo "Triggered by: ${{ github.actor }}"
+                if [[ "${{ github.event.comment.body }}" == "/deploy"* ]]; then
+                  echo "Deploying..."
+                fi
+
+            - name: Post status comment
+              uses: actions/github-script@v7
+              with:
+                script: |
+                  // This comment posts as github-actions[bot] — the [bot] check above
+                  // ensures this new issue_comment event does NOT cancel this run.
+                  await github.rest.issues.createComment({
+                    issue_number: context.issue.number,
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    body: '✅ Deploy started!'
+                  })
+
+  - language: yaml
+    label: 'Separate concurrency groups for human vs bot triggers'
+    code: |
+      on:
+        issue_comment:
+          types: [created]
+
+      concurrency:
+        group: >-
+          ${{ github.workflow }}-${{ github.event.issue.number }}-
+          ${{ contains(github.actor, '[bot]') && 'bot' || 'human' }}
+        cancel-in-progress: true
+        # Bot runs compete only with other bot runs (same -bot group)
+        # Human runs compete only with other human runs (same -human group)
+        # A bot run NEVER cancels a human-triggered run
+
+      jobs:
+        dispatch:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Actor ${{ github.actor }} — group suffix ${{ contains(github.actor, '[bot]') && 'bot' || 'human' }}"
+
+  - language: yaml
+    label: 'Skip workflow entirely when triggered by a bot (most conservative approach)'
+    code: |
+      on:
+        issue_comment:
+          types: [created]
+
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.event.issue.number }}
+        cancel-in-progress: true
+
+      jobs:
+        dispatch:
+          # Skip the entire job if a bot posted the comment
+          if: ${{ !contains(github.actor, '[bot]') }}
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Processing slash command from human actor ${{ github.actor }}"
+
+prevention:
+  - 'Whenever a workflow uses `cancel-in-progress: true` AND also posts comments via GITHUB_TOKEN, always add the `${{ !contains(github.actor, "[bot]") }}` guard to cancel-in-progress.'
+  - 'Audit workflows that trigger on `issue_comment` with a static concurrency group — any workflow that posts comments is at risk of self-cancellation.'
+  - 'Use a dedicated GitHub App token (not GITHUB_TOKEN) for bot comments if you need precise actor control in concurrency expressions.'
+  - 'Prefer posting comments from a separate "cleanup" job that runs after the main concurrency group releases its slot, rather than mid-run.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency'
+    label: 'Using concurrency — cancel-in-progress expressions'
+  - url: 'https://github.com/github/gh-aw/issues/21975'
+    label: 'gh-aw#21975 — self-cancellation footgun when workflow posts comments with cancel-in-progress: true (Mar 2026)'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions#using-concurrency-to-prevent-reentrant-workflows'
+    label: 'Security hardening — using concurrency to prevent re-entrant workflows'

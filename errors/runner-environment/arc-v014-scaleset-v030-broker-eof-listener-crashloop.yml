@@ -1,0 +1,157 @@
+id: runner-environment-400
+title: 'ARC v0.14.1 listener pods crash-loop on broker EOF — scaleset v0.3.0 treats EOF as fatal'
+category: runner-environment
+severity: error
+tags:
+  - arc
+  - actions-runner-controller
+  - kubernetes
+  - listener
+  - broker
+  - eof
+  - crash-loop
+  - scaleset
+  - self-hosted
+patterns:
+  - regex: 'failed to get next message.*actions error.*StatusCode 200.*EOF'
+    flags: 'i'
+  - regex: 'failed to decode runner scale set message response.*EOF'
+    flags: 'i'
+  - regex: 'Listener pod is terminated.*reason.*Error'
+    flags: 'i'
+  - regex: 'scaleset@v0\.3\.'
+    flags: 'i'
+error_messages:
+  - 'Application returned an error: failed to get message: failed to get next message: actions error: StatusCode 200, AcivityId "": EOF'
+  - 'failed to get next message: request GET https://broker.actions.githubusercontent.com/scalesets/message?lastMessageId=... failed(status="200 OK", ...): failed to parse message response: failed to decode runner scale set message response: EOF: unknown error'
+  - 'Listener pod is terminated  {"reason": "Error", "message": ""}'
+root_cause: |
+  In ARC (Actions Runner Controller) v0.14.1, the `scaleset` library was upgraded from
+  v0.2.0 to v0.3.0. The v0.3.0 "Restore job acquisition flow" change altered how the
+  listener process handles EOF responses from the GitHub Actions broker service at
+  `broker.actions.githubusercontent.com/scalesets/message`.
+
+  The broker endpoint is a long-poll HTTP request (up to ~50 seconds). An EOF on this
+  long-poll connection is a normal, transient network event — the connection times out,
+  the load balancer resets the TCP connection, or a brief network interruption occurs.
+
+  In `scaleset` v0.2.0 (ARC v0.14.0 and earlier), an EOF response was treated as a
+  recoverable error and the listener would retry. In `scaleset` v0.3.0 (ARC v0.14.1+),
+  an EOF from the broker causes the listener process to exit with a non-zero status code.
+
+  When the listener pod exits with an error, the ARC controller immediately recreates it.
+  The new listener pod connects to the broker, receives another EOF on the long-poll, and
+  exits again — producing a continuous crash-loop that prevents ANY jobs from being
+  dispatched across all scale sets managed by this controller.
+
+  Impact scope: all `AutoscalingRunnerSet` resources managed by the controller enter a
+  permanently non-functional state. Jobs remain queued indefinitely with no runners
+  picking them up.
+
+  Note: `scaleset` v0.4.0 does NOT fix this regression — it addresses a different
+  (message ordering) issue. The EOF-on-exit regression persists through v0.4.0.
+
+  GitHub rolled out a partial server-side mitigation for the most common EOF cause, but
+  infrastructure-triggered EOFs (NAT timeouts, proxy resets, network policy interruptions)
+  can still reproduce the crash-loop.
+
+  Sources:
+  - actions/actions-runner-controller#4488 (May 2026, crash-loop after v0.14.1 upgrade)
+  - actions/actions-runner-controller#4470 (Apr/May 2026, 10-15 min queued + listener restart)
+  - actions/actions-runner-controller#4356 (Jan 2026, listener restart loop on EOF)
+  - actions/actions-runner-controller#4285 (Oct 2025, AutoscalingListener EOF stop accepting jobs)
+fix: |
+  Option 1 — Downgrade to ARC v0.14.0 (pinned to scaleset v0.2.0):
+
+    helm upgrade gha-runner-scale-set-controller \
+      oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller \
+      --version 0.14.0
+
+  Option 2 — Upgrade to ARC v0.14.2+ once released with the EOF retry fix applied to
+  scaleset library.
+
+  Option 3 — Patch the Kubernetes NetworkPolicy or proxy configuration to prevent
+  premature TCP resets on the long-poll connection. The broker endpoint uses connections
+  up to ~50s; NAT gateways with idle timeout < 60s cause frequent EOFs:
+    - Increase idle timeout on NAT gateways, cloud load balancers, and proxies to 90s+
+    - Ensure `broker.actions.githubusercontent.com` is not routed through a proxy that
+      resets long-lived connections
+
+  Option 4 — Set listener pod restart policy with exponential backoff to reduce the
+  thundering herd of simultaneous restarts:
+
+    # In controller values.yaml
+    listenerPodSpec:
+      containers:
+        - name: listener
+          # The restart delay won't fix the root cause but reduces log noise
+          # and ARC API pressure during sustained EOF periods.
+fix_code:
+  - language: yaml
+    label: 'Downgrade ARC controller to v0.14.0 in HelmRelease'
+    code: |
+      # Flux HelmRelease or equivalent
+      apiVersion: helm.toolkit.fluxcd.io/v2beta1
+      kind: HelmRelease
+      metadata:
+        name: gha-runner-scale-set-controller
+        namespace: arc-systems
+      spec:
+        chart:
+          spec:
+            chart: gha-runner-scale-set-controller
+            version: "0.14.0"   # Pin to v0.14.0 (scaleset v0.2.0, EOF is retried not fatal)
+            sourceRef:
+              kind: HelmRepository
+              name: actions-runner-controller
+
+  - language: yaml
+    label: 'Increase NAT/proxy idle timeout via AWS EKS node group annotation (example)'
+    code: |
+      # For EKS clusters: ensure NAT gateway idle timeout >= 90s
+      # NAT gateway idle timeout defaults to 350s for TCP — usually fine.
+      # Check for intermediate proxies:
+      #
+      # kubectl get configmap -n kube-system aws-auth -o yaml | grep -i proxy
+      #
+      # If using a corporate proxy or service mesh, add broker.actions.githubusercontent.com
+      # to the no-proxy list so long-poll connections are not terminated early:
+      #
+      # In runner scale set values:
+      env:
+        - name: NO_PROXY
+          value: "broker.actions.githubusercontent.com,*.actions.githubusercontent.com"
+        - name: HTTPS_PROXY
+          value: ""  # Bypass proxy for GitHub Actions broker
+
+  - language: bash
+    label: 'Verify scaleset version in use and confirm crash-loop is this issue'
+    code: |
+      # Check which scaleset version the listener is using:
+      kubectl logs -n arc-systems \
+        $(kubectl get pods -n arc-systems -l app.kubernetes.io/component=listener \
+          -o jsonpath='{.items[0].metadata.name}') \
+        --tail=50 | grep -E "scaleset@|failed to get|EOF"
+
+      # If you see scaleset@v0.3.x and EOF errors — this is the issue.
+      # Expected output:
+      # level=INFO source=github.com/actions/scaleset@v0.3.0/listener/listener.go
+      # Application returned an error: ... EOF
+
+prevention:
+  - 'Before upgrading ARC, check the scaleset library version in the controller image changelog — a major scaleset bump may introduce EOF handling regressions.'
+  - 'Pin ARC controller Helm chart to a specific version in production and test upgrades in a staging cluster first.'
+  - 'Monitor listener pod restart count with a Kubernetes alert: if the listener pod restarts more than 3 times in 5 minutes, page on-call.'
+  - 'Ensure NAT gateway, cloud load balancer, and any intermediate proxy idle TCP timeout is ≥90 seconds for connections to *.actions.githubusercontent.com.'
+  - 'Track actions/actions-runner-controller releases for scaleset v0.3.x EOF fix; upgrade promptly once released.'
+docs:
+  - url: 'https://github.com/actions/actions-runner-controller/issues/4488'
+    label: 'ARC#4488 — Listener pods crash-loop after upgrading to ARC v0.14.1 (scaleset v0.3.0 EOF fatal exit, May 2026)'
+  - url: 'https://github.com/actions/actions-runner-controller/issues/4470'
+    label: 'ARC#4470 — Jobs queued 10-15 min, listener intermittently restarting (EOF/scaling regression, Apr 2026)'
+  - url: 'https://github.com/actions/actions-runner-controller/issues/4356'
+    label: 'ARC#4356 — Listener restart loop: StatusCode 200 EOF (Jan 2026)'
+  - url: 'https://github.com/actions/actions-runner-controller/issues/4285'
+    label: 'ARC#4285 — AutoscalingListener stops accepting jobs, EOF loop (Oct 2025)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners-with-actions-runner-controller/troubleshooting-actions-runner-controller-errors'
+    label: 'ARC Troubleshooting Guide — GitHub Docs'

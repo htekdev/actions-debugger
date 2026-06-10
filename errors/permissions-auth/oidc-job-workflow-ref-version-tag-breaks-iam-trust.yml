@@ -1,0 +1,194 @@
+id: permissions-auth-099
+title: 'OIDC job_workflow_ref claim includes reusable workflow version tag — IAM trust policy breaks after version bump'
+category: permissions-auth
+severity: error
+tags:
+  - oidc
+  - job-workflow-ref
+  - reusable-workflow
+  - iam-trust-policy
+  - aws
+  - gcp
+  - azure
+  - version-bump
+  - breaking-change
+patterns:
+  - regex: 'Not authorized to perform sts:AssumeRoleWithWebIdentity'
+    flags: 'i'
+  - regex: 'AADSTS70021.*job_workflow_ref'
+    flags: 'i'
+  - regex: 'job_workflow_ref.*@refs/tags/v\d+'
+    flags: 'i'
+  - regex: 'Error: Not authorized to perform sts:AssumeRoleWithWebIdentity'
+    flags: 'i'
+error_messages:
+  - 'Error: Not authorized to perform sts:AssumeRoleWithWebIdentity'
+  - 'AADSTS70021: No matching federated identity record found for presented assertion subject'
+  - 'Error: google-github-actions/auth failed with: Permission denied on resource'
+root_cause: |
+  GitHub Actions OIDC tokens include a `job_workflow_ref` claim that identifies the
+  reusable workflow being executed, including its exact ref. The format is:
+
+    repo:org/terraform.actions/.github/workflows/plan.yml@refs/tags/v2.1.0
+
+  When configuring cloud IAM trust policies (AWS IAM, Azure Entra federated credentials,
+  Google Cloud Workload Identity), developers often add a condition on `job_workflow_ref`
+  to restrict which callers can assume a role. For example in AWS:
+
+    "Condition": {
+      "StringLike": {
+        "token.actions.githubusercontent.com:job_workflow_ref":
+          "org/infra/.github/workflows/deploy.yml@refs/tags/v2.*"
+      }
+    }
+
+  This trust policy works as long as the reusable workflow stays on a v2.x tag. When the
+  reusable workflow is released as v3.0.0 and callers are updated to `uses: ...@v3`, the
+  `job_workflow_ref` claim in the OIDC token changes to:
+
+    repo:org/terraform.actions/.github/workflows/plan.yml@refs/tags/v3.0.0
+
+  The new `job_workflow_ref` no longer matches `...@refs/tags/v2.*`, so the cloud provider
+  rejects the OIDC token with an authorization error — even though the workflow code itself
+  is unchanged and permissions are correct.
+
+  This is commonly triggered by:
+  - Bumping a shared internal reusable workflow from v2 to v3 (semantic versioning)
+  - Using Dependabot to auto-update reusable workflow tags — Dependabot updates the
+    `uses:` ref in callers, which changes the `job_workflow_ref` claim immediately
+  - Migrating from SHA pinning to tag pinning in calling workflows
+
+  The failure is silent until deployment — the workflow runs fine in development
+  (where the trust policy allows v2.*) and breaks in production only after the merge.
+
+  Sources:
+  - aws-actions/configure-aws-credentials#1707 (Mar 2026) — documented root cause after
+    apparent v5→v6 regression that was actually a co-located v2→v3 workflow version bump
+  - aws-actions/configure-aws-credentials#639 — cross-repo token reads GITHUB_TOKEN first
+fix: |
+  Option 1 — Use a wildcard that spans major versions in the trust policy condition:
+
+    # Allow any version of the reusable workflow:
+    "StringLike": {
+      "token.actions.githubusercontent.com:job_workflow_ref":
+        "org/infra/.github/workflows/deploy.yml@*"
+    }
+
+  Option 2 — Allow multiple version ranges by using StringLike with an array:
+
+    "StringLike": {
+      "token.actions.githubusercontent.com:job_workflow_ref": [
+        "org/infra/.github/workflows/deploy.yml@refs/tags/v2.*",
+        "org/infra/.github/workflows/deploy.yml@refs/tags/v3.*"
+      ]
+    }
+
+  Option 3 — Use the `ref` claim instead of `job_workflow_ref` if branch-level access
+  is sufficient (note: `ref` is the caller workflow's ref, not the called workflow's):
+
+    "StringEquals": {
+      "token.actions.githubusercontent.com:ref": "refs/heads/main"
+    }
+
+  Option 4 — Use `job_workflow_ref` without version pinning and rely on the `repository`
+  or `sub` claim for sufficient restriction:
+
+    # Restrict to the caller repo + specific environment, not the called workflow version:
+    "StringEquals": {
+      "token.actions.githubusercontent.com:sub":
+        "repo:org/my-app:environment:production"
+    }
+
+  Before bumping reusable workflow versions, audit all cloud trust policies that reference
+  `job_workflow_ref` with a version-pinned pattern to identify which roles will break.
+fix_code:
+  - language: json
+    label: 'AWS IAM trust policy — wildcard job_workflow_ref (version-agnostic)'
+    code: |
+      {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+            },
+            "Action": "sts:AssumeRoleWithWebIdentity",
+            "Condition": {
+              "StringEquals": {
+                "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+              },
+              "StringLike": {
+                "token.actions.githubusercontent.com:job_workflow_ref":
+                  "org/infra/.github/workflows/deploy.yml@*"
+                  // Use @* to allow any version/branch of the reusable workflow.
+                  // Restrict to the caller via 'sub' claim instead if needed:
+                  // "token.actions.githubusercontent.com:sub": "repo:org/my-app:environment:production"
+              }
+            }
+          }
+        ]
+      }
+
+  - language: json
+    label: 'AWS IAM trust policy — allow multiple major versions'
+    code: |
+      {
+        "Condition": {
+          "StringEquals": {
+            "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+          },
+          "StringLike": {
+            "token.actions.githubusercontent.com:job_workflow_ref": [
+              "org/infra/.github/workflows/deploy.yml@refs/tags/v2.*",
+              "org/infra/.github/workflows/deploy.yml@refs/tags/v3.*"
+            ]
+          }
+        }
+      }
+
+  - language: yaml
+    label: 'Print OIDC token claims for debugging (add as first step in failing job)'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          permissions:
+            id-token: write
+            contents: read
+          steps:
+            # Add this step TEMPORARILY to debug claim values
+            - name: Print OIDC token claims (debug only — remove before merge)
+              run: |
+                TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+                  "$ACTIONS_ID_TOKEN_REQUEST_URL" | jq -r '.value')
+                echo "$TOKEN" | cut -d'.' -f2 | base64 -d 2>/dev/null | jq '{
+                  sub,
+                  job_workflow_ref,
+                  ref,
+                  repository,
+                  environment
+                }'
+                # Look for job_workflow_ref value — must match your trust policy condition
+
+            - name: Configure AWS credentials
+              uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-to-assume: arn:aws:iam::123456789012:role/my-deploy-role
+                aws-region: us-east-1
+
+prevention:
+  - 'When publishing a new major version of a shared reusable workflow, update all cloud trust policies that reference job_workflow_ref with the old version before merging.'
+  - 'Prefer using `@*` wildcard for job_workflow_ref in trust policies and rely on caller-side restrictions (sub, repository, environment) for authorization boundaries.'
+  - 'Add a CI step that prints OIDC token claims in non-production environments — this makes version changes visible before they break prod trust policies.'
+  - 'Document all IAM roles that depend on job_workflow_ref in the reusable workflow repository (e.g., in SECURITY.md or a TRUST_POLICIES.md) so maintainers know what to update on version bumps.'
+  - 'When using Dependabot to auto-update reusable workflow refs, add a pre-merge check that validates cloud trust policies still match the new job_workflow_ref value.'
+docs:
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/using-openid-connect-with-reusable-workflows'
+    label: 'Using OpenID Connect with reusable workflows — GitHub Docs'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect#understanding-the-oidc-token'
+    label: 'About security hardening with OIDC — job_workflow_ref claim'
+  - url: 'https://github.com/aws-actions/configure-aws-credentials/issues/1707'
+    label: 'configure-aws-credentials#1707 — OIDC failure from co-located v2→v3 reusable workflow bump (Mar 2026)'
+  - url: 'https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_create_for-idp_oidc.html'
+    label: 'AWS: Creating a role for web identity or OIDC federation'
