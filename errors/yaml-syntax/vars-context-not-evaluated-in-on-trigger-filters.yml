@@ -1,0 +1,161 @@
+id: yaml-syntax-111
+title: 'vars and env Contexts Not Evaluated in on: Trigger Sections — Expressions Become Literal Branch/Tag Names'
+category: yaml-syntax
+severity: silent-failure
+tags:
+  - vars-context
+  - env-context
+  - on-trigger
+  - expression
+  - literal-string
+  - branches-filter
+  - workflow-dispatch
+patterns:
+  - regex: '\$\{\{\s*vars\.'
+    flags: 'i'
+  - regex: '\$\{\{\s*env\.'
+    flags: 'i'
+  - regex: 'on:\s*\n.*push:|on:\s*\n.*pull_request:'
+    flags: 'im'
+error_messages:
+  - '# No explicit error — expression is treated as a literal string; workflow never triggers as expected'
+  - '# Workflow may trigger on a branch literally named "${{ vars.DEPLOY_BRANCH }}" (which never exists)'
+root_cause: |
+  GitHub Actions expression evaluation (`${{ ... }}`) runs at job/step execution time,
+  NOT during trigger event matching. The `on:` section of a workflow file is processed
+  by GitHub's event routing layer, which treats all filter values as static YAML
+  strings — not as expressions to be evaluated.
+
+  Common patterns that appear valid but silently fail:
+
+  **1. vars in push branches filter:**
+  ```yaml
+  on:
+    push:
+      branches:
+        - ${{ vars.DEPLOY_BRANCH }}   # literal string, never matches
+  ```
+  GitHub matches the literal string "${{ vars.DEPLOY_BRANCH }}" against incoming
+  branch names. Unless a branch is literally named "${{ vars.DEPLOY_BRANCH }}", the
+  workflow never triggers.
+
+  **2. vars in workflow_dispatch input defaults:**
+  ```yaml
+  on:
+    workflow_dispatch:
+      inputs:
+        environment:
+          default: ${{ vars.DEFAULT_ENV }}   # literal string default shown in UI
+  ```
+  The expression is shown as a literal string in the GitHub Actions dispatch UI
+  dropdown. Users see "${{ vars.DEFAULT_ENV }}" as the default value, not the
+  resolved variable value.
+
+  **3. env in tag filters:**
+  ```yaml
+  on:
+    push:
+      tags:
+        - ${{ env.VERSION_PREFIX }}*   # literal, never matches any tag
+  ```
+
+  **Why developers hit this:**
+  - Variables and environments make trigger configuration feel like it should be
+    dynamic (e.g., "deploy to the branch defined in vars").
+  - There is no validation error and no warning in the workflow run logs.
+  - The workflow either never triggers (paths filter silently never matches) or
+    triggers on a branch with the literal expression name (which never exists in
+    practice).
+  - Actionlint does not flag context use in `on:` sections as an error.
+fix: |
+  Trigger filter values must be static strings. Use these alternatives for dynamic
+  behavior:
+
+  1. **Hardcode the branches/tags** in the `on:` section. Use Variables for things
+     that can change, but only pass them as job inputs, not trigger filters.
+
+  2. **For dynamic branch routing**: Always trigger on all branches and add an
+     early job with an `if:` condition that reads `vars.DEPLOY_BRANCH` and compares
+     to `github.ref_name`:
+     ```yaml
+     jobs:
+       gate:
+         if: ${{ github.ref_name == vars.DEPLOY_BRANCH }}
+     ```
+
+  3. **For workflow_dispatch defaults**: Hardcode a sensible default in the YAML.
+     Dynamic defaults are not supported — consider a `choice` input with static
+     options, or pass `vars.DEFAULT_ENV` as a required input with no default.
+fix_code:
+  - language: yaml
+    label: 'WRONG: vars context in on.push.branches — literal string, never matches'
+    code: |
+      # This workflow NEVER triggers for real branches.
+      # GitHub looks for a branch literally named "${{ vars.DEPLOY_BRANCH }}"
+      on:
+        push:
+          branches:
+            - ${{ vars.DEPLOY_BRANCH }}   # ← NOT evaluated — literal string
+  - language: yaml
+    label: 'CORRECT: hardcode branches in on:, use vars inside the job with if:'
+    code: |
+      # Trigger on all feature branches and main, then gate in the job
+      on:
+        push:
+          branches:
+            - main
+            - 'feature/**'
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          # vars IS evaluated here — job/step context, not trigger filter
+          if: ${{ github.ref_name == vars.DEPLOY_BRANCH || github.ref_name == 'main' }}
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./deploy.sh
+  - language: yaml
+    label: 'WRONG: vars in workflow_dispatch default — shows literal expression in UI'
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            environment:
+              type: string
+              default: ${{ vars.DEFAULT_ENV }}   # ← literal "${{ vars.DEFAULT_ENV }}" in UI
+              description: Deployment environment
+  - language: yaml
+    label: 'CORRECT: hardcode default or use choice input with static options'
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            environment:
+              type: choice
+              options: [staging, production]     # ← static options
+              default: staging                   # ← static default
+              description: Deployment environment
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - run: |
+                # Now use the ACTUAL default from vars at runtime if input not provided
+                ENV="${{ inputs.environment || vars.DEFAULT_ENV }}"
+                echo "Deploying to: $ENV"
+prevention:
+  - 'Never use ${{ vars.X }}, ${{ env.X }}, or any expression in on: trigger filter values — they are not evaluated.'
+  - 'Trigger filters (branches, tags, paths) only support static strings and glob patterns.'
+  - 'Move dynamic routing logic into job-level if: conditions where the vars, env, and github contexts are fully available.'
+  - 'Test trigger filter behavior by pushing to branches with the exact names you specify, not expression values.'
+  - 'For workflow_dispatch input defaults, only use static literal values.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows'
+    label: 'GitHub Docs: Events that trigger workflows — filter pattern syntax'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#context-availability'
+    label: 'GitHub Docs: Context availability — contexts are not available in on: sections'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#filter-pattern-cheat-sheet'
+    label: 'GitHub Docs: Filter pattern cheat sheet — only static glob patterns supported'
+  - url: 'https://github.com/orgs/community/discussions/categories/actions?discussions_q=vars+context+on+trigger+branches'
+    label: 'GitHub Community: vars context in trigger filters discussions'

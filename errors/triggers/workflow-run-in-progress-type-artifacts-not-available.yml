@@ -1,0 +1,135 @@
+id: triggers-108
+title: 'workflow_run types: [in_progress] Fires Before Upstream Artifacts Exist — Download Always Fails'
+category: triggers
+severity: error
+tags:
+  - workflow-run
+  - in-progress
+  - artifacts
+  - download-artifact
+  - timing
+  - race-condition
+patterns:
+  - regex: 'types:\s*\[.*in_progress.*\]'
+    flags: 'i'
+  - regex: 'No artifacts found that are associated with workflow run'
+    flags: 'i'
+  - regex: 'Unable to find any artifacts for the associated workflow run'
+    flags: 'i'
+error_messages:
+  - 'Error: No artifacts found that are associated with workflow run 12345678'
+  - 'Error: Unable to find any artifacts for the associated workflow run'
+  - 'No files were found with the provided path:'
+root_cause: |
+  The `workflow_run` event supports three activity types: `completed`, `requested`,
+  and `in_progress`. The `in_progress` type fires as soon as the upstream workflow
+  begins executing (transitions from queued to running) — not when it finishes.
+
+  Developers use `in_progress` hoping to start parallel work in a downstream workflow
+  while the upstream is still running. However, at the moment `in_progress` fires:
+
+  - The upstream workflow has just started its first job
+  - No artifacts have been uploaded yet (artifact uploads happen during or at the end
+    of a run, via `actions/upload-artifact`)
+  - Any call to `actions/download-artifact` referencing the upstream run ID will fail
+    with "No artifacts found" because nothing has been uploaded
+
+  This error is confusing because:
+  1. The `github.event.workflow_run.id` is correctly populated — the run exists and
+     has a valid ID.
+  2. The artifact API returns a valid (but empty) list — there are no artifacts yet,
+     not a permission error.
+  3. The downstream workflow triggers correctly with no CI warning about the timing issue.
+
+  The root cause is a semantic mismatch: `in_progress` means "the run started" not
+  "the run completed and artifacts are available". Only `completed` guarantees that
+  all artifact upload steps in the upstream workflow have finished.
+fix: |
+  Use `types: [completed]` instead of `types: [in_progress]` if your downstream
+  workflow needs access to artifacts uploaded by the upstream workflow.
+
+  If you need to start parallel work before the upstream finishes, use a different
+  coordination mechanism:
+
+  1. **Split the upstream into two workflows**: An early workflow runs the fast part
+     and uploads intermediate artifacts; the downstream uses `types: [completed]`
+     on the first workflow.
+
+  2. **Polling with retry**: Use `actions/download-artifact` with `github-token`
+     and add a retry loop (e.g., with `nick-fields/retry`) to wait until the artifact
+     appears. Be aware this consumes runner minutes while waiting.
+
+  3. **workflow_dispatch relay**: The upstream workflow explicitly triggers the
+     downstream at the right moment via `workflow_dispatch` API call, passing artifact
+     IDs or other coordination data as inputs.
+fix_code:
+  - language: yaml
+    label: 'WRONG: in_progress fires before artifacts exist'
+    code: |
+      # downstream.yml — fires as soon as upstream starts, but artifacts are not yet there
+      on:
+        workflow_run:
+          workflows: ['Build and Package']
+          types: [in_progress]   # ← artifacts not yet available!
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/download-artifact@v4
+              with:
+                name: build-output
+                github-token: ${{ secrets.GITHUB_TOKEN }}
+                run-id: ${{ github.event.workflow_run.id }}
+                # ↑ fails: no artifacts uploaded yet at in_progress time
+  - language: yaml
+    label: 'CORRECT: use completed type to ensure artifacts are available'
+    code: |
+      # downstream.yml — fires only after the upstream workflow finishes
+      on:
+        workflow_run:
+          workflows: ['Build and Package']
+          types: [completed]     # ← artifacts guaranteed to be available now
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          # Also check conclusion to avoid deploying failed builds
+          if: ${{ github.event.workflow_run.conclusion == 'success' }}
+          steps:
+            - uses: actions/download-artifact@v4
+              with:
+                name: build-output
+                github-token: ${{ secrets.GITHUB_TOKEN }}
+                run-id: ${{ github.event.workflow_run.id }}
+  - language: yaml
+    label: 'VALID use of in_progress: no artifact dependency, just notification'
+    code: |
+      # in_progress IS valid when you do not need artifacts from the upstream run
+      on:
+        workflow_run:
+          workflows: ['Long Running Tests']
+          types: [in_progress]   # fires immediately when tests start
+
+      jobs:
+        notify-start:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Post Slack notification that tests started
+              run: |
+                echo "Tests started: ${{ github.event.workflow_run.html_url }}"
+                # curl -X POST ... slack webhook
+prevention:
+  - 'Use types: [completed] for any workflow_run trigger that needs artifacts from the upstream run.'
+  - 'Only use types: [in_progress] for notifications or lightweight coordination that does not depend on upstream output.'
+  - 'Always check github.event.workflow_run.conclusion == ''success'' when using types: [completed] to avoid acting on failed runs.'
+  - 'If you need partial artifact access mid-run, restructure the upstream into multiple workflows chained via completed events.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run'
+    label: 'GitHub Docs: workflow_run event — activity types including in_progress'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-and-sharing-data-from-a-workflow'
+    label: 'GitHub Docs: Storing and sharing data — artifact lifecycle'
+  - url: 'https://github.com/actions/download-artifact'
+    label: 'actions/download-artifact — run-id parameter documentation'
+  - url: 'https://github.com/orgs/community/discussions/categories/actions?discussions_q=workflow_run+in_progress+artifact'
+    label: 'GitHub Community: workflow_run in_progress artifact availability discussions'
