@@ -1,0 +1,112 @@
+id: permissions-auth-103
+title: 'changesets/action publish Command Does Not Propagate OIDC Env Vars to npm Subprocess — ENEEDAUTH or E404'
+category: permissions-auth
+severity: error
+tags:
+  - changesets
+  - npm-trusted-publishing
+  - oidc
+  - ACTIONS_ID_TOKEN_REQUEST_TOKEN
+  - subprocess
+  - bun
+  - ENEEDAUTH
+  - monorepo
+patterns:
+  - regex: 'npm (error|ERR!) code ENEEDAUTH.*need auth.*logged in'
+    flags: 'i'
+  - regex: 'ACTIONS_ID_TOKEN_REQUEST_TOKEN.*not.*set|ACTIONS_ID_TOKEN_REQUEST_URL.*not.*set'
+    flags: 'i'
+  - regex: 'npm (error|ERR!) 404.*is not in this registry'
+    flags: 'i'
+error_messages:
+  - "npm ERR! code ENEEDAUTH"
+  - "npm ERR! need auth This command requires you to be logged in to https://registry.npmjs.org/"
+  - "npm ERR! need auth You need to authorize this machine using 'npm adduser'"
+  - "npm error 404 Not Found - PUT https://registry.npmjs.org/@scope%2fpkg - Not found"
+root_cause: |
+  When `changesets/action` is configured with a `publish` script such as:
+  ```yaml
+  - uses: changesets/action@v1
+    with:
+      publish: bun run release   # or: npx changeset publish
+  ```
+  The `publish` command runs as a child process spawned by the changesets action.
+  The GitHub OIDC environment variables (`ACTIONS_ID_TOKEN_REQUEST_TOKEN` and
+  `ACTIONS_ID_TOKEN_REQUEST_URL`) that enable npm OIDC trusted publishing are **not
+  forwarded** into that spawned subprocess.
+
+  As a result, npm sees no OIDC context in the subprocess and falls back to:
+  - `ENEEDAUTH` — telling users to run `npm adduser` (misleading in an OIDC flow)
+  - `E404 Not Found` — when provenance or OIDC negotiation fails silently
+
+  The OIDC env vars ARE present in shell steps at the top level of the job. A direct
+  `npm publish` step in the workflow inherits them correctly. Only npm invocations
+  spawned inside changesets/action's `publish` subprocess fail.
+
+  Source: npm/cli#8976 (jovicheng comment, May 2026)
+fix: |
+  Do NOT let `changesets/action` run the publish command when using npm OIDC trusted
+  publishing. Use `changesets/action` only to open/update the Release PR, then publish
+  in a separate top-level workflow step where OIDC env vars are available.
+fix_code:
+  - language: yaml
+    label: Split changesets PR creation from npm publish
+    code: |
+      jobs:
+        release:
+          runs-on: ubuntu-latest
+          environment: npm-publish
+          permissions:
+            contents: write
+            pull-requests: write
+            id-token: write    # required for npm OIDC
+
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                fetch-depth: 0
+
+            - uses: actions/setup-node@v4
+              with:
+                node-version: 24   # Node 24 ships npm >= 11.5.1 for OIDC support
+                # Do NOT set registry-url here (blocks OIDC)
+
+            - run: npm ci
+
+            # changesets only opens/updates the Release PR — NO publish
+            - name: Create or update Release PR
+              id: changesets
+              uses: changesets/action@v1
+              with:
+                version: npm run version-packages
+                commit: 'chore(release): version packages'
+                title: 'chore(release): version packages'
+              env:
+                GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+            # Direct npm publish so OIDC env vars reach npm process
+            - name: Publish to npm via OIDC
+              if: steps.changesets.outputs.hasChangesets == 'false'
+              run: npm publish --access public
+              # ACTIONS_ID_TOKEN_REQUEST_TOKEN and ACTIONS_ID_TOKEN_REQUEST_URL
+              # are automatically available in top-level shell steps
+
+  - language: yaml
+    label: Verify OIDC env vars are present (debug step)
+    code: |
+      - name: Debug OIDC availability
+        run: |
+          echo "OIDC URL set: ${{ env.ACTIONS_ID_TOKEN_REQUEST_URL != '' }}"
+          echo "OIDC TOKEN set: ${{ env.ACTIONS_ID_TOKEN_REQUEST_TOKEN != '' }}"
+prevention:
+  - "Never pass `publish:` to `changesets/action` when using npm OIDC trusted publishing; use it only for the Release PR (`version:` only)."
+  - "Always publish in a top-level `run: npm publish` step — this guarantees OIDC env vars are inherited."
+  - "If a wrapper tool (bun, pnpm, yarn) is needed, test it by logging `process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN` before `npm publish` to confirm the variable is present."
+  - "Set `id-token: write` on the job and target an environment matching the npm Trusted Publisher config."
+docs:
+  - url: https://github.com/npm/cli/issues/8976
+    label: "npm/cli #8976: OIDC trusted publishing E404 (jovicheng analysis of changesets + bun propagation failure)"
+  - url: https://github.com/changesets/changesets/blob/main/packages/action/README.md
+    label: "changesets/action README — publish input"
+  - url: https://docs.npmjs.com/trusted-publishers
+    label: "npm docs: Trusted publishing for GitHub Actions"
