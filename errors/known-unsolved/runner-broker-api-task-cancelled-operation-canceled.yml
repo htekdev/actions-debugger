@@ -1,0 +1,169 @@
+id: known-unsolved-109
+title: 'Random "The operation was canceled" / "A task was cancelled" in GitHub Actions — intermittent broker API cancellation'
+category: known-unsolved
+severity: error
+tags:
+  - runner
+  - arc
+  - self-hosted
+  - task-cancelled
+  - operation-canceled
+  - broker-api
+  - intermittent
+  - known-unsolved
+patterns:
+  - regex: 'Error: The operation was canceled\.'
+    flags: 'i'
+  - regex: 'Error: A task was canceled\.'
+    flags: 'i'
+  - regex: 'System\.OperationCanceledException.*The operation was canceled'
+    flags: 'i'
+  - regex: 'Runner will be shutdown for UserCancelled'
+    flags: 'i'
+  - regex: 'An error occurred: Runner not found'
+    flags: 'i'
+error_messages:
+  - 'Error: The operation was canceled.'
+  - 'Error: A task was canceled.'
+  - 'System.OperationCanceledException: The operation was canceled.'
+  - 'GET request to https://broker.actions.githubusercontent.com/message has been cancelled.'
+  - 'An error occurred: Runner not found'
+  - '[INFO HostContext] Runner will be shutdown for UserCancelled'
+root_cause: |
+  GitHub Actions workflows intermittently fail mid-execution with "Error: The operation
+  was canceled." or "Error: A task was canceled." during any job step — including setup-job,
+  normal script steps, or post-steps. The job does not timeout; it is cancelled abruptly
+  with no user-initiated cancel action.
+
+  This is an open, unresolved issue in the GitHub Actions runner (actions/runner#3819,
+  48+ reactions, open since April 2025).
+
+  Root cause analysis from the community:
+
+  1. BROKER API RACE CONDITION (primary cause in ARC/scale-set environments):
+     The runner makes a GET request to the broker API (/message endpoint) to fetch the
+     next job message. When the broker responds with a "RunnerNotFound" error — even
+     though the scale-set controller's GetRunner endpoint confirms the runner exists —
+     the runner immediately shuts down with UserCancelled. The two APIs appear to check
+     different internal state, creating a race window.
+
+     Trace: runner/src/Sdk/WebApi/WebApi/BrokerHttpClient.cs:L119 generates the
+     RunnerNotFound exception. The scale-set controller uses a different endpoint
+     (_apis/distributedtask/pools/0/agents/) that sees the runner as present.
+
+  2. NETWORK TRANSPORT INTERRUPTION: The broker.actions.githubusercontent.com long-poll
+     HTTP connection is interrupted (TCP reset, proxy timeout, container restart) and
+     the runner treats it as a cancellation rather than retrying.
+
+  3. OOM KILLS: The Node.js process running the action receives SIGKILL from the kernel
+     OOM killer. The runner interprets this as an OperationCanceledException.
+     Workaround: reduce NODE_OPTIONS --max-old-space-size.
+
+  4. DinD AND KUBERNETES MODE: In Docker-in-Docker or Kubernetes (containerMode) runner
+     configurations, the network namespace differences can cause broker connection drops.
+
+  The error message is identical across all causes — no sub-categorization is provided
+  in runner logs — making root cause identification very difficult.
+
+  GitHub has not committed to a fix timeline. The issue began appearing more frequently
+  after runner v2.321.0 (Nov 2024) and persists through v2.327.0+.
+fix: |
+  There is no confirmed fix for the root broker API race. Workarounds based on
+  community investigation (actions/runner#3819):
+
+  Option 1: Switch from DinD to Kubernetes containerMode in ARC configurations.
+  Several users report fewer cancellations in kubernetes mode vs dind mode.
+
+  Option 2: Add job-level retry logic using a retry action (e.g., nick-invision/retry):
+    - name: Build (with retry)
+      uses: nick-invision/retry@v3
+      with:
+        timeout_minutes: 10
+        max_attempts: 3
+        command: make build
+
+  Option 3: Reduce parallel matrix concurrency. The race is more likely under
+  high-concurrency matrix runs with many ephemeral runners registering simultaneously.
+
+  Option 4: For OOM-related cancellations, reduce Node.js heap size:
+    env:
+      NODE_OPTIONS: '--max-old-space-size=4096'
+
+  Option 5: Add timeout-minutes to individual steps so the job fails fast instead
+  of hanging:
+    - name: Checkout
+      uses: actions/checkout@v4
+      timeout-minutes: 5
+
+  Option 6: Enable ACTIONS_RUNNER_DEBUG: true / ACTIONS_STEP_DEBUG: true secrets to
+  collect broker API timing information for GitHub Support escalation.
+fix_code:
+  - language: yaml
+    label: 'Add retry wrapper for steps that randomly cancel'
+    code: |
+      jobs:
+        build:
+          runs-on: self-hosted
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Build (retry on cancellation)
+              uses: nick-invision/retry@v3
+              with:
+                timeout_minutes: 15
+                max_attempts: 3
+                retry_on: error
+                command: make build
+
+  - language: yaml
+    label: 'Reduce matrix parallelism to lower broker race probability'
+    code: |
+      jobs:
+        test:
+          strategy:
+            matrix:
+              node: [18, 20, 22]
+            max-parallel: 2    # Reduce from default (all at once) to lower race probability
+          runs-on: self-hosted
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+
+  - language: yaml
+    label: 'Enable debug logging to capture broker API cancellation details'
+    code: |
+      # In repository Settings → Secrets and variables → Actions → Secrets:
+      # ACTIONS_RUNNER_DEBUG = true
+      # ACTIONS_STEP_DEBUG = true
+      #
+      # With these enabled, runner logs will show:
+      # [WARN BrokerServer] GET request to broker.actions.githubusercontent.com/message cancelled
+      # [INFO HostContext] Runner will be shutdown for UserCancelled
+      #
+      # This provides the timing context needed to distinguish broker race vs OOM.
+
+      jobs:
+        debug-run:
+          runs-on: self-hosted
+          steps:
+            - name: Debug info
+              run: |
+                echo "Runner version: $(cat /actions-runner/version 2>/dev/null || echo unknown)"
+                echo "Node options: $NODE_OPTIONS"
+                free -h
+                df -h
+prevention:
+  - 'Use Kubernetes containerMode in ARC instead of DinD — this reduces the broker race window for many users.'
+  - 'Keep ARC scale-set controller and runner versions in sync with the latest releases — broker API race fixes may be included in patches.'
+  - 'Enable ACTIONS_RUNNER_DEBUG and ACTIONS_STEP_DEBUG secrets for affected repositories to collect diagnostic data for GitHub Support.'
+  - 'For OOM-triggered cancellations, set NODE_OPTIONS=--max-old-space-size=4096 and monitor job memory usage with free -h before/after intensive steps.'
+  - 'Track actions/runner#3819 for upstream broker API fix progress.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/3819'
+    label: 'actions/runner#3819 — Random "A task was cancelled" errors (48 reactions, open Apr 2025)'
+  - url: 'https://github.com/actions/runner/issues/3857'
+    label: 'actions/runner#3857 — An error occurred: Runner not found (ARC ephemeral runner race condition)'
+  - url: 'https://github.com/actions/actions-runner-controller/issues/4091'
+    label: 'ARC#4091 — EphemeralRunner stuck in failed state if allocated job is cancelled'
+  - url: 'https://docs.github.com/en/actions/monitoring-and-troubleshooting-workflows/troubleshooting-workflows/enabling-debug-logging'
+    label: 'GitHub Docs: Enabling debug logging — ACTIONS_RUNNER_DEBUG and ACTIONS_STEP_DEBUG'

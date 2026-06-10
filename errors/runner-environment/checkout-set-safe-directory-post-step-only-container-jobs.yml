@@ -1,0 +1,139 @@
+id: runner-environment-399
+title: 'actions/checkout set-safe-directory runs only in post step — git safe.directory not set before job steps in container jobs'
+category: runner-environment
+severity: error
+tags:
+  - checkout
+  - safe-directory
+  - container-jobs
+  - git-config
+  - arc
+  - self-hosted
+  - dubious-ownership
+patterns:
+  - regex: 'fatal.*detected dubious ownership in repository'
+    flags: 'i'
+  - regex: 'fatal.*unsafe repository.*is owned by someone else'
+    flags: 'i'
+  - regex: 'not a git repository.*No such file or directory'
+    flags: 'i'
+error_messages:
+  - 'fatal: detected dubious ownership in repository at ''/github/workspace'''
+  - 'fatal: detected dubious ownership in repository at ''/home/runner/work/repo/repo'''
+  - 'fatal: unsafe repository (''/github/workspace'' is owned by someone else)'
+root_cause: |
+  actions/checkout accepts a set-safe-directory input (default: true) which is documented
+  as configuring the workspace as a safe git directory via git config --global --add
+  safe.directory. However, this configuration is only applied inside the action's POST
+  step — the cleanup phase that runs AFTER all job steps complete.
+
+  In standard ephemeral runner environments this has no visible effect on the main job
+  steps because git commands run as the same user as checkout. But in container jobs
+  (runs-on + container:) and ARC Kubernetes mode, the job container runs as a different
+  user than the runner that performed the checkout, or the workspace volume is mounted
+  with a different ownership. Git 2.35.2+ detects this mismatch and refuses all git
+  commands with "fatal: detected dubious ownership in repository".
+
+  Because set-safe-directory: true only adds the safe.directory to git config in the
+  post step (too late), every git command and git-dependent action (reviewdog, pre-commit,
+  changed-files, paths-filter, etc.) that runs BEFORE the post step will fail.
+
+  Affected scenarios:
+  - Container jobs on any runner (runs-on: ubuntu-latest with container: node:20)
+  - ARC Kubernetes mode (containerMode: kubernetes) — workspace volume has different UID
+  - Self-hosted runners running the runner as a service user that differs from the git
+    clone user
+  - Docker-in-Docker (dind) runner configurations
+
+  Source: actions/checkout#2031 (Jan 6, 2025), labeled 'bug' by GitHub. Open as of
+  June 2026. Related fix PR: actions/checkout#2418.
+fix: |
+  Add a manual git safe.directory configuration step BEFORE the checkout action (or
+  between checkout and any git-using step):
+
+    - name: Configure git safe directory
+      run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+    - uses: actions/checkout@v4
+
+  This runs inside the container and sets safe.directory before any subsequent git
+  commands need it. The post-step from checkout will also set it, but having it
+  manually ensures all intermediate steps work.
+
+  Alternative: Set the safe.directory to '*' (allows any directory) — acceptable for
+  ephemeral CI containers where security isolation is already enforced at the runner level:
+
+    - name: Configure git safe directory (wildcard)
+      run: git config --global --add safe.directory '*'
+fix_code:
+  - language: yaml
+    label: 'Add manual safe.directory step before checkout in container jobs'
+    code: |
+      jobs:
+        lint:
+          runs-on: ubuntu-latest
+          container: node:20-bookworm
+
+          steps:
+            # Workaround for actions/checkout#2031 — set-safe-directory runs post-step only
+            - name: Configure git safe directory
+              run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+            - uses: actions/checkout@v4
+
+            - name: Run pre-commit
+              run: pre-commit run --all-files
+
+            - name: Run reviewdog
+              uses: reviewdog/action-eslint@v1
+
+  - language: yaml
+    label: 'Use wildcard safe.directory for ephemeral container jobs'
+    code: |
+      jobs:
+        check:
+          runs-on: ubuntu-latest
+          container: python:3.12-slim
+
+          steps:
+            - name: Allow git in any directory (container job workaround)
+              run: git config --global safe.directory '*'
+
+            - uses: actions/checkout@v4
+              with:
+                set-safe-directory: false   # Skip the broken post-step behavior
+
+            - uses: dorny/paths-filter@v3
+              with:
+                filters: |
+                  python:
+                    - '**/*.py'
+
+  - language: yaml
+    label: 'ARC Kubernetes mode — safe.directory fix for arc runners'
+    code: |
+      jobs:
+        test:
+          runs-on: arc-runner-set    # ARC Kubernetes mode runner
+          steps:
+            - name: Fix git safe.directory for ARC workspace volume
+              run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+            - uses: actions/checkout@v4
+
+            - name: Run tests
+              run: pytest
+prevention:
+  - 'In all container jobs and ARC Kubernetes-mode jobs, add git config --global --add safe.directory "$GITHUB_WORKSPACE" as the first step before any git-using action.'
+  - 'When using reviewdog, tj-actions/changed-files, dorny/paths-filter, or pre-commit in container jobs, always add the safe.directory workaround.'
+  - 'Track actions/checkout#2031 and PR#2418 — once merged, set-safe-directory will run in the main step instead of post step.'
+  - 'Set set-safe-directory: false on the checkout action and manage safe.directory manually to avoid confusion about when git config is applied.'
+docs:
+  - url: 'https://github.com/actions/checkout/issues/2031'
+    label: 'actions/checkout#2031 — Git safe directory only set in post step which has no effect in container jobs (labeled bug, open Jan 2025)'
+  - url: 'https://github.com/actions/checkout/pull/2418'
+    label: 'actions/checkout#2418 — Fix: add safe.directory in container (fix PR for issue#2031)'
+  - url: 'https://git-scm.com/docs/git-config#Documentation/git-config.txt-safedirectory'
+    label: 'Git docs: safe.directory — ownership checks introduced in git 2.35.2'
+  - url: 'https://github.blog/open-source/git/git-security-vulnerabilities-announced/#cve-2022-24765'
+    label: 'GitHub Blog: CVE-2022-24765 — git safe.directory background and rationale'

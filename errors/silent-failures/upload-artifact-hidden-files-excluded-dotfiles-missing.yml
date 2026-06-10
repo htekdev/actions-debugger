@@ -1,0 +1,113 @@
+id: silent-failures-179
+title: 'upload-artifact v3/v4 silently excludes hidden files — dotfiles and .directories disappear from artifacts'
+category: silent-failures
+severity: silent-failure
+tags:
+  - upload-artifact
+  - hidden-files
+  - dotfiles
+  - artifacts
+  - breaking-change
+  - silent-failure
+patterns:
+  - regex: 'No files were found with the provided path.*\.[a-zA-Z]'
+    flags: 'i'
+  - regex: 'include-hidden-files.*false|hidden.*files.*excluded'
+    flags: 'i'
+error_messages:
+  - 'No files were found with the provided path: .coverage'
+  - 'No files were found with the provided path: .nyc_output'
+  - 'No files were found with the provided path: .env'
+root_cause: |
+  Starting September 2, 2024, actions/upload-artifact v3 and v4 began excluding hidden
+  files (files or directories whose name starts with a dot) from artifact uploads by
+  default. This was a retroactive breaking change rolled out as a patch release to both
+  v3 and v4 — NOT a new major version.
+
+  The change was motivated by security concerns: preventing accidental upload of
+  credentials files (.env, .git/config, etc.). However, it was applied globally without
+  any grace period or warning, breaking workflows that relied on uploading:
+  - .coverage (Python coverage data)
+  - .nyc_output (Istanbul/NYC coverage)
+  - .git/ directory snapshots
+  - .env files (intentionally included for deployment)
+  - .gitignore, .prettierrc, .eslintrc
+  - Pip installs that create hidden subdirectories (e.g. __pycache__ sibling .dist-info)
+
+  The failure is silent in most cases — the upload-artifact step shows green ✅ but
+  the artifact contains fewer files than expected. Downstream jobs then fail with
+  "No module named X", "coverage file not found", or similar errors with no clear
+  link back to the artifact upload step.
+
+  When the path: field explicitly names a hidden file (e.g., path: .coverage), the
+  action will report "No files were found with the provided path" and fail — but when
+  a hidden file is nested inside a directory, the step still succeeds with no warning
+  and the files are simply absent.
+
+  Source: actions/upload-artifact#602 (Aug 2024). Announced on GitHub Changelog:
+  https://github.blog/changelog/2024-08-19-notice-of-upcoming-deprecations-and-breaking-changes-in-github-actions-runners/
+fix: |
+  Add include-hidden-files: true to any upload-artifact step that needs to upload
+  hidden files or directories:
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: coverage-report
+        path: |
+          .coverage
+          .nyc_output/
+        include-hidden-files: true
+
+  This input exists in both v3.2.1+ and v4.4.0+ (earlier patches introduced a bug
+  in v3 that was fixed in v3.2.1).
+
+  For v3 workflows on older pinned versions, upgrade to v3.2.1 or later to get
+  the include-hidden-files input.
+fix_code:
+  - language: yaml
+    label: 'Add include-hidden-files: true to upload-artifact steps with dotfiles'
+    code: |
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-data
+          path: |
+            .coverage
+            .nyc_output/
+            htmlcov/
+          include-hidden-files: true  # Required since Sep 2, 2024 patch
+
+  - language: yaml
+    label: 'Upload full workspace including hidden files (e.g., deployment artifact)'
+    code: |
+      - name: Upload deployment bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-bundle
+          path: dist/
+          include-hidden-files: true   # Includes .env, .htaccess, etc.
+          retention-days: 1
+
+  - language: yaml
+    label: 'Detect the issue — verify artifact contents match expected files'
+    code: |
+      # Add this step AFTER upload-artifact to catch silent exclusion early
+      - name: Verify artifact contains expected dotfiles
+        run: |
+          if [ ! -f ".coverage" ]; then
+            echo "::warning::.coverage not found — upload-artifact may have excluded it"
+          fi
+          # Or list what was uploaded in logs:
+          ls -la .coverage .nyc_output/ 2>&1 || true
+prevention:
+  - 'Add include-hidden-files: true to every upload-artifact step that uploads dotfiles, .env files, coverage data, or directories containing hidden files.'
+  - 'After adding include-hidden-files: true, verify the artifact contents using the download-artifact action and a file existence check in a separate job.'
+  - 'Audit existing workflows for upload-artifact steps with path: patterns that may include hidden files — check for .coverage, .nyc_output, pip install targets, and .env.'
+  - 'Pin upload-artifact to v3.2.1 or later (v3) and v4.4.0 or later (v4) to have access to the include-hidden-files input.'
+docs:
+  - url: 'https://github.com/actions/upload-artifact/issues/602'
+    label: 'upload-artifact#602 — Upcoming breaking change: hidden files excluded by default (Sep 2, 2024)'
+  - url: 'https://github.blog/changelog/2024-08-19-notice-of-upcoming-deprecations-and-breaking-changes-in-github-actions-runners/'
+    label: 'GitHub Changelog — Notice of upcoming breaking changes (hidden files + Node 16 deprecation)'
+  - url: 'https://github.com/actions/upload-artifact?tab=readme-ov-file#inputs'
+    label: 'upload-artifact README — include-hidden-files input documentation'
