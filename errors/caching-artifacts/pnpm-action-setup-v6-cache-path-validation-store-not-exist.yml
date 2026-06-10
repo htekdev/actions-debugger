@@ -1,0 +1,109 @@
+id: caching-artifacts-130
+title: 'pnpm/action-setup@v6 cache:true Fails with Path Validation Error — Store Path Not Yet Created'
+category: caching-artifacts
+severity: error
+tags:
+  - pnpm
+  - action-setup
+  - v6
+  - cache
+  - path-validation
+  - store
+  - packageManager
+patterns:
+  - regex: 'Path Validation Error.*Path\(s\) specified in the action for caching do\(es\) not exist'
+    flags: 'i'
+  - regex: 'Some specified paths were not resolved, unable to cache dependencies'
+    flags: 'i'
+  - regex: 'pnpm.*store path.*silent.*\n.*Error.*cache'
+    flags: 'si'
+error_messages:
+  - "Error: Path Validation Error: Path(s) specified in the action for caching do(es) not exist, hence no cache is being saved."
+  - "Error: Some specified paths were not resolved, unable to cache dependencies."
+root_cause: |
+  `pnpm/action-setup@v6.0.x` introduced a self-update bootstrap: when `packageManager`
+  in `package.json` (or `devEngines.packageManager`) pins a specific pnpm version,
+  the action downloads and installs that pinned version at runtime.
+
+  When `cache: true` is set on the action, it runs `pnpm store path --silent` to
+  determine the pnpm store directory for caching. The bootstrap runs this command
+  against the version *being installed*, but at the moment the command is executed
+  the new version's store directory does not yet exist on disk — the install
+  hasn't completed. The path returned is the final install path (e.g.,
+  `/home/runner/.local/share/pnpm/store/v10`) which is empty/missing.
+
+  The cache action then tries to save (or restore) from a non-existent path and
+  fails with a path-validation error.
+
+  This is distinct from `pnpm-action-setup-v600-setup-node-cache-pnpm-modifies-lockfile.yml`
+  (re-317), which is about pnpm/action-setup v6.0.0 using `cache: "pnpm"` via
+  `actions/setup-node` and silently modifying `pnpm-lock.yaml`. The path validation
+  error here is about the action's own `cache: true` option (not `setup-node`).
+
+  Affects pnpm/action-setup v6.0.0 through v6.0.x. Fixed in v6.1.0 (PR #256,
+  merged May 11, 2026): the bootstrap now waits for the install to complete before
+  computing the cache path.
+fix: |
+  **Primary fix — upgrade to pnpm/action-setup v6.1.0 or later:**
+    - uses: pnpm/action-setup@v6.1.0
+      with:
+        version: 10
+        cache: true
+
+  **Workaround if upgrading is not immediately possible — remove `cache: true`
+  and use a separate `actions/cache` step with an explicit path:**
+    - name: Get pnpm store directory
+      id: pnpm-cache
+      run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
+      shell: bash
+
+    - uses: actions/cache@v4
+      with:
+        path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+        key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+        restore-keys: |
+          ${{ runner.os }}-pnpm-store-
+
+  **Workaround 2 — pin to pnpm/action-setup@v5:**
+  v5 does not have the self-update bootstrap that causes this issue.
+fix_code:
+  - language: yaml
+    label: 'Upgrade to v6.1.0+ to fix the path validation error'
+    code: |
+      - uses: pnpm/action-setup@v6.1.0   # v6.1.0+ fixes PR #256
+        with:
+          version: 10
+          cache: true                     # now safe in v6.1.0+
+  - language: yaml
+    label: 'Manual cache workaround for pnpm/action-setup v6.0.x'
+    code: |
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+          # Do NOT use cache: true on v6.0.x; use a manual cache step instead
+
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Install dependencies
+        run: pnpm install
+prevention:
+  - 'After upgrading pnpm/action-setup to v6, verify the exact minor version — v6.1.0+ is required for `cache: true` to work reliably.'
+  - 'When using `packageManager` field in `package.json` to pin pnpm, ensure pnpm/action-setup is at least v6.1.0.'
+  - 'Test pnpm setup changes with a fresh CI run (no cache) to confirm the store path resolves correctly before caching.'
+docs:
+  - url: 'https://github.com/pnpm/action-setup/issues/233'
+    label: 'pnpm/action-setup issue #233 — Path Validation Error with v6 and packageManager field'
+  - url: 'https://github.com/pnpm/action-setup/pull/256'
+    label: 'pnpm/action-setup PR #256 — fix: self-update bootstrap to packageManager-pinned version'
+  - url: 'https://github.com/pnpm/action-setup'
+    label: 'pnpm/action-setup GitHub repository and README'

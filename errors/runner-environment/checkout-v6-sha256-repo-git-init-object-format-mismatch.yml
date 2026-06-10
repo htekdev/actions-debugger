@@ -1,0 +1,104 @@
+id: runner-environment-420
+title: 'checkout@v6.0.0–v6.0.2 Fails on SHA-256 Repositories — git init Object-Format Mismatch (Fixed in v6.0.3)'
+category: runner-environment
+severity: error
+tags:
+  - checkout
+  - v6
+  - sha256
+  - git-init
+  - object-format
+  - hash-algorithm
+  - regression
+  - v6-0-3
+patterns:
+  - regex: 'error.*remote object format incompatible|object.format.*mismatch|client.*server.*object.format'
+    flags: 'i'
+  - regex: 'fatal.*could not get the object format of remote repository'
+    flags: 'i'
+  - regex: 'GIT_DEFAULT_HASH.*sha256|--object-format.*sha256'
+    flags: 'i'
+error_messages:
+  - "error: remote object format incompatible with local object format"
+  - "fatal: could not get the object format of remote repository"
+  - "fatal: the remote end hung up unexpectedly"
+root_cause: |
+  `actions/checkout@v6.0.0` through `v6.0.2` contain a bug (tracked as
+  `github/actions-runtime#5528`) that causes checkout to fail for
+  **SHA-256 repositories** — GitHub repositories where the object storage
+  uses SHA-256 hashes instead of the traditional SHA-1 algorithm.
+
+  The bug arises in the initialization sequence:
+
+  1. checkout runs `git init` without specifying `--object-format=sha256`.
+     The default `git init` creates a local SHA-1 repository.
+  2. checkout then attempts to `git fetch` from the remote SHA-256 repository.
+  3. The client (local SHA-1 repo) and server (remote SHA-256 repo) negotiate
+     the fetch protocol. Git detects the object-format mismatch between the
+     local (sha1) and remote (sha256) repositories and aborts.
+
+  The connection failure manifests as `error: remote object format incompatible`
+  or as a generic hang-up error. In some configurations, adding
+  `GIT_DEFAULT_HASH=sha256` to the workflow environment works around the issue
+  because it causes `git init` to use SHA-256 format.
+
+  **Fixed in `actions/checkout@v6.0.3`** (merged June 1, 2026, PR #2439):
+  - Before `git init`, checkout now calls `GET /repos/{owner}/{repo}/hash-algorithm`
+    to determine the target repository's object format.
+  - If SHA-256, checkout runs `git init --object-format=sha256` instead of plain
+    `git init`.
+  - This extra API call is one round-trip using the existing action token and
+    completes before the first fetch.
+
+  Note: v6.0.3 introduced a separate issue where rate-limiting on the
+  `/hash-algorithm` endpoint can cause checkout to fail on high-frequency CI
+  systems. That issue is documented separately in
+  `checkout-v603-hash-algorithm-api-rate-limiting.yml`.
+fix: |
+  **Upgrade to actions/checkout@v6.0.3 or later:**
+  This is the primary fix. v6.0.3 detects SHA-256 repositories automatically
+  and initializes the local git repository with the correct object format.
+
+  **Workaround for v6.0.0–v6.0.2 — set GIT_DEFAULT_HASH:**
+  Set the `GIT_DEFAULT_HASH=sha256` environment variable. This causes git to
+  default to SHA-256 when `git init` is called without `--object-format`.
+
+  **Workaround — use checkout@v4:**
+  v4 uses a different initialization path that is not affected by this issue.
+  However, v4 is approaching end-of-life and this is not a long-term solution.
+fix_code:
+  - language: yaml
+    label: 'Upgrade to checkout@v6.0.3 to fix SHA-256 object-format mismatch'
+    code: |
+      steps:
+        - uses: actions/checkout@v6.0.3   # v6.0.3+ fixes SHA-256 repo support
+  - language: yaml
+    label: 'Workaround — set GIT_DEFAULT_HASH for v6.0.0-v6.0.2'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          env:
+            # Workaround for checkout v6.0.0-v6.0.2 on SHA-256 repos
+            # Tells git init to default to sha256 format
+            GIT_DEFAULT_HASH: sha256
+          steps:
+            - uses: actions/checkout@v6
+  - language: yaml
+    label: 'Pin to checkout@v4 as a temporary fallback'
+    code: |
+      steps:
+        # Temporary: v4 handles SHA-256 repos differently and is not affected
+        - uses: actions/checkout@v4
+prevention:
+  - 'Always pin checkout to v6.0.3 or later when working with SHA-256 repositories.'
+  - 'When testing new checkout major or minor versions, include a smoke test on a SHA-256 repository to catch object-format mismatches early.'
+  - 'If you see intermittent `fatal: the remote end hung up unexpectedly` on checkout, check whether the repository uses SHA-256 and whether your checkout version predates v6.0.3.'
+  - 'Monitor actions/checkout releases for notes about hash-algorithm support, especially when upgrading across minor versions.'
+docs:
+  - url: 'https://github.com/actions/checkout/pull/2439'
+    label: 'actions/checkout PR #2439 — Fix checkout init for SHA-256 repositories (merged v6.0.3)'
+  - url: 'https://github.com/actions/checkout/releases/tag/v6.0.3'
+    label: 'actions/checkout v6.0.3 release notes'
+  - url: 'https://docs.github.com/en/repositories/working-with-files/managing-large-files/about-git-large-file-storage'
+    label: 'GitHub Docs — SHA-256 repository support'
