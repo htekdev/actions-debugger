@@ -1,0 +1,118 @@
+id: caching-artifacts-129
+title: '`actions/cache@v5.0.2+` Silently Skips Cache Save on HTTP 429 — No Retry, No Error'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - cache
+  - 429
+  - rate-limit
+  - silent-failure
+  - v5
+  - no-retry
+  - cache-miss
+  - post-step
+patterns:
+  - regex: 'Cache service responded with 429'
+    flags: 'i'
+  - regex: 'Cache not saved.*429|429.*cache.*not.*saved'
+    flags: 'i'
+  - regex: 'Skipping cache save.*rate.?limit|rate.?limit.*cache.*skip'
+    flags: 'i'
+error_messages:
+  - 'Cache service responded with 429'
+  - 'Cache not saved due to rate limiting'
+  - 'Skipping cache save: rate limit exceeded'
+root_cause: |
+  Starting with `actions/cache@v5.0.2` (released January 16, 2026), the action was
+  changed to **not retry** HTTP 429 responses from the GitHub cache service during
+  the post-step cache-save phase. The specific change from the release notes:
+
+    "When creating cache entries, 429s returned from the cache service will not be
+    retried."
+
+  Before v5.0.2 (i.e., v5.0.0 and v5.0.1), receiving a 429 during cache save would
+  trigger a retry loop that could crash the post-step with an EBADF error (#4030,
+  documented as `caching-artifacts-030`).
+
+  After v5.0.2, the cache save step is silently skipped when a 429 is received:
+  - The cache save post-step logs a brief message and exits with code 0
+  - No error annotation is surfaced — the step shows as green or is invisible
+  - The next workflow run gets a **cache miss** on what was supposed to be a
+    freshly-written cache entry
+
+  This is confusing because:
+  1. The cache restore step succeeds (the old cache is hit)
+  2. The build runs normally
+  3. The cache save post-step appears to succeed or is silent
+  4. The next run unexpectedly gets a full cache miss (cold build)
+  5. There is no direct signal that the cache was dropped — only a longer build time
+
+  The 429 rate limit typically occurs when many concurrent workflows try to write to
+  the same cache key simultaneously (e.g., merge queue, matrix builds, high-frequency
+  main branch deploys) or when the organization's cache write quota is exhausted.
+
+  Note: `actions/cache@v4` and `v3` do NOT exhibit this behavior — they retry on 429.
+  The no-retry change was intentional to prevent the EBADF crash but introduced this
+  silent-failure mode as a side effect.
+fix: |
+  1. **Add debug logging** to detect 429s — enable `ACTIONS_STEP_DEBUG: true` as a
+     repo/org secret to see the full cache save output including the 429 response.
+
+  2. **Use `cache-hit` output to skip redundant saves** — if the cache was hit exactly
+     (primary key match), avoid re-saving identical content:
+
+  3. **Stagger concurrent cache writes** — if many matrix jobs share a key, add
+     `concurrency:` to the job or use unique keys per job to prevent cache service
+     contention:
+
+  4. **Monitor cache storage usage** — navigate to repo Settings → Actions → Caches
+     to check if you're near the 10 GB eviction threshold. 429s increase when the
+     service is under write pressure near capacity.
+
+  5. **Fall back to cache@v4** if reliability is more important than the EBADF fix:
+     v4 retries on 429 (but may crash with EBADF on very high contention).
+fix_code:
+  - language: yaml
+    label: 'Use unique per-matrix cache keys to avoid 429 rate limit contention'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, macos-latest, windows-latest]
+          runs-on: ${{ matrix.os }}
+          steps:
+            - uses: actions/cache@v5
+              with:
+                path: ~/.npm
+                # Include runner.os in key to avoid all matrix jobs competing
+                # for the same cache entry and triggering 429 rate limits
+                key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+                restore-keys: |
+                  ${{ runner.os }}-npm-
+  - language: yaml
+    label: 'Skip re-save when primary key hit exactly (avoids redundant write that may 429)'
+    code: |
+      steps:
+        - id: cache-deps
+          uses: actions/cache@v5
+          with:
+            path: ~/.gradle/caches
+            key: gradle-${{ hashFiles('**/*.gradle') }}
+
+        # Only save if cache was a miss (no hit) — avoids 429 on re-save of identical key
+        - name: Build dependencies
+          if: steps.cache-deps.outputs.cache-hit != 'true'
+          run: ./gradlew dependencies
+prevention:
+  - 'Use runner-OS-scoped cache keys (`${{ runner.os }}-...`) to spread cache writes across keys and reduce contention.'
+  - 'Monitor repository cache storage (Settings → Actions → Caches) — 429s increase when approaching 10 GB limit.'
+  - 'Enable `ACTIONS_STEP_DEBUG` on long-running workflows to detect silent 429 cache skip events.'
+  - 'Avoid sharing a single cache key across large matrix builds — unique keys per dimension reduce write collisions.'
+docs:
+  - url: 'https://github.com/actions/cache/releases/tag/v5.0.2'
+    label: 'actions/cache v5.0.2 release notes: 429 no longer retried'
+  - url: 'https://github.com/actions/cache'
+    label: 'actions/cache action repository'
+  - url: 'https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows'
+    label: 'GitHub Docs: Caching dependencies to speed up workflows'

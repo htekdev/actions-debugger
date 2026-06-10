@@ -1,0 +1,131 @@
+id: silent-failures-190
+title: '`setup-python@v6` pip cache "Cache entry deserialization failed" — False Error Annotation on `macos-26` Python 3.10'
+category: silent-failures
+severity: silent-failure
+tags:
+  - setup-python
+  - pip-cache
+  - macos-26
+  - false-error-annotation
+  - python-3.10
+  - cache
+  - macos
+patterns:
+  - regex: 'WARNING: Cache entry deserialization failed, entry ignored'
+    flags: 'i'
+  - regex: 'Error: WARNING: Cache entry deserialization failed'
+    flags: 'i'
+  - regex: 'setup-python.*macos-26.*Cache entry deserialization|Cache entry deserialization.*setup-python.*macos-26'
+    flags: 'i'
+error_messages:
+  - 'WARNING: Cache entry deserialization failed, entry ignored'
+  - 'Error: WARNING: Cache entry deserialization failed, entry ignored'
+root_cause: |
+  When `actions/setup-python@v6` restores a pip dependency cache on `macos-26`
+  with Python 3.10, pip itself occasionally emits a `WARNING` message at the start
+  of `pip install`:
+
+    WARNING: Cache entry deserialization failed, entry ignored
+
+  This warning is printed to pip's standard output with the word "WARNING" in the
+  message. The GitHub Actions runner's log scanner treats any line matching the
+  pattern `WARNING: ` as a candidate for promotion, and the prefix-based classifier
+  escalates it to an `::error::` annotation when it appears inside a `run:` step
+  wrapped by `setup-python`.
+
+  The result is a red "Error" annotation on the workflow run even though:
+  - The pip install succeeds (exit code 0)
+  - The package(s) install correctly
+  - No actual cache corruption occurred — pip fell back to downloading the package
+
+  The root cause in pip itself is that macOS 26 (which ships a newer macOS / newer
+  Python binary ABI profile) sometimes stores cache wheel entries with metadata that
+  pip 24/25 cannot deserialize using the expected format. Pip gracefully falls back
+  to a network download, but its warning message confuses the Actions runner log
+  annotator.
+
+  This issue was reported and confirmed in `actions/setup-python#1317` (May 2026),
+  occurring specifically on `macos-26` with Python 3.10 and `cache: "pip"`. It has
+  been observed consistently (every run) for affected combinations.
+fix: |
+  1. **Ignore the annotation** — if the workflow step exits 0 and packages installed
+     correctly, the error annotation is cosmetic. The job succeeded.
+
+  2. **Upgrade to Python 3.12 or 3.14** — the deserialization error only manifests
+     with Python 3.10 on `macos-26`. Newer Python versions (3.12, 3.14) do not
+     trigger this warning. If Python 3.10 is not strictly required, upgrade:
+
+     ```yaml
+     - uses: actions/setup-python@v6
+       with:
+         python-version: '3.12'
+         cache: 'pip'
+     ```
+
+  3. **Disable pip cache** — removing the `cache: "pip"` input prevents the
+     deserialization path entirely:
+
+     ```yaml
+     - uses: actions/setup-python@v6
+       with:
+         python-version: '3.10'
+         # cache: 'pip'   # disabled to avoid false error annotation
+     ```
+
+  4. **Clear the pip cache manually** before setup-python if you must use Python 3.10
+     and pip cache on macos-26:
+
+     ```yaml
+     - name: Clear pip cache (macos-26 workaround)
+       if: runner.os == 'macOS'
+       run: pip cache purge || true
+
+     - uses: actions/setup-python@v6
+       with:
+         python-version: '3.10'
+         cache: 'pip'
+     ```
+
+  5. **Track the upstream fix** in `actions/setup-python#1317` — the maintainers are
+     investigating and a fix is expected in a future patch release.
+fix_code:
+  - language: yaml
+    label: 'Upgrade to Python 3.12 to avoid false error annotation on macos-26'
+    code: |
+      jobs:
+        build:
+          runs-on: macos-26
+          steps:
+            - uses: actions/checkout@v6
+            - uses: actions/setup-python@v6
+              with:
+                python-version: '3.12'   # 3.10 triggers false error on macos-26
+                cache: 'pip'
+            - run: pip install -r requirements.txt
+  - language: yaml
+    label: 'Workaround: clear pip cache before setup-python on macOS-26 with Python 3.10'
+    code: |
+      jobs:
+        build:
+          runs-on: macos-26
+          steps:
+            - uses: actions/checkout@v6
+            - name: Clear stale pip cache (macos-26 / Python 3.10 workaround)
+              run: pip cache purge 2>/dev/null || true
+            - uses: actions/setup-python@v6
+              with:
+                python-version: '3.10'
+                cache: 'pip'
+            - run: pip install -r requirements.txt
+prevention:
+  - 'Run Python 3.12 or higher on macos-26 runners to avoid pip cache deserialization warnings.'
+  - 'Do not confuse Action annotations with actual failures — always check the step exit code, not just the annotation color.'
+  - 'Test new macOS runner images (macos-26, macos-latest) with a matrix to catch python-version-specific failures early.'
+  - 'Track actions/setup-python issues when upgrading to new macOS runner images.'
+docs:
+  - url: 'https://github.com/actions/setup-python/issues/1317'
+    label: 'setup-python#1317: Cache entry deserialization failed turns builds red (May 2026)'
+  - url: 'https://github.com/actions/setup-python'
+    label: 'actions/setup-python action repository'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/using-labels-with-self-hosted-runners'
+    label: 'GitHub Docs: GitHub-hosted runner specifications'
