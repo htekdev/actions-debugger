@@ -1,0 +1,120 @@
+id: caching-artifacts-122
+title: 'download-artifact@v7 Fails with Invalid ZIP When Downloading archive:false Artifact (Needs v8)'
+category: caching-artifacts
+severity: error
+tags:
+  - download-artifact
+  - upload-artifact
+  - v7
+  - v8
+  - archive
+  - non-zipped
+  - breaking-change
+  - version-mismatch
+patterns:
+  - regex: 'End of Central Directory Record could not be found'
+    flags: 'i'
+  - regex: 'invalid zip.*file|not a valid zip|zip.*invalid|corrupt.*zip'
+    flags: 'i'
+  - regex: 'Artifact download failed.*Central Directory'
+    flags: 'i'
+  - regex: 'Failed to extract artifact.*End of Central Directory'
+    flags: 'i'
+error_messages:
+  - "Error: End of Central Directory Record could not be found"
+  - "Error: Artifact download failed: End of Central Directory Record could not be found"
+  - "Error: Invalid zip file: End of Central Directory Record could not be found"
+root_cause: |
+  actions/upload-artifact@v7 introduced the `archive: false` input (released February 26, 2026),
+  which uploads files directly to the artifact backend without ZIP compression. When `archive: false`
+  is set, the artifact is stored and served with the file's actual MIME type (e.g.,
+  `application/octet-stream`), not `application/zip`.
+
+  actions/download-artifact@v7 and earlier ALWAYS assume downloaded artifacts are ZIP archives.
+  When v7 attempts to decompress an `archive: false` artifact, it reads the raw file bytes and tries
+  to locate the ZIP End of Central Directory Record signature (`PK\x05\x06`). Since the file is not
+  a ZIP, this signature is absent, and extraction fails with "End of Central Directory Record could
+  not be found."
+
+  actions/download-artifact@v8 (released the same day, February 26, 2026) resolves this by checking
+  the `Content-Type` response header BEFORE attempting decompression. Non-zipped artifacts are written
+  directly to disk without ZIP processing, while ZIP artifacts continue to be extracted normally.
+
+  The official GitHub Changelog for the non-zipped artifacts feature explicitly states:
+  "You will also need to update to v8 of actions/download-artifact if you use that action."
+
+  This affects any workflow that:
+  1. Uploads with `actions/upload-artifact@v7` and `archive: false`
+  2. Downloads with `actions/download-artifact@v7` or any version below v8
+
+fix: |
+  Upgrade `actions/download-artifact` to v8 in any job that downloads artifacts uploaded with
+  `archive: false`. The upload and download action versions must be compatible:
+
+  - upload: actions/upload-artifact@v7 (archive: false) → REQUIRES download: actions/download-artifact@v8
+  - upload: actions/upload-artifact@v7 (archive: true, the default) → works with download v7 or v8
+
+  If upgrading to v8 is not immediately possible, remove `archive: false` from the upload step
+  to keep the default ZIP behavior, which is compatible with all download-artifact versions.
+
+fix_code:
+  - language: yaml
+    label: 'Wrong: v7 download cannot handle archive:false upload — fails with invalid ZIP'
+    code: |
+      jobs:
+        upload:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "report" > report.html
+            - uses: actions/upload-artifact@v7
+              with:
+                name: html-report
+                path: report.html
+                archive: false          # uploads raw file, not zipped
+        download:
+          needs: upload
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/download-artifact@v7    # ✗ tries to unzip — fails with invalid ZIP
+              with:
+                name: html-report
+  - language: yaml
+    label: 'Fix: upgrade to download-artifact@v8 to handle non-zipped artifacts'
+    code: |
+      jobs:
+        upload:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "report" > report.html
+            - uses: actions/upload-artifact@v7
+              with:
+                name: html-report
+                path: report.html
+                archive: false
+        download:
+          needs: upload
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/download-artifact@v8    # ✓ checks Content-Type, skips unzip
+              with:
+                name: html-report
+  - language: yaml
+    label: 'Alternative: remove archive:false to keep ZIP behavior (compatible with v7 download)'
+    code: |
+      - uses: actions/upload-artifact@v7
+        with:
+          name: html-report
+          path: report.html
+          # archive: false removed — defaults to true (ZIP), compatible with download-artifact@v7
+prevention:
+  - 'Always pair upload-artifact@v7 with archive:false with download-artifact@v8 — the GitHub changelog (Feb 26, 2026) for non-zipped artifacts explicitly requires v8.'
+  - 'Search all workflow files for `archive: false` — every corresponding download step must use @v8.'
+  - 'When reviewing upload-artifact upgrades to v7, check all downstream jobs for the matching download-artifact version.'
+  - 'Set up Dependabot or Renovate grouping for artifact action pairs so v7/v8 upgrades stay in sync.'
+docs:
+  - url: 'https://github.blog/changelog/2026-02-26-github-actions-now-supports-uploading-and-downloading-non-zipped-artifacts/'
+    label: 'GitHub Changelog: GitHub Actions now supports uploading and downloading non-zipped artifacts (Feb 26, 2026)'
+  - url: 'https://github.com/actions/download-artifact/releases/tag/v8.0.0'
+    label: 'actions/download-artifact v8.0.0 release notes'
+  - url: 'https://github.com/actions/upload-artifact?tab=readme-ov-file#upload-an-unarchived-artifact'
+    label: 'actions/upload-artifact: Upload an unarchived artifact (archive: false)'
