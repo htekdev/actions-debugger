@@ -1,0 +1,112 @@
+id: triggers-107
+title: 'on.merge_group paths Filter Silently Ignored — Workflow Always Triggers for Every Merge Queue Entry'
+category: triggers
+severity: silent-failure
+tags:
+  - merge_group
+  - paths-filter
+  - merge-queue
+  - trigger
+  - always-runs
+  - silent
+patterns:
+  - regex: 'merge_group'
+    flags: 'i'
+  - regex: 'paths:\s*\n\s+-'
+    flags: 'im'
+error_messages:
+  - '# No explicit error — workflow triggers for every merge queue entry regardless of changed files'
+root_cause: |
+  The `merge_group` event does not support the `paths` or `paths-ignore` filter.
+  GitHub Actions documentation explicitly states: "Only the `branches` filter is
+  supported for the `merge_group` event."
+
+  When a `paths:` or `paths-ignore:` block is added to an `on.merge_group` trigger,
+  GitHub Actions silently ignores the filter entirely. The workflow runs for every PR
+  entering the merge queue, regardless of which files were changed.
+
+  This trips up developers who:
+  1. Copy a `push` or `pull_request` trigger block (which supports `paths`) and
+     change the event type to `merge_group` without checking filter support.
+  2. Expect expensive checks (lint, test, build) to be skipped for doc-only PRs
+     when `paths: ['src/**']` is set — but the check runs every time.
+  3. Notice unexpected runner usage and bill accumulation for trivial PRs in the
+     merge queue and cannot determine why the `paths` filter has no effect.
+
+  There is no validation error and no log warning. The workflow silently triggers
+  as if no `paths` filter exists, wasting minutes and consuming required-check quota.
+
+  Contrast with `push` and `pull_request` events, where `paths` filters are
+  fully supported and correctly skip the workflow when no matching files changed.
+fix: |
+  Two approaches depending on your goal:
+
+  1. **Move path filtering inside the workflow** (recommended):
+     Remove `paths` from the `merge_group` trigger entirely. Add an early job
+     that detects changed files using `dorny/paths-filter` or
+     `tj-actions/changed-files`. Gate subsequent expensive jobs with
+     `if: needs.detect.outputs.src-changed == 'true'`.
+
+  2. **Accept all-or-nothing execution for the merge queue:**
+     Remove `paths` and let the workflow always run for merge queue entries.
+     Use `branches` to restrict which merge queues trigger the workflow if needed.
+fix_code:
+  - language: yaml
+    label: 'WRONG: paths filter on merge_group is silently ignored'
+    code: |
+      on:
+        merge_group:
+          branches: [main]
+          paths:            # ← silently ignored — workflow always runs
+            - 'src/**'
+  - language: yaml
+    label: 'CORRECT: gate expensive jobs inside the workflow with paths-filter action'
+    code: |
+      on:
+        merge_group:
+          branches: [main]   # only supported filter for merge_group
+
+      jobs:
+        detect-changes:
+          runs-on: ubuntu-latest
+          outputs:
+            src-changed: ${{ steps.filter.outputs.src }}
+          steps:
+            - uses: actions/checkout@v4
+            - uses: dorny/paths-filter@v3
+              id: filter
+              with:
+                filters: |
+                  src:
+                    - 'src/**'
+
+        build-and-test:
+          needs: detect-changes
+          if: ${{ needs.detect-changes.outputs.src-changed == 'true' }}
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: make build test
+  - language: yaml
+    label: 'CORRECT: combine push + merge_group triggers with paths on push only'
+    code: |
+      on:
+        push:
+          branches: [main]
+          paths: ['src/**']      # works for push
+        merge_group:
+          branches: [main]       # paths not supported here — use in-workflow gating
+prevention:
+  - 'Before using any filter (paths, tags, paths-ignore) on a trigger, check the GitHub Docs for that event to verify the filter is supported.'
+  - 'The merge_group event only supports the branches filter — all other filters are silently ignored.'
+  - 'Add a comment in your workflow YAML next to merge_group triggers noting that paths filtering must be done in-workflow.'
+  - 'Monitor required-check run frequency — if expensive checks fire for every PR including doc-only PRs, a silently-ignored paths filter may be the cause.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#merge_group'
+    label: 'GitHub Docs: merge_group event — only branches filter is supported'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#onpushbranchestagsbranches-ignoretags-ignore'
+    label: 'GitHub Docs: Filter patterns for push and pull_request events'
+  - url: 'https://github.com/dorny/paths-filter'
+    label: 'dorny/paths-filter — in-workflow path filtering action'
+  - url: 'https://github.com/orgs/community/discussions/categories/actions?discussions_q=merge_group+paths'
+    label: 'GitHub Community: merge_group paths filter discussions'
