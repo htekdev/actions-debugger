@@ -1,0 +1,86 @@
+id: runner-environment-412
+title: "Action Archive Download Returns 403 — Runner v2.335.0+ Reports AccessDeniedException Immediately (No Retry)"
+category: runner-environment
+severity: error
+tags:
+  - action-download
+  - 403
+  - access-denied
+  - organization-policy
+  - private-action
+  - v2.335.0
+  - uses-step
+patterns:
+  - regex: 'Access denied to .*(codeload\.github\.com|github\.com).*\([a-zA-Z0-9_-]+\)'
+    flags: 'i'
+  - regex: 'An action could not be found at the URI .* \(.*\)'
+    flags: 'i'
+  - regex: 'action.*download.*403|403.*action.*archive'
+    flags: 'i'
+error_messages:
+  - "Access denied to 'https://codeload.github.com/owner/action/tar.gz/SHA' (request-id-abc123)"
+  - "An action could not be found at the URI 'https://codeload.github.com/owner/action/tar.gz/SHA'"
+root_cause: |
+  When a `uses: owner/repo@version` step runs, the runner downloads the action archive
+  from `codeload.github.com`. If the download returns HTTP 403 (Forbidden), the runner
+  throws an `AccessDeniedException` immediately.
+
+  Before runner **v2.335.0** (released June 8, 2026), a 403 response would trigger the
+  standard retry loop -- 3 retry attempts with backoff -- before eventually failing with
+  a generic download error. This masked the real cause and added up to 3 minutes of delay.
+
+  Starting with **runner v2.335.0** (PR #4391 -- "Not retry and report action download 403"),
+  403 is treated as a non-retryable client-side error: the runner throws an
+  `AccessDeniedException` immediately and the job fails fast with a specific message
+  including the download URL and request ID.
+
+  Common causes of the 403:
+  - The action's source repository is private and the runner's GITHUB_TOKEN does not
+    have access to it (cross-repo access not configured).
+  - The organization's Actions policy is set to an allowed-list and the action is not
+    on the list (Settings -> Actions -> General -> Actions permissions).
+  - The action reference (@SHA, @tag) was deleted or made inaccessible.
+  - The GITHUB_TOKEN does not have sufficient scope to download from the target repo.
+fix: |
+  Check the exact blocked URL in the error message. The request-id in the
+  AccessDeniedException message is a GitHub-side identifier for support escalation.
+
+  If blocked by organization policy: Add the action to the organization's allowed-list
+  under Settings -> Actions -> General -> Actions permissions -> Allow specific actions.
+  Wildcard patterns like `actions/*` or `owner/*` are supported.
+
+  If the action is private: Private actions must be in the same repository (or the
+  runner must have cross-repo access granted via GitHub Apps). Consider converting the
+  action to a public repository or using a local composite action in .github/actions/
+  instead.
+fix_code:
+  - language: yaml
+    label: "Allow specific action in organization policy"
+    code: |
+      # Organization Settings -> Actions -> General -> Actions permissions
+      # Allowed actions (wildcard patterns):
+      #   actions/*,octocat/example-action@v2
+      #
+      # Or pin to a specific SHA to bypass policy for internal actions:
+      # uses: owner/private-action@abc123def456  # SHA-pinned
+  - language: yaml
+    label: "Convert to local composite action to avoid cross-repo 403"
+    code: |
+      # Move action code to .github/actions/my-action/action.yml
+      # Then reference locally (no cross-repo 403 risk):
+      steps:
+        - uses: ./.github/actions/my-action
+          with:
+            input: value
+prevention:
+  - "Pin organization Actions policies before using actions from private repos"
+  - "Test action access with a direct curl or gh api call to the archive URL using the same token"
+  - "Actions blocked by policy now fail immediately on runner v2.335.0+ (no 3-minute retry delay)"
+  - "For private actions, prefer keeping them in the same repository as the workflow"
+docs:
+  - url: "https://github.com/actions/runner/pull/4391"
+    label: "runner PR #4391 -- Not retry and report action download 403 (shipped in v2.335.0)"
+  - url: "https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository"
+    label: "GitHub Docs -- Managing GitHub Actions settings (allowed actions)"
+  - url: "https://docs.github.com/en/actions/sharing-automations/creating-actions/about-custom-actions"
+    label: "GitHub Docs -- About custom actions"
