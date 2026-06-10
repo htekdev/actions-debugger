@@ -1,0 +1,99 @@
+id: runner-environment-417
+title: 'checkout@v6 SHA-pinned fetch fails — "The ref may have been updated after the workflow was triggered"'
+category: runner-environment
+severity: error
+tags:
+  - checkout
+  - v6
+  - rapid-push
+  - sha-pinned
+  - ref-mismatch
+  - git-fetch
+  - concurrent-push
+patterns:
+  - regex: 'The ref .* does not point to the expected commit .* The ref may have been updated after the workflow was triggered'
+    flags: 'i'
+  - regex: 'does not point to the expected commit.*may have been updated after the workflow was triggered'
+    flags: 'i'
+error_messages:
+  - "The ref 'refs/heads/branch-name' does not point to the expected commit 'abc123...'. The ref may have been updated after the workflow was triggered."
+  - "fatal: the remote end hung up unexpectedly"
+  - "fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+root_cause: |
+  actions/checkout@v6.0.0 introduced SHA-pinned fetching (PR #2356): instead of
+  fetching the branch tip by name, checkout constructs the fetch refspec using the
+  exact commit SHA from the triggering event (e.g., `github.sha`). It then requests
+  that specific object from GitHub with a request like:
+    git fetch origin +<SHA>:refs/remotes/origin/branch
+
+  When multiple commits are pushed to the same branch in rapid succession, the
+  workflow may be triggered on commit SHA A. By the time the job starts and checkout
+  runs, the branch has already advanced to SHA B. GitHub returns HTTP 401 (Unauthorized)
+  for the stale SHA request because it's no longer the branch tip and is treated as
+  an access attempt on a non-existent ref. Git responds to the 401 by printing two
+  misleading messages:
+    - "fatal: could not read Username" (red herring — git is requesting credentials)
+    - "fatal: the remote end hung up unexpectedly"
+
+  After the failed fetch, checkout validates the local state and reports the real
+  error: the checked-out ref does not match the SHA that was expected. The error
+  manifests as "The ref may have been updated after the workflow was triggered."
+
+  This is a regression introduced in checkout@v6.0.0 and remains open as of
+  actions/checkout issue #2372 (February 2026). It does not occur with checkout@v4
+  or earlier because those versions fetch by branch name rather than exact SHA.
+fix: |
+  **Immediate workaround — pin a `ref` explicitly:**
+  Add `ref: ${{ github.sha }}` to the checkout step so the action skips the
+  SHA-pinned fetch path and checks out the triggering commit directly.
+
+  **Longer-term — upgrade or pin to a patched version:**
+  Monitor actions/checkout releases for a fix to issue #2372. As of v6.0.3, the
+  most common related fix (PR #2439) addressed SHA-256 repos but not rapid-push
+  concurrency; however, future patch releases may resolve this completely.
+
+  **Architecture workaround — serialize rapid pushes:**
+  If you push multiple commits to a branch (e.g., via `git push --force` or
+  multiple rapid `git push` calls), consider adding a concurrency group to prevent
+  duplicate in-flight runs from the same branch:
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+fix_code:
+  - language: yaml
+    label: 'Pin ref to github.sha to avoid stale-SHA fetch failure'
+    code: |
+      steps:
+        - uses: actions/checkout@v6
+          with:
+            # Explicitly pin the commit SHA so checkout skips SHA-pinned fetch
+            # validation that can fail on rapid-push branches
+            ref: ${{ github.sha }}
+  - language: yaml
+    label: 'Add concurrency group to cancel stale runs from rapid pushes'
+    code: |
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: true
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v6
+              with:
+                ref: ${{ github.sha }}
+prevention:
+  - "Add a concurrency group scoped to the branch so only the latest push triggers a run — reduces the window for SHA staleness."
+  - "Avoid pushing multiple rapid commits to the same branch in automated scripts; consider batching changes into a single commit before pushing."
+  - "Pin checkout to a specific minor version and monitor the actions/checkout releases for fixes to issue #2372."
+  - "If the misleading 'could not read Username' or 'remote end hung up' messages appear before the real error, look further down the log for the ref-mismatch message."
+docs:
+  - url: 'https://github.com/actions/checkout/issues/2372'
+    label: 'checkout issue #2372 — Ref may have been updated after workflow was triggered (open)'
+  - url: 'https://github.com/actions/checkout/pull/2356'
+    label: 'checkout PR #2356 — SHA-pinned fetch introduced in v6.0.0'
+  - url: 'https://github.com/actions/checkout/releases/tag/v6.0.3'
+    label: 'checkout v6.0.3 release notes'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency'
+    label: 'GitHub Actions — Using concurrency'

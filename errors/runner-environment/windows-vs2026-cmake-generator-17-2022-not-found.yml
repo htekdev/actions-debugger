@@ -1,0 +1,130 @@
+id: runner-environment-418
+title: 'windows-latest / windows-2025 CMake generator "Visual Studio 17 2022" fails after VS 2026 migration'
+category: runner-environment
+severity: error
+tags:
+  - cmake
+  - visual-studio
+  - vs2026
+  - windows-latest
+  - windows-2025
+  - cmake-generator
+  - breaking-change
+  - build
+patterns:
+  - regex: 'CMake Error.*Could not create named generator.*Visual Studio 17 2022'
+    flags: 'i'
+  - regex: 'Generator.*Visual Studio 17 2022.*could not find any instance of Visual Studio'
+    flags: 'i'
+  - regex: 'CMake.*Visual Studio 17 2022.*not (found|available|installed)'
+    flags: 'i'
+error_messages:
+  - "CMake Error: Could not create named generator Visual Studio 17 2022"
+  - "Generator \"Visual Studio 17 2022\" could not find any instance of Visual Studio."
+  - "CMake Error at CMakeLists.txt (cmake_minimum_required): Generator \"Visual Studio 17 2022\" could not find any instance of Visual Studio."
+root_cause: |
+  The `windows-latest` and `windows-2025` runner labels were migrated to use
+  Windows Server 2025 with **Visual Studio 2026** (version 18.x) between
+  June 8-15, 2026. Visual Studio 2022 (version 17.x) is no longer installed on
+  these runners.
+
+  CMake workflows that hardcode `-G "Visual Studio 17 2022"` specify the
+  CMake generator by its exact name, which includes the VS version number. Since
+  VS 17 (2022) is gone, CMake cannot find an installation matching the requested
+  generator and reports:
+
+    CMake Error: Could not create named generator Visual Studio 17 2022
+
+  This is distinct from the MSBuild-level VS 2026 migration errors (which manifest
+  as missing MSBuild targets or missing VS components) because CMake fails at
+  configure time, before any compilation begins.
+
+  The replacement generator for VS 2026 is `"Visual Studio 18 2026"`. CMake 4.3.2
+  (which shipped with the migrated Windows images) includes the new generator and
+  retains the `v143` toolset compatibility shim for projects that need the MSVC
+  v143 compiler.
+
+  To continue building on `windows-2022` (which retains VS 2022), the easiest
+  temporary workaround is to pin to that runner label. However, `windows-2022`
+  has an end-of-life date, so migrating the CMake generator is the correct
+  long-term fix.
+fix: |
+  **Update the CMake generator string:**
+  Change `-G "Visual Studio 17 2022"` to `-G "Visual Studio 18 2026"` in all
+  cmake invocations in workflow files and build scripts.
+
+  **Use `vswhere` for future-proof dynamic generator resolution:**
+  Instead of hardcoding the generator, detect the installed VS version at
+  runtime and construct the generator name dynamically, or let CMake default
+  to the installed version by omitting the -G flag (CMake auto-selects the
+  highest available VS version).
+
+  **Temporary rollback:**
+  Pin to `windows-2022` while updating your CMake configuration:
+    runs-on: windows-2022
+
+  **Using the v143 toolset with VS 2026:**
+  If your project requires the MSVC v143 toolset (the VS 2022 compiler), VS 2026
+  ships a compatibility shim. You can use it with the new generator:
+    cmake -G "Visual Studio 18 2026" -A x64 -T v143
+fix_code:
+  - language: yaml
+    label: 'Update CMake generator to Visual Studio 18 2026'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-latest  # or windows-2025
+          steps:
+            - uses: actions/checkout@v6
+
+            - name: Configure CMake
+              run: |
+                # Before: cmake -B build -G "Visual Studio 17 2022" -A x64
+                # After:
+                cmake -B build -G "Visual Studio 18 2026" -A x64 `
+                  -DCMAKE_BUILD_TYPE=Release
+
+            - name: Build
+              run: cmake --build build --config Release
+  - language: yaml
+    label: 'Use v143 toolset (MSVC 2022 compiler) with VS 2026 generator'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-latest
+          steps:
+            - uses: actions/checkout@v6
+
+            - name: Configure CMake with v143 toolset
+              # -T v143 forces MSVC v143 (VS 2022 compiler) even inside VS 2026
+              run: cmake -B build -G "Visual Studio 18 2026" -A x64 -T v143
+
+            - name: Build
+              run: cmake --build build --config Release
+  - language: yaml
+    label: 'Pin to windows-2022 as a temporary rollback'
+    code: |
+      jobs:
+        build:
+          # Temporary: keep using VS 2022 while updating CMake generator
+          runs-on: windows-2022
+          steps:
+            - uses: actions/checkout@v6
+            - name: Configure
+              run: cmake -B build -G "Visual Studio 17 2022" -A x64
+            - name: Build
+              run: cmake --build build --config Release
+prevention:
+  - "Avoid hardcoding CMake generator version strings like 'Visual Studio 17 2022' in workflow files — either omit -G to auto-detect, or derive it from the installed VS version via `vswhere`."
+  - "When windows-latest is updated (it tracks the latest Windows Server image), pin to a specific label like windows-2025 or windows-2022 in production workflows to avoid unexpected generator changes."
+  - "Test with the preview label `windows-2025-vs2026` before the migration window to discover CMake generator incompatibilities before they hit production."
+  - "If you require the MSVC v143 toolset specifically, add `-T v143` to your cmake command — VS 2026 ships v143 as a compatibility shim alongside the native v144 toolset."
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14017'
+    label: 'runner-images issue #14017 — windows-latest and windows-2025 migrate to VS 2026 in June 2026'
+  - url: 'https://github.com/actions/runner-images/issues/14004'
+    label: 'runner-images issue #14004 — windows-2025 prematurely served VS 2026 image (real-world CMake failures)'
+  - url: 'https://github.blog/changelog/2026-05-14-github-actions-upcoming-image-migrations/'
+    label: 'GitHub Changelog — Upcoming image migrations (May 14, 2026)'
+  - url: 'https://cmake.org/cmake/help/latest/generator/Visual%20Studio%2018%202026.html'
+    label: 'CMake documentation — Visual Studio 18 2026 generator'
