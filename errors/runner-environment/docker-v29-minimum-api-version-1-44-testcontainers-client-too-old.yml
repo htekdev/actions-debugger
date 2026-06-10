@@ -1,0 +1,117 @@
+id: runner-environment-426
+title: 'Docker v29.0.0 Raised Minimum API Version to v1.44 — Testcontainers and Legacy Docker Clients Fail with "client version X is too old"'
+category: runner-environment
+severity: error
+tags:
+  - docker
+  - testcontainers
+  - api-version
+  - self-hosted
+  - runner-images
+  - docker-v29
+patterns:
+  - regex: 'client version .* is too old\. Minimum supported API version is'
+    flags: 'i'
+  - regex: 'UnixSocketClientProviderStrategy.*BadRequestException.*client version.*too old'
+    flags: 'i'
+  - regex: 'Minimum supported API version is 1\.44'
+    flags: 'i'
+error_messages:
+  - 'UnixSocketClientProviderStrategy: failed with exception BadRequestException (Status 400: {"message":"client version 1.32 is too old. Minimum supported API version is 1.44, please upgrade your client to a newer version"})'
+  - 'Error response from daemon: client version 1.41 is too old. Minimum supported API version is 1.44, please upgrade your client to a newer version'
+  - 'API version 1.41 is not supported by this client: the minimum supported API version is 1.44'
+root_cause: |
+  Docker Engine v29.0.0 (released November 2025) dropped backward compatibility for
+  Docker API versions below v1.44. Previously, Docker accepted API negotiation down to
+  v1.12 or lower. With v29.0.0, requests using API versions < v1.44 receive an immediate
+  HTTP 400 Bad Request with the message "client version X is too old."
+
+  This affects any CI workflow that:
+  1. Uses Testcontainers Java ≤ 1.21.3 or ≤ 2.0.1 — these versions negotiate API v1.32
+     via docker-java, which is now below the minimum.
+  2. Uses a Docker CLI or Docker-in-Docker image pinned to an older tag (e.g., docker:24)
+     against a v29+ daemon.
+  3. Runs on a self-hosted runner where Docker auto-updated to v29.0.0 overnight, or on a
+     GitHub-hosted runner image that received a Docker upgrade.
+  4. Uses Podman with Docker CLI compatibility shim where Podman server reports an older
+     API version than the Docker client expects.
+
+  The daemon change is documented in Docker Engine v29 release notes as a breaking change:
+  "The daemon now requires API version v1.44 or later (Docker v25.0+)."
+  Ubuntu 24.04 runner images and self-hosted runners running apt-get upgrade are the
+  most common vectors for this sudden breakage in GitHub Actions pipelines.
+fix: |
+  Option 1 — Update Testcontainers (recommended for Java/Kotlin/Scala pipelines):
+  Upgrade to Testcontainers Java 1.21.4+ or 2.0.2+. These versions use an updated
+  docker-java that negotiates API v1.44 correctly.
+
+  Option 2 — Set DOCKER_API_VERSION environment variable:
+  Add DOCKER_API_VERSION=1.44 (or the version your daemon requires) to the runner
+  environment or workflow env block. This overrides the client-negotiated version.
+
+  Option 3 — Set min-api-version in Docker daemon config:
+  On the runner host, create or update /etc/docker/daemon.json:
+    {"min-api-version": "1.44"}
+  then restart: sudo systemctl restart docker
+  Use the version reported in the error as the target value.
+
+  Option 4 — Upgrade Docker-in-Docker image:
+  Change docker:24 to docker:29 (or docker:latest) in your service container or
+  step definition so client and daemon versions match.
+
+  Option 5 — Pin Docker to v28.x (short-term workaround):
+  Downgrade the runner's Docker to the last v28 release:
+    sudo apt remove docker-ce docker-ce-cli containerd.io
+    sudo apt install -y docker-ce=5:28.5.2-1~ubuntu.22.04~jammy \
+      docker-ce-cli=5:28.5.2-1~ubuntu.22.04~jammy containerd.io
+fix_code:
+  - language: yaml
+    label: 'Option 2 — Set DOCKER_API_VERSION to satisfy the v29 daemon requirement'
+    code: |
+      jobs:
+        test:
+          runs-on: self-hosted
+          env:
+            DOCKER_API_VERSION: '1.44'
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run tests with Testcontainers
+              run: ./gradlew test
+  - language: yaml
+    label: 'Option 4 — Upgrade Docker-in-Docker service container from docker:24 to docker:29'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          services:
+            docker:
+              image: docker:29       # was docker:24 — upgrade to fix API version mismatch
+              options: --privileged
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run integration tests
+              run: ./mvnw verify
+  - language: yaml
+    label: 'Option 1 — Upgrade Testcontainers in build.gradle to 1.21.4+ or 2.0.2+'
+    code: |
+      # build.gradle (Groovy DSL)
+      dependencies {
+          # Upgrade to ≥ 1.21.4 (Java) or ≥ 2.0.2 (new major) to fix docker-java API version
+          testImplementation 'org.testcontainers:testcontainers:1.21.4'
+          testImplementation 'org.testcontainers:junit-jupiter:1.21.4'
+      }
+prevention:
+  - 'Pin Testcontainers to a version that explicitly supports Docker API v1.44 (≥1.21.4 or ≥2.0.2). Check Testcontainers release notes before upgrading Docker on self-hosted runners.'
+  - 'After upgrading Docker on any self-hosted runner, immediately run a smoke-test workflow using the Docker CLI or a Testcontainers-based test to detect API version mismatches before they hit production pipelines.'
+  - 'When using Docker-in-Docker (DinD) service containers, pin the image tag (e.g., docker:29) rather than using an implicit old tag. Client and server versions should be compatible.'
+  - 'Monitor Docker Engine release notes for breaking changes before enabling automatic security upgrades on runner hosts.'
+  - 'If using DOCKER_MIN_API_VERSION env var as a server-side override (in DinD pods), align it with the docker-java or CLI version used by the job.'
+docs:
+  - url: 'https://stackoverflow.com/questions/79817033/sudden-docker-error-about-client-api-version'
+    label: 'Stack Overflow (91 votes, Nov 2025) — Sudden Docker error: client version too old, minimum supported API version is 1.44'
+  - url: 'https://github.com/testcontainers/testcontainers-java/issues/11212'
+    label: 'testcontainers-java#11212 — Docker 29 raises minimum API version to 1.44 (fix in 1.21.4 / 2.0.2)'
+  - url: 'https://www.docker.com/blog/docker-engine-version-29/'
+    label: 'Docker Engine v29 release blog — breaking change: minimum API version raised to v1.44'
+  - url: 'https://github.com/moby/moby/releases/tag/docker-v29.0.0'
+    label: 'moby/moby v29.0.0 release notes — minimum supported API version v1.44'

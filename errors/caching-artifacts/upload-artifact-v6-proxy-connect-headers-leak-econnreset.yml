@@ -1,0 +1,126 @@
+id: caching-artifacts-131
+title: 'upload-artifact v6 Fails with ECONNRESET or "Proxy connection ended" on Strict Corporate Proxies — @typespec/ts-http-runtime CONNECT Headers Leak'
+category: caching-artifacts
+severity: error
+tags:
+  - upload-artifact
+  - self-hosted
+  - proxy
+  - https-proxy
+  - econnreset
+  - v6
+  - azure-blob
+  - connect-tunnel
+patterns:
+  - regex: 'Proxy connection ended before receiving CONNECT response'
+    flags: 'i'
+  - regex: 'Unable to make request: ECONNRESET'
+    flags: 'i'
+  - regex: 'upload.*artifact.*v6.*proxy|v6.*upload.*ECONNRESET|upload.*v6.*CONNECT'
+    flags: 'i'
+error_messages:
+  - 'Error: Proxy connection ended before receiving CONNECT response'
+  - 'Error: Unable to make request: ECONNRESET'
+  - 'Beginning upload of artifact content to blob storage'
+root_cause: |
+  actions/upload-artifact@v6 switched its Azure Blob Storage SDK from
+  @azure/storage-blob@12.17 + @azure/core-http (used by v5) to
+  @azure/storage-blob@12.29 + @azure/core-rest-pipeline + @typespec/ts-http-runtime.
+
+  The proxyPolicy.ts in @typespec/ts-http-runtime contains a bug: it copies the
+  outgoing HTTP request headers (content-type, content-length, x-ms-version, accept)
+  into the CONNECT tunnel handshake request that is sent to the corporate proxy server.
+  These headers are meant for the destination Azure Blob endpoint INSIDE the TLS tunnel,
+  not for the CONNECT request itself.
+
+  Most permissive proxies (e.g., Squid in default config) ignore unexpected headers on
+  CONNECT and establish the tunnel normally. However, strict corporate forward proxies
+  that follow RFC 9110 strictly reject CONNECT requests containing Content-Length
+  (because that implies a request body, which violates the expected semantics of CONNECT).
+  This causes the connection to be torn down immediately with:
+    - "Proxy connection ended before receiving CONNECT response"
+    - "Error: Unable to make request: ECONNRESET"
+
+  actions/upload-artifact@v5 and earlier did NOT exhibit this bug because they used
+  @azure/core-http which constructs CONNECT tunnels without leaking request headers.
+
+  The issue is tracked in actions/upload-artifact#747 (Dec 2025 – Apr 2026) and fixed
+  via PR #792 (Apache Proxy headers patch). The fix is included in v7.0.1+.
+
+  Note: This is DISTINCT from ca-126 (upload-artifact v4/v5 BlobClient missing proxy
+  transport options — different root cause, different SDK version, different fix).
+fix: |
+  Recommended fix: Upgrade to actions/upload-artifact@v7 (v7.0.1 or later).
+  PR #792 removed the header leak from the CONNECT tunnel request in the
+  @typespec/ts-http-runtime proxyPolicy. The fix is only available in v7+.
+
+  If upgrading to v7 is not immediately possible:
+  - Workaround A: Add Azure Blob Storage and Actions artifact endpoints to NO_PROXY
+    so the artifact upload bypasses the proxy entirely. Works if the runner has
+    direct network access to Azure Blob Storage.
+  - Workaround B: Apply the source patch to the runner's local upload-artifact index.js
+    to remove { headers } from ProxyAgent constructors (see fix_code below).
+  - Workaround C: Stay on v5 while the v7 upgrade is planned.
+fix_code:
+  - language: yaml
+    label: 'Recommended fix — upgrade to upload-artifact@v7'
+    code: |
+      steps:
+        - name: Upload build artifacts
+          uses: actions/upload-artifact@v7   # v7.0.1+ contains the proxy CONNECT fix
+          with:
+            name: build-output
+            path: dist/
+  - language: yaml
+    label: 'Workaround A — set NO_PROXY to bypass proxy for Azure Blob artifact endpoints'
+    code: |
+      jobs:
+        build:
+          runs-on: self-hosted
+          env:
+            NO_PROXY: '.blob.core.windows.net,*.actions.githubusercontent.com,results-receiver.actions.githubusercontent.com'
+            no_proxy: '.blob.core.windows.net,*.actions.githubusercontent.com,results-receiver.actions.githubusercontent.com'
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build
+              run: make build
+            - name: Upload artifacts (v6, proxy bypassed via NO_PROXY)
+              uses: actions/upload-artifact@v6
+              with:
+                name: build-output
+                path: dist/
+  - language: yaml
+    label: 'Workaround B — patch ProxyAgent headers leak in place (temporary, fragile)'
+    code: |
+      steps:
+        - name: Patch upload-artifact v6 proxy headers bug
+          run: |
+            ACTIONS_BASE="${GITHUB_WORKSPACE}/../.."
+            for INDEX_JS in $(find "$ACTIONS_BASE/_actions/actions/upload-artifact" \
+              -name "index.js" -path "*/dist/*" 2>/dev/null); do
+              COUNT=$(grep -c 'ProxyAgent(proxyUrl, { headers })' "$INDEX_JS" || true)
+              if [ "$COUNT" -gt 0 ]; then
+                sed -i 's/ProxyAgent(proxyUrl, { headers })/ProxyAgent(proxyUrl)/g' "$INDEX_JS"
+                echo "Patched $INDEX_JS ($COUNT occurrences)"
+              fi
+            done
+
+        - name: Upload artifacts (patched v6)
+          uses: actions/upload-artifact@v6
+          with:
+            name: build-output
+            path: dist/
+prevention:
+  - 'Always use actions/upload-artifact@v7 or later for self-hosted runners behind corporate HTTPS proxies. v7.0.1+ includes the CONNECT headers leak fix.'
+  - 'When upgrading upload-artifact major versions on proxied self-hosted runners, always test artifact upload in a dry-run workflow before enabling production pipelines.'
+  - 'If your corporate proxy is strict (rejects CONNECT with Content-Length), also apply NO_PROXY for .blob.core.windows.net as a defense-in-depth measure regardless of the upload-artifact version.'
+  - 'Track actions/upload-artifact releases and upgrade promptly when proxy-related fixes are released — the underlying SDK (ts-http-runtime) continues to evolve.'
+docs:
+  - url: 'https://github.com/actions/upload-artifact/issues/747'
+    label: 'actions/upload-artifact#747 — V6 upload progress stalled behind proxy while V5 works (Dec 2025 – Apr 2026, fixed in v7.0.1)'
+  - url: 'https://github.com/actions/upload-artifact/pull/792'
+    label: 'actions/upload-artifact#792 — Fix proxy headers leak errconnect on strict proxies (merged Apr 2026)'
+  - url: 'https://github.com/actions/upload-artifact/releases/tag/v7.0.1'
+    label: 'actions/upload-artifact v7.0.1 release — contains proxy CONNECT fix'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners#communication-between-self-hosted-runners-and-github'
+    label: 'GitHub Docs — Self-hosted runner network requirements (required domains for artifact upload)'
