@@ -1,0 +1,144 @@
+id: permissions-auth-106
+title: 'PyPI Trusted Publishing OIDC Token Rejected — Missing `id-token: write` Permission or Environment Name Mismatch'
+category: permissions-auth
+severity: error
+tags:
+  - pypi
+  - trusted-publishing
+  - oidc
+  - id-token
+  - permissions
+  - pypa
+  - python-publish
+  - environment
+patterns:
+  - regex: 'PyPI rejected token.*claims.*not trusted|claims.*OIDC.*not trusted.*trusted publisher'
+    flags: 'i'
+  - regex: 'Error.*The claims in the OIDC token are not trusted by any active trusted publisher'
+    flags: 'i'
+  - regex: 'Error: OIDC token request failed|ACTIONS_ID_TOKEN_REQUEST_TOKEN.*not.*set|id.?token.*not.*available'
+    flags: 'i'
+  - regex: 'HTTPError.*403.*forbidden.*pypi\.org|forbidden.*trusted.*publisher.*pypi'
+    flags: 'i'
+error_messages:
+  - 'The claims in the OIDC token are not trusted by any active trusted publisher'
+  - 'Error: OIDC token request failed: Error: No OIDC token available'
+  - 'forbidden: The credentials associated with this request are not currently valid for this project'
+  - '403 Forbidden: The requested trusted publisher does not exist'
+root_cause: |
+  PyPI Trusted Publishing uses GitHub Actions OIDC to authenticate publish requests
+  without needing a PyPI API token. The `pypa/gh-action-pypi-publish` action (or any
+  action that calls PyPI's upload endpoint with a short-lived OIDC token) requires
+  three conditions to be met:
+
+  1. **`permissions: id-token: write`** must be set at the job or workflow level.
+     Without this, the Actions runtime refuses to issue an OIDC token and the action
+     fails with "No OIDC token available."
+
+  2. **The GitHub Actions `environment:` name must match exactly** what was configured
+     in the PyPI project's Trusted Publisher settings (under
+     pypi.org → Project → Manage → Trusted Publishers). The OIDC claims include the
+     `environment` claim, and PyPI checks it case-sensitively. A mismatch causes
+     "The claims in the OIDC token are not trusted by any active trusted publisher."
+
+  3. **The workflow file path (`workflow` claim) must match** the path configured in
+     the PyPI Trusted Publisher. If the workflow was moved, renamed, or the YAML path
+     changed, PyPI rejects it.
+
+  Common patterns that trigger this failure:
+
+  - Forgetting `id-token: write` when copying a publish workflow template
+  - Configuring `environment: release` in PyPI but `environment: production` in the
+    workflow (or vice versa) — case-sensitive exact match required
+  - Running the publish step from a workflow triggered by `pull_request` — OIDC is
+    not available for PRs from forks (the token is either absent or has restricted
+    claims that PyPI doesn't trust)
+  - Renaming the workflow file after setting up the Trusted Publisher (PyPI stores
+    the exact `.github/workflows/publish.yml` path)
+  - Missing `environment:` field in the job definition entirely — PyPI trusted
+    publisher entries that require a specific environment will reject tokens without
+    the `environment` claim
+
+  The `pypa/gh-action-pypi-publish` action raises a descriptive error on OIDC
+  rejection, but users often first see only the HTTP 403 from the upload attempt.
+fix: |
+  1. **Add `permissions: id-token: write`** to the publishing job:
+
+  2. **Verify the environment name** matches PyPI Trusted Publisher config exactly:
+     - In PyPI: Project → Manage → Trusted Publishers → view the configured publisher
+     - In the workflow: the `environment:` field on the job must match character-for-
+       character (case-sensitive)
+
+  3. **Verify the workflow file path** in the PyPI Trusted Publisher matches the
+     actual path in the repository. If renamed, update the trusted publisher in PyPI.
+
+  4. **Do not publish from fork PRs** — OIDC is not available or not trusted on
+     `pull_request` events from forked repositories. Use `push: tags:` trigger or
+     `release: types: [published]` instead.
+
+  5. **Test OIDC availability** before publishing with a debug step:
+     ```yaml
+     - name: Check OIDC token availability
+       run: |
+         TOKEN=$(curl -sSf "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=pypi" \
+           -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" | jq -r '.value')
+         echo "OIDC token available: $([ -n "$TOKEN" ] && echo yes || echo no)"
+     ```
+fix_code:
+  - language: yaml
+    label: 'Correct PyPI Trusted Publishing workflow with required permissions and environment'
+    code: |
+      name: Publish to PyPI
+
+      on:
+        push:
+          tags:
+            - 'v*'
+
+      jobs:
+        publish:
+          runs-on: ubuntu-latest
+          environment: release   # Must match EXACTLY what is in PyPI Trusted Publisher config
+          permissions:
+            id-token: write      # Required: allows OIDC token issuance for PyPI
+            contents: read
+          steps:
+            - uses: actions/checkout@v6
+            - uses: actions/setup-python@v6
+              with:
+                python-version: '3.12'
+            - name: Build distribution
+              run: python -m build
+            - name: Publish to PyPI
+              uses: pypa/gh-action-pypi-publish@release/v1
+              # No token required — OIDC is used via trusted publishing
+  - language: yaml
+    label: 'Debug: verify OIDC claims available to the job before publishing'
+    code: |
+      - name: Verify OIDC token claims (debug)
+        run: |
+          OIDC_TOKEN=$(curl -sSf \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=pypi" \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            | jq -r '.value')
+          # Decode and show claims (header + payload)
+          echo "Claims:"
+          echo "$OIDC_TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null | jq .
+        env:
+          ACTIONS_ID_TOKEN_REQUEST_URL: ${{ env.ACTIONS_ID_TOKEN_REQUEST_URL }}
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ${{ env.ACTIONS_ID_TOKEN_REQUEST_TOKEN }}
+prevention:
+  - 'Always set `permissions: id-token: write` on any job that uses PyPI Trusted Publishing.'
+  - 'The environment name in the workflow must exactly match (case-sensitive) what is configured in the PyPI Trusted Publisher.'
+  - 'Do not trigger PyPI publishing from `pull_request` events — use `push: tags:` or `release: published` triggers.'
+  - 'If you rename or move the workflow file, update the Trusted Publisher on PyPI to reflect the new path.'
+  - 'Verify Trusted Publisher configuration at: pypi.org → Your Project → Manage → Publishing'
+docs:
+  - url: 'https://docs.pypi.org/trusted-publishers/'
+    label: 'PyPI Trusted Publishers documentation'
+  - url: 'https://docs.pypi.org/trusted-publishers/troubleshooting/'
+    label: 'PyPI Trusted Publisher troubleshooting guide'
+  - url: 'https://github.com/pypa/gh-action-pypi-publish'
+    label: 'pypa/gh-action-pypi-publish action repository'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/configuring-openid-connect-in-pypi'
+    label: 'GitHub Docs: Configuring OpenID Connect in PyPI'
