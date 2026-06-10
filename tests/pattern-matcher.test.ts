@@ -58,7 +58,7 @@ describe("Pattern Matcher", () => {
     });
 
     it("returns empty array for unknown error", () => {
-      const results = lookupByPattern(db, "wxqz9887bm nondescript-uvpx44zz not-a-workflow qrst1234");
+      const results = lookupByPattern(db, "xyz9 noop a4b z7q8");
       expect(results.length).toBe(0);
     });
 
