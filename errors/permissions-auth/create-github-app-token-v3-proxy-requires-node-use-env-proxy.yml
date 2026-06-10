@@ -1,0 +1,102 @@
+id: permissions-auth-104
+title: '`create-github-app-token` v3 proxy environment variables require `NODE_USE_ENV_PROXY=1` — silent failure on upgrade from v1/v2'
+category: permissions-auth
+severity: error
+tags:
+  - create-github-app-token
+  - proxy
+  - NODE_USE_ENV_PROXY
+  - enterprise
+  - self-hosted
+  - http-proxy
+  - breaking-change
+  - v3
+patterns:
+  - regex: 'proxy environment variable is set.*NODE_USE_ENV_PROXY.*not enabled'
+    flags: 'i'
+  - regex: 'A proxy environment variable is set, but Node\.js native proxy support is not enabled'
+    flags: 'i'
+  - regex: 'Set NODE_USE_ENV_PROXY=1 for this action step'
+    flags: 'i'
+error_messages:
+  - 'A proxy environment variable is set, but Node.js native proxy support is not enabled. Set NODE_USE_ENV_PROXY=1 for this action step.'
+  - '::error::A proxy environment variable is set, but Node.js native proxy support is not enabled. Set NODE_USE_ENV_PROXY=1 for this action step.'
+root_cause: |
+  In `actions/create-github-app-token` v3 (released March 13, 2026, commit 4451bcb),
+  custom proxy handling was removed and replaced with Node.js native proxy support.
+
+  **Before v3 (v1/v2)**: The action automatically read `HTTP_PROXY`/`HTTPS_PROXY`
+  environment variables and routed requests through the proxy without any additional
+  configuration. This worked transparently in enterprise environments with outbound
+  proxy requirements.
+
+  **After v3**: The action detects proxy environment variables (`HTTP_PROXY`,
+  `HTTPS_PROXY`, `http_proxy`, `https_proxy`) at startup. If any of them are set but
+  `NODE_USE_ENV_PROXY` is NOT set to `"1"`, the action immediately fails with a hard
+  error to prevent silent proxy misconfiguration.
+
+  This is a **BREAKING CHANGE** for any environment where:
+  - A system-level or runner-level proxy is configured (common in enterprise CI)
+  - The proxy env vars are inherited automatically (e.g., set in runner environment,
+    Docker container, or OS-level proxy settings)
+  - The workflow previously used `create-github-app-token@v1` or `@v2` without any
+    proxy-specific configuration
+
+  The action will fail immediately after startup — before generating any token — on
+  every run in environments with proxy environment variables set.
+
+  Source: actions/create-github-app-token commit 4451bcbc, PR #342 (Mar 13, 2026).
+  The error message is explicit: "A proxy environment variable is set, but Node.js
+  native proxy support is not enabled. Set NODE_USE_ENV_PROXY=1 for this action step."
+fix: |
+  Add `NODE_USE_ENV_PROXY: "1"` as an environment variable on the action step to
+  enable Node.js native proxy support. Optionally add `NO_PROXY` for any hosts that
+  should bypass the proxy (e.g., the GitHub API endpoint if accessible directly).
+fix_code:
+  - language: yaml
+    label: 'Enable native proxy support on the action step (required in v3+)'
+    code: |
+      steps:
+        - uses: actions/create-github-app-token@v3
+          id: app-token
+          env:
+            # Required in v3+ when HTTP_PROXY or HTTPS_PROXY is set in the environment.
+            # Without this, the action fails immediately with:
+            # "A proxy environment variable is set, but Node.js native proxy support
+            #  is not enabled. Set NODE_USE_ENV_PROXY=1 for this action step."
+            NODE_USE_ENV_PROXY: '1'
+            HTTPS_PROXY: ${{ vars.CORPORATE_PROXY_URL }}
+            NO_PROXY: 'github.com,api.github.com'
+          with:
+            app-id: ${{ vars.APP_ID }}
+            private-key: ${{ secrets.PRIVATE_KEY }}
+
+        - name: Use token
+          env:
+            GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          run: gh api /rate_limit
+  - language: yaml
+    label: 'Bypass proxy for GitHub API if accessible directly'
+    code: |
+      steps:
+        - uses: actions/create-github-app-token@v3
+          id: app-token
+          env:
+            NODE_USE_ENV_PROXY: '1'
+            NO_PROXY: 'github.com,api.github.com,*.github.com'
+          with:
+            app-id: ${{ vars.APP_ID }}
+            private-key: ${{ secrets.PRIVATE_KEY }}
+prevention:
+  - 'When upgrading create-github-app-token from v1/v2 to v3, check if HTTP_PROXY or HTTPS_PROXY is set anywhere in the runner environment (system, runner config, or inherited from Docker). Add NODE_USE_ENV_PROXY=1 if so.'
+  - 'Use the exact version tag (e.g., @v3.2.0) with Dependabot or Renovate so you control when this breaking change takes effect.'
+  - 'In enterprise CI environments with mandatory outbound proxies, add NODE_USE_ENV_PROXY=1 as a standard env var on all create-github-app-token steps.'
+  - 'Use NO_PROXY to list GitHub API endpoints that are accessible directly, reducing unnecessary proxy hops for token generation.'
+  - 'Review the README migration notes when upgrading major versions — v3 explicitly documents this breaking change in the Proxy support section.'
+docs:
+  - url: 'https://github.com/actions/create-github-app-token/commit/4451bcbc139f8124b0bf04f968ea2586b17df458'
+    label: 'create-github-app-token commit 4451bcb — fix!: require NODE_USE_ENV_PROXY for proxy support (Mar 13, 2026)'
+  - url: 'https://github.com/actions/create-github-app-token'
+    label: 'create-github-app-token README — Proxy support section'
+  - url: 'https://nodejs.org/en/blog/release/v24.0.0'
+    label: 'Node.js — NODE_USE_ENV_PROXY environment variable support'

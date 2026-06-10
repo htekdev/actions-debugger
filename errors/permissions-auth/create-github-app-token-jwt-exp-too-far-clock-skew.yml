@@ -1,0 +1,104 @@
+id: permissions-auth-103
+title: '`create-github-app-token` JWT `exp` claim too far in the future — self-hosted runner clock skew'
+category: permissions-auth
+severity: error
+tags:
+  - create-github-app-token
+  - self-hosted
+  - clock-skew
+  - jwt
+  - ghes
+  - authentication
+  - ntp
+patterns:
+  - regex: "Expiration time.*claim.*exp.*too far in the future"
+    flags: 'i'
+  - regex: "'Expiration time' claim \\('exp'\\) is too far in the future"
+    flags: 'i'
+  - regex: 'Failed to create token for.*attempt \d+.*Expiration time.*exp.*too far'
+    flags: 'i'
+error_messages:
+  - "'Expiration time' claim ('exp') is too far in the future"
+  - "Failed to create token for \"ORG\" (attempt 1): 'Expiration time' claim ('exp') is too far in the future"
+  - "RequestError [HttpError]: 'Expiration time' claim ('exp') is too far in the future"
+root_cause: |
+  The `actions/create-github-app-token` action generates a JSON Web Token (JWT) to
+  authenticate as a GitHub App. The JWT's `exp` (expiration) claim is set to
+  `current_time + 10 minutes` using the runner host's system clock.
+
+  When a self-hosted runner's system clock is **ahead of real time** (clock drift), the
+  calculated `exp` value is further in the future than the GitHub API (or GHES) allows.
+  GitHub/GHES enforces a maximum allowable `exp` value based on the server's clock.
+  If the runner clock is ahead by more than the allowed tolerance, the JWT is rejected
+  with HTTP 401 and the message "'Expiration time' claim ('exp') is too far in the future".
+
+  This is particularly common on:
+  - Self-hosted runners in cloud VMs or containers whose system clock drifts without
+    proper NTP synchronization
+  - GitHub Enterprise Server (GHES) installations where the GHES server's clock is
+    slightly behind GitHub.com's time or the runner's clock is slightly ahead
+  - Runners that have been running for a long time without NTP re-sync
+
+  The action retries up to 4 times by default, but all attempts fail with the same 401
+  because the JWT `exp` claim is always computed from the same drifted clock.
+
+  Source: actions/create-github-app-token#178 (Oct 2024, self-hosted macOS on AWS).
+fix: |
+  1. **Synchronize the runner's system clock via NTP.** This is the definitive fix.
+
+     On Linux (systemd-timesyncd or chrony):
+     ```bash
+     sudo systemctl start systemd-timesyncd
+     timedatectl status   # verify NTP: active and Synchronized: yes
+     ```
+
+     On macOS:
+     ```bash
+     sudo sntp -sS pool.ntp.org
+     ```
+
+     On Windows:
+     ```powershell
+     w32tm /resync /force
+     ```
+
+  2. **Add a clock-sync step before the token step** as a CI workaround when NTP is
+     unreliable or unavailable:
+
+  3. **On GHES**: ensure the GHES server itself is NTP-synchronized and within the
+     expected clock tolerance. GHES admin console → Management Console → Time → verify
+     NTP settings.
+fix_code:
+  - language: yaml
+    label: 'Sync clock before token step (self-hosted runner workaround)'
+    code: |
+      steps:
+        # Workaround: sync clock to prevent JWT exp claim rejection on drifted runners
+        - name: Sync system clock
+          if: runner.os == 'Linux'
+          run: |
+            sudo chronyc -a makestep 2>/dev/null || \
+              sudo ntpdate -u pool.ntp.org 2>/dev/null || \
+              true
+          continue-on-error: true
+
+        - uses: actions/create-github-app-token@v3
+          id: app-token
+          with:
+            app-id: ${{ vars.APP_ID }}
+            private-key: ${{ secrets.PRIVATE_KEY }}
+            # For GHES:
+            # github-api-url: ${{ vars.GHES_URL }}/api/v3
+prevention:
+  - 'Ensure all self-hosted runner hosts have NTP synchronization enabled and verified (timedatectl status on Linux, w32tm /query /status on Windows).'
+  - 'For runners in cloud VMs, enable the cloud provider NTP service (e.g., AWS Time Sync Service via 169.254.169.123) for accurate time without external network dependency.'
+  - 'Monitor runner logs for periodic clock-drift warnings; a drift of even 30 seconds can push the JWT exp claim out of tolerance on strict GHES installs.'
+  - 'On GHES, verify the server NTP settings in Management Console → Time and ensure the GHES server clock is within 1–2 minutes of real time.'
+  - 'Do not run self-hosted runners in long-lived container images that never resync NTP; ensure NTP is running inside the container or inherited from the host.'
+docs:
+  - url: 'https://github.com/actions/create-github-app-token/issues/178'
+    label: 'create-github-app-token#178 — exp claim too far in the future on self-hosted GHES (Oct 2024)'
+  - url: 'https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app#about-json-web-tokens-for-github-apps'
+    label: 'GitHub Docs: JWT for GitHub Apps — exp claim format and requirements'
+  - url: 'https://docs.github.com/en/enterprise-server@latest/admin/monitoring-managing-and-updating-your-instance/configuring-time-for-your-appliance'
+    label: 'GHES Docs: Configuring time for your appliance'
