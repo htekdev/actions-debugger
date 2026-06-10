@@ -1,0 +1,131 @@
+id: silent-failures-188
+title: 'ARC Kubernetes Mode: WebSocket Idle Timeout Silently Kills Long-Quiet Steps and Reports Job as SUCCESS'
+category: silent-failures
+severity: silent-failure
+tags:
+  - arc
+  - actions-runner-controller
+  - kubernetes
+  - runner-container-hooks
+  - websocket
+  - idle-timeout
+  - silent-success
+  - node-gyp
+  - compression
+  - long-running
+patterns:
+  - regex: 'Post job cleanup\.'
+    flags: 'i'
+  - regex: 'execPodStep.*WebSocket|WebSocket.*closed.*execPodStep'
+    flags: 'i'
+patterns_note: |
+  This failure has NO distinctive error pattern — the job ends with a success exit code
+  and "Post job cleanup." appears in the log after 4-5 minutes of silence. The only
+  signal is a suspicious gap in log timestamps (e.g., a step shows no output for
+  ~5 minutes then suddenly the NEXT step starts).
+error_messages:
+  - "(no error — job completes with green checkmark)"
+  - "Post job cleanup."
+  - "Compressing <file>... (no output for 300+ seconds) ... Post job cleanup."
+root_cause: |
+  In ARC Kubernetes mode (`containerMode.type: kubernetes`), `runner-container-hooks`
+  uses `execPodStep` in `packages/k8s/src/k8s/index.ts` to execute workflow steps
+  inside the job container. It establishes a WebSocket connection via the Kubernetes
+  `exec` API (`k8s.Exec`) to stream `stdout`/`stderr` from the running command.
+
+  Network intermediaries between the runner and the Kubernetes API server — including
+  load balancers, ingress controllers, and the API server itself — enforce **idle
+  connection timeouts**, typically around 4–5 minutes. When a running step produces
+  NO output (e.g., `tar` or `gzip` compressing a large file, `cmake` linking,
+  waiting on a lock, or any silent long-running process), the WebSocket connection
+  is idle and gets torn down by the network infrastructure.
+
+  When the WebSocket closes, `runner-container-hooks` interprets the closed
+  connection as **the command completing normally** and resolves the step as
+  **success**. The runner then proceeds to post-job cleanup and reports the entire
+  job as **succeeded (green)**.
+
+  The actual command was killed mid-execution. There is no error, no exit code
+  mismatch, and no timeout message — the workflow simply appears to have succeeded.
+
+  **Reported in**: actions/runner-container-hooks#331 (March 2026)
+  **Affects**: runner-container-hooks v0.8.0+ in Kubernetes mode
+  **ARC chart versions affected**: gha-runner-scale-set 0.9.x+
+
+  Common triggers:
+  - `tar`/`gzip`/`zstd` compressing large archives silently
+  - `cmake --build` or `cargo build` linking phase (no output during link)
+  - Large file transfers or checksumming
+  - `sleep` or polling loops without output
+  - `npm install` on very slow networks (no output during download)
+fix: |
+  **Workaround 1 — Force periodic output from silent steps:**
+  Add a background process that emits heartbeat output every ~2 minutes:
+  ```bash
+  # In bash: send periodic dots to keep WebSocket alive
+  (while true; do sleep 120; echo "⏳ still running..."; done) &
+  HEARTBEAT_PID=$!
+  <your-silent-command>
+  kill $HEARTBEAT_PID
+  ```
+
+  **Workaround 2 — Increase the WebSocket idle timeout on your ingress/load balancer:**
+  - For NGINX ingress: set `proxy_read_timeout 600s;` and `proxy_send_timeout 600s;`
+  - For AWS ALB: increase idle timeout to 600+ seconds
+  - For GKE ingress: set `kubernetes.io/ingress.global-static-ip-name` annotation
+    with appropriate backend timeout settings
+  - For Istio: set `connectionPool.tcp.connectTimeout` and HTTP idle timeout
+  
+  **Workaround 3 — Add `stdbuf -o0` or `unbuffer` to prevent output buffering:**
+  Some tools buffer output internally. Forcing line-buffered output can keep the
+  WebSocket active:
+  ```bash
+  stdbuf -o0 <your-command>
+  ```
+
+  **Long-term fix:** Track actions/runner-container-hooks#331 and upgrade once
+  a fix is released that detects WebSocket disconnection as a job failure rather
+  than normal completion.
+fix_code:
+  - language: yaml
+    label: "Heartbeat workaround — keep WebSocket alive during silent steps"
+    code: |
+      - name: Build (with WebSocket keepalive for ARC Kubernetes mode)
+        run: |
+          # Start heartbeat to prevent 5-minute idle WebSocket timeout in ARC k8s mode
+          (while true; do sleep 120; echo "⏳ build still running..."; done) &
+          HEARTBEAT_PID=$!
+          
+          # Your long-running silent command here
+          make release  # or: cmake --build . / cargo build --release / tar -czf ...
+          BUILD_EXIT=$?
+          
+          kill $HEARTBEAT_PID 2>/dev/null || true
+          exit $BUILD_EXIT
+  - language: yaml
+    label: "NGINX ingress annotation — increase timeout for ARC runners"
+    code: |
+      # In your ARC runner scale-set values.yaml or ingress annotations:
+      # nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+      # nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+      #
+      # Or in a separate Ingress resource:
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        annotations:
+          nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+          nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+prevention:
+  - "Always add a heartbeat loop (background process emitting output every 2 minutes) to any ARC Kubernetes workflow step that may run silently for more than 4 minutes."
+  - "Configure your Kubernetes ingress/load balancer idle timeout to 600+ seconds for ARC runner traffic."
+  - "Add timing assertions after critical build steps — compare artifact file sizes or checksums to detect partial builds that completed due to a WebSocket timeout."
+  - "Monitor log timestamp gaps: a gap of exactly ~5 minutes between two log lines in a Kubernetes ARC job is a strong indicator of this bug."
+  - "Subscribe to actions/runner-container-hooks releases to pick up the WebSocket reconnect fix when it lands."
+docs:
+  - url: "https://github.com/actions/runner-container-hooks/issues/331"
+    label: "runner-container-hooks#331 — k8s mode: WebSocket idle timeout silently kills jobs and reports SUCCESS (March 2026)"
+  - url: "https://github.com/actions/runner-container-hooks"
+    label: "actions/runner-container-hooks — Runner Container Hooks for GitHub Actions"
+  - url: "https://kubernetes.io/docs/concepts/services-networking/ingress/"
+    label: "Kubernetes Ingress — proxy timeout configuration"
