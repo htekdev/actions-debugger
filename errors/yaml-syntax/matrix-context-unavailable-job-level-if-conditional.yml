@@ -1,0 +1,117 @@
+id: yaml-syntax-109
+title: 'Matrix context unavailable in job-level if conditional — Unrecognized named-value matrix'
+category: yaml-syntax
+severity: error
+tags:
+  - matrix
+  - if-condition
+  - job-level
+  - context-availability
+  - expression
+  - runs-on
+  - workaround
+patterns:
+  - regex: 'Unrecognized named-value: ''matrix'''
+    flags: 'i'
+  - regex: 'Located at position \d+ within expression:.*matrix\.'
+    flags: 'i'
+  - regex: 'jobs\.<job_id>\.if.*matrix|if.*matrix\.\w+.*job level'
+    flags: 'i'
+error_messages:
+  - "Unrecognized named-value: 'matrix'. Located at position 26 within expression: contains(inputs.SCHEMAS, matrix.customer.schema)"
+  - "Unrecognized named-value: 'matrix'. Located at position 4 within expression: matrix.os == 'ubuntu-latest'"
+  - "The workflow is not valid. .github/workflows/build.yml (Line: 10, Col: 8): Unrecognized named-value: 'matrix'"
+root_cause: |
+  GitHub Actions allows the `matrix` context in most per-step and per-job fields such as
+  `runs-on:`, `environment:`, `steps[*].if:`, and `steps[*].with:`, but **does not allow it
+  in the job-level `if:` condition** (`jobs.<job_id>.if`). This is a long-standing limitation
+  documented in actions/runner#1985 (64 reactions, open since July 2022).
+
+  The inconsistency is particularly confusing because `runs-on: ${{ matrix.os }}` works on the
+  same job while `if: ${{ matrix.os == 'ubuntu-latest' }}` on the same job fails. Both appear at
+  the same YAML indentation level but are evaluated at different phases of the workflow engine.
+
+  The job-level `if:` is evaluated before the matrix expansion phase completes, so the `matrix`
+  context is not yet populated when the condition is checked. In contrast, `runs-on:` and
+  `steps[*].if:` are evaluated after matrix expansion, when `matrix.*` values are available.
+
+  This means developers cannot use job-level `if:` to conditionally skip individual matrix
+  combinations — such as "only run the deploy job when matrix.env == 'prod'" or "only run when
+  matrix.os is not windows-latest." The error appears as HTTP 422 "Unrecognized named-value: 
+  'matrix'" and prevents the entire workflow from parsing.
+fix: |
+  Three effective workarounds are available:
+
+  **Option 1 — Move the condition to step-level `if:`** (simplest for small jobs):
+  Remove the job-level `if:` condition and add `if: ${{ matrix.value == 'expected' }}` to each
+  step within the job. The job always runs but all steps are skipped when the condition is false.
+  This results in a job marked as "Success" even when skipped, which can be noisy.
+
+  **Option 2 — Use a setup job to pre-filter the matrix** (cleanest, eliminates unwanted runs):
+  Add a setup job that computes and outputs a pre-filtered JSON matrix. The main job consumes
+  this filtered matrix via `fromJSON(needs.setup.outputs.matrix)`. Jobs that don't meet the
+  condition are simply absent from the matrix and never queued.
+
+  **Option 3 — Use a reusable workflow call with the matrix as input** (elegant for complex cases):
+  Call a reusable workflow with `uses:` in the job, passing matrix values as `with:` inputs.
+  The job-level `if:` on a `uses:` job can reference `matrix` context. This works because
+  `workflow_call` jobs evaluate the matrix differently from regular jobs.
+fix_code:
+  - language: yaml
+    label: 'Wrong: job-level if with matrix context (HTTP 422)'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ${{ matrix.os }}       # OK: matrix works in runs-on
+          if: matrix.env == 'prod'        # ERROR: matrix not available in job-level if
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest]
+              env: [dev, staging, prod]
+          steps:
+            - run: echo "deploying to ${{ matrix.env }}"
+  - language: yaml
+    label: 'Option 1: move condition to step-level if (quick fix, job still appears)'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ${{ matrix.os }}
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest]
+              env: [dev, staging, prod]
+          steps:
+            - if: matrix.env == 'prod'    # OK: matrix works in step-level if
+              run: echo "deploying to ${{ matrix.env }}"
+  - language: yaml
+    label: 'Option 2: setup job pre-filters matrix (no phantom job runs)'
+    code: |
+      jobs:
+        setup:
+          runs-on: ubuntu-latest
+          outputs:
+            matrix: ${{ steps.filter.outputs.matrix }}
+          steps:
+            - id: filter
+              run: |
+                # Only include prod entries in the matrix
+                echo 'matrix={"os":["ubuntu-latest"],"env":["prod"]}' >> $GITHUB_OUTPUT
+        deploy:
+          needs: setup
+          runs-on: ${{ matrix.os }}
+          strategy:
+            matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+          steps:
+            - run: echo "deploying to ${{ matrix.env }}"
+prevention:
+  - "Use step-level if conditions to filter individual matrix jobs rather than job-level if when matrix context is needed."
+  - "Pre-filter the matrix in a setup job when you need to skip specific matrix combinations entirely."
+  - "Check the GHA context availability docs before using matrix in new field types — job-level if is one of the exceptions."
+  - "actionlint does not always flag this as an error because matrix IS listed as available for job-level if in some schema versions — test with gh workflow run to confirm."
+docs:
+  - url: 'https://github.com/actions/runner/issues/1985'
+    label: 'actions/runner#1985: Unrecognized named-value matrix in job if conditional (64 reactions, open since 2022)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#context-availability'
+    label: 'GitHub Docs: Context availability by workflow field'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idif'
+    label: "GitHub Docs: jobs.<job_id>.if syntax reference"

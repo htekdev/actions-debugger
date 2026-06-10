@@ -1,0 +1,99 @@
+id: yaml-syntax-108
+title: 'Step-level shell field rejects matrix context — Unrecognized named-value matrix'
+category: yaml-syntax
+severity: error
+tags:
+  - matrix
+  - shell
+  - context-availability
+  - parse-time
+  - expression
+  - defaults
+  - actionlint
+patterns:
+  - regex: 'Unrecognized named-value: ''matrix'''
+    flags: 'i'
+  - regex: 'context "matrix" is not allowed here'
+    flags: 'i'
+  - regex: 'shell.*matrix.*not allowed|matrix.*shell.*context'
+    flags: 'i'
+error_messages:
+  - "Unrecognized named-value: 'matrix'. Located at position 1 within expression: matrix.shell"
+  - "context \"matrix\" is not allowed here. no context is available here."
+  - "The workflow is not valid. .github/workflows/test.yml (Line: 18, Col: 16): Unrecognized named-value: 'matrix'"
+root_cause: |
+  GitHub Actions evaluates workflow field values against a per-field allowlist of expression
+  contexts (defined in the runner schema at workflow-v1.0.json). The step-level `shell:` field
+  (`jobs.<job_id>.steps[*].shell`) has **no allowed expression contexts** — it accepts only a
+  plain string value and cannot reference any context, including `matrix`.
+
+  By contrast, `jobs.<job_id>.defaults.run.shell` (job-level defaults) explicitly lists `matrix`
+  as an allowed context. This inconsistency is unintuitive: developers see that `matrix` works in
+  `runs-on:` and `steps[*].if:` and assume it works in `steps[*].shell:` as well.
+
+  When a step uses `shell: ${{ matrix.shell }}` (or any matrix expression in the shell field),
+  GitHub's workflow parser rejects the workflow at parse time with HTTP 422 and the error
+  "Unrecognized named-value: 'matrix'". No job steps execute. The `gh workflow run` CLI command
+  also returns 422 for affected workflows.
+
+  This is a known, long-standing limitation documented in actions/runner#444 (open since 2020).
+  actionlint (≥1.7.12) detects this exact violation locally.
+fix: |
+  Move the matrix expression from each step's `shell:` field to the **job-level**
+  `defaults: run: shell:` key, where the `matrix` context IS allowed by the runner schema.
+
+  Replace every occurrence of `shell: ${{ matrix.shell }}` at the step level with a single
+  `defaults: run: shell: ${{ matrix.shell }}` entry under the job. Remove the step-level
+  `shell:` from all affected steps.
+
+  If only a subset of steps need the matrix-defined shell, keep those steps without a `shell:`
+  override and rely on the job-level default, or rename/restructure the matrix to distinguish
+  them.
+fix_code:
+  - language: yaml
+    label: 'Wrong: step-level shell with matrix expression (HTTP 422 parse error)'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          strategy:
+            matrix:
+              shell: [bash, sh]
+          steps:
+            - name: Run tests
+              shell: ${{ matrix.shell }}   # ERROR: matrix context not allowed in step-level shell
+              run: echo "running tests"
+            - name: Lint
+              shell: ${{ matrix.shell }}   # ERROR: same issue on every step
+              run: echo "linting"
+  - language: yaml
+    label: 'Correct: job-level defaults.run.shell (matrix context allowed here)'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          strategy:
+            matrix:
+              shell: [bash, sh]
+          defaults:
+            run:
+              shell: ${{ matrix.shell }}   # OK: matrix context IS allowed at job defaults level
+          steps:
+            - name: Run tests
+              run: echo "running tests"    # inherits shell from defaults.run.shell
+            - name: Lint
+              run: echo "linting"          # inherits shell from defaults.run.shell
+prevention:
+  - "Use actionlint locally to validate workflows before pushing — it catches this exact violation with 'context matrix is not allowed here'."
+  - "Place matrix-dependent shell selection at job level via defaults.run.shell, not at individual step level."
+  - "Consult the GHA context availability table before using any context in a new field — not all fields allow the same contexts."
+  - "Run 'gh workflow run' against the workflow to get HTTP 422 validation errors early rather than discovering on push."
+docs:
+  - url: 'https://github.com/actions/runner/issues/444'
+    label: 'actions/runner#444: Allow expressions in step-level shell (open since 2020)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#context-availability'
+    label: 'GitHub Docs: Context availability by workflow field'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#defaultsrun'
+    label: 'GitHub Docs: defaults.run (job-level, supports matrix)'
+  - url: 'https://github.com/rhysd/actionlint'
+    label: 'actionlint: Static checker that detects context availability violations'
