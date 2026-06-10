@@ -141,7 +141,7 @@ function matchEntry(entry: ErrorEntry, input: string): number {
   const inputLower = input.toLowerCase();
   const titleWords = entry.title.toLowerCase().split(/\s+/);
   const matchingWords = titleWords.filter(w => w.length > 5 && inputLower.includes(w));
-  if (matchingWords.length >= 2) {
+  if (matchingWords.length >= 3) {
     bestScore = Math.max(bestScore, 20 + matchingWords.length * 5);
   }
 
