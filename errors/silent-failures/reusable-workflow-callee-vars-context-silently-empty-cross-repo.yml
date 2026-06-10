@@ -1,0 +1,121 @@
+id: silent-failures-183
+title: 'Reusable Workflow Callee vars Context Silently Returns Empty String for Cross-Repo Variables'
+category: silent-failures
+severity: silent-failure
+tags:
+  - reusable-workflow
+  - vars
+  - context
+  - cross-repo
+  - silent-failure
+  - variables
+  - caller-callee
+patterns:
+  - regex: 'Deploying to \s*$'
+    flags: 'm'
+  - regex: 'with\s+\[\s*\]\s*region|deploy.*target.*empty|environment.*name.*empty'
+    flags: 'i'
+error_messages:
+  - "(no error — vars.VAR_NAME silently resolves to empty string inside cross-repo callee)"
+  - "Warning: Unexpected input(s) 'REGION' ignored — symptom when caller passes vars as direct inputs without callee input declaration"
+root_cause: |
+  GitHub Actions `vars` (repository/organization/environment variables) are context-scoped per
+  repository. When a caller workflow in Repository A invokes a reusable workflow from Repository B,
+  the callee (Repository B) evaluates `vars.*` against ITS OWN repository's variable store —
+  not the caller's.
+
+  This means:
+  - `vars.MY_VAR` evaluated inside the callee's steps will be EMPTY STRING if `MY_VAR` is not
+    defined in Repository B, even if it is defined in Repository A (the caller).
+  - No error is raised. The callee silently receives an empty string, causing downstream steps
+    to behave incorrectly (empty deploy target, wrong region, incorrect branch name, etc.).
+
+  This is distinct from `env:` context not being forwarded:
+  - `env:` variables in the caller's job-level or workflow-level block are NOT forwarded to callees.
+  - `vars` are also NOT forwarded — they are independently resolved per-repository.
+  - `secrets` CAN be forwarded via `secrets: inherit`, but there is no equivalent `vars: inherit`.
+
+  The failure is particularly deceptive in monorepo or same-org setups where the caller and callee
+  are in different repositories but appear to share the same configuration. Developers often assume
+  org-level variables (defined in the GitHub org settings) will be available in all repos, but
+  org-level vars must be explicitly scoped to the callee's repository to appear in its `vars` context.
+
+  Common scenario:
+  1. Org A defines `vars.DEPLOY_ENV = "production"` at the org level, scoped to repo-caller only.
+  2. Caller workflow references reusable workflow in repo-callee via `uses: org/repo-callee/.github/...`
+  3. Inside repo-callee steps, `${{ vars.DEPLOY_ENV }}` resolves to "" (empty) — not "production".
+  4. The deploy step silently targets an empty environment, either skipping or deploying to wrong target.
+
+  Same-repository reusable workflows (where caller and callee are in the same repo) are NOT affected
+  because they share the same `vars` context.
+
+fix: |
+  Explicitly pass required caller-side `vars` as `with:` inputs to the reusable workflow.
+  The callee must declare them as `inputs:` in its `on: workflow_call:` block.
+
+  For org-level variables, ensure the variable is scoped to the CALLEE's repository in the
+  GitHub org settings (Settings → Variables → Organization Variables → Selected repositories).
+
+fix_code:
+  - language: yaml
+    label: 'Wrong: callee directly accesses vars.REGION — silently empty in cross-repo call'
+    code: |
+      # --- .github/workflows/caller.yml (in org/repo-caller) ---
+      jobs:
+        deploy:
+          uses: org/repo-callee/.github/workflows/deploy.yml@main
+          # vars.REGION = "us-east-1" is defined in repo-caller, NOT passed to callee
+
+      # --- .github/workflows/deploy.yml (in org/repo-callee) ---
+      on:
+        workflow_call:    # no inputs declared
+
+      jobs:
+        run:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying to ${{ vars.REGION }}"
+              # ✗ vars.REGION is "" because repo-callee has no REGION variable — silent failure
+  - language: yaml
+    label: 'Fix: pass caller vars as explicit with: inputs to the reusable workflow'
+    code: |
+      # --- .github/workflows/caller.yml (in org/repo-caller) ---
+      jobs:
+        deploy:
+          uses: org/repo-callee/.github/workflows/deploy.yml@main
+          with:
+            region: ${{ vars.REGION }}    # ✓ explicitly pass caller's vars as input
+
+      # --- .github/workflows/deploy.yml (in org/repo-callee) ---
+      on:
+        workflow_call:
+          inputs:
+            region:
+              required: true
+              type: string
+
+      jobs:
+        run:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploying to ${{ inputs.region }}"    # ✓ receives "us-east-1"
+  - language: yaml
+    label: 'Alternative: scope the org-level variable to the callee repository'
+    code: |
+      # In GitHub org settings → Variables → Organization Variables
+      # Edit the variable "REGION" and change repository access to:
+      # "Selected repositories" → add org/repo-callee
+      # After this, vars.REGION will resolve correctly inside repo-callee's context
+prevention:
+  - 'Never assume cross-repo reusable workflows share vars context — always pass caller-side vars explicitly via with: inputs.'
+  - 'Audit all cross-repository reusable workflow calls: anywhere the callee uses `vars.*` in steps, ensure the variable is either scoped to the callee repo or passed as an input.'
+  - 'Add required: true to callee inputs for critical variables (region, environment name, deploy target) so missing values cause an explicit validation error instead of silent empty string.'
+  - 'When defining org-level variables, explicitly scope them to all repositories that need them, including callee repos used by reusable workflows.'
+  - 'There is no `vars: inherit` equivalent — unlike secrets: inherit, variable context is never automatically forwarded across repos.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/store-information-in-variables#using-the-vars-context-to-access-configuration-variable-values'
+    label: 'GitHub Docs: vars context — repository/org/environment variable resolution'
+  - url: 'https://docs.github.com/en/actions/sharing-automations/reusing-workflows#passing-inputs-and-secrets-to-a-reusable-workflow'
+    label: 'GitHub Docs: Passing inputs and secrets to a reusable workflow'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/store-information-in-variables#creating-configuration-variables-for-an-organization'
+    label: 'GitHub Docs: Creating org-level variables and scoping to repositories'

@@ -1,0 +1,100 @@
+id: caching-artifacts-123
+title: 'download-artifact@v8 digest-mismatch Now Defaults to error — Breaks Workflows That Relied on v7 Warning-Only Behavior'
+category: caching-artifacts
+severity: error
+tags:
+  - download-artifact
+  - v8
+  - digest-mismatch
+  - hash-mismatch
+  - breaking-change
+  - upgrade
+  - network-corruption
+patterns:
+  - regex: 'Digest mismatch.*expected.*but got'
+    flags: 'i'
+  - regex: 'Artifact download failed.*digest.*mismatch'
+    flags: 'i'
+  - regex: 'hash.*verification failed|artifact.*hash.*mismatch'
+    flags: 'i'
+  - regex: 'Expected digest sha256:[a-f0-9]+ but got sha256:[a-f0-9]+'
+    flags: 'i'
+error_messages:
+  - "Error: Digest mismatch: Expected digest sha256:abc123def456... but got sha256:789ghi012jkl..."
+  - "Error: Artifact download failed: Digest mismatch"
+  - "Error: Artifact hash verification failed: digest mismatch"
+root_cause: |
+  actions/download-artifact@v8 (released February 26, 2026) introduced a breaking behavior change
+  for artifact hash validation:
+
+  - v7 behavior: when a downloaded artifact's SHA-256 digest did not match the expected digest
+    provided by the artifact backend, the action logged a WARNING and allowed the workflow to continue.
+    Many workflows were silently tolerating transient hash mismatches without ever knowing.
+
+  - v8 behavior: the same condition now defaults to `error`, failing the step and stopping the
+    workflow run. This is controlled by the new `digest-mismatch` input parameter
+    (accepted values: `warn`, `error`; default in v8: `error`).
+
+  Transient hash mismatches can occur due to:
+  - Network-layer corruption during download from Azure Blob Storage (especially in high-latency regions)
+  - CDN or proxy byte-range delivery issues
+  - MTU mismatch on self-hosted runner network interfaces
+  - Very rare race conditions if an artifact is still being finalized while download begins
+  - Load balancer-level TCP retransmission producing inconsistent payloads
+
+  Because v7 silently warned on these cases, many organizations have long-running CI pipelines that
+  experience occasional hash mismatches without anyone noticing. Upgrading to v8 (or pinning to @v8)
+  surfaces these previously hidden failures as hard errors.
+
+fix: |
+  Option 1 — Restore v7 permissive behavior (workaround while investigating):
+  Set `digest-mismatch: warn` to log the mismatch and continue, matching v7 behavior.
+
+  Option 2 — Investigate the root cause (recommended):
+  Hash mismatches indicate genuine data integrity issues. Check network conditions on your runners,
+  review proxy/MTU settings on self-hosted runners, and examine whether the upload itself is
+  producing consistent artifacts.
+
+  Option 3 — Add retry logic for transient mismatches:
+  Wrap the download step in a retry loop. Transient corruption will usually resolve on retry while
+  genuine artifact corruption will fail consistently.
+
+fix_code:
+  - language: yaml
+    label: 'Restore v7 warning-only behavior with digest-mismatch: warn'
+    code: |
+      - uses: actions/download-artifact@v8
+        with:
+          name: my-artifact
+          digest-mismatch: warn    # ✓ logs warning and continues — matches v7 behavior
+  - language: yaml
+    label: 'Add retry logic for transient network-related hash mismatches'
+    code: |
+      - name: Download artifact with retry
+        uses: nick-fields/retry@v3
+        with:
+          max_attempts: 3
+          retry_on: error
+          command: |
+            gh run download ${{ github.run_id }} -n my-artifact
+      # Or use continue-on-error + explicit re-run logic if retry action unavailable
+  - language: yaml
+    label: 'Strict mode (recommended for security): keep default error and fix root cause'
+    code: |
+      - uses: actions/download-artifact@v8
+        with:
+          name: my-artifact
+          # digest-mismatch defaults to 'error' — any hash mismatch fails the step
+          # This is the SECURE default: prevents tampered artifacts from being silently used
+prevention:
+  - 'When upgrading from download-artifact@v7 to v8, explicitly set `digest-mismatch: warn` first to uncover pre-existing hash mismatches without breaking builds, then switch to `error` after investigation.'
+  - 'Treat hash mismatches as a signal to investigate network integrity, not just a warning to suppress — persistent mismatches may indicate corrupted artifact storage or network-layer issues.'
+  - 'Review runner network configuration (MTU, proxy settings) if mismatches appear consistently on self-hosted runners but not on GitHub-hosted runners.'
+  - 'The strict default (`digest-mismatch: error`) is intentional security hardening — keep it enabled to detect tampered or partially uploaded artifacts in supply-chain scenarios.'
+docs:
+  - url: 'https://github.com/actions/download-artifact/releases/tag/v8.0.0'
+    label: 'actions/download-artifact v8.0.0 release notes — digest-mismatch behavior change'
+  - url: 'https://github.com/actions/download-artifact?tab=readme-ov-file#inputs'
+    label: 'actions/download-artifact: digest-mismatch input reference'
+  - url: 'https://github.blog/changelog/2026-02-26-github-actions-now-supports-uploading-and-downloading-non-zipped-artifacts/'
+    label: 'GitHub Changelog: Non-zipped artifacts and download-artifact@v8 (Feb 26, 2026)'
