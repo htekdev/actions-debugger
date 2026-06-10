@@ -1,0 +1,95 @@
+id: runner-environment-408
+title: 'npm v12 allowScripts Defaults to Off — Native Module Builds (node-gyp, canvas, sharp) Silently Break in CI'
+category: runner-environment
+severity: error
+tags:
+  - npm
+  - npm-v12
+  - allowScripts
+  - node-gyp
+  - native-modules
+  - breaking-change
+  - canvas
+  - sharp
+  - scripts
+patterns:
+  - regex: 'npm warn.*install scripts.*not.*reviewed|npm warn.*scripts.*allowScripts|allowScripts.*not allowed|scripts.*blocked.*allowScripts'
+    flags: 'i'
+  - regex: 'gyp ERR! build error|gyp: No Xcode or CLT version|node-gyp rebuild.*blocked|binding\.gyp.*scripts.*not allowed'
+    flags: 'i'
+  - regex: 'npm approve-scripts --allow-scripts-pending|install scripts are not allowed'
+    flags: 'i'
+error_messages:
+  - "npm warn install scripts for <package> are not reviewed and will be blocked in the next major version"
+  - "npm warn Use `npm approve-scripts --allow-scripts-pending` to see which packages have unreviewed scripts"
+  - "npm error install scripts are not allowed for <package>@<version>"
+  - "gyp ERR! build error"
+  - "Error: ENOENT: no such file or directory, open 'build/Release/<addon>.node'"
+root_cause: |
+  npm v12 (estimated July 2026) changes `allowScripts` to default to `off`. This means
+  packages with `preinstall`, `install`, or `postinstall` scripts are blocked during
+  `npm install` unless explicitly reviewed and approved with `npm approve-scripts`.
+
+  This directly impacts GitHub Actions workflows that install packages with native
+  add-ons compiled by `node-gyp` (e.g., `canvas`, `sharp`, `bcrypt`, `sqlite3`,
+  `bufferutil`, `utf-8-validate`). A `binding.gyp` file triggers an implicit
+  `node-gyp rebuild` — even without an explicit install script — and that is also
+  blocked under npm v12.
+
+  Starting with npm 11.16.0, CI logs will show:
+    `npm warn install scripts for <package> are not reviewed`
+  After npm v12 ships, the same `npm install` step will fail or silently produce a
+  broken native addon that crashes at runtime instead of install time.
+
+  GitHub Actions runners bundle npm with the Node.js versions from `actions/setup-node`.
+  As Node.js 22+ images update their bundled npm to v12+, any workflow calling
+  `npm install` without an `allowScripts` allowlist will break.
+
+  Documented in the GitHub Changelog (2026-06-09):
+  https://github.blog/changelog/2026-06-09-upcoming-breaking-changes-for-npm-v12/
+fix: |
+  **Before npm v12 ships** (proactive — do this now):
+  1. Upgrade to npm 11.16.0+ locally: `npm install -g npm@latest`
+  2. In your project directory, run: `npm approve-scripts --allow-scripts-pending`
+     to see which packages have unreviewed install scripts.
+  3. Review each package and approve trusted ones: `npm approve-scripts <pkg>`
+     or approve all at once: `npm approve-scripts --all`
+  4. This writes an `allowScripts` block to your `package.json` — commit it.
+
+  **After npm v12 ships** (if CI already broke):
+  - Ensure `package.json` has `allowScripts` entries for all required packages.
+  - For native addon packages (anything with `binding.gyp`), you must also approve
+    the implicit `node-gyp rebuild`. Check with `npm approve-scripts --allow-scripts-pending`.
+  - If you cannot modify `package.json`, pass `--allow-scripts=all` to `npm install`
+    as a temporary workaround (not recommended for security).
+fix_code:
+  - language: yaml
+    label: "Run npm approve-scripts in CI to prepare the allowlist"
+    code: |
+      - name: Prepare npm allowScripts for npm v12
+        run: |
+          # Review and approve install scripts ahead of npm v12
+          npm approve-scripts --allow-scripts-pending
+          npm approve-scripts --all
+          # Commit the resulting package.json changes
+      # After running locally and committing package.json with allowScripts block,
+      # your CI workflows will be npm v12-ready.
+  - language: yaml
+    label: "Temporary workaround — allow all scripts (not recommended for security)"
+    code: |
+      - name: Install dependencies
+        run: npm install --allow-scripts=all
+        # ⚠️ Only use this temporarily — review and use npm approve-scripts properly
+prevention:
+  - "Run `npm approve-scripts --allow-scripts-pending` now (requires npm 11.16.0+) to discover which packages need allowlisting before npm v12 ships."
+  - "Pin your npm version in CI to avoid unexpected upgrades: `npm install -g npm@11.x` until you have reviewed and committed an allowScripts policy."
+  - "For repos with native modules (binding.gyp files), test your `npm install` locally with `npm v12` beta to catch failures early."
+  - "Monitor npm CHANGELOG and GitHub Actions runner image changelogs for when npm v12 is bundled in hosted runner images."
+  - "Consider switching native dependencies to WebAssembly-based alternatives that don't require install-time compilation."
+docs:
+  - url: "https://github.blog/changelog/2026-06-09-upcoming-breaking-changes-for-npm-v12/"
+    label: "GitHub Changelog — Upcoming breaking changes for npm v12 (2026-06-09)"
+  - url: "https://docs.npmjs.com/cli/v11/commands/npm-approve-scripts"
+    label: "npm approve-scripts documentation"
+  - url: "https://github.blog/changelog/2026-05-22-staged-publishing-and-new-install-time-controls-for-npm/"
+    label: "GitHub Changelog — Staged publishing and new install-time controls for npm (2026-05-22)"
