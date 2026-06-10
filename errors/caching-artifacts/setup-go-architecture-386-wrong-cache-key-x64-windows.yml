@@ -1,0 +1,112 @@
+id: caching-artifacts-128
+title: "setup-go architecture: '386' Uses Wrong Cache Key (x64 Suffix) -- Cache Miss and Incorrect Isolation on Windows"
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - setup-go
+  - go
+  - cache
+  - architecture
+  - 386
+  - x86
+  - windows
+  - cache-key-bug
+patterns:
+  - regex: 'setup-go-Windows-x64-go-.*386|cache.*setup-go.*Windows.*x64.*386'
+    flags: 'i'
+  - regex: 'Cache not found.*setup-go-Windows-x64.*go.*[0-9]'
+    flags: 'i'
+error_messages:
+  - "Cache not found for key: setup-go-Windows-x64-go-1.22.12-{hash}"
+  - "setup-go-Windows-x64-go-1.22.12-{hash} (when architecture: '386' was specified)"
+root_cause: |
+  actions/setup-go builds its cache key using the runner OS, architecture, Go version,
+  and a hash of the go.sum file:
+
+    setup-go-{os}-{arch}-go-{version}-{hash}
+
+  When architecture: '386' is specified in the action's with: block, the intended
+  key is setup-go-Windows-386-go-{version}-{hash}. However, due to a bug in how the
+  architecture input is resolved for the cache key (it reads the system architecture
+  rather than the requested architecture), the actual key produced is:
+
+    setup-go-Windows-x64-go-{version}-{hash}
+
+  The x64 suffix comes from the host runner architecture. A 386-targeted Go build
+  running on an x64 Windows runner generates a key that collides with a native x64
+  build key. This causes:
+
+  1. Cache pollution: if x64 and 386 builds share the same cache entry, the first
+     build to save wins, potentially restoring the wrong architecture's module cache.
+  2. Silent cache miss: even if the 386 cache entry was saved correctly in a prior
+     run, subsequent runs with architecture: '386' may restore the x64 cache (or
+     vice versa), causing unexpected build failures or incorrect binaries.
+
+  This is documented in actions/setup-go issue #749 (open as of June 2026).
+fix: |
+  Workaround: Disable the built-in cache and provide an explicit actions/cache step
+  that includes the architecture in the key:
+
+    - uses: actions/setup-go@v5
+      with:
+        go-version: '1.22'
+        architecture: '386'
+        cache: false          # disable built-in cache
+
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~\AppData\Local\go-build
+          ~\go\pkg\mod
+        key: setup-go-Windows-386-go-1.22-${{ hashFiles('**/go.sum') }}
+
+  Track actions/setup-go#749 for an official fix -- once merged, the built-in cache
+  will correctly use the requested architecture in the key.
+fix_code:
+  - language: yaml
+    label: "Workaround -- manual cache step with architecture in key"
+    code: |
+      - name: Setup Go (386 architecture)
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          architecture: '386'
+          cache: false            # disable built-in cache to use manual key below
+
+      - name: Cache Go modules (386-specific key)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\AppData\Local\go-build
+            ~\go\pkg\mod
+          key: setup-go-Windows-386-go-1.22-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            setup-go-Windows-386-go-1.22-
+  - language: yaml
+    label: "Workaround -- separate matrix jobs for x64 and 386 with explicit cache keys"
+    code: |
+      strategy:
+        matrix:
+          arch: ['x64', '386']
+      steps:
+        - uses: actions/setup-go@v5
+          with:
+            go-version: '1.22'
+            architecture: ${{ matrix.arch }}
+            cache: false
+
+        - uses: actions/cache@v4
+          with:
+            path: '~\AppData\Local\go-build'
+            key: setup-go-Windows-${{ matrix.arch }}-go-1.22-${{ hashFiles('**/go.sum') }}
+prevention:
+  - "When using setup-go with architecture: '386' on Windows, disable the built-in cache and provide an explicit cache step that includes '386' in the key"
+  - "Verify cache isolation: after a 386 build, check that the saved cache key includes '386' not 'x64'"
+  - "Track actions/setup-go#749 for an official fix"
+docs:
+  - url: "https://github.com/actions/setup-go/issues/749"
+    label: "actions/setup-go#749 -- Cache key incorrectly uses x64 instead of 386 when architecture is set to 386"
+  - url: "https://docs.github.com/en/actions/use-cases-and-examples/building-and-testing/building-and-testing-go"
+    label: "GitHub Docs -- Building and testing Go"
+  - url: "https://github.com/actions/setup-go#caching-dependency-files-and-build-outputs"
+    label: "actions/setup-go -- Caching dependency files and build outputs"
