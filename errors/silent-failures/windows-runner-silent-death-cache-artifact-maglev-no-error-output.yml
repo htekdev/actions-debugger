@@ -1,0 +1,138 @@
+id: silent-failures-194
+title: 'Windows Runner Silently Terminates Mid-Job During actions/cache Restore or actions/download-artifact (Node.js 24 Maglev JIT Crash — No Error Output)'
+category: silent-failures
+severity: silent-failure
+tags:
+  - windows
+  - actions-cache
+  - download-artifact
+  - node24
+  - maglev
+  - silent-failure
+  - runner-crash
+  - self-hosted
+patterns:
+  - regex: 'Cache hit for:.*\n.*Post job cleanup\.'
+    flags: 'i'
+  - regex: 'Downloading single artifact\s*$'
+    flags: 'i'
+  - regex: 'Post job cleanup\.\s*\nPost job cleanup\.'
+    flags: 'i'
+  - regex: 'Node Action run completed with exit code -1073740791'
+    flags: 'i'
+  - regex: '\[DEP0040\] DeprecationWarning: The `punycode` module is deprecated'
+    flags: 'i'
+error_messages:
+  - 'Cache hit for: <key> [then immediately "Post job cleanup." with no further cache output]'
+  - 'Downloading single artifact [then job terminates with no error]'
+  - '##[debug]Node Action run completed with exit code -1073740791'
+  - '(node:XXXX) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. [then job dies]'
+  - '[Post job cleanup appears immediately after cache hit — no artifact download or restore output follows]'
+root_cause: |
+  On Windows runners (windows-latest, windows-2022, windows-2025), JavaScript actions
+  including actions/cache and actions/download-artifact can crash mid-execution with no
+  visible error output. The runner process terminates with exit code -1073740791
+  (0xC0000409 / STATUS_STACK_BUFFER_OVERRUN) caused by a V8 Maglev JIT compiler bug in
+  Node.js 24 on Windows (reported as nodejs/node#62260 in March 2026 and confirmed on
+  Windows Server 2025 runners in May 2026).
+
+  The distinguishing feature of this pattern (vs. the general Maglev crash) is that
+  without debug logging enabled, the exit code is never displayed to the user. The job
+  log shows the cache/artifact action beginning its work and then immediately jumps to
+  "Post job cleanup." lines as if the step succeeded, followed by the job failing with
+  "Error: Process completed with exit code 1" or the job just ending with no step error.
+
+  Commonly observed log sequence for actions/cache silent crash:
+    Cache hit for: <key>        ← cache restore starts
+    Post job cleanup.           ← appears immediately (process crashed)
+    Post job cleanup.
+    Cache up-to-date.
+    <job fails or ends without error>
+
+  Commonly observed for actions/download-artifact:
+    Downloading single artifact ← download starts
+    <job terminates with no further output>
+
+  The runner v2.335.1 (released June 2026) automatically disables the Maglev JIT on
+  Windows x64 for Node 24 actions (prepends --no-maglev), which fixes the crash for
+  GitHub-hosted runners. Self-hosted runners on older versions remain affected.
+
+  Multiple repositories added "continue-on-error: true" to cache steps as a workaround,
+  masking CI failures at the cost of unpredictable build states.
+fix: |
+  Option 1 — Upgrade self-hosted runners to v2.335.1+ (recommended):
+  The runner now automatically invokes Node 24 with --no-maglev on Windows x64. Update
+  self-hosted runners by downloading v2.335.1 from github.com/actions/runner/releases.
+
+  Option 2 — Set ACTIONS_RUNNER_DISABLE_NODE_MAGLEV=1 on older runner versions:
+  Set this environment variable at machine level (system environment variables or
+  .env file in the runner directory) on any self-hosted Windows runner running v2.334.x
+  or earlier. This disables the Maglev JIT before the runner invokes Node 24.
+
+  Option 3 — Enable debug logging to confirm the crash (diagnosis):
+  Add ACTIONS_STEP_DEBUG=true and ACTIONS_RUNNER_DEBUG=true secrets to the repository.
+  With debug logging enabled, the exit code -1073740791 becomes visible in the step log,
+  confirming the Maglev JIT root cause. Then apply Option 1 or 2.
+
+  Option 4 — Temporary workaround: add continue-on-error to cache/artifact steps:
+  While NOT recommended long-term (it masks real errors), adding continue-on-error: true
+  to the affected step allows the rest of the job to proceed. The cache miss is then a
+  cold miss and performance degrades, but the pipeline keeps moving.
+fix_code:
+  - language: yaml
+    label: 'Option 1 — Diagnose with debug logging, then confirm Maglev exit code -1073740791'
+    code: |
+      # In repository Settings → Secrets and variables → Actions → Repository secrets:
+      # ACTIONS_STEP_DEBUG = true
+      # ACTIONS_RUNNER_DEBUG = true
+      #
+      # Then re-run the workflow. In debug output you will see:
+      # ##[debug]Node Action run completed with exit code -1073740791
+      # This confirms Node.js 24 Maglev JIT crash on Windows.
+      # Fix: upgrade self-hosted runner to v2.335.1+ or set ACTIONS_RUNNER_DISABLE_NODE_MAGLEV=1
+  - language: yaml
+    label: 'Option 2 — Set ACTIONS_RUNNER_DISABLE_NODE_MAGLEV for self-hosted Windows runners via workflow env'
+    code: |
+      jobs:
+        build:
+          runs-on: [self-hosted, windows]
+          env:
+            # Disables V8 Maglev JIT on Windows x64 for Node 24 actions
+            # Required for runner versions < v2.335.1 (fixed by default in v2.335.1+)
+            ACTIONS_RUNNER_DISABLE_NODE_MAGLEV: '1'
+          steps:
+            - uses: actions/cache@v4
+              with:
+                path: ~/.cargo/registry
+                key: cargo-${{ hashFiles('**/Cargo.lock') }}
+
+            - uses: actions/download-artifact@v4
+              with:
+                name: build-output
+  - language: yaml
+    label: 'Option 4 — Temporary workaround: continue-on-error on cache step to avoid silent pipeline failure'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-latest
+          steps:
+            - uses: actions/cache@v4
+              continue-on-error: true   # Prevents silent job death from masking all subsequent steps
+              with:
+                path: ~/.cargo/registry
+                key: cargo-${{ hashFiles('**/Cargo.lock') }}
+            # Note: this masks the root cause — upgrade runner to v2.335.1+ instead
+prevention:
+  - 'Keep self-hosted Windows runners updated to the latest runner version (v2.335.1+). The Maglev JIT workaround is applied automatically for Node 24 actions on Windows x64 in this version.'
+  - 'Monitor your Windows pipeline failure rates. A sudden increase in silent job deaths on Windows runners is a strong indicator of a Node.js crash affecting Maglev JIT — enable ACTIONS_RUNNER_DEBUG=true to confirm the -1073740791 exit code.'
+  - 'Avoid using continue-on-error: true as a permanent fix for cache steps — it masks genuine failures. Use it only as a short-term workaround while upgrading the runner.'
+  - 'If using self-hosted runners that cannot be upgraded immediately, set ACTIONS_RUNNER_DISABLE_NODE_MAGLEV=1 as a machine-level environment variable rather than a per-workflow setting so all Actions on the runner benefit.'
+docs:
+  - url: 'https://github.com/actions/cache/issues/1754'
+    label: 'actions/cache#1754 — Windows runner randomly dies in actions/cache (May 2026, 7+ reactions, multiple repos affected)'
+  - url: 'https://github.com/actions/download-artifact/issues/475'
+    label: 'actions/download-artifact#475 — Action failed without any error message on Windows (Apr 2026, 9 reactions)'
+  - url: 'https://github.com/nodejs/node/issues/62260'
+    label: 'nodejs/node#62260 — V8 Maglev JIT causes STATUS_STACK_BUFFER_OVERRUN (0xC0000409) on Windows (Mar 2026)'
+  - url: 'https://github.com/actions/runner/pull/4447'
+    label: 'actions/runner#4447 — Allow disable node v8 maglev jit compiler on node24 (fix in runner v2.335.1, May 2026)'
