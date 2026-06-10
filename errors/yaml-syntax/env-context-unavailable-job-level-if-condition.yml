@@ -1,0 +1,122 @@
+id: yaml-syntax-107
+title: 'env context unavailable in job-level if: condition — "Unrecognized named-value: ''env''"'
+category: yaml-syntax
+severity: error
+tags:
+  - env-context
+  - job-level-if
+  - context-availability
+  - expression-syntax
+  - conditional
+  - workflow-validation
+patterns:
+  - regex: 'Unrecognized named-value:\s+''env'''
+    flags: 'i'
+  - regex: 'if:\s*\$\{\{\s*env\.'
+    flags: 'im'
+  - regex: 'jobs\.\S+\.if.*env\.'
+    flags: 'i'
+error_messages:
+  - "Unrecognized named-value: 'env'. Located at position 2 within expression: env.MY_VAR"
+  - "The workflow is not valid. .github/workflows/deploy.yml (Line: 11, Col: 13): Unrecognized named-value: 'env'."
+  - "Context access might be invalid: env.VAR_NAME"
+root_cause: |
+  The `env` context is not available at the job-level `if:` condition evaluation point.
+  When GitHub Actions evaluates `jobs.<job_id>.if:`, the workflow runner has not yet
+  allocated a runner for the job — the `env` context, which is populated per-runner,
+  is not computed until a runner starts executing. As a result, any expression that
+  references `env.<VAR>` inside a job-level `if:` condition produces an immediate
+  workflow-validation error: "Unrecognized named-value: 'env'".
+
+  Contexts available at job-level `if:` evaluation include: `github`, `needs`, `vars`,
+  `inputs`, `secrets`, and `strategy`. The `env`, `runner`, `job`, and `steps` contexts
+  are all unavailable — they are only populated after the job begins execution.
+
+  This is distinct from:
+  - `env` in step-level `if:` conditions — where `env` IS available because steps run
+    inside an already-allocated runner.
+  - `env` in reusable workflow `with:` input blocks — a different context restriction
+    documented separately.
+
+  A common pattern that triggers this error is using an environment variable set at the
+  workflow level to conditionally skip a job (e.g., based on `env.SKIP_TESTS: 'true'`).
+fix: |
+  Move the conditional check to use `vars` context (repository/org/environment variables)
+  instead of `env` context at the job level, or restructure the condition to use
+  `github` or `inputs` context values that are available at job scheduling time.
+
+  For workflow-level environment variables intended to control job execution, set them as
+  repository variables (accessible via `vars.*`) or pass them as `workflow_dispatch` inputs.
+  Alternatively, check the condition inside the job steps using `if: env.VAR == 'value'`
+  at the step level where the `env` context is available.
+fix_code:
+  - language: yaml
+    label: 'WRONG — env context in job-level if (validation error)'
+    code: |
+      env:
+        SKIP_TESTS: 'false'
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          # ERROR: Unrecognized named-value: 'env'
+          if: ${{ env.SKIP_TESTS != 'true' }}
+          steps:
+            - run: echo "Running tests"
+  - language: yaml
+    label: 'FIX — use vars context (repository variable) instead'
+    code: |
+      # Set SKIP_TESTS as a repository variable in Settings > Secrets and variables > Variables
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          # CORRECT: vars context is available at job scheduling time
+          if: ${{ vars.SKIP_TESTS != 'true' }}
+          steps:
+            - run: echo "Running tests"
+  - language: yaml
+    label: 'FIX — use workflow_dispatch input for manual control'
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            skip_tests:
+              description: 'Skip test jobs'
+              type: boolean
+              default: false
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          # CORRECT: inputs context is available at job scheduling time
+          if: ${{ !inputs.skip_tests }}
+          steps:
+            - run: echo "Running tests"
+  - language: yaml
+    label: 'FIX — check env at step level (not job level)'
+    code: |
+      env:
+        SKIP_TESTS: 'false'
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          # No job-level if needed — env context works at step level
+          steps:
+            - name: Run tests
+              # CORRECT: env context is available at step-level if
+              if: ${{ env.SKIP_TESTS != 'true' }}
+              run: echo "Running tests"
+prevention:
+  - 'Never reference env.* in job-level if: conditions — only github, needs, vars, inputs, secrets, and strategy are available'
+  - 'Use vars.* (repository/environment variables) instead of env.* for job-level conditionals'
+  - 'Use workflow_dispatch inputs for user-controllable job skipping'
+  - 'Use step-level if: conditions when env context values must control execution flow'
+  - 'Run actionlint locally to catch context availability errors before pushing'
+docs:
+  - url: 'https://github.com/actions/runner/issues/1189'
+    label: 'actions/runner#1189: Unrecognized named-value: ''env'' for job conditional (63 reactions)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#context-availability'
+    label: 'GitHub Docs: Context availability — which contexts are available at each evaluation point'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#vars-context'
+    label: 'GitHub Docs: vars context — repository and environment variables'
