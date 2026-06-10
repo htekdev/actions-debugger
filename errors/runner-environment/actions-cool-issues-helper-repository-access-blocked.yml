@@ -1,0 +1,139 @@
+id: runner-environment-407
+title: 'Repository Access Blocked — GitHub-Disabled Action Repo (actions-cool Supply Chain Attack)'
+category: runner-environment
+severity: error
+tags:
+  - supply-chain
+  - security
+  - disabled-action
+  - repository-access-blocked
+  - actions-cool
+  - workflow-init
+patterns:
+  - regex: 'Repository access blocked'
+    flags: 'i'
+  - regex: '##\[error\]Repository access blocked'
+    flags: 'i'
+  - regex: 'Getting action download info.*blocked|action.*download.*blocked'
+    flags: 'i'
+error_messages:
+  - '##[error]Repository access blocked'
+  - 'Repository access blocked'
+  - 'Error: Repository access blocked'
+root_cause: |
+  GitHub can permanently disable a repository for policy violations, DMCA takedowns,
+  or security incidents. When a workflow references an action from a disabled
+  repository, the runner fails at the "Getting action download info" phase — before
+  any step executes — with: `Repository access blocked`.
+
+  The most widely-impacted example occurred on May 19, 2026: the GitHub Actions
+  action `actions-cool/issues-helper` was compromised in a supply chain attack
+  (TeamPCP threat actor). Attackers redirected all repository tags to malicious
+  commits that read Runner.Worker process memory to exfiltrate CI/CD credentials
+  and secrets. GitHub immediately disabled the repository.
+
+  Any workflow referencing `actions-cool/issues-helper@v3`, `@v1`, `@main`, or
+  any SHA that pointed to the malicious tree now fails at startup with
+  "Repository access blocked". The companion action `actions-cool/maintain-one-comment`
+  was also compromised in the same attack wave.
+
+  The action was widely used for issue management automation (opening/closing
+  issues, labels, comments) — especially in fork sync workflows (lobehub forks,
+  template repositories). Thousands of repositories were affected.
+
+  General causes of "Repository access blocked":
+  1. Supply chain attack — GitHub disables a compromised action repo (most common)
+  2. DMCA takedown — copyright violation forces repo removal
+  3. GitHub ToS / security policy violation
+  4. Action owner manually archives or makes repo private after others depended on it
+fix: |
+  Remove or replace all references to the blocked action in your workflow files.
+  The only fix is to use an alternative implementation.
+
+  For `actions-cool/issues-helper` and `actions-cool/maintain-one-comment`,
+  use `actions/github-script` to replicate the functionality inline:
+    - Creating issues: `github.rest.issues.create()`
+    - Adding comments: `github.rest.issues.createComment()`
+    - Updating labels: `github.rest.issues.addLabels()`, `removeLabel()`
+    - Maintaining a single comment: find + update or create pattern
+
+  Also audit your entire workflow suite for other actions from the same author
+  or related repositories that may have been compromised in the same attack wave.
+  Run `git log --all --oneline -- .github/workflows/` to find all workflow files.
+fix_code:
+  - language: yaml
+    label: 'Replace actions-cool/issues-helper with github-script (open/close issues)'
+    code: |
+      # BEFORE (broken — repository disabled by GitHub):
+      # - uses: actions-cool/issues-helper@v3
+      #   with:
+      #     actions: 'open-issue'
+      #     title: 'Sync failed: ${{ github.workflow }}'
+      #     body: 'Upstream sync failed.'
+      #     labels: 'sync-failure'
+
+      # AFTER: equivalent github-script replacement
+      - name: Open failure issue
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Sync failed: ${context.workflow}`,
+              body: 'Upstream sync failed. See workflow run for details.',
+              labels: ['sync-failure']
+            })
+  - language: yaml
+    label: 'Replace actions-cool/maintain-one-comment with github-script (upsert comment)'
+    code: |
+      # BEFORE (broken — repository disabled):
+      # - uses: actions-cool/maintain-one-comment@v3
+      #   with:
+      #     body: '<!-- marker -->\nStatus: ${{ job.status }}'
+
+      # AFTER: find-and-update-or-create pattern
+      - name: Maintain status comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const marker = '<!-- status-bot -->';
+            const body = `${marker}\nStatus: ${context.job}`;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+prevention:
+  - 'Pin third-party actions to a full commit SHA (not a tag or branch name) — tags and branches can be hijacked, SHAs cannot change'
+  - 'Audit workflows for unmaintained or low-visibility third-party actions before depending on them in production'
+  - 'Enable Dependabot for GitHub Actions to receive alerts when pinned action versions change'
+  - 'Use StepSecurity Harden-Runner or OpenSSF Scorecards to detect anomalous network or filesystem activity from actions'
+  - 'Prefer official GitHub-maintained actions (actions/*, github/*, docker/*) over community actions for critical workflow steps'
+  - 'Regularly audit .github/workflows/ for stale action references — compromised repos are often disabled with no warning'
+docs:
+  - url: 'https://github.com/lobehub/lobehub/issues/15026'
+    label: 'lobehub#15026: Upstream Sync workflow fails — actions-cool disabled after supply chain attack (May 2026)'
+  - url: 'https://github.com/lobehub/lobehub/pull/14956'
+    label: 'lobehub#14956: Remove compromised actions-cool/issues-helper@v3'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions#using-third-party-actions'
+    label: 'GitHub Docs: Security hardening — third-party actions best practices'
+  - url: 'https://github.com/step-security/harden-runner'
+    label: 'StepSecurity Harden-Runner: detect and prevent supply chain attacks in Actions'
