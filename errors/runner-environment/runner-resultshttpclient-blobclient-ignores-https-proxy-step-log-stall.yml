@@ -1,0 +1,131 @@
+id: runner-environment-423
+title: 'Runner .NET ResultsHttpClient BlobClient Ignores HTTPS_PROXY — Step Logs and Summaries Stall 75s Behind Deny-All Egress Firewall'
+category: runner-environment
+severity: error
+tags:
+  - self-hosted
+  - https-proxy
+  - blob-storage
+  - step-summary
+  - step-log
+  - egress-firewall
+  - azure-blob
+  - no-proxy
+patterns:
+  - regex: 'host=productionresultssa[0-9]+\.blob\.core\.windows\.net.+latency=7[0-9]\.'
+    flags: 'i'
+  - regex: 'ResultsHttpClient.+BlobClient.+proxy|blob\.core\.windows\.net.+75 second'
+    flags: 'i'
+  - regex: 'azsdk-net-Storage\.Blobs.+latency=7[4-9]\.[0-9]+s'
+    flags: 'i'
+error_messages:
+  - 'host=productionresultssa6.blob.core.windows.net:443  latency=74.999634s  ua=azsdk-net-Storage.Blobs/12.27.0 (.NET 8.0.25)'
+  - 'host=results-receiver.actions.githubusercontent.com:443  latency=74.999750s  ua=VSServices/2.333.1'
+  - 'Step Summary file (/home/runner/work/_temp/_runner_file_commands/step_summary_...) does not exist; skipping attachment upload'
+root_cause: |
+  The GitHub Actions runner uses two separate HTTP stacks for different operations:
+
+  1. **GitHub API calls** — use the runner's custom `RunnerWebProxy` / `VssHttpMessageHandler`,
+     which correctly inherits `HTTPS_PROXY` from the environment.
+
+  2. **Azure Blob Storage writes** (step logs, step summaries, diagnostic logs) — use `BlobClient`
+     and `AppendBlobClient` instances created by `ResultsHttpClient.cs` in the runner SDK. These
+     blob clients are created with only retry/timeout options and **no `HttpClientTransport`**:
+
+       var opts = new BlobClientOptions { Retry = { ... } };
+       return new BlobClient(blobUri.path, new AzureSasCredential(blobUri.sas), opts);
+
+     Without an `HttpClientTransport`, the Azure SDK uses its default HTTP pipeline, which does
+     NOT inherit the runner's `RunnerWebProxy`. The .NET `BlobClient` connects directly to
+     `*.blob.core.windows.net` and `*.actions.githubusercontent.com`, bypassing `HTTPS_PROXY`.
+
+  **Behavior without a firewall**: Direct connections succeed. The proxy bypass is invisible.
+
+  **Behavior with a deny-all egress firewall (only proxy egress allowed)**:
+  - Direct connections to `*.blob.core.windows.net` are blocked at the firewall.
+  - The TCP connect times out at exactly 75 seconds (the proxy's tunnel timeout or the Azure
+    SDK's default network timeout), then retries — each attempt stalls 75 seconds.
+  - Step logs, summaries, and diagnostic logs are never uploaded to the results service.
+  - Jobs appear to complete successfully but take 5–15+ extra minutes and produce no logs.
+
+  Note: The Node.js `@actions/artifact` BlobClient (used by `actions/upload-artifact`) has the
+  same pattern but fails with HTTP 400 "Bad Request" rather than a 75-second stall, because the
+  JavaScript Azure SDK partially handles CONNECT tunnels but rejects the proxy's response.
+
+  This is distinct from the `upload-artifact` HTTP 400 proxy error — the runner's .NET
+  `ResultsHttpClient` affects step logs/summaries, not artifact uploads.
+
+  Source: actions/runner#4351 (Apr 2026, labeled bug; also filed as actions/toolkit#2377 for the
+  Node.js side).
+fix: |
+  **Workaround — add Azure blob and results endpoints to NO_PROXY:**
+
+  Add the affected hostnames to `NO_PROXY` so the runner can connect to them directly without
+  routing through the proxy. This requires that the runner nodes have direct internet access to
+  these specific domains:
+
+    NO_PROXY=.blob.core.windows.net,.actions.githubusercontent.com
+
+  Set this as an environment variable in your runner startup configuration (systemd unit, Docker
+  Compose, ARC EphemeralRunnerSet, etc.).
+
+  **Longer-term fix (pending PR actions/runner#4371):**
+  The runner SDK needs to pass an `HttpClientTransport` configured with the runner's proxy to
+  `BlobClientOptions`. Until a patched runner version ships, `NO_PROXY` is the only workaround.
+
+  **Alternative — use a transparent proxy:**
+  If your egress policy allows it, configure the proxy at the network level (L3/L4 transparent
+  proxy) rather than relying on application-level `HTTPS_PROXY`. The runner's direct blob client
+  connections will then be intercepted by the network layer without requiring `HTTPS_PROXY`.
+fix_code:
+  - language: yaml
+    label: 'ARC EphemeralRunnerSet — add NO_PROXY for Azure blob endpoints'
+    code: |
+      apiVersion: actions.github.com/v1alpha1
+      kind: EphemeralRunnerSet
+      spec:
+        ephemeralRunnerSpec:
+          spec:
+            containers:
+              - name: runner
+                env:
+                  - name: HTTPS_PROXY
+                    value: "http://your-proxy.example.com:3128"
+                  # Add Azure blob and results endpoints to NO_PROXY to bypass the
+                  # runner's BlobClient proxy bypass bug (actions/runner#4351)
+                  - name: NO_PROXY
+                    value: ".blob.core.windows.net,.actions.githubusercontent.com,localhost"
+  - language: yaml
+    label: 'systemd unit / runner env file — add NO_PROXY'
+    code: |
+      # In /etc/actions-runner/.env (for standard binary runner):
+      HTTPS_PROXY=http://your-proxy.example.com:3128
+      # Workaround for runner .NET BlobClient ignoring HTTPS_PROXY (actions/runner#4351)
+      # Step logs and summaries connect directly to Azure Blob; add them to NO_PROXY
+      NO_PROXY=.blob.core.windows.net,.actions.githubusercontent.com,localhost
+  - language: yaml
+    label: 'GitHub Actions workflow — diagnose the proxy bypass in a debugging step'
+    code: |
+      jobs:
+        debug-proxy:
+          runs-on: self-hosted
+          steps:
+            - name: Check proxy configuration
+              run: |
+                echo "HTTPS_PROXY: $HTTPS_PROXY"
+                echo "NO_PROXY: $NO_PROXY"
+                # Test connectivity to blob endpoint (should succeed via proxy or direct)
+                curl -sv --proxy-insecure -x "$HTTPS_PROXY" \
+                  "https://productionresultssa6.blob.core.windows.net/" 2>&1 | head -20 || true
+prevention:
+  - 'When running GitHub Actions runners behind a deny-all egress firewall, always add `.blob.core.windows.net` and `.actions.githubusercontent.com` to `NO_PROXY`.'
+  - 'Test proxy configuration with a fresh runner instance by checking that step logs and summaries appear within 10 seconds of job start — stalls indicate the proxy bypass.'
+  - 'Monitor GCP/AWS Secure Web Proxy logs for connections to `*.blob.core.windows.net` with latency near 75 seconds — these confirm the .NET BlobClient is bypassing the proxy.'
+  - 'File a watch on actions/runner#4351 to be notified when a fixed runner version ships that properly configures BlobClient with an HttpClientTransport.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4351'
+    label: 'actions/runner#4351 — Runner .NET BlobClient ignores HTTPS_PROXY (Apr 2026)'
+  - url: 'https://github.com/actions/toolkit/issues/2377'
+    label: 'actions/toolkit#2377 — @actions/artifact BlobClient proxy issue (Node.js side)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/using-a-proxy-server-with-self-hosted-runners'
+    label: 'GitHub Docs: Using a proxy server with self-hosted runners'

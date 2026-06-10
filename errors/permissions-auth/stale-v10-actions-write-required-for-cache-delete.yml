@@ -1,0 +1,116 @@
+id: permissions-auth-109
+title: 'actions/stale v10+ Requires `actions: write` Permission to Delete Its State Cache'
+category: permissions-auth
+severity: error
+tags:
+  - actions-stale
+  - permissions
+  - actions-write
+  - cache
+  - stale
+  - 403
+  - resource-not-accessible
+patterns:
+  - regex: 'Error delete _state: \[403\] Resource not accessible by integration'
+    flags: 'i'
+  - regex: 'Failed to reserve cache: Error: Failed to Create.*_state'
+    flags: 'i'
+  - regex: 'Warning: Error delete _state.*403.*Resource not accessible by integration'
+    flags: 'i'
+error_messages:
+  - 'Warning: Error delete _state: [403] Resource not accessible by integration - https://docs.github.com/rest/actions/cache#delete-github-actions-caches-for-a-repository-using-a-cache-key'
+  - '##[debug]Failed to reserve cache: Error: Failed to CreateArtifact: Resource not accessible by integration'
+root_cause: |
+  Starting with `actions/stale@v10`, the action persists its processing state across runs
+  using the GitHub Actions cache API (via `@actions/cache`). On each run, it:
+
+  1. Restores the previous `_state` cache entry to resume processing from where it left off.
+  2. Saves a new `_state` cache entry at the end of the run.
+  3. **Deletes the old `_state` cache entry** to avoid accumulating stale entries
+     (GitHub caps cache storage at 10 GB and uses LRU eviction).
+
+  Step 3 calls `DELETE /repos/{owner}/{repo}/actions/caches?key=_state`, which requires the
+  `actions: write` permission. Without it, GitHub returns HTTP 403 Forbidden with:
+
+    Error delete _state: [403] Resource not accessible by integration
+
+  This is a new permission requirement introduced in v10 that did not exist in v9 and earlier
+  (which stored state in a separate database rather than the Actions cache).
+
+  The error appears as a **warning** in logs — `actions/stale` does not fail the step on 403
+  cache deletion failures. However, cache entries accumulate over time because the old `_state`
+  entry is never deleted, eventually hitting the 10 GB cache quota and degrading other caches in
+  the repository.
+
+  Workflows that set any explicit `permissions:` block without including `actions: write` are
+  affected. Repositories where the default token permission has been downgraded to "read-only"
+  are also affected.
+
+  Sources: actions/stale#1131 (2024); actions/stale#1133 (2024); actions/stale PR#1248 (README
+  update documenting the requirement); python/cpython#148165 (2026, real-world example).
+fix: |
+  Add `actions: write` to the `permissions` block of the workflow job that calls
+  `actions/stale`. This grants the GITHUB_TOKEN the ability to delete cache entries.
+
+  Note: If you use `permissions: {}` (empty block) at the workflow level for security hardening,
+  you must explicitly grant `actions: write` at the job level for the stale job.
+fix_code:
+  - language: yaml
+    label: 'Add actions: write permission to the stale job'
+    code: |
+      name: Mark stale issues and pull requests
+
+      on:
+        schedule:
+          - cron: '30 1 * * *'
+
+      jobs:
+        stale:
+          runs-on: ubuntu-latest
+          permissions:
+            issues: write
+            pull-requests: write
+            actions: write   # Required by actions/stale v10+ to delete its _state cache
+
+          steps:
+            - uses: actions/stale@v10
+              with:
+                stale-issue-message: 'This issue is stale...'
+                stale-pr-message: 'This PR is stale...'
+  - language: yaml
+    label: 'Workflow with top-level permissions: {} security hardening'
+    code: |
+      name: Mark stale issues and pull requests
+
+      on:
+        schedule:
+          - cron: '30 1 * * *'
+
+      # Lock down all permissions at workflow level for security
+      permissions: {}
+
+      jobs:
+        stale:
+          runs-on: ubuntu-latest
+          # Grant only what the stale action needs (including actions: write for cache deletion)
+          permissions:
+            issues: write
+            pull-requests: write
+            actions: write   # actions/stale v10+ deletes its _state cache via DELETE /actions/caches
+
+          steps:
+            - uses: actions/stale@v10
+prevention:
+  - 'When upgrading from actions/stale v9 or earlier to v10+, add `actions: write` to the job permissions — this is a new requirement introduced by the cache-backed state persistence.'
+  - 'Check for `Warning: Error delete _state: [403]` in stale job logs — this is the canary for a missing `actions: write` permission.'
+  - 'Monitor repository cache storage usage via Settings → Actions → Caches — accumulating `_state` entries (many with key starting with `_state`) indicate the 403 permission issue.'
+  - 'The `actions/stale` README now documents the `actions: write` requirement (PR#1248). Check the action README when upgrading major versions for new permission requirements.'
+docs:
+  - url: 'https://github.com/actions/stale/issues/1133'
+    label: 'actions/stale#1133 — Error delete _state: [403] Resource not accessible by integration'
+  - url: 'https://github.com/actions/stale/issues/1131'
+    label: 'actions/stale#1131 — Stale workflow fails to override cache (missing actions: write)'
+  - url: 'https://github.com/actions/stale/pull/1248'
+    label: 'actions/stale PR#1248 — README update: document actions: write requirement'
+  - url: 'https://docs.github.com/en/rest/actions/cache?apiVersion=2022-11-28#delete-github-actions-caches-for-a-repository-using-a-cache-key'
+    label: 'GitHub REST API: Delete caches (requires actions: write)'
