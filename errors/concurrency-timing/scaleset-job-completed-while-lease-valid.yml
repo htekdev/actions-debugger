@@ -1,0 +1,107 @@
+id: concurrency-timing-091
+title: 'Scale-Set Message Session Delivers JobCompleted While Execution Lease Is Still Valid — Long Job Killed Mid-Run'
+category: concurrency-timing
+severity: error
+tags:
+  - arc
+  - scale-set
+  - job-lease
+  - long-running
+  - premature-completion
+  - message-session
+  - ephemeral
+  - timing
+  - exit-143
+patterns:
+  - regex: 'The runner has received a shutdown signal'
+    flags: 'i'
+  - regex: 'Successfully renew job.*valid till'
+    flags: 'i'
+  - regex: 'shutdown.*UserCancelled.*operation.*canceled'
+    flags: 'i'
+error_messages:
+  - 'The runner has received a shutdown signal. This can happen when the runner service is stopped, or a manually started runner is canceled.'
+  - 'Error: The operation was canceled.'
+  - 'exit 143'
+root_cause: |
+  On standalone scaleset listener implementations (github.com/actions/scaleset Go module,
+  v0.4.0+), the message session and the job-execution lease are managed by two independent
+  channels with independent lifetimes:
+
+  1. **Message session** — long-poll on RunnerScaleSetJobMessages queue; delivers
+     JobAvailable, JobStarted, JobCompleted events to the controller.
+  2. **Job-execution lease** — renewed every 60 seconds by the runner worker via a
+     separate API endpoint, independent of the message session.
+
+  For long-running jobs (~30-50+ minutes), the message session can emit a `JobCompleted`
+  event while the job-execution lease is still valid and recently renewed (with 10+
+  minutes of remaining headroom), and while the runner worker is still streaming console
+  output. The controller receives `JobCompleted` and sends SIGTERM to the runner
+  ("The runner has received a shutdown signal"), aborting the still-running job.
+
+  Possible causes for the premature JobCompleted:
+  - Stale/replayed message redelivered after a message-session refresh that crossed an
+    internal session lifetime boundary (long-lived sessions may hit a server-side expiry).
+  - Server-side reaping of jobs "in-flight" longer than an internal threshold without
+    consulting the actively-renewed job-execution lease.
+  - Message session reconnect during a long job causing dequeue of a stale completion
+    event from a previous attempt.
+
+  The bug has been confirmed with: lease renewed every 60s to 15:42:57, worker
+  streaming output at 15:33:19, JobCompleted delivered at 15:33:26. Runner process alive,
+  no OOM, no preemption, no workflow-level cancellation or concurrency group.
+  Only jobs > ~30-40 minutes are affected; short jobs never hit this pattern.
+  Source: actions/runner#4492 (filed June 9, 2026, standalone Go scaleset module).
+fix: |
+  No upstream fix available (actions/runner#4492 is open as of June 2026).
+  Workarounds:
+
+  1. **Shard long jobs into shorter sequential stages** (each < 25-30 min) so no single
+     message session lives long enough to cross a session lifetime boundary.
+  2. Use the ARC Helm chart controller (gha-runner-scale-set >= 0.12.1) instead of the
+     standalone scaleset Go module if possible — the chart controller has more session
+     lifecycle hardening.
+  3. Log the full JobCompleted message payload (result, runnerRequestId, finishTime) from
+     the message session to distinguish stale/replayed messages from genuine completions.
+  4. Alert when a job terminates with exit 143 or "operation was canceled" before its
+     expected completion time — these are likely premature kills, not genuine failures.
+fix_code:
+  - language: yaml
+    label: 'Shard long job into sequential stages to stay under message session lifetime'
+    code: |
+      jobs:
+        # Instead of one 50-min job, split into shorter sequential stages
+        build:
+          runs-on: [self-hosted, scale-set-runner]
+          timeout-minutes: 25
+          steps:
+            - uses: actions/checkout@v4
+            - run: make build
+            - uses: actions/upload-artifact@v4
+              with:
+                name: build-artifacts
+                path: dist/
+
+        test:
+          needs: build
+          runs-on: [self-hosted, scale-set-runner]
+          timeout-minutes: 25
+          steps:
+            - uses: actions/download-artifact@v4
+              with:
+                name: build-artifacts
+                path: dist/
+            - run: make test
+prevention:
+  - 'Keep individual job runtime under 25-30 minutes on scale-set runners to avoid message session lifetime boundaries'
+  - 'Use ARC Helm chart controller (>= 0.12.1) rather than the standalone scaleset Go module for better session lifecycle management'
+  - 'Log full JobCompleted message payload to distinguish stale message redeliveries from genuine completions'
+  - 'Alert on jobs ending with exit 143 before expected completion time — not a code failure'
+  - 'Follow actions/runner#4492 for upstream fix progress in the scaleset module'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4492'
+    label: 'actions/runner #4492: Scale-set JobCompleted delivered while execution lease still valid (Jun 2026)'
+  - url: 'https://github.com/actions/actions-runner-controller/releases/tag/gha-runner-scale-set-0.12.1'
+    label: 'ARC gha-runner-scale-set 0.12.1 release — session lifecycle improvements'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/autoscaling-with-self-hosted-runners'
+    label: 'GitHub Docs: Autoscaling with self-hosted runners'
