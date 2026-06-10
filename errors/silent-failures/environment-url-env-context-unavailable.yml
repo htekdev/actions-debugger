@@ -1,0 +1,93 @@
+id: silent-failures-181
+title: "environment.url Uses env Context — URL Resolves to Empty String, No Link in UI"
+category: silent-failures
+severity: silent-failure
+tags:
+  - environment
+  - deployment
+  - url
+  - env-context
+  - contexts
+  - deployment-link
+patterns:
+  - regex: "Environment URL '' is not a valid http"
+    flags: "i"
+  - regex: 'environment url .* is not a valid http\(s\) url'
+    flags: "i"
+error_messages:
+  - "Environment URL '' is not a valid http(s) URL, so it will not be shown as a link in the workflow graph"
+root_cause: |
+  The `environment: url:` field supports GitHub Actions expressions but only has access
+  to a limited set of contexts: `github`, `inputs`, `vars`, `needs`, `steps`, and `job`.
+  The `env` context is NOT available in `environment: url:`.
+
+  A common pattern is to compute the deployment URL in a run step and export it via
+  `$GITHUB_ENV` (which writes to the `env` context), then reference it in `url:`:
+
+    steps:
+      - name: Deploy
+        run: echo "DEPLOY_URL=https://..." >> $GITHUB_ENV
+    environment:
+      name: production
+      url: ${{ env.DEPLOY_URL }}   # ❌ env context not evaluated here
+
+  At the job/deployment level, `env` context is unavailable for `url:`, so the expression
+  silently resolves to an empty string. GitHub emits a warning annotation but the workflow
+  does NOT fail. The deployment record in the GitHub UI and the workflow graph simply
+  show no clickable URL — no indication that the expression was misconfigured.
+fix: |
+  Capture the deployment URL as a step output (via `$GITHUB_OUTPUT`) and reference it
+  using the `steps` context, which IS available in `environment: url:`.
+fix_code:
+  - language: yaml
+    label: "WRONG — env context not available in environment.url"
+    code: |
+      jobs:
+        deploy:
+          environment:
+            name: production
+            url: ${{ env.DEPLOY_URL }}   # ❌ resolves to empty string
+          steps:
+            - name: Deploy
+              run: |
+                echo "DEPLOY_URL=https://my-app.example.com" >> $GITHUB_ENV
+  - language: yaml
+    label: "CORRECT — use step output via steps context"
+    code: |
+      jobs:
+        deploy:
+          environment:
+            name: production
+            url: ${{ steps.deploy.outputs.url }}   # ✅ steps context is available
+          steps:
+            - name: Deploy
+              id: deploy
+              run: |
+                echo "url=https://my-app.example.com" >> $GITHUB_OUTPUT
+  - language: yaml
+    label: "CORRECT — using needs context from a prior job's output"
+    code: |
+      jobs:
+        get-url:
+          outputs:
+            deploy_url: ${{ steps.compute.outputs.url }}
+          steps:
+            - id: compute
+              run: echo "url=https://my-app.example.com" >> $GITHUB_OUTPUT
+        deploy:
+          needs: get-url
+          environment:
+            name: production
+            url: ${{ needs.get-url.outputs.deploy_url }}   # ✅ needs context available
+prevention:
+  - "Use `$GITHUB_OUTPUT` (step outputs) for values that need to appear in `environment: url:` — not `$GITHUB_ENV`."
+  - "The env context is also unavailable in `runs-on:`, `timeout-minutes:` at job level, and `concurrency: group:` at workflow level."
+  - "Consult the context availability table in GitHub docs to verify which contexts apply to each workflow field."
+  - "If you see no deployment link after a successful workflow, check whether `environment: url:` is using the env context."
+docs:
+  - url: "https://stackoverflow.com/questions/67385568/github-actions-how-to-dynamically-set-environment-url-based-on-deployment-step"
+    label: "How to dynamically set environment url based on deployment step output (SO#67385568, 15k views)"
+  - url: "https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#context-availability"
+    label: "Context availability table — GitHub Docs"
+  - url: "https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/deploy-to-environment"
+    label: "Deploying to an environment"
