@@ -1,0 +1,107 @@
+id: ku-113
+title: "windows-11-arm Runner Runs in Non-Interactive Session — GUI and Window-Activation Tests Fail"
+category: known-unsolved
+severity: limitation
+tags:
+  - windows-11-arm
+  - arm64
+  - gui
+  - non-interactive
+  - headless
+  - windows-forms
+  - desktop-automation
+patterns:
+  - regex: 'Form\.ActiveForm.*null|ActiveForm returned null'
+    flags: 'i'
+  - regex: 'Non-interactive session detected'
+    flags: 'i'
+  - regex: 'Window activation is not functional in this environment'
+    flags: 'i'
+  - regex: 'windows-11-arm.*non.interactive|non.interactive.*windows.11.arm'
+    flags: 'i'
+error_messages:
+  - "RESULT: Non-interactive session detected. Form.ActiveForm returned null despite a visible form. Window activation is not functional in this environment."
+  - "Form.ActiveForm: null"
+root_cause: |
+  The `windows-11-arm` GitHub Actions runner (partner image, previously maintained by Arm Limited,
+  transitioning to GitHub maintenance in 2026) is provisioned in a non-interactive/headless Windows
+  desktop session. This is structurally different from `windows-latest` (Windows Server 2025) and
+  `windows-2025` which run in an interactive Windows session.
+
+  In a non-interactive session:
+  - `System.Windows.Forms.Form.ActiveForm` returns `null` even for visible, focused forms.
+  - Window activation calls (`Form.Activate()`, `Form.BringToFront()`, `Application.DoEvents()`) have
+    no effect — the window is created but the interactive desktop manager does not track it.
+  - Browser automation requiring a headless=false / headed browser (e.g., Playwright, Selenium with
+    Chrome in non-headless mode) fails or hangs.
+  - Any test framework that checks `Form.ActiveForm`, `Form.ContainsFocus`, or `Screen.PrimaryScreen`
+    for an interactive UI gets unexpected null/empty results.
+
+  This affects all GUI frameworks including WinForms, WPF, WinUI 3, and MAUI running on the ARM64
+  Windows partner image. The issue is specific to `windows-11-arm` — every other standard GitHub-hosted
+  Windows runner (`windows-latest`, `windows-2025`, `windows-2022`) uses an interactive session.
+
+  No user-configurable workaround exists to switch the `windows-11-arm` session type. This is a
+  platform infrastructure constraint on how partner-provisioned ARM64 Windows runner VMs are launched.
+fix: |
+  There is no user-side fix to make `windows-11-arm` interactive. Options:
+
+  1. **Use `windows-latest` or `windows-2025` for GUI tests.** These run in interactive mode and pass
+     window-activation and Form.ActiveForm tests.
+
+  2. **Conditional skip on ARM64:** Gate GUI-dependent tests with `if: runner.arch != 'ARM64'` and run
+     them only on x64 Windows runners. Use `windows-11-arm` only for architecture-specific (ARM64
+     native code, ARM64 ABI, SIMD) tests that don't require the interactive desktop.
+
+  3. **Headless alternatives:** For browser tests, switch to `headless: true` mode (Playwright, Chrome,
+     Electron) which works in non-interactive sessions. For WinForms/WPF UI tests, consider a virtual
+     screen driver (e.g., VirtualDesktopSetup via win32 API) but this requires elevated provisioning
+     rights not available on hosted runners.
+
+  4. **Track the upstream issue** at actions/runner-images#14049. If/when GitHub resolves the
+     interactive session configuration for `windows-11-arm`, update `runs-on` to include it.
+fix_code:
+  - language: yaml
+    label: "Run GUI tests on windows-latest; skip on windows-11-arm (non-interactive)"
+    code: |
+      jobs:
+        tests:
+          strategy:
+            matrix:
+              include:
+                - os: windows-latest    # interactive session — GUI tests pass
+                - os: windows-11-arm    # non-interactive — skip GUI-dependent tests
+          runs-on: ${{ matrix.os }}
+          steps:
+            - uses: actions/checkout@v6
+
+            - name: Run GUI tests (skip on non-interactive ARM64 runner)
+              if: runner.arch != 'ARM64'
+              run: dotnet test --filter Category=GUI
+
+            - name: Run non-GUI tests (all runners)
+              run: dotnet test --filter Category!=GUI
+  - language: yaml
+    label: "Headless browser workaround for windows-11-arm"
+    code: |
+      # Playwright example: use headless mode on ARM64 to avoid interactive session requirement
+      - name: Run Playwright tests
+        run: |
+          if [ "${{ runner.arch }}" = "ARM64" ]; then
+            # Non-interactive session: force headless
+            npx playwright test --project=chromium-headless
+          else
+            # Interactive session: can use headed mode
+            npx playwright test
+          fi
+prevention:
+  - "Always gate GUI tests with `runner.arch != 'ARM64'` when targeting windows-11-arm to avoid false failures."
+  - "For cross-platform GUI test suites, test for interactive-session availability at runtime rather than asserting runner label."
+  - "Subscribe to actions/runner-images#14049 for updates on windows-11-arm interactive session support."
+docs:
+  - url: "https://github.com/actions/runner-images/issues/14049"
+    label: "actions/runner-images#14049: [windows-11-arm] Environment is non-interactive/headless"
+  - url: "https://github.com/actions/partner-runner-images/issues/169"
+    label: "partner-runner-images#169: [windows-11-arm] Composite action bash steps intermittently produce zero output (related WoW64 issue)"
+  - url: "https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners#supported-runners-and-hardware-resources"
+    label: "GitHub Docs: Supported runners and hardware resources"
