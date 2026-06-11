@@ -1,0 +1,97 @@
+id: runner-environment-464
+title: 'Windows containers fail with hcs::CreateComputeSystem InternalServerError (Incorrect function.) on windows-2025'
+category: runner-environment
+severity: error
+tags:
+  - windows
+  - docker
+  - windows-containers
+  - testcontainers
+  - hcs
+  - windows-2025
+  - intermittent
+patterns:
+  - regex: 'hcs::CreateComputeSystem.*Incorrect function'
+    flags: 'i'
+  - regex: 'Docker API responded with status code.*InternalServerError.*hcs::CreateComputeSystem'
+    flags: 'i'
+  - regex: 'InternalServerError.*hcs::CreateComputeSystem.*Incorrect function'
+    flags: 'i'
+  - regex: 'CreateComputeSystem.*Incorrect function\.'
+    flags: 'i'
+error_messages:
+  - "Docker API responded with status code='InternalServerError', response='{\"message\":\"hcs::CreateComputeSystem ... Incorrect function.\"}'"
+  - "hcs::CreateComputeSystem <id>: Incorrect function."
+  - "Error response from daemon: hcs::CreateComputeSystem: Incorrect function."
+root_cause: |
+  Windows HCS (Host Compute System) intermittently fails to create compute systems for
+  Windows containers on the windows-2025 GitHub-hosted runner. This manifests as a flaky
+  "Incorrect function." error from the Windows Hyper-V Compute Service layer when Docker
+  attempts to provision a new Windows container (Hyper-V isolated or process-isolated).
+
+  The underlying cause is a timing or state issue in the Windows container runtime on the
+  shared GitHub-hosted runner infrastructure. The Docker daemon is reachable (unlike the
+  related issue where Docker is not started at all), but the HCS subsystem encounters a
+  non-deterministic error when allocating compute resources for a new Windows container.
+
+  This regression was first reported against windows-2025 image builds starting around
+  early 2026. It exclusively affects Windows containers (not Linux containers running on
+  Windows via WSL2 or Hyper-V). Testcontainers.NET users are commonly affected when
+  running Windows container integration test suites.
+fix: |
+  1. **Add retry logic**: Wrap the Docker container start in a retry loop. Most retries
+     succeed immediately after the first HCS failure.
+
+  2. **Use process isolation explicitly**:
+     Specify `--isolation=process` in your Docker run command to avoid Hyper-V isolation
+     overhead (requires Windows Server containers):
+     ```
+     docker run --isolation=process ...
+     ```
+
+  3. **Switch to windows-2022 temporarily** as a workaround while GitHub investigates
+     the underlying HCS issue on windows-2025.
+
+  4. **Testcontainers.NET**: Set `WaitStrategy` with a longer timeout to allow
+     the container to start after a transient HCS failure.
+fix_code:
+  - language: yaml
+    label: 'Add retry to Docker Windows container startup'
+    code: |
+      - name: Run Windows container with retry
+        shell: pwsh
+        run: |
+          $maxRetries = 3
+          for ($i = 1; $i -le $maxRetries; $i++) {
+            try {
+              docker run --rm mcr.microsoft.com/windows/servercore:ltsc2022 cmd /c echo "hello"
+              break
+            } catch {
+              if ($i -eq $maxRetries) { throw }
+              Write-Warning "HCS error, attempt $i/$maxRetries failed. Retrying in 5s..."
+              Start-Sleep -Seconds 5
+            }
+          }
+  - language: yaml
+    label: 'Testcontainers.NET: increase startup timeout'
+    code: |
+      # In C# test code:
+      # await new ContainerBuilder()
+      #   .WithImage("mcr.microsoft.com/windows/servercore:ltsc2022")
+      #   .WithWaitStrategy(Wait.ForUnixContainer()
+      #     .UntilCommandIsCompleted("cmd", "/c", "echo ready")
+      #     .WithTimeout(TimeSpan.FromSeconds(120)))
+      #   .Build()
+      #   .StartAsync();
+prevention:
+  - 'Track the GitHub issue actions/runner-images#13729 for official status updates on Docker availability on Windows runners.'
+  - 'Use Linux containers where possible — Windows containers have higher failure rates on shared GitHub-hosted runners.'
+  - 'Pin to windows-2022 if windows-2025 Windows container reliability is unacceptable for your workload.'
+  - 'Implement retry logic for any step that starts Windows containers; one retry is almost always sufficient.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/13888'
+    label: 'runner-images#13888: Docker internal server error on Windows runners'
+  - url: 'https://github.com/actions/runner-images/issues/13729'
+    label: 'runner-images#13729: windows-2022 docker not available when runner starts (related)'
+  - url: 'https://learn.microsoft.com/en-us/virtualization/windowscontainers/about/'
+    label: 'Microsoft Docs: Windows Containers overview'
