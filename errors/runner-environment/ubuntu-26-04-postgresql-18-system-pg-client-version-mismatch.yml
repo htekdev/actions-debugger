@@ -1,0 +1,134 @@
+id: runner-environment-458
+title: 'ubuntu-26.04 PostgreSQL Upgraded to v18 — System pg_dump / psql Client Version Mismatch with Older Servers'
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-26.04
+  - postgresql
+  - postgresql-18
+  - pg_dump
+  - psql
+  - version-mismatch
+  - runner-image
+  - breaking-change
+patterns:
+  - regex: 'pg_dump:.*server version.*18.*client version.*1[0-7]'
+    flags: 'i'
+  - regex: 'pg_dump:.*server version mismatch|psql:.*server version.*18'
+    flags: 'i'
+  - regex: 'ERROR.*operator does not exist.*ubuntu.*26|column.*of relation.*does not exist.*postgres.*18'
+    flags: 'i'
+  - regex: 'FATAL.*unsupported.*protocol.*version.*postgres.*18|pg_restore.*server.*version.*18'
+    flags: 'i'
+error_messages:
+  - 'pg_dump: server version: 18.0; pg_dump version: 16.x'
+  - 'pg_dump: server version mismatch'
+  - 'pg_restore: server version: 18.0; pg_restore version: 16.x'
+  - 'psql: error: server version mismatch'
+  - 'FATAL: unsupported frontend protocol'
+root_cause: |
+  The ubuntu-26.04 GitHub Actions hosted runner image installs **PostgreSQL 18** as the
+  system-level database tool (up from PostgreSQL 16 on ubuntu-24.04). This upgrade
+  affects workflows in the following ways:
+
+  **1. pg_dump / pg_restore client version mismatch**
+  If a workflow uses `pg_dump` or `pg_restore` from the runner system to connect to an
+  older PostgreSQL server (e.g., a service container running `postgres:16`), the client
+  (v18) and server (v16) versions are mismatched. `pg_dump` only supports server versions
+  up to its own version but will warn or fail if the server major version is higher.
+  Conversely, a v18 `pg_dump` connecting to a v16 server runs in compatibility mode but
+  some dump options are unavailable.
+
+  **2. Workflow scripts hard-coding pg16 paths or extensions**
+  Scripts using `/usr/lib/postgresql/16/bin/psql` or `postgresql-16` package names will
+  fail because the system package is now `postgresql-18`.
+
+  **3. SQL syntax removed in PostgreSQL 18**
+  PostgreSQL 18 removes several deprecated SQL features and changes some operator
+  behavior. Workflows that run raw SQL migration scripts against a postgres service
+  container may encounter runtime errors if they rely on deprecated syntax.
+
+  **4. pg_hba.conf and authentication defaults changed**
+  PostgreSQL 18 changed the default `password_encryption` to `scram-sha-256` and made
+  `trust` authentication less permissive in some contexts.
+
+  The ubuntu-26.04 announcement (runner-images#14226, June 11, 2026) lists:
+  > PostgreSQL | 16.* (ubuntu-24.04) → 18.* (ubuntu-26.04)
+fix: |
+  **For service container workflows:** Always pin the postgres image version explicitly.
+  The runner's system PostgreSQL version does not affect service containers — those use
+  Docker images independently. Ensure your service container matches any schema
+  expectations:
+
+  ```yaml
+  services:
+    postgres:
+      image: postgres:16  # Pin explicitly; don't rely on default
+      env:
+        POSTGRES_PASSWORD: postgres
+  ```
+
+  **For system psql / pg_dump usage:** Install the matching PostgreSQL client version:
+
+  ```yaml
+  - name: Install PostgreSQL 16 client
+    run: |
+      sudo apt-get install -y postgresql-client-16
+      # pg_dump from /usr/lib/postgresql/16/bin/pg_dump
+  ```
+
+  **For migrations that fail on PostgreSQL 18:** Update SQL syntax to PostgreSQL 18
+  standards. Use `psql --version` in CI to confirm the version in use.
+fix_code:
+  - language: yaml
+    label: 'Pin postgres service container version to avoid runner system PG version confusion'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-26.04
+          services:
+            postgres:
+              # Always pin the postgres image — runner system PostgreSQL (v18 on ubuntu-26.04)
+              # does not affect service containers which use their own Docker image
+              image: postgres:16
+              env:
+                POSTGRES_USER: testuser
+                POSTGRES_PASSWORD: testpass
+                POSTGRES_DB: testdb
+              options: >-
+                --health-cmd pg_isready
+                --health-interval 10s
+                --health-timeout 5s
+                --health-retries 5
+              ports:
+                - 5432:5432
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run migrations
+              run: psql -h localhost -U testuser -d testdb -f schema.sql
+              env:
+                PGPASSWORD: testpass
+  - language: yaml
+    label: 'Install matching PostgreSQL client version for pg_dump against older servers'
+    code: |
+      steps:
+        - name: Install PostgreSQL 16 client tools
+          run: |
+            # System psql on ubuntu-26.04 is v18; install v16 client for v16 server compatibility
+            sudo apt-get update -qq
+            sudo apt-get install -y postgresql-client-16
+            # Now use the versioned binary explicitly
+            /usr/lib/postgresql/16/bin/pg_dump -h $DB_HOST -U $DB_USER $DB_NAME > dump.sql
+prevention:
+  - 'Always pin the `image:` field in postgres service containers — never rely on unversioned postgres images.'
+  - 'Use `pg_dump --version` in CI to confirm the client version in use; mismatch warnings may indicate an issue.'
+  - 'When using ubuntu-26.04, explicitly install the PostgreSQL client version matching your target server.'
+  - 'Update SQL migration scripts to PostgreSQL 18 compatibility; test against the target server version locally.'
+  - 'Set `PGHOST`, `PGUSER`, `PGPASSWORD` environment variables to avoid relying on system defaults that differ across Ubuntu LTS images.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14226'
+    label: 'runner-images#14226 — Ubuntu 26.04 public preview announcement (June 11, 2026)'
+  - url: 'https://www.postgresql.org/docs/18/release-18.html'
+    label: 'PostgreSQL 18 release notes — breaking changes and removed features'
+  - url: 'https://www.postgresql.org/docs/current/app-pgdump.html'
+    label: 'PostgreSQL docs — pg_dump version compatibility notes'
