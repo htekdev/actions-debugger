@@ -1,0 +1,118 @@
+id: re-454
+title: 'Docker buildx container driver PAM authentication error when using sudo in Dockerfile'
+category: runner-environment
+severity: error
+tags:
+  - docker
+  - buildx
+  - container-driver
+  - PAM
+  - sudo
+  - dockerfile
+  - setup-buildx-action
+  - github-hosted
+patterns:
+  - regex: 'sudo: PAM account management error: Authentication service cannot retrieve authentication info'
+    flags: 'i'
+  - regex: 'PAM account management error'
+    flags: 'i'
+  - regex: 'sudo:.*a password is required'
+    flags: 'i'
+error_messages:
+  - "sudo: PAM account management error: Authentication service cannot retrieve authentication info"
+  - "sudo: a password is required"
+root_cause: |
+  When Docker buildx uses the `container` driver (the default when
+  `docker/setup-buildx-action` is used), it creates a dedicated BuildKit
+  container. `RUN sudo <cmd>` instructions in the Dockerfile execute inside
+  this container as a non-root user. The PAM (Pluggable Authentication
+  Modules) subsystem attempts to authenticate `sudo` by reading
+  `/etc/pam.d/sudo` and loading the referenced PAM shared libraries
+  (e.g., `pam_unix.so`), which in turn need access to `/etc/shadow`.
+
+  Inside the BuildKit container, `/etc/shadow` is either missing or
+  inaccessible to the non-root user namespace, causing PAM to fail with:
+  ```
+  sudo: PAM account management error: Authentication service cannot retrieve authentication info
+  sudo: a password is required
+  ```
+
+  This error does NOT occur when building locally with the default `docker`
+  driver or on Linux hosts where `/etc/shadow` is readable by PAM modules.
+  It is specific to the BuildKit `container` driver used in GitHub-hosted
+  runners when `docker/setup-buildx-action` is present in the workflow.
+
+  Affected pattern:
+  ```dockerfile
+  FROM fedora:latest
+  RUN useradd -m -G wheel -u 1001 user
+  RUN echo '%wheel ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers.d/user
+  USER user
+  WORKDIR /home/user
+  RUN sudo whoami    # PAM error — fails in buildx container driver
+  ```
+fix: |
+  There are several workarounds:
+
+  1. **Run privileged commands before switching to non-root user** — move all
+     `sudo`-requiring steps before the `USER` instruction:
+     ```dockerfile
+     RUN useradd -m -G wheel -u 1001 user
+     RUN echo '%wheel ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers.d/user
+     RUN whoami   # run as root here, no sudo needed
+     USER user
+     ```
+
+  2. **Use the default `docker` driver** — remove `docker/setup-buildx-action`
+     from your workflow (or set `driver: docker`) to avoid the container driver:
+     ```yaml
+     - name: Set up Docker Buildx
+       uses: docker/setup-buildx-action@v3
+       with:
+         driver: docker   # uses host Docker daemon, no PAM restriction
+     ```
+
+  3. **Avoid `sudo` in Dockerfiles** — perform privileged operations as root
+     directly instead of using `sudo`.
+fix_code:
+  - language: yaml
+    label: 'Use docker driver to avoid buildx container driver PAM issue'
+    code: |
+      steps:
+        - uses: actions/checkout@v4
+
+        - name: Set up Docker Buildx
+          uses: docker/setup-buildx-action@v3
+          with:
+            driver: docker   # avoids container driver PAM restriction
+
+        - name: Build image
+          uses: docker/build-push-action@v6
+          with:
+            push: false
+  - language: dockerfile
+    label: 'Refactor Dockerfile — run privileged steps before USER switch'
+    code: |
+      FROM fedora:latest
+      # Run privileged operations as root (no sudo needed)
+      RUN useradd -m -G wheel -u 1001 user && \
+          echo '%wheel ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers.d/user && \
+          whoami  # executes as root, PAM not involved
+      # Switch to non-root user AFTER all root operations are complete
+      USER user
+      WORKDIR /home/user
+      # RUN sudo whoami  ← avoid this pattern in buildx container driver
+prevention:
+  - 'Avoid `RUN sudo <cmd>` in Dockerfiles when using `docker/setup-buildx-action`
+    with the default container driver.'
+  - 'Perform all privileged operations (package installs, user creation, permission
+    changes) as root before the `USER` instruction in your Dockerfile.'
+  - 'Test locally using `docker buildx build --driver-opt network=host` to reproduce
+    the container driver environment before pushing to CI.'
+docs:
+  - url: 'https://github.com/docker/build-push-action/issues/1302'
+    label: 'GitHub Issue: PAM error inside buildx (docker/build-push-action#1302)'
+  - url: 'https://github.com/docker/setup-buildx-action'
+    label: 'docker/setup-buildx-action — driver options'
+  - url: 'https://docs.docker.com/engine/reference/commandline/buildx_create/#driver'
+    label: 'Docker buildx create — driver options'

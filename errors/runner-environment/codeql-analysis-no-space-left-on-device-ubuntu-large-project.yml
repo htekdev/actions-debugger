@@ -1,0 +1,131 @@
+id: re-455
+title: 'CodeQL analysis fails with No space left on device on ubuntu-latest for large projects'
+category: runner-environment
+severity: error
+tags:
+  - codeql
+  - disk-space
+  - ubuntu-latest
+  - javascript
+  - typescript
+  - monorepo
+  - no-space-left
+  - runner-disk
+patterns:
+  - regex: 'IOException.*No space left on device'
+    flags: 'i'
+  - regex: 'Severe disk cache trouble'
+    flags: 'i'
+  - regex: 'The Actions runner is running low on disk space'
+    flags: 'i'
+  - regex: 'Failed to write item to disk'
+    flags: 'i'
+error_messages:
+  - "IOException \"No space left on device\""
+  - "Severe disk cache trouble (corruption or out of space)"
+  - "Failed to write item to disk"
+  - "Warning: The Actions runner is running low on disk space (664.8 MB available)."
+root_cause: |
+  CodeQL creates large intermediate files during analysis — specifically
+  `.trap` (Tuple Representation of Abstract Programs) files and compiled
+  database files. For large JavaScript/TypeScript monorepos, these intermediate
+  files can exceed 10 GB in size.
+
+  The ubuntu-latest GitHub-hosted runner provides approximately 14 GB of
+  usable disk space on the root partition. However, by the time a CodeQL
+  analysis job runs:
+
+  - The runner image pre-installs tools that consume ~5 GB (Docker images,
+    .NET SDK, Android SDK, Haskell, etc.).
+  - The repository checkout and any build artifacts consume additional space.
+  - CodeQL downloads and extracts its own toolchain (~1–2 GB).
+
+  This leaves insufficient space for CodeQL to write its intermediate analysis
+  files, causing `IOException "No space left on device"` during the
+  `Perform CodeQL Analysis` step. This issue was exacerbated when GitHub
+  reduced available disk space on hosted runners in 2024.
+
+  Most commonly seen with:
+  - Large JavaScript or TypeScript projects with many `node_modules`
+  - Monorepos checked out with full history
+  - Workflows that build the project before analysis
+fix: |
+  Free up disk space before running CodeQL analysis. The most effective
+  approach is to use the `jlumbroso/free-disk-space` action (or equivalent)
+  to remove unused pre-installed tools from the runner image before CodeQL runs.
+fix_code:
+  - language: yaml
+    label: 'Free disk space before CodeQL analysis'
+    code: |
+      jobs:
+        analyze:
+          name: Analyze
+          runs-on: ubuntu-latest
+          permissions:
+            actions: read
+            contents: read
+            security-events: write
+
+          steps:
+            - name: Free disk space
+              uses: jlumbroso/free-disk-space@main
+              with:
+                tool-cache: false        # keep tool cache for setup actions
+                android: true            # free ~8 GB
+                dotnet: true             # free ~2 GB
+                haskell: true            # free ~5 GB
+                large-packages: true
+                docker-images: false     # keep if you need Docker
+                swap-storage: true
+
+            - name: Checkout repository
+              uses: actions/checkout@v4
+
+            - name: Initialize CodeQL
+              uses: github/codeql-action/init@v3
+              with:
+                languages: javascript-typescript
+
+            - name: Perform CodeQL Analysis
+              uses: github/codeql-action/analyze@v3
+  - language: yaml
+    label: 'Alternative: use maximize-build-space to extend disk'
+    code: |
+      steps:
+        - name: Maximize build space
+          uses: easimon/maximize-build-space@master
+          with:
+            root-reserve-mb: 8192      # reserve 8 GB for CodeQL analysis
+            swap-size-mb: 1024
+            remove-dotnet: 'true'
+            remove-android: 'true'
+            remove-haskell: 'true'
+
+        - name: Checkout repository
+          uses: actions/checkout@v4
+
+        - name: Initialize CodeQL
+          uses: github/codeql-action/init@v3
+          with:
+            languages: javascript-typescript
+
+        - name: Perform CodeQL Analysis
+          uses: github/codeql-action/analyze@v3
+prevention:
+  - 'Check available disk space early in the job using `df -h` in a `run:` step
+    to detect space issues before CodeQL runs.'
+  - 'Add `jlumbroso/free-disk-space` or `easimon/maximize-build-space` as the
+    first step in any job that runs CodeQL on large projects.'
+  - 'Avoid checking out the full git history (`fetch-depth: 0`) unless required,
+    as large repository histories consume significant disk space.'
+  - 'Use `--no-deps` for Rust or similar flags to avoid checking out all transitive
+    dependencies before analysis.'
+docs:
+  - url: 'https://github.com/github/codeql-action/issues/3265'
+    label: 'GitHub Issue: IOException No space left on device (codeql-action#3265)'
+  - url: 'https://github.com/jlumbroso/free-disk-space'
+    label: 'jlumbroso/free-disk-space — action to reclaim runner disk space'
+  - url: 'https://github.com/orgs/community/discussions/26488'
+    label: 'GitHub Community: Disk space on GitHub-hosted runners'
+  - url: 'https://docs.github.com/en/code-security/code-scanning/creating-an-advanced-setup-for-code-scanning/codeql-code-scanning-for-compiled-languages'
+    label: 'CodeQL documentation — compiled language analysis'
