@@ -1,0 +1,94 @@
+id: known-unsolved-121
+title: 'windows-latest g++ First Compilation Extremely Slow (4–60 Seconds); Subsequent Runs Are Fast'
+category: known-unsolved
+severity: limitation
+tags:
+  - windows
+  - windows-latest
+  - gcc
+  - g++
+  - mingw
+  - performance
+  - cold-start
+  - compilation
+  - cpp
+patterns:
+  - regex: 'g\+\+.*\d{2,}ms|cc1plus.*phase.*setup.*\d{2,}\.\d+.*s'
+    flags: 'i'
+  - regex: 'compilation.*took.*[1-9]\d\s*seconds'
+    flags: 'i'
+error_messages:
+  - "g++ compilation time: 60 seconds"
+  - "phase setup: 5.36 s"
+  - "phase parsing: 11.88 s"
+root_cause: |
+  On `windows-latest` (Windows Server 2022 and 2025) GitHub Actions runners, the **first**
+  invocation of `g++` (or `cc1plus.exe`, `as.exe`, `collect2.exe`) in a job takes anywhere
+  from 4 to 60 seconds — with severe variability — while every subsequent compilation in
+  the same job completes in under 1 second.
+
+  Profiling with `g++ -ftime-report` reveals that the delay occurs before `cc1plus.exe`
+  prints its first version line (~18.5 s unaccounted for in `-ftime-report`), and that
+  `phase setup`, `preprocessing`, and `callgraph functions expansion` all take unexpectedly
+  long on the first run.
+
+  The root cause has not been officially confirmed by GitHub or GCC maintainers, but the
+  evidence points to Windows Loader cold-start overhead for the MinGW-w64 toolchain:
+  - MinGW executables link against many DLLs that must be mapped into memory on first load.
+  - On freshly provisioned runners, these DLLs are not yet in the OS file-system cache, so
+    the loader incurs full-disk I/O latency for each library.
+  - Subsequent invocations benefit from the OS page cache and pre-fetched executable
+    sections, hence the sub-second times.
+
+  Note: disabling Windows Defender (which is already disabled by default on GitHub-hosted
+  runners) does **not** improve first-compilation speed.
+
+  This is a known behavior on `windows-2022` and `windows-2025` labels. It is somewhat
+  mitigated on `windows-2025-vs2026` but may still appear intermittently.
+fix: |
+  There is no complete fix for this known limitation. Mitigation options:
+
+  1. **Accept the cold-start cost** — build time statistics collected from `windows-latest`
+     will always include one cold-start compilation per job. Design benchmarks accordingly.
+
+  2. **Use a warm-up compile step** — run a trivial compilation (e.g., `echo "" | g++ -x c++ -`) at the start of the job to prime the loader before the real build:
+
+  3. **Pre-build with ccache or sccache** — caching compiled object files removes the need
+     for most first-time compilations after the cache is populated.
+
+  4. **Use `windows-2025-vs2026` instead of `windows-latest`** — empirically, the
+     VS2026 image shows less first-compile variability than `windows-2022`/`windows-2025`.
+
+  5. **Switch to MSVC** — if MinGW is not required, the MSVC `cl.exe` toolchain does not
+     exhibit the same cold-start delay.
+fix_code:
+  - language: yaml
+    label: 'Warm-up g++ before the real build to prime DLL loader cache'
+    code: |
+      - name: Warm up g++ loader
+        shell: bash
+        run: echo "int main(){}" | g++ -x c++ -o /dev/null -    # primes the DLL cache
+
+      - name: Build
+        shell: bash
+        run: g++ -O2 -o myapp src/main.cpp
+  - language: yaml
+    label: 'Use sccache to avoid repeated cold-start compilations across cache hits'
+    code: |
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.5
+
+      - name: Build with sccache
+        env:
+          SCCACHE_GHA_ENABLED: 'true'
+        run: g++ -O2 -o myapp src/main.cpp
+prevention:
+  - 'Do not benchmark individual compilation steps on `windows-latest` without accounting for the one-time cold-start penalty on the first compile.'
+  - 'Use `sccache` or `ccache` to avoid repeated cold-start compilations across workflow runs.'
+  - 'If MinGW is not strictly required, prefer the MSVC toolchain which does not have this cold-start behaviour.'
+  - 'Add a warm-up compile step early in the job to amortize the cold-start cost before time-sensitive build steps.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14096'
+    label: "runner-images #14096: windows-latest runner's g++ first compilation extremely slow (May 2026)"
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-where-your-workflow-runs/choosing-the-runner-for-a-job'
+    label: 'GitHub Docs: Choosing the runner for a job'
