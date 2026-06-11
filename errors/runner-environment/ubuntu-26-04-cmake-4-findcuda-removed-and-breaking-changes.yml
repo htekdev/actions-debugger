@@ -1,0 +1,123 @@
+id: runner-environment-466
+title: 'ubuntu-26.04 default CMake upgraded from 3.31.6 to 4.3.3 — FindCUDA removed and other cmake 4.x incompatibilities'
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-26.04
+  - cmake
+  - cmake-4
+  - cuda
+  - FindCUDA
+  - runner-image
+  - breaking-change
+  - c-cpp
+patterns:
+  - regex: 'CMake Error at.*find_package.*CUDA.*not found|FindCUDA.*no longer.*cmake 4'
+    flags: 'i'
+  - regex: 'By not providing.*FindCUDA.*cmake_module_path.*CUDA.*cmake did not find'
+    flags: 'i'
+  - regex: 'cmake_minimum_required.*cmake.*3\.\d+.*but cmake.*4\.\d+.*found|requires cmake.*3\.\d+.*found.*4\.\d+'
+    flags: 'i'
+  - regex: 'Policy CMP0146.*FindCUDA.*deprecated|CMP0146.*not set.*FindCUDA'
+    flags: 'i'
+  - regex: 'CUDA_FOUND.*cmake 4.*FindCUDAToolkit|cmake.*4.*FindCUDA.*removed'
+    flags: 'i'
+error_messages:
+  - "CMake Error at CMakeLists.txt:X (find_package): By not providing \"FindCUDA.cmake\" in CMAKE_MODULE_PATH this project has asked CMake to find a package configuration file provided by \"CUDA\", but CMake did not find one."
+  - "CMake Warning (dev) at CMakeLists.txt:X (find_package): Policy CMP0146 is not set: The FindCUDA module is deprecated. Run \"cmake --help-policy CMP0146\" for policy details."
+  - "Could not find a package configuration file provided by \"CUDA\" (requested version 10.0) with any of the following names: CUDAConfig.cmake cuda-config.cmake"
+root_cause: |
+  ubuntu-26.04 ships with **CMake 4.3.3** as the system cmake. On ubuntu-24.04, the system
+  cmake was version 3.31.6. This is a major version upgrade with multiple breaking changes
+  that affect CI workflows migrating from ubuntu-24.04 to ubuntu-26.04.
+
+  **Key cmake 4.x breaking changes on ubuntu-26.04:**
+
+  1. **FindCUDA module removed** (CMP0146 → hard removal in cmake 4.0):
+     The legacy `FindCUDA.cmake` module was deprecated in cmake 3.27 and **completely removed**
+     in cmake 4.0. Projects that use `find_package(CUDA)` with the old FindCUDA module must
+     migrate to `find_package(CUDAToolkit)` or enable CUDA as a native language:
+     `enable_language(CUDA)` or `project(myproject LANGUAGES CXX CUDA)`.
+
+  2. **cmake_minimum_required VERSION < 3.5 is a hard error** (covered separately in
+     runner-environment-256; see that entry for details and fix).
+
+  3. **Relative CMAKE_INSTALL_PREFIX now errors** (CMP0177): Setting a relative installation
+     prefix is no longer silently accepted — cmake 4.0 requires an absolute path.
+
+  4. **No cmake 3.x fallback available**: Unlike ubuntu-24.04 where cmake 3.31.6 was the
+     default, ubuntu-26.04 provides **no cmake3 compatibility package**. `cmake --version`
+     returns `cmake version 4.3.3`.
+
+  Workflows that ran fine on ubuntu-24.04 may fail on ubuntu-26.04 purely because of the
+  cmake version change, even if `cmake_minimum_required` is >= 3.5.
+fix: |
+  1. **Migrate from FindCUDA to FindCUDAToolkit** in your CMakeLists.txt:
+     Replace `find_package(CUDA REQUIRED)` with `find_package(CUDAToolkit REQUIRED)` and
+     update variable names: `CUDA_LIBRARIES` → `CUDA::cudart`, etc.
+
+  2. **Use native CUDA language** (modern cmake >= 3.8):
+     ```cmake
+     cmake_minimum_required(VERSION 3.18)
+     project(myproject LANGUAGES CXX CUDA)
+     ```
+
+  3. **Fix relative CMAKE_INSTALL_PREFIX** (CMP0177):
+     Use `${CMAKE_CURRENT_BINARY_DIR}/install` instead of `install/` as the prefix.
+
+  4. **Pin cmake version with `actions/setup-cmake`** if you need cmake 3.x while migrating:
+     ```yaml
+     - uses: jwlawson/actions-setup-cmake@v2
+       with:
+         cmake-version: '3.31.6'
+     ```
+
+  5. **Temporarily pin to ubuntu-24.04** while migrating cmake configurations.
+fix_code:
+  - language: yaml
+    label: 'Migrate FindCUDA to FindCUDAToolkit in CMakeLists.txt'
+    code: |
+      # CMakeLists.txt — OLD (fails on cmake 4.x):
+      # find_package(CUDA REQUIRED)
+      # target_link_libraries(myapp ${CUDA_LIBRARIES})
+      # include_directories(${CUDA_INCLUDE_DIRS})
+      #
+      # NEW (cmake >= 3.17 FindCUDAToolkit):
+      # find_package(CUDAToolkit REQUIRED)
+      # target_link_libraries(myapp CUDA::cudart CUDA::cublas)
+      # (include_directories not needed — CUDAToolkit targets add includes automatically)
+  - language: yaml
+    label: 'Pin cmake version with jwlawson/actions-setup-cmake'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-26.04
+          steps:
+            - uses: actions/checkout@v6
+            - name: Install cmake 3.31.6 (workaround for cmake 4 incompatibilities)
+              uses: jwlawson/actions-setup-cmake@v2
+              with:
+                cmake-version: '3.31.6'
+            - run: cmake --version  # Confirms 3.31.6
+            - run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+            - run: cmake --build build
+  - language: yaml
+    label: 'Use ubuntu-24.04 temporarily to avoid cmake 4.x'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-24.04  # cmake 3.31.6; migrate to ubuntu-26.04 after CMakeLists.txt update
+prevention:
+  - 'Search your CMakeLists.txt files for `find_package(CUDA)` and migrate to `find_package(CUDAToolkit)` before upgrading to ubuntu-26.04.'
+  - 'Test builds locally or in CI with `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` to surface cmake < 3.5 compatibility errors early.'
+  - 'Review cmake 4.0 release notes for the full list of breaking changes: https://cmake.org/cmake/help/latest/release/4.0.html'
+  - 'Use `actions/setup-cmake` or `apt-get install cmake=3.x.y` to pin cmake version during migration periods.'
+docs:
+  - url: 'https://cmake.org/cmake/help/latest/release/4.0.html'
+    label: 'CMake 4.0 Release Notes — Removed modules and breaking changes'
+  - url: 'https://cmake.org/cmake/help/latest/policy/CMP0146.html'
+    label: 'CMake Policy CMP0146: FindCUDA module removed'
+  - url: 'https://cmake.org/cmake/help/latest/module/FindCUDAToolkit.html'
+    label: 'CMake FindCUDAToolkit — modern CUDA package finder'
+  - url: 'https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2604-Readme.md'
+    label: 'ubuntu-26.04 runner image README (CMake 4.3.3 as system cmake)'
