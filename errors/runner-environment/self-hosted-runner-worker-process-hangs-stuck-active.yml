@@ -1,0 +1,142 @@
+id: runner-environment-431
+title: 'Self-Hosted Runner Worker Process Hangs — Runner Stuck in Active State, All Job Pickup Blocked'
+category: runner-environment
+severity: error
+tags:
+  - self-hosted
+  - runner
+  - hanging-process
+  - stuck-active
+  - timeout
+  - worker-process
+patterns:
+  - regex: 'Waiting for a runner to pick up this job'
+    flags: 'i'
+  - regex: 'Runner.Worker.*running|worker.*process.*attached'
+    flags: 'i'
+  - regex: 'A session for this runner already exists'
+    flags: 'i'
+error_messages:
+  - "Waiting for a runner to pick up this job..."
+  - "A session for this runner already exists."
+  - "Runner.Worker process remains attached despite job completion"
+root_cause: |
+  When a job spawns a subprocess that hangs (e.g., a test runner like `vitest --coverage`,
+  a server process that doesn't exit, or a background task that outlives the job), the
+  runner's `Runner.Worker` process stays alive waiting for the subprocess to complete.
+
+  While `Runner.Worker` is alive, the self-hosted runner remains in **active/busy** state
+  in GitHub's UI. It does not transition back to idle and cannot accept new job assignments.
+  This blocks all queued jobs across every repository assigned to that runner host — not just
+  the current repository.
+
+  The root cause is that the runner process tree does not forcibly kill lingering subprocesses
+  when the workflow finishes. The runner waits indefinitely for the worker process to exit
+  naturally.
+
+  **How it manifests:**
+  - Runner appears as "Active" in GitHub UI but no job is visibly running
+  - New queued jobs sit at "Waiting for a runner to pick up this job..." for hours
+  - `ps aux` or Task Manager shows a lingering child process (test runner, coverage tool, etc.)
+  - Restarting the runner service resolves the issue immediately
+  - If the runner restarts, it gets `TaskAgentSessionConflictException: A session for this
+    runner already exists` — GitHub still thinks the previous session is active
+
+  **Conditions that trigger this:**
+  - Long-running test coverage tools (Jest, Vitest, Istanbul) that don't auto-exit
+  - Server processes started in CI without explicit `kill` steps
+  - Node.js/Python subprocesses that keep the event loop open
+  - OOM kill of the worker process (leaves runner in broken state)
+
+  Without explicit `timeout-minutes` on the job, the runner will block indefinitely.
+  GitHub's default 6-hour job timeout applies to hosted runners, but self-hosted runners
+  may not reliably enforce it in all failure modes.
+
+  Source: actions/runner#4312 (Mar 2026, 4 reactions) — multiple repos blocked for 3+ hours
+  until the runner was manually restarted.
+fix: |
+  **Immediate fix:** Restart the runner service on the affected host:
+  ```
+  sudo systemctl restart actions.runner.<org>.<runner-name>.service
+  ```
+
+  **Permanent fix 1: Add `timeout-minutes` to all jobs that use self-hosted runners.**
+  This ensures the runner kills the job (and its process tree) if it exceeds the limit:
+
+  ```yaml
+  jobs:
+    test:
+      runs-on: self-hosted
+      timeout-minutes: 30   # forces job termination after 30 minutes
+      steps:
+        - run: npx vitest run --coverage
+  ```
+
+  **Permanent fix 2: Ensure subprocesses exit cleanly.**
+  Background processes started in `run:` steps that must be killed before the job ends
+  need an explicit cleanup step:
+
+  ```yaml
+  steps:
+    - name: Start server
+      run: ./server &
+      shell: bash
+
+    - name: Run tests
+      run: npx jest
+
+    - name: Stop server
+      if: always()
+      run: pkill -f ./server || true
+  ```
+
+  **Permanent fix 3: Use `cancel-in-progress` + monitor for hung runners.**
+  Add health monitoring to detect runners stuck in active state with no active job session
+  and trigger automatic restarts.
+fix_code:
+  - language: yaml
+    label: 'Add timeout-minutes to prevent runner hanging indefinitely'
+    code: |
+      jobs:
+        test:
+          runs-on: self-hosted
+          timeout-minutes: 30   # kills the job if it runs longer than 30 minutes
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run tests with coverage
+              run: npx vitest run --coverage
+              # Without timeout-minutes, vitest coverage can hang indefinitely,
+              # keeping the runner in active state and blocking all other jobs.
+  - language: yaml
+    label: 'Kill background processes in cleanup step'
+    code: |
+      jobs:
+        integration-test:
+          runs-on: self-hosted
+          timeout-minutes: 20
+          steps:
+            - uses: actions/checkout@v4
+            - name: Start application server
+              run: ./server.sh &
+              shell: bash
+            - name: Wait for server to be ready
+              run: npx wait-on http://localhost:3000
+            - name: Run integration tests
+              run: npx jest --testPathPattern=integration
+            - name: Stop application server
+              if: always()          # runs even if tests fail
+              run: pkill -f server.sh || true
+              shell: bash
+prevention:
+  - 'Always set `timeout-minutes` on jobs using self-hosted runners — the default 6-hour timeout may not be reliably enforced when worker processes hang.'
+  - 'Add `if: always()` cleanup steps to kill any background processes your job starts — test servers, mock services, coverage daemons, etc.'
+  - 'Monitor self-hosted runners for jobs stuck in "active" state with no visible job log activity — automate restarts for runners idle for >N minutes.'
+  - 'Use `pkill -P $$` in a `post` composite action step to kill all child processes of the current shell when the job ends.'
+  - 'If a runner frequently gets stuck, check for zombie subprocesses left by test coverage tools (Jest --coverage, Vitest, Istanbul) that keep the Node.js process alive.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idtimeout-minutes'
+    label: 'GitHub Docs — jobs.<job_id>.timeout-minutes'
+  - url: 'https://github.com/actions/runner/issues/4312'
+    label: 'actions/runner#4312 — Self-hosted runner stuck in active state, blocking queued jobs (Mar 2026)'
+  - url: 'https://github.com/actions/actions-runner-controller/pull/4399'
+    label: 'actions-runner-controller#4399 — Attempted fix for stale EphemeralRunner registrations (Apr 2026)'

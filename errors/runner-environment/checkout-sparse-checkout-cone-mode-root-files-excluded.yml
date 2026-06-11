@@ -1,0 +1,139 @@
+id: runner-environment-432
+title: 'actions/checkout sparse-checkout Cone Mode Does Not Include Root Files by Default'
+category: runner-environment
+severity: silent-failure
+tags:
+  - checkout
+  - sparse-checkout
+  - cone-mode
+  - monorepo
+  - root-files
+  - missing-files
+patterns:
+  - regex: 'sparse-checkout-cone-mode:\s*true'
+    flags: 'i'
+  - regex: 'sparse-checkout:\s*true'
+    flags: 'i'
+  - regex: 'sparse.checkout.*cone'
+    flags: 'i'
+error_messages:
+  - "sparse-checkout cone mode: true — root files not found"
+  - "Repository root files missing after checkout with sparse-checkout-cone-mode: true"
+  - "File not found: package.json (or README.md, .gitignore, etc.) after sparse checkout"
+root_cause: |
+  When using `actions/checkout` with `sparse-checkout: true` and
+  `sparse-checkout-cone-mode: true`, root-level files (files located directly in the
+  repository root, NOT inside any subdirectory) may not be included in the checkout
+  unless they are explicitly specified in `sparse-checkout-patterns`.
+
+  Git's cone mode documentation states: "files in the root directory are always included."
+  However, the `actions/checkout` action generates cone-mode patterns programmatically
+  from `sparse-checkout-patterns`, and the generated patterns may be overly restrictive —
+  effectively "locking out" root-level files when the pattern list only names subdirectories
+  (`src/`, `libs/`, etc.) without also including a root wildcard.
+
+  **Example:** If `sparse-checkout-patterns` lists only `src/` and `packages/`, the
+  generated cone-mode patterns may exclude root files such as:
+  - `package.json`, `yarn.lock`, `pnpm-lock.yaml` — build tool manifests
+  - `.gitignore`, `.gitattributes`, `.npmrc` — repository configuration
+  - `README.md`, `LICENSE` — documentation
+  - `Makefile`, `Dockerfile`, `docker-compose.yml` — build/deploy configs
+
+  This causes silent build failures downstream when tools (npm install, yarn, make, etc.)
+  can't find their configuration files in the expected root location.
+
+  **Why it's a silent failure:** The checkout step succeeds without error. Files are simply
+  absent from the working directory. Build tools then fail with "file not found" errors
+  that appear unrelated to the sparse checkout configuration.
+
+  Source: actions/checkout#2366 (Jan 2026, 2 reactions) — self-hosted machine, cone mode
+  actively contradicts documented Git behavior for root files.
+fix: |
+  Add `/*` to your `sparse-checkout-patterns` list to explicitly include all root-level files.
+  The `/*` pattern matches all files in the root directory (depth 1, non-recursive) while
+  leaving subdirectory traversal controlled by your other patterns.
+
+  ```yaml
+  - uses: actions/checkout@v4
+    with:
+      sparse-checkout: |
+        /*
+        src/
+        packages/
+      sparse-checkout-cone-mode: true
+  ```
+
+  This ensures root files are always checked out, while still limiting deep checkout to
+  only the subdirectories you specify.
+
+  **Alternative: use non-cone mode** if you need precise file selection without cone
+  mode's subdirectory semantics:
+  ```yaml
+  - uses: actions/checkout@v4
+    with:
+      sparse-checkout: |
+        package.json
+        yarn.lock
+        src/
+      sparse-checkout-cone-mode: false
+  ```
+  Non-cone mode uses standard gitignore-style patterns rather than cone-mode's
+  directory-boundary semantics.
+fix_code:
+  - language: yaml
+    label: 'Broken: cone mode silently excludes root files when only subdirs are listed'
+    code: |
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            src/
+            packages/
+          sparse-checkout-cone-mode: true
+          # ❌ Root files (package.json, .gitignore, Makefile, etc.)
+          # may be missing — cone mode generates patterns that exclude root
+          # unless root files are explicitly requested
+
+      # Downstream failure:
+      - run: npm install   # Error: ENOENT: no such file or directory, open 'package.json'
+  - language: yaml
+    label: 'Fixed: add /* to explicitly include all root-level files'
+    code: |
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            /*
+            src/
+            packages/
+          sparse-checkout-cone-mode: true
+          # ✅ /* matches all files in the root directory (non-recursive)
+          # src/ and packages/ are still the only subdirectories checked out
+
+      - run: npm install   # Now works — package.json found at root
+  - language: yaml
+    label: 'Alternative: non-cone mode with explicit file list'
+    code: |
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            package.json
+            yarn.lock
+            .gitignore
+            .npmrc
+            src/
+            packages/
+          sparse-checkout-cone-mode: false
+          # Non-cone mode uses gitignore-style patterns — more explicit
+          # but each root file must be listed individually
+prevention:
+  - 'Always add `/*` to `sparse-checkout-patterns` when using `sparse-checkout-cone-mode: true` to ensure root files are included.'
+  - 'After setting up sparse checkout, verify that expected root files (package.json, Makefile, etc.) exist before running build steps.'
+  - 'If root file inclusion is uncertain, add a validation step: `ls package.json yarn.lock || echo "WARNING: root files missing"` before builds.'
+  - 'When in doubt, prefer `sparse-checkout-cone-mode: false` (non-cone mode) with explicit file patterns — behavior is more predictable.'
+  - 'Test sparse-checkout configurations on a local clone before deploying to CI: `git sparse-checkout init --cone && git sparse-checkout set src/`'
+docs:
+  - url: 'https://github.com/actions/checkout/issues/2366'
+    label: 'actions/checkout#2366 — Sparse checkout cone mode does not include root files by default (Jan 2026)'
+  - url: 'https://github.com/actions/checkout#sparse-checkout'
+    label: 'actions/checkout README — sparse-checkout and sparse-checkout-cone-mode inputs'
+  - url: 'https://git-scm.com/docs/git-sparse-checkout#_cone_mode_handling'
+    label: 'Git docs — sparse-checkout cone mode: root directory handling'
