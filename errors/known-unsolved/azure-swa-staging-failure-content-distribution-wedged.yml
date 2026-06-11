@@ -1,0 +1,106 @@
+id: known-unsolved-120
+title: 'Azure Static Web Apps Staging Deployment Hangs With "Failure during content distribution" and Environments Left Wedged'
+category: known-unsolved
+severity: error
+tags:
+  - azure-static-web-apps
+  - swa
+  - staging
+  - deployment-timeout
+  - azure
+  - content-distribution
+  - wedged-environment
+  - azure-static-web-apps-deploy
+patterns:
+  - regex: 'Upload Timed Out\. Unsure if deployment was successful or not'
+    flags: 'i'
+  - regex: 'Deployment Failure Reason: Failure during content distribution'
+    flags: 'i'
+  - regex: 'Status: InProgress\. Time: [0-9]+\.[0-9]+\(s\)'
+    flags: 'i'
+  - regex: 'Polling on deployment.*InProgress.*Timed Out'
+    flags: 'ims'
+error_messages:
+  - "Finished Upload. Polling on deployment."
+  - "Status: InProgress. Time: 594.8112435(s)"
+  - "Upload Timed Out. Unsure if deployment was successful or not."
+  - "Deployment Failure Reason: Failure during content distribution."
+root_cause: |
+  Azure Static Web Apps (SWA) staging (pre-production named) environments can enter a broken state on the
+  Azure backend where the content distribution pipeline fails silently. When this happens, the
+  `Azure/static-web-apps-deploy@v1` GitHub Action uploads the built artifact successfully but the deployment
+  never transitions from "InProgress" to a completed state.
+
+  After the default polling timeout (~10 minutes), the action reports:
+    "Upload Timed Out. Unsure if deployment was successful or not."
+
+  The affected staging environment is left in a wedged state:
+    - Status: "Failed" or stuck in "Uploading" or "Deleting"
+    - Delete requests for the broken environment may also hang for over an hour
+    - Creating a fresh staging environment may reproduce the same failure
+
+  This failure is specific to **staging environments with Azure Functions APIs**. Static-only staging
+  deployments may succeed while API-inclusive deployments fail. The root cause is a backend Azure service
+  issue, not a workflow configuration problem. No amount of workflow changes will resolve it — it requires
+  Azure support intervention.
+
+  Observed incident: June 10, 2026 ~09:00 UTC, West Europe region (Azure/static-web-apps#1753). The same
+  commit that deployed successfully to production at 08:42 UTC failed to staging from 09:07 UTC onward.
+fix: |
+  There is no self-service fix at the workflow level. Options:
+
+  1. **Check Azure Status**: Visit https://status.azure.com to see if there is an active incident affecting
+     Azure Static Web Apps in your region.
+
+  2. **Open Azure Support**: File a support ticket via the Azure Portal. Reference the deployment timestamps,
+     the staging environment hostname, and the GitHub Actions run IDs. The Azure team can inspect the backend
+     and clear wedged environments.
+
+  3. **Wait for service recovery**: If this is a widespread backend issue, Azure typically resolves it within
+     hours to a business day.
+
+  4. **Deploy to production as a workaround**: If your staging environment is stuck and you need to ship,
+     you can temporarily bypass staging and deploy directly to the production slot. This is not recommended
+     as a permanent practice.
+
+  5. **Recreate the staging environment**: If the staging environment is wedged, delete it and create a fresh
+     one. Note that this may also fail if the underlying backend issue persists.
+fix_code:
+  - language: yaml
+    label: 'Add timeout to the SWA deploy step to surface the failure faster'
+    code: |
+      - name: Deploy to Azure Static Web Apps
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          action: 'upload'
+          app_location: '/'
+          api_location: 'api'
+          output_location: 'build'
+        timeout-minutes: 15   # Fail fast instead of waiting the full default period
+  - language: yaml
+    label: 'Use Azure SWA CLI directly to get more detailed error output'
+    code: |
+      - name: Deploy via SWA CLI (verbose errors)
+        run: |
+          npx @azure/static-web-apps-cli deploy ./build \
+            --api-location ./api \
+            --deployment-token "${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}" \
+            --env preview
+        # SWA CLI surfaces: "Deployment Failure Reason: Failure during content distribution."
+        # which is more informative than the action's generic timeout message
+prevention:
+  - 'Always check Azure Status (https://status.azure.com) before assuming a workflow bug when Azure deployments fail.'
+  - 'Add `timeout-minutes` to the SWA deploy step to fail fast and free up the runner instead of waiting 10+ minutes.'
+  - 'Subscribe to Azure Service Health alerts for Azure Static Web Apps in your target region to get notified of incidents proactively.'
+  - 'Include the staging environment hostname and GitHub Actions run ID when filing Azure support tickets — Azure teams require these for backend lookup.'
+docs:
+  - url: 'https://github.com/Azure/static-web-apps/issues/1753'
+    label: 'Azure/static-web-apps#1753: "Failure during content distribution" incident (June 2026)'
+  - url: 'https://docs.microsoft.com/en-us/azure/static-web-apps/review-publish-pull-requests'
+    label: 'Azure Docs: Review and publish in pre-production environments'
+  - url: 'https://status.azure.com'
+    label: 'Azure Service Status'
+  - url: 'https://github.com/Azure/static-web-apps-deploy'
+    label: 'Azure/static-web-apps-deploy GitHub Action'
