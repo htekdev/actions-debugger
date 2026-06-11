@@ -1,0 +1,90 @@
+id: runner-environment-452
+title: 'macOS-15-arm64 image 20260511: `cargo` resolves to Homebrew `rustup-init` shim instead of toolchain cargo'
+category: runner-environment
+severity: error
+tags:
+  - macos-15-arm64
+  - rust
+  - cargo
+  - homebrew
+  - rustup
+  - PATH
+  - runner-image-regression
+  - arm64
+patterns:
+  - regex: 'error: error: unexpected argument .(?:test|nextest|build|check|run|clippy). found\s*Usage: rustup-init'
+    flags: 'i'
+  - regex: 'cargo.*resolves.*rustup-init|rustup-init.*cargo.*homebrew|/opt/homebrew/bin/cargo.*rustup-init'
+    flags: 'i'
+  - regex: 'unexpected argument .(?:test|nextest|build|check|run|clippy). found\n.*Usage: rustup-init\[EXE\]'
+    flags: 'i'
+error_messages:
+  - "error: error: unexpected argument 'test' found\nUsage: rustup-init[EXE] [OPTIONS]"
+  - "error: error: unexpected argument 'nextest' found\nUsage: rustup-init[EXE] [OPTIONS]"
+  - "error: error: unexpected argument 'build' found\nUsage: rustup-init[EXE] [OPTIONS]"
+  - "##[error]Process completed with exit code 1."
+root_cause: |
+  On `macos-15-arm64` image version 20260511.0048, the Homebrew `rust` formula installs a
+  `rustup-init` shim at `/opt/homebrew/bin/cargo`. When a workflow uses `dtolnay/rust-toolchain`
+  or any toolchain action that prepends `~/.cargo/bin` to `GITHUB_PATH`, a race or PATH ordering
+  issue causes `/opt/homebrew/bin/cargo` to win over `~/.cargo/bin/cargo`.
+
+  The Homebrew `cargo` binary is actually the `rustup-init` binary renamed/shimmed. It does not
+  understand `cargo` subcommands like `test`, `build`, `nextest`, etc. — it only accepts
+  `rustup-init` init options.
+
+  This is distinct from runner-images#14097 (which affects `rustup component add` via the
+  `+stable` argv issue) — here `cargo` itself is affected because the Homebrew shim wins the
+  PATH resolution. `rustc` is typically unaffected because the toolchain action installs a native
+  `rustc` that takes precedence, while `cargo` does not.
+
+  The failure is intermittent (low single-digit % per job) because it depends on which runner
+  pool member is allocated — some members have the PATH ordering issue and others do not.
+  Retrying the job almost always lands on a clean runner.
+fix: |
+  Explicitly prepend `~/.cargo/bin` to PATH before invoking cargo, or use the full cargo path.
+  Alternatively, unlink the Homebrew cargo shim before the Rust toolchain step.
+fix_code:
+  - language: yaml
+    label: 'Prepend cargo bin to PATH before use'
+    code: |
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Ensure correct cargo is on PATH
+        run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - run: cargo test --all-features
+  - language: yaml
+    label: 'Unlink Homebrew rust to avoid cargo shim conflict'
+    code: |
+      - name: Remove Homebrew cargo shim (macos-15-arm64 workaround)
+        if: runner.os == 'macOS'
+        run: brew unlink rust || true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - run: cargo test --all-features
+  - language: yaml
+    label: 'Explicit PATH ordering fix'
+    code: |
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Fix cargo PATH on macOS ARM64
+        if: runner.os == 'macOS' && runner.arch == 'ARM64'
+        run: |
+          CARGO_BIN="$HOME/.cargo/bin"
+          echo "$CARGO_BIN" >> $GITHUB_PATH
+          # Verify cargo is the toolchain cargo, not Homebrew shim
+          which cargo && cargo --version
+prevention:
+  - "Explicitly prepend `~/.cargo/bin` to PATH after toolchain setup on macOS ARM64 runners"
+  - "Use `brew unlink rust` before toolchain setup to remove the Homebrew cargo shim"
+  - "Add `cargo --version` as a diagnostic step after toolchain setup to catch PATH issues early"
+  - "Pin to a newer macOS-15-arm64 image version (> 20260511.0048) where the issue is resolved"
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14099'
+    label: 'runner-images#14099: cargo resolves to rustup-init shim on macos-15-arm64/20260511.0048'
+  - url: 'https://github.com/actions/runner-images/issues/14097'
+    label: 'runner-images#14097: related — rustup-init rejects +stable and metadata argv (same image)'
+  - url: 'https://github.com/dtolnay/rust-toolchain'
+    label: 'dtolnay/rust-toolchain action'
