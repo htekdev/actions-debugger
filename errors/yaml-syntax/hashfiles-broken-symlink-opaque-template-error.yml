@@ -1,0 +1,127 @@
+id: yaml-syntax-116
+title: 'hashFiles() Fails with Opaque "Fail to hash files under directory" Error When Glob Matches Broken Symlink'
+category: yaml-syntax
+severity: error
+tags:
+  - hashFiles
+  - symlink
+  - broken-symlink
+  - template-expression
+  - cache
+  - debug-logging
+patterns:
+  - regex: 'hashFiles\([''"].*[''"]\) failed\. Fail to hash files under directory'
+    flags: 'i'
+  - regex: 'The template is not valid.*hashFiles.*failed'
+    flags: 'i'
+  - regex: 'Fail to hash files under directory.*ENOENT'
+    flags: 'i'
+  - regex: 'hashFiles.*ENOENT.*no such file or directory.*stat'
+    flags: 'i'
+error_messages:
+  - "Error: The template is not valid. .github/workflows/ci.yml (Line: 14, Col: 14): hashFiles('*') failed. Fail to hash files under directory '/home/runner/work/repo/repo'"
+  - "Error: The template is not valid. .github/workflows/ci.yml (Line: X, Col: Y): hashFiles('**/*.lock') failed. Fail to hash files under directory '...'"
+  - "##[debug]Error: ENOENT: no such file or directory, stat '/home/runner/work/repo/repo/broken-link'"
+root_cause: |
+  `hashFiles()` is a template expression evaluated at job initialization (before any
+  steps run). It recursively stats every file matched by the provided glob pattern.
+  When it encounters a symbolic link whose target does not exist (a dangling symlink),
+  the underlying Node.js `statSync()` call throws `ENOENT`, which propagates as a
+  `hashFiles() failed` template error.
+
+  The error message deliberately surfaces as "The template is not valid" because
+  template expressions are evaluated during workflow compilation. The message names
+  the workflow file and line number but does NOT identify which file caused the
+  failure — it only says "Fail to hash files under directory '...'".
+
+  Without `ACTIONS_STEP_DEBUG=true` (or `RUNNER_DEBUG=1`), users have no way to
+  determine which symlink triggered the error. With debug logging enabled, the
+  runner logs `ENOENT: no such file or directory, stat '...'` entries that reveal
+  the broken symlink path.
+
+  Common causes:
+  - The repository was checked out on a case-insensitive filesystem (Windows/macOS)
+    where the symlink target casing differs from the actual path casing.
+  - A build artifact creates a symlink, and the artifact was cleaned but the symlink
+    was not. The next workflow run then hashes it.
+  - Git submodules that are not initialized leave directory-level symlinks unresolved.
+  - A developer committed a symlink to a file that was later deleted or renamed
+    without removing the symlink.
+
+  Note: This only affects `hashFiles()` expressions — `actions/cache`'s `path:`
+  key, `actions/checkout`, and `run:` steps handle symlinks differently.
+fix: |
+  Step 1: Identify the broken symlink by enabling debug logging.
+  Re-run the failed workflow with debug logging enabled (set the secret
+  `ACTIONS_STEP_DEBUG=true` or add `RUNNER_DEBUG: 1` to the workflow env), then
+  search the logs for `ENOENT` entries inside the hashFiles evaluation output.
+
+  Step 2: Fix the broken symlink using one of these approaches:
+
+  Option A: Delete the broken symlink from the repository.
+  Option B: Fix the symlink target so it points to a valid path.
+  Option C: Narrow the hashFiles glob to exclude the directory containing the symlink.
+  Option D: Add the broken symlink path to .gitignore so it is not present in the
+  checkout, or use a `paths-ignore` filter in the workflow.
+
+  Option E (temporary): Exclude the problematic directory from the hashFiles glob
+  by using a more specific pattern instead of broad wildcards like `**` or `*`.
+fix_code:
+  - language: yaml
+    label: 'Enable RUNNER_DEBUG to identify which symlink is causing the hashFiles failure'
+    code: |
+      # Re-run the workflow with this environment variable to see the broken path:
+      jobs:
+        build:
+          env:
+            RUNNER_DEBUG: '1'
+          steps:
+            # After enabling debug, search the log for lines containing ENOENT
+            # to identify the exact broken symlink path.
+            - uses: actions/cache@v4
+              with:
+                path: ~/.npm
+                key: npm-${{ hashFiles('**/package-lock.json') }}
+                #                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                # This broad glob fails if any package-lock.json sibling has a
+                # broken symlink; debug logging reveals which one.
+
+  - language: yaml
+    label: 'Narrow the hashFiles glob to avoid directories containing broken symlinks'
+    code: |
+      # Instead of broad glob:
+      # key: ${{ hashFiles('**/*.lock') }}
+
+      # Use a specific path that avoids the problematic directory:
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ hashFiles('package-lock.json', 'packages/*/package-lock.json') }}
+          #                       ^^^^^^ explicit paths instead of ** wildcard
+
+  - language: yaml
+    label: 'Add a pre-check step to detect and list broken symlinks before hashFiles runs'
+    code: |
+      - name: Check for broken symlinks
+        run: |
+          broken=$(find . -type l ! -exec test -e {} \; -print 2>/dev/null || true)
+          if [ -n "$broken" ]; then
+            echo "::warning::Broken symlinks detected — these will cause hashFiles() to fail:"
+            echo "$broken"
+          fi
+      # Fix or remove any symlinks reported above, then retry the workflow.
+prevention:
+  - 'Add a CI step that detects broken symlinks early: `find . -type l ! -exec test -e {} \; -print` — fail the build if any are found'
+  - 'When hashFiles() fails with an opaque "Fail to hash files under directory" error, your first step is always to enable `RUNNER_DEBUG=1` and search the debug log for `ENOENT` to identify the culprit symlink'
+  - 'Use specific hashFiles patterns (e.g., `hashFiles(''package-lock.json'')`) rather than broad globs (`hashFiles(''**'')`) to reduce the chance of hitting unexpected symlinks in deeply nested directories'
+  - 'When checking out repos that use git submodules, always initialize submodules before any hashFiles expressions run — uninitialized submodules leave empty directories that may contain symlinks'
+  - 'Add broken symlink detection to pre-commit hooks or GitHub Actions CI for the target repo itself to catch the problem at source'
+docs:
+  - url: 'https://github.com/actions/runner/issues/3015'
+    label: 'actions/runner#3015: hashFiles failing on broken symlink produces no useful diagnostic'
+  - url: 'https://github.com/actions/runner/issues/1666'
+    label: 'actions/runner#1666: hashFiles ENOENT broken symlink related discussion'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#hashfiles'
+    label: 'GitHub Docs — hashFiles expression'
+  - url: 'https://docs.github.com/en/actions/monitoring-and-troubleshooting-workflows/enabling-debug-logging'
+    label: 'GitHub Docs — Enabling debug logging (RUNNER_DEBUG, ACTIONS_STEP_DEBUG)'

@@ -1,0 +1,108 @@
+id: runner-environment-468
+title: 'Broken Symbolic Link in Action Repository Causes "Set up job" Failure — FileNotFoundException'
+category: runner-environment
+severity: error
+tags:
+  - composite-action
+  - symlink
+  - broken-symlink
+  - set-up-job
+  - git-submodule
+  - file-not-found
+patterns:
+  - regex: 'Could not find file.*_actions.*\.sh|Could not find file.*_actions.*\.(js|ts|py|rb)'
+    flags: 'i'
+  - regex: 'System\.IO\.FileNotFoundException: Could not find file.*_actions'
+    flags: 'i'
+  - regex: 'Download action repository.*Finishing: Set up job'
+    flags: 'i'
+  - regex: 'Unwrap.*_actions.*Could not find file'
+    flags: 'i'
+error_messages:
+  - "Error: Could not find file '/home/runner/work/_actions/_temp_{uuid}/_staging/{repo}-{sha}/{path}/file.sh'."
+  - "System.IO.FileNotFoundException: Could not find file '/home/runner/work/_actions/_temp_{uuid}/_staging/...'"
+  - "##[debug]System.IO.FileNotFoundException: Could not find file '/home/runner/work/_actions/...'"
+root_cause: |
+  When the GitHub Actions runner downloads an action repository (during "Set up job"),
+  it extracts the tarball and copies files using .NET's `File.Copy`/`IOUtil.CopyDirectory`.
+  Unlike `cp -r`, .NET's file copy follows symbolic links and attempts to copy the
+  target of each symlink. If the symlink is dangling (pointing to a path that does not
+  exist), `File.Copy` throws a `FileNotFoundException` and the "Set up job" step fails.
+
+  This commonly occurs when:
+  1. An action repository contains git submodules that are not initialized during the
+     tarball download. Symlinks inside the repo that reference paths within the submodule
+     (e.g., `src/lib/module.sh -> ../../submodule/src/lib/module.sh`) become dangling
+     because the submodule directory is empty.
+  2. The action author committed a symlink referencing a file that was later deleted
+     from the repo without removing the symlink.
+  3. A build step generates symlinks that reference paths outside the action archive.
+
+  The runner does NOT skip or ignore broken symlinks — the very first dangling symlink
+  encountered terminates the entire download phase, preventing the workflow from starting.
+  The error appears during "Download action repository" and surfaces as "Finishing: Set up job"
+  with exit code non-zero.
+
+  This affects both composite actions (`action.yml` with `using: composite`) and
+  JavaScript/Docker actions when the action repo contains broken symlinks anywhere
+  in its file tree.
+fix: |
+  Fix the symlinks in the action repository itself:
+
+  Option 1 (best): Remove broken symlinks from the action repository.
+  If the symlink was created to reference a git submodule that is not available when
+  the action is downloaded standalone, delete the symlink or replace it with a copy
+  of the target file.
+
+  Option 2: Use a .gitattributes export-ignore rule to exclude the symlink from the
+  tarball that GitHub sends to the runner. Files matched by `export-ignore` in
+  `.gitattributes` are excluded from `git archive` output.
+
+  Option 3: Initialize the submodule as part of the action or restructure the repo
+  to avoid cross-boundary symlinks.
+
+  For workflow authors who are calling a third-party action they cannot modify:
+  Pin to an older tag/SHA of the action before the broken symlink was introduced,
+  or open an issue with the action maintainer.
+fix_code:
+  - language: yaml
+    label: 'Add .gitattributes export-ignore to exclude broken symlinks from action download'
+    code: |
+      # In the action repository's .gitattributes file:
+      # Exclude paths containing dangling symlinks from git archive export
+      src/lib/librtui/   export-ignore
+      # This prevents the runner from receiving the dangling symlink in the tarball
+
+  - language: yaml
+    label: 'Pin to a known-good version of the action before the broken symlink was introduced'
+    code: |
+      - name: Use action at known-good SHA
+        # Pin to the last SHA before broken symlink was committed
+        uses: owner/action-repo@abc1234  # replace with a working SHA or tag
+
+  - language: yaml
+    label: 'Identify broken symlinks in an action repo before publishing'
+    code: |
+      # Run locally in the action repo before tagging a release:
+      - name: Check for broken symlinks
+        run: |
+          broken=$(find . -type l ! -exec test -e {} \; -print)
+          if [ -n "$broken" ]; then
+            echo "Broken symlinks found:"
+            echo "$broken"
+            exit 1
+          fi
+          echo "No broken symlinks found."
+prevention:
+  - 'Before tagging or releasing an action, run `find . -type l ! -exec test -e {} \; -print` in the repo to detect broken symlinks'
+  - 'Add a CI check to the action repo itself that fails if any dangling symlinks are introduced'
+  - 'If the action depends on git submodules, avoid creating symlinks that reference submodule-internal paths — the runner downloads action tarballs without submodules'
+  - 'Use `git archive HEAD | tar -t` to preview what files will be included in the tarball sent to runners — dangling symlink targets will appear as missing entries'
+  - 'Add a `.gitattributes` `export-ignore` rule for any directory containing generated or submodule-relative symlinks'
+docs:
+  - url: 'https://github.com/actions/runner/issues/3234'
+    label: 'actions/runner#3234: Broken symbolic link in action repo causes Set up job failure'
+  - url: 'https://git-scm.com/docs/gitattributes#_export_ignore'
+    label: 'git-scm.com: gitattributes export-ignore — exclude paths from git archive'
+  - url: 'https://docs.github.com/en/actions/creating-actions/creating-a-composite-action'
+    label: 'GitHub Docs — Creating a composite action'

@@ -1,0 +1,121 @@
+id: known-unsolved-128
+title: 'setup-python pip Cache Key Uses Runner Process Architecture — Not Python Binary Architecture'
+category: known-unsolved
+severity: silent-failure
+tags:
+  - setup-python
+  - pip
+  - cache
+  - architecture
+  - windows
+  - x86
+  - x64
+  - cache-key
+patterns:
+  - regex: 'pip cache.*architecture|cache.*pip.*x86.*x64|setup.python.*cache.*arch'
+    flags: 'i'
+  - regex: 'pip.*cache.*hit.*wrong.*arch|cache.*restore.*pip.*wrong.*arch'
+    flags: 'i'
+error_messages:
+  - "Cache hit for pip but packages installed are for wrong Python architecture (x86 vs x64)"
+  - "No visible error — pip packages silently cached under wrong architecture key"
+root_cause: |
+  `actions/setup-python` generates pip cache keys using the Node.js runner process
+  architecture (`process.arch`) rather than the architecture of the Python binary
+  being installed. On Linux and macOS, these two always match. On Windows, however,
+  they can diverge: the GitHub-hosted runner process is x64, but you can request
+  a 32-bit (x86) Python installation via the `architecture: x86` input.
+
+  When a matrix builds both x86 and x64 Python on Windows:
+
+    matrix:
+      python-version: ['3.11']
+      architecture: ['x86', 'x64']
+
+  Both jobs generate pip cache keys that include `win32` (the Node process arch)
+  for both builds, rather than distinguishing between `x86` and `x64` Python.
+  As a result, the x64 job's pip cache is saved under the same key as the x86 job,
+  and whichever job runs second restores a cache populated by the wrong architecture.
+  Installed packages may have arch-specific compiled extensions (e.g., `pywin32`,
+  `cryptography`, `numpy`) that silently malfunction or crash at runtime when loaded
+  under the wrong architecture.
+
+  The GitHub team reviewed this report and declined to change the cache key to
+  include the Python binary architecture, citing concern about breaking existing
+  workflows that rely on shared pip caches across architecture legs. This is a
+  known design limitation in `actions/setup-python` as of v5.
+
+  See: https://github.com/actions/setup-python/issues/971
+fix: |
+  Since setup-python will not fix the cache key automatically, work around it by
+  adding the Python architecture to the cache key manually.
+
+  Option 1 (recommended): Use actions/cache directly with an explicit architecture key
+  instead of relying on setup-python's built-in cache: pip option.
+
+  Option 2: Append the architecture to the hash input using an environment variable
+  or matrix value in the cache-dependency-path or key expression.
+
+  Option 3: If you only run one architecture per workflow (the common case), no
+  action is needed — the bug only manifests in multi-arch matrix builds on Windows.
+fix_code:
+  - language: yaml
+    label: 'Use actions/cache directly with arch-aware key (avoids the built-in cache bug)'
+    code: |
+      jobs:
+        test:
+          runs-on: windows-latest
+          strategy:
+            matrix:
+              python-version: ['3.11', '3.12']
+              architecture: ['x86', 'x64']
+          steps:
+            - uses: actions/checkout@v4
+
+            # Set up Python WITHOUT the built-in pip cache
+            - uses: actions/setup-python@v5
+              id: python
+              with:
+                python-version: ${{ matrix.python-version }}
+                architecture: ${{ matrix.architecture }}
+                # Do NOT use cache: pip here — the built-in key omits arch
+
+            # Restore pip cache with explicit architecture key
+            - uses: actions/cache@v4
+              with:
+                path: ~\AppData\Local\pip\Cache
+                # Include matrix.architecture so x86 and x64 caches never collide
+                key: pip-${{ runner.os }}-${{ matrix.architecture }}-${{ steps.python.outputs.python-version }}-${{ hashFiles('**/requirements*.txt') }}
+                restore-keys: |
+                  pip-${{ runner.os }}-${{ matrix.architecture }}-${{ steps.python.outputs.python-version }}-
+                  pip-${{ runner.os }}-${{ matrix.architecture }}-
+
+            - run: pip install -r requirements.txt
+
+  - language: yaml
+    label: 'Single-arch builds — no workaround needed (bug only affects multi-arch matrix on Windows)'
+    code: |
+      # Single architecture builds are unaffected — use built-in cache normally
+      jobs:
+        test:
+          runs-on: windows-latest
+          steps:
+            - uses: actions/setup-python@v5
+              with:
+                python-version: '3.12'
+                # architecture defaults to x64 — no conflict possible
+                cache: 'pip'  # ✅ safe for single-arch
+prevention:
+  - 'When building a Windows matrix with both x86 and x64 Python, do not use `cache: pip` in setup-python — use actions/cache directly with `${{ matrix.architecture }}` in the cache key'
+  - 'For single-architecture builds on Windows, the built-in `cache: pip` works correctly and needs no workaround'
+  - 'Detect the issue by checking if pip installs arch-native compiled extensions (e.g., numpy, pywin32, cryptography) are importable after a cache restore in a multi-arch matrix'
+  - 'Test your matrix by adding a step that prints `python -c "import struct; print(struct.calcsize(\"P\")*8)"` — it should print 32 for x86 and 64 for x64; a mismatch after cache restore confirms the bug'
+docs:
+  - url: 'https://github.com/actions/setup-python/issues/971'
+    label: 'setup-python#971: pip cache always uses node process architecture, ignoring architecture key (won''t fix)'
+  - url: 'https://github.com/actions/setup-python/blob/main/src/cache-distributions/pip-cache.ts'
+    label: 'setup-python pip-cache.ts — source showing process.arch used in cache key'
+  - url: 'https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows'
+    label: 'GitHub Docs — Caching dependencies to speed up workflows'
+  - url: 'https://github.com/actions/cache'
+    label: 'actions/cache — use for architecture-aware pip caching on Windows'
