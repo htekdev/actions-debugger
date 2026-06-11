@@ -1,0 +1,150 @@
+id: sf-200
+title: '`windows-11-arm` runner: `platform.machine()` and `PROCESSOR_ARCHITECTURE` return `AMD64` instead of `ARM64` — architecture detection silent failure'
+category: silent-failures
+severity: silent-failure
+tags:
+  - windows-11-arm
+  - arm64
+  - architecture-detection
+  - PROCESSOR_ARCHITECTURE
+  - platform-machine
+  - python
+  - silent-failure
+  - binary-download
+patterns:
+  - regex: 'platform\.machine.*AMD64.*windows.*arm|PROCESSOR_ARCHITECTURE.*AMD64.*arm'
+    flags: 'i'
+  - regex: 'windows-11-arm.*AMD64|AMD64.*windows.11.arm'
+    flags: 'i'
+error_messages:
+  - "Python platform.machine(): AMD64"
+  - "PROCESSOR_ARCHITECTURE=AMD64"
+  - "platform.architecture(): ('64bit', 'WindowsPE')"
+root_cause: |
+  On the `windows-11-arm` runner, common architecture detection methods return
+  `AMD64` instead of `ARM64`, causing workflows that download architecture-specific
+  binaries or apply architecture-specific logic to silently use the x64 path.
+
+  **Why this happens:**
+
+  The runner process and the Python interpreter shipped with the runner image are
+  **x86-64 (AMD64) executables** running under Windows' WOW64 x64-on-ARM64
+  emulation layer.
+
+  When an x64 process runs under WOW64 emulation on ARM64 Windows, the
+  `PROCESSOR_ARCHITECTURE` environment variable is set to `AMD64` (the emulated
+  architecture of the current process), not `ARM64` (the native host architecture).
+  Similarly, Python's `platform.machine()` queries `PROCESSOR_ARCHITECTURE`
+  under the hood and returns `AMD64`.
+
+  **Affected detection methods (return wrong result — AMD64):**
+  - Python: `platform.machine()` → `"AMD64"`
+  - Python: `platform.architecture()` → `("64bit", "WindowsPE")`
+  - PowerShell/CMD: `$env:PROCESSOR_ARCHITECTURE` → `"AMD64"`
+  - Node.js: `process.arch` → `"x64"` (if running x64 Node)
+
+  **Working detection methods (return correct result — ARM64):**
+  - PowerShell: `$env:PROCESSOR_IDENTIFIER` → `"ARMv8 (64-bit) Family 8 Model D49..."`
+  - PowerShell: `[System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture` → `Arm64`
+  - Python (if ARM64-native Python): `platform.machine()` → `"ARM64"`
+  - GitHub context: `${{ runner.arch }}` → `ARM64` (always correct regardless of process arch)
+
+  **Impact:**
+  Workflows that conditionally download binaries based on `platform.machine()` or
+  `PROCESSOR_ARCHITECTURE` will download the **x64 binary** on an ARM64 runner.
+  This works silently via WOW64 emulation — the binary runs, but slower. Workflows
+  that only support ARM64 natively will silently install the wrong binary and may
+  produce subtly wrong builds without any error.
+fix: |
+  **Option 1 (Recommended) — Use `${{ runner.arch }}` from the GitHub context:**
+  The `runner.arch` context variable is set by the runner itself to the true
+  hardware architecture and is always correct:
+  - x64 runners: `runner.arch = X64`
+  - `windows-11-arm`: `runner.arch = ARM64`
+
+  Use this in `if:` conditions and `env:` to route architecture-specific logic.
+
+  **Option 2 — Use `PROCESSOR_IDENTIFIER` for native arch detection in PowerShell:**
+  ```powershell
+  if ($env:PROCESSOR_IDENTIFIER -match 'ARMv8') { "ARM64" } else { "AMD64" }
+  ```
+
+  **Option 3 — Use `RuntimeInformation.OSArchitecture` in .NET / PowerShell:**
+  ```powershell
+  [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+  # Returns: Arm64 (correct, reflects host hardware)
+  ```
+
+  **Option 4 — Install ARM64-native Python via `actions/setup-python`:**
+  If you use Python-based architecture detection, installing a native ARM64 Python
+  (available from Python 3.11+ on Windows ARM64) fixes `platform.machine()`:
+  ```yaml
+  - uses: actions/setup-python@v5
+    with:
+      python-version: '3.12'
+      architecture: 'arm64'
+  ```
+fix_code:
+  - language: yaml
+    label: 'Broken — PROCESSOR_ARCHITECTURE and platform.machine() return AMD64 on windows-11-arm'
+    code: |
+      jobs:
+        download-tool:
+          runs-on: windows-11-arm
+          steps:
+            - name: Detect architecture (broken on windows-11-arm)
+              run: |
+                $arch = $env:PROCESSOR_ARCHITECTURE    # Returns "AMD64" — WRONG
+                # Downloads x64 binary silently; no error but wrong architecture
+                Invoke-WebRequest "https://example.com/tool-windows-$arch.zip"
+              shell: pwsh
+
+  - language: yaml
+    label: 'Fixed — use runner.arch context variable for correct architecture'
+    code: |
+      jobs:
+        download-tool:
+          runs-on: windows-11-arm
+          steps:
+            - name: Download architecture-specific binary
+              run: |
+                # runner.arch = ARM64 on windows-11-arm (always correct)
+                $arch = "${{ runner.arch }}"           # "ARM64" — correct
+                Invoke-WebRequest "https://example.com/tool-windows-$arch.zip"
+              shell: pwsh
+
+  - language: yaml
+    label: 'Fixed — install ARM64-native Python so platform.machine() is correct'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-11-arm
+          steps:
+            - uses: actions/setup-python@v5
+              with:
+                python-version: '3.12'
+                architecture: 'arm64'   # Native ARM64 Python
+
+            - name: Architecture detection now correct
+              run: |
+                python -c "import platform; print(platform.machine())"
+                # ✓ Returns: ARM64
+
+prevention:
+  - 'Never use `$env:PROCESSOR_ARCHITECTURE` or `platform.machine()` (with the
+    default x64 Python) for architecture routing on `windows-11-arm` — use
+    `${{ runner.arch }}` from the GitHub context instead.'
+  - 'Add a workflow validation step that asserts `runner.arch == ARM64` when
+    running on `windows-11-arm` to catch accidental x64-only logic early.'
+  - 'When testing ARM64 workflows locally or in CI matrix, always add an
+    assertion that verifies ARM64-native binaries were selected, not x64 ones.'
+  - 'If your workflow installs Python and then uses `platform.machine()`, specify
+    `architecture: arm64` in `actions/setup-python` to get a native ARM64
+    interpreter that reports the correct architecture.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14071'
+    label: 'runner-images#14071: windows-11-arm reports incorrect architecture in platform.machine() and PROCESSOR_ARCHITECTURE (April 2026)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#runner-context'
+    label: 'GitHub Docs: runner context — runner.arch'
+  - url: 'https://learn.microsoft.com/en-us/windows/arm/overview'
+    label: 'Microsoft docs: Windows on ARM — x64 emulation and architecture detection'

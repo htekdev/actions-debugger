@@ -1,0 +1,143 @@
+id: re-439
+title: '`libclang.dll` fails to load on `windows-11-arm` runner — `LoadLibraryExW` rejects x64 DLL on ARM64 host'
+category: runner-environment
+severity: error
+tags:
+  - windows-11-arm
+  - arm64
+  - libclang
+  - llvm
+  - rust
+  - bindgen
+  - windows
+  - LoadLibraryExW
+patterns:
+  - regex: 'Unable to find libclang.*libclang\.dll.*could not be opened'
+    flags: 'i'
+  - regex: 'LoadLibraryExW failed.*libclang|libclang.*LoadLibraryExW failed'
+    flags: 'i'
+  - regex: 'the `libclang` shared library.*could not be opened'
+    flags: 'i'
+  - regex: 'C:\\Program Files\\LLVM\\bin\\libclang\.dll.*could not be opened'
+    flags: 'i'
+error_messages:
+  - 'Unable to find libclang: "the `libclang` shared library at C:\\Program Files\\LLVM\\bin\\libclang.dll could not be opened: LoadLibraryExW failed"'
+  - "thread 'main' panicked at 'Unable to find libclang: LoadLibraryExW failed'"
+root_cause: |
+  The `windows-11-arm` GitHub Actions runner ships with an **x86-64 (AMD64)
+  build of LLVM/Clang** pre-installed at `C:\Program Files\LLVM\`. This includes
+  `libclang.dll`, which is compiled for x64.
+
+  On the ARM64 hardware of the `windows-11-arm` runner, Windows can execute
+  x64 binaries via the WOW64 x64-on-ARM64 emulation layer. However,
+  **`LoadLibraryExW` with the `LOAD_LIBRARY_AS_DATAFILE` or
+  `LOAD_LIBRARY_SEARCH_SYSTEM32` flag does not support cross-architecture DLL
+  loading** — an ARM64 process cannot load an x64 DLL into its address space.
+
+  The following toolchains and build tools are affected:
+  - **Rust `bindgen`** — uses `libclang` to parse C/C++ headers for FFI bindings.
+    The `bindgen` crate calls `libloading::Library::new("libclang.dll")` which
+    internally calls `LoadLibraryExW`. On ARM64, this fails.
+  - **`clang-sys`** — the Rust crate that wraps libclang and is used by bindgen,
+    grcov, and other tools.
+  - Any native build that links against `libclang.dll` directly.
+
+  Workflows that run correctly on `windows-latest` (x64) break on
+  `windows-11-arm` because:
+  1. The LLVM pre-installed on the image is the x64 installer.
+  2. No ARM64-native `libclang.dll` is present in the standard LLVM path.
+  3. `LIBCLANG_PATH` is not set to an ARM64 libclang location.
+fix: |
+  **Option 1 (Recommended) — Install the ARM64 LLVM build in the workflow:**
+  Download and install the official ARM64 LLVM release from llvm.org before
+  running any bindgen or clang-sys based builds.
+
+  **Option 2 — Set `LIBCLANG_PATH` to a known ARM64 libclang:**
+  If you build or vendor an ARM64 `libclang.dll`, set the environment variable
+  `LIBCLANG_PATH` to its directory. `clang-sys` / `bindgen` will prefer this
+  over the default search path.
+
+  **Option 3 — Cross-compile from an x64 runner:**
+  Build the ARM64 target on `windows-latest` (x64 runner) using the MSVC ARM64
+  cross-compilation toolset:
+  ```yaml
+  runs-on: windows-latest
+  env:
+    CARGO_BUILD_TARGET: aarch64-pc-windows-msvc
+  ```
+  This avoids the need to run `bindgen` on the ARM64 host entirely.
+fix_code:
+  - language: yaml
+    label: 'Broken — windows-11-arm + bindgen; x64 libclang.dll cannot be loaded'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-11-arm
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Build (calls bindgen internally)
+              run: cargo build --release
+              # ✗ Unable to find libclang: the `libclang` shared library at
+              #   C:\Program Files\LLVM\bin\libclang.dll could not be opened:
+              #   LoadLibraryExW failed
+
+  - language: yaml
+    label: 'Fixed Option 1 — install ARM64 LLVM, point LIBCLANG_PATH to it'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-11-arm
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Install ARM64 LLVM
+              run: |
+                # Download ARM64 LLVM installer for Windows
+                $version = "18.1.8"
+                $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/LLVM-$version-woa64.exe"
+                Invoke-WebRequest -Uri $url -OutFile llvm-arm64.exe
+                Start-Process -Wait -FilePath llvm-arm64.exe -ArgumentList "/S", "/D=C:\LLVM-arm64"
+              shell: pwsh
+
+            - name: Build with ARM64 libclang
+              run: cargo build --release
+              env:
+                LIBCLANG_PATH: 'C:\LLVM-arm64\bin'
+                # ✓ bindgen finds ARM64 libclang.dll — LoadLibraryExW succeeds
+
+  - language: yaml
+    label: 'Fixed Option 2 — cross-compile for ARM64 from x64 runner (avoids issue entirely)'
+    code: |
+      jobs:
+        build-arm64:
+          runs-on: windows-latest   # x64 runner — can load x64 libclang
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Add ARM64 MSVC target
+              run: rustup target add aarch64-pc-windows-msvc
+
+            - name: Cross-compile for ARM64
+              run: cargo build --release --target aarch64-pc-windows-msvc
+              # ✓ bindgen runs on x64, produces ARM64 output — no LoadLibraryExW issue
+
+prevention:
+  - 'Before migrating a Rust project to `windows-11-arm`, run `cargo build` on
+    the new runner in a test workflow to detect any `libclang`/`bindgen` issues
+    early, before modifying your main CI pipeline.'
+  - 'Check whether your dependencies use `bindgen` or `clang-sys` transitively
+    (`cargo tree | grep bindgen`) — any match means `libclang` must be ARM64-native
+    on `windows-11-arm`.'
+  - 'Set `LIBCLANG_PATH` explicitly in your workflow environment rather than
+    relying on the default LLVM installation path — this future-proofs your
+    workflow against image changes to the LLVM install location.'
+  - 'Consider pinning to `windows-latest` (x64) for complex native-compile
+    workflows until the `windows-11-arm` image ships an ARM64-native LLVM.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14085'
+    label: 'runner-images#14085: [windows-11-arm] libclang broken — LoadLibraryExW failed (May 2026)'
+  - url: 'https://github.com/rust-lang/rust-bindgen/blob/main/book/src/requirements.md'
+    label: 'rust-bindgen requirements: libclang installation'
+  - url: 'https://docs.microsoft.com/en-us/windows/arm/arm64ec'
+    label: 'Microsoft docs: Running x64 on ARM64 (Windows on ARM)'
