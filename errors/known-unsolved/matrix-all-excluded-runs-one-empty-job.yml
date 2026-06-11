@@ -1,0 +1,166 @@
+id: known-unsolved-115
+title: 'Dynamic Matrix with All Entries Excluded Still Runs One Empty-Context Job Instance'
+category: known-unsolved
+severity: limitation
+tags:
+  - matrix
+  - exclude
+  - dynamic-matrix
+  - empty-context
+  - job-skipping
+  - known-limitation
+patterns:
+  - regex: 'strategy.*matrix.*exclude.*\$\{\{|exclude.*needs\.\w+\.outputs'
+    flags: 'i'
+  - regex: 'matrix\.\w+.*undefined|matrix context.*empty'
+    flags: 'i'
+error_messages:
+  - "(no error — a single job instance runs with an empty matrix context when all combinations are excluded)"
+  - "Error accessing ${{ matrix.image }} — matrix context is empty when all combinations were excluded"
+root_cause: |
+  When a job's `strategy.matrix` uses dynamic `exclude:` conditions that evaluate at
+  runtime and remove ALL generated combinations, GitHub Actions does NOT skip the job.
+  Instead, it runs exactly ONE job instance with an empty `matrix` context object.
+
+  This is a documented behavioral design decision: GitHub Actions requires at least one
+  completed job instance to fulfill a `needs:` dependency for downstream jobs. When all
+  matrix entries are excluded, running one empty-context instance ensures downstream jobs
+  do not get stuck in a "waiting for dependency" state.
+
+  **How it appears:**
+  - The downstream job runs unexpectedly even though no work was intended
+  - Steps that reference `${{ matrix.image }}` or `${{ matrix.target }}` see empty/undefined values
+  - The job appears to succeed (exit 0) if no steps fail, but it did nothing useful
+  - If a step fails when `matrix.image` is empty, the "unnecessary" job produces an error
+
+  **Common trigger:** Workflows that use outputs from a path-filter action to dynamically
+  build `exclude:` lists. When no file paths changed, ALL entries are excluded, but one
+  empty job still runs.
+
+  This is **different** from the `fromJSON([])` error (yaml-syntax-112): that error occurs
+  when the matrix DIMENSION itself is an empty array. This limitation occurs when the
+  matrix has valid dimensions but all COMBINATIONS are excluded at runtime.
+
+  Source: Stack Overflow Q#78821409 (score 1, 198 views — Aug 2024); GitHub Community
+  discussions #17832 and #21725; GitHub Actions documented behaviour for matrix exclusion.
+fix: |
+  There is no way to make GitHub Actions skip a matrix job entirely when all exclude
+  conditions evaluate to true at runtime — the single empty-instance job always runs.
+
+  **Workaround 1 (recommended): Add an `if:` condition at the JOB level** that checks
+  whether any real work needs to be done, based on the upstream job outputs:
+
+  ```yaml
+  jobs:
+    docker:
+      needs: changes
+      if: |
+        needs.changes.outputs.api == 'true' ||
+        needs.changes.outputs.workers == 'true' ||
+        needs.changes.outputs.library == 'true'
+      strategy:
+        matrix:
+          image: [api, workers]
+  ```
+
+  This prevents the job from running at all when no changes are detected, without
+  relying on `exclude:` to do the filtering.
+
+  **Workaround 2: Move filtering logic inside the job, not into `exclude:`.**
+  Use a simple matrix (all possible values) and add `if:` conditions per-step or at
+  the job level to skip steps for targets that should not run:
+
+  ```yaml
+  strategy:
+    matrix:
+      image: [api, workers, collector]
+  steps:
+    - if: |
+        (matrix.image == 'api' && needs.changes.outputs.api == 'true') ||
+        (matrix.image == 'workers' && needs.changes.outputs.workers == 'true')
+      run: docker build -f ${{ matrix.image }}/Dockerfile .
+  ```
+
+  **Workaround 3: Use a `fromJSON` matrix that outputs the filtered list** (not
+  a full matrix with exclusions). The upstream job outputs only the changed targets
+  as a JSON array, so the matrix never has excluded combinations. If the array is
+  empty, use a sentinel value (see yaml-syntax-112) to avoid the `fromJSON([])` error.
+fix_code:
+  - language: yaml
+    label: 'Broken: dynamic exclude runs one empty job when all entries are excluded'
+    code: |
+      jobs:
+        changes:
+          outputs:
+            api: ${{ steps.filter.outputs.api }}
+            workers: ${{ steps.filter.outputs.workers }}
+          steps:
+            - uses: dorny/paths-filter@v3
+              id: filter
+              with:
+                filters: |
+                  api: ['api/**']
+                  workers: ['workers/**']
+
+        docker:
+          needs: changes
+          strategy:
+            matrix:
+              image: [api, workers]
+              isApi:
+                - ${{ needs.changes.outputs.api == 'true' }}
+              isWorkers:
+                - ${{ needs.changes.outputs.workers == 'true' }}
+              exclude:
+                - isApi: false
+                  image: api
+                - isWorkers: false
+                  image: workers
+          steps:
+            # ❌ When no files changed: ALL entries excluded but ONE empty job still runs
+            # matrix.image is undefined — steps may fail or silently produce nothing
+            - run: docker build ${{ matrix.image }}
+  - language: yaml
+    label: 'Fixed: job-level if: prevents the job from running when no changes detected'
+    code: |
+      jobs:
+        changes:
+          outputs:
+            api: ${{ steps.filter.outputs.api }}
+            workers: ${{ steps.filter.outputs.workers }}
+          steps:
+            - uses: dorny/paths-filter@v3
+              id: filter
+              with:
+                filters: |
+                  api: ['api/**']
+                  workers: ['workers/**']
+
+        docker:
+          needs: changes
+          # ✅ Job-level if: prevents execution when nothing changed
+          if: |
+            needs.changes.outputs.api == 'true' ||
+            needs.changes.outputs.workers == 'true'
+          strategy:
+            matrix:
+              image: [api, workers]
+          steps:
+            # Use per-step conditions for which images to actually build
+            - if: |
+                (matrix.image == 'api' && needs.changes.outputs.api == 'true') ||
+                (matrix.image == 'workers' && needs.changes.outputs.workers == 'true')
+              run: docker build ${{ matrix.image }}
+prevention:
+  - 'Use a job-level `if:` condition to prevent a matrix job from running entirely when no work is needed — do not rely solely on `exclude:` to suppress execution.'
+  - 'Prefer filtering the matrix list in an upstream job (output only the items that need processing) over using complex `exclude:` logic.'
+  - 'Add a guard step at the start of matrix jobs that exits early with `exit 0` if the matrix context is empty or the specific image/target should not be processed.'
+  - 'Understand that GitHub Actions will always run at least one job instance from a matrix to fulfil `needs:` dependencies — this is by design, not a bug.'
+  - 'Test your workflow with no changes (empty path filter results) to verify that the matrix job behaves as expected rather than running with empty context.'
+docs:
+  - url: 'https://stackoverflow.com/questions/78821409/github-actions-matrix-job-running-despite-false-conditions'
+    label: 'Stack Overflow — Matrix job running despite false conditions when all excluded (Aug 2024, 198 views)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-a-matrix-for-your-jobs#excluding-matrix-configurations'
+    label: 'GitHub Docs — Excluding matrix configurations'
+  - url: 'https://github.com/orgs/community/discussions/17832'
+    label: 'GitHub Community — Empty matrix still runs one job (known limitation)'
