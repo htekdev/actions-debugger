@@ -1,0 +1,159 @@
+id: concurrency-timing-093
+title: "Simultaneous Multi-Label Additions Cancel Each Other — Only Last Label Run Survives"
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - labeled
+  - pull_request
+  - multiple-labels
+  - cancel-in-progress
+  - event-action
+  - batch
+patterns:
+  - regex: 'on:\s+pull_request:\s+types:.*\blabeled\b'
+    flags: 'si'
+  - regex: 'github\.event\.label\.name'
+    flags: 'i'
+  - regex: 'This run was automatically cancelled'
+    flags: 'i'
+error_messages:
+  - "This run was automatically cancelled"
+  - "Canceling since a higher priority waiting run was found"
+  - "Workflow triggered by label 'X' but label condition evaluated to false"
+root_cause: |
+  When multiple labels are added to a PR simultaneously — for example via the GitHub UI
+  bulk-add, `gh pr edit --add-label "bug,enhancement,priority:high"`, or Renovate/
+  Dependabot auto-labelers applying several labels at once — GitHub emits a separate
+  `pull_request: labeled` event for each individual label.
+
+  Each event triggers the same workflow. If those runs share a concurrency group keyed
+  on the PR number (without including the label name), they all compete for the same
+  concurrency slot:
+
+  1. Label "bug" fires → Run A starts
+  2. Label "enhancement" fires → Run B created → Run A cancelled (new pending: Run B)
+  3. Label "priority:high" fires → Run C created → Run B cancelled (new pending: Run C)
+  4. Only Run C survives and executes.
+
+  **The critical failure mode:** Run C's `github.event.label.name` is `"priority:high"`.
+  If the workflow contains conditional logic like:
+
+    if: ${{ github.event.label.name == 'bug' }}
+
+  ...that condition evaluates to `false` on the surviving Run C, and the critical
+  labeling automation (e.g., "assign triage team on 'bug' label") never runs. The
+  workflow ran successfully but did nothing, and the team has no idea.
+
+  This is especially painful for automation that gates on a specific label (e.g.,
+  auto-assign, notify on-call, or deploy trigger). With only the last label's run
+  surviving, all other label-specific actions are silently skipped.
+
+  Sources:
+  - github/gh-aw#23020 (Mar 2026) — documented in GitHub Agentic Workflows codebase
+  - github/gh-aw#23021 — fix: include label name in concurrency group
+  - Widely observed with Renovate PRs that apply multiple labels simultaneously
+fix: |
+  Include `github.event.label.name` in the concurrency group key so each label's run
+  gets its own independent slot. Runs triggered by different labels no longer cancel
+  each other:
+
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event.pull_request.number }}-${{ github.event.label.name }}
+      cancel-in-progress: true
+
+  This gives each label its own concurrency group:
+  - Run A (bug):          group = "ci-42-bug"
+  - Run B (enhancement):  group = "ci-42-enhancement"
+  - Run C (priority:high): group = "ci-42-priority:high"
+
+  All three run in parallel (or queue independently) without cancelling each other.
+
+  If label-specific automation must be serialized (e.g., to prevent race conditions
+  when writing to the same resource), use `cancel-in-progress: false` so each label
+  run queues behind the previous one without cancellation.
+fix_code:
+  - language: yaml
+    label: 'Broken: all label events share one concurrency slot'
+    code: |
+      on:
+        pull_request:
+          types: [labeled]
+
+      concurrency:
+        group: label-handler-${{ github.event.pull_request.number }}
+        cancel-in-progress: true   # ← each new label cancels the previous label's run!
+
+      jobs:
+        handle-label:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Assign triage team on bug label
+              if: ${{ github.event.label.name == 'bug' }}
+              run: gh issue edit ${{ github.event.pull_request.number }} --add-assignee "triage-team"
+              env:
+                GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  - language: yaml
+    label: 'Fixed: each label gets its own independent concurrency slot'
+    code: |
+      on:
+        pull_request:
+          types: [labeled]
+
+      concurrency:
+        # Each label runs in its own group — simultaneous labels never cancel each other
+        group: ${{ github.workflow }}-pr-${{ github.event.pull_request.number }}-label-${{ github.event.label.name }}
+        cancel-in-progress: true
+
+      jobs:
+        handle-label:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Assign triage team on bug label
+              if: ${{ github.event.label.name == 'bug' }}
+              run: |
+                echo "Processing label: ${{ github.event.label.name }}"
+                gh pr edit ${{ github.event.pull_request.number }} --add-assignee "triage-team"
+              env:
+                GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Set priority milestone on priority:high label
+              if: ${{ github.event.label.name == 'priority:high' }}
+              run: gh pr edit ${{ github.event.pull_request.number }} --milestone "Sprint-Current"
+              env:
+                GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  - language: yaml
+    label: 'Alternative: guard against missing label context with run_id fallback'
+    code: |
+      on:
+        pull_request:
+          types: [labeled]
+        workflow_dispatch:  # also triggerable manually
+
+      concurrency:
+        # Include label name; fall back to run_id for workflow_dispatch (no label context)
+        group: >-
+          ${{ github.workflow }}-${{ github.event.pull_request.number }}-
+          ${{ github.event.label.name || github.run_id }}
+        cancel-in-progress: true
+
+      jobs:
+        handle:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Label = '${{ github.event.label.name }}'"
+prevention:
+  - "Always include `${{ github.event.label.name }}` in the concurrency group for `pull_request: labeled` workflows."
+  - "When debugging missing label automation, check if multiple labels were applied simultaneously — the surviving run may have a different label name."
+  - "Test multi-label scenarios explicitly: add 3 labels at once and verify each label's automation ran, not just the last one."
+  - "For Renovate/Dependabot repos that auto-label PRs, assume simultaneous label events are the norm — design concurrency groups accordingly."
+  - "Log `${{ github.event.label.name }}` at workflow start to make it visible which label triggered each run."
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request'
+    label: 'GitHub Docs — pull_request event and action types'
+  - url: 'https://github.com/github/gh-aw/issues/23020'
+    label: 'gh-aw#23020 — concurrent label events cancel each other via shared concurrency group'
+  - url: 'https://github.com/github/gh-aw/pull/23021'
+    label: 'gh-aw#23021 — fix: include label name in concurrency group to prevent cross-label cancellation'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs'
+    label: 'GitHub Docs — Control the concurrency of workflows and jobs'
