@@ -1,0 +1,98 @@
+id: runner-environment-462
+title: 'Ubuntu 26.04 Default Go Changed from 1.24 to 1.26 — Workflows Without setup-go Get Go 1.26'
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-26.04
+  - golang
+  - go-version
+  - runner-image
+  - breaking-change
+  - setup-go
+patterns:
+  - regex: 'go version go1\.26\.[0-9]+ linux'
+    flags: 'i'
+  - regex: 'go: module requires go >= 1\.2[56]|GOEXPERIMENT.*not.*supported.*go1\.24|note: module requires Go 1\.2[56]'
+    flags: 'i'
+  - regex: 'go1\.26.*incompatible|requires.*go 1\.26|go.mod.*go 1\.26'
+    flags: 'i'
+error_messages:
+  - "go version go1.26.0 linux/amd64"
+  - "note: module requires Go >= 1.25"
+  - "# command-line-arguments: requires go >= 1.25 (running go 1.24)"
+  - "go: updates to go.mod needed; to update it: go mod tidy"
+root_cause: |
+  Ubuntu 26.04 runner images (announced June 11, 2026 as public preview) ship with
+  Go 1.26.x as the pre-installed default Go toolchain, replacing Go 1.24.x which is
+  the default on ubuntu-24.04.
+
+  Workflows that do NOT use `actions/setup-go` to pin a specific Go version will
+  silently receive Go 1.26 when running on ubuntu-26.04. Key differences
+  between Go 1.24 and Go 1.26 include:
+
+  - `go.mod` files with `go 1.24` directive still compile under Go 1.26, but
+    packages using APIs deprecated-and-removed between 1.24 and 1.26 may fail
+  - New `go vet` analysis passes enabled by default in 1.25 and 1.26 may surface
+    previously silent issues as build errors when running with stricter settings
+  - `GODEBUG` settings controlling legacy behavior removed in 1.25/1.26 are
+    silently ignored — code relying on them will behave differently
+  - Go 1.26 toolchain selection rules: `go.mod` without an explicit `toolchain`
+    directive may trigger automatic toolchain downloads when min version differs
+  - CGo interface changes in select stdlib packages (net/http, crypto/tls)
+
+  Source: actions/runner-images#14226 (Ubuntu 26.04 public preview announcement,
+  June 11, 2026) — Go toolchain row shows "1.26.* (default)" for ubuntu-26.04
+  versus "1.24.* (default)" for ubuntu-24.04.
+fix: |
+  Always pin an explicit Go version using actions/setup-go. Prefer using
+  go-version-file: go.mod so that the workflow automatically uses the version
+  declared in the module, avoiding silent runner default changes.
+fix_code:
+  - language: yaml
+    label: 'Pin Go via go.mod (recommended — version follows module)'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-26.04
+          steps:
+            - uses: actions/checkout@v4
+
+            # go-version-file reads from go.mod — safe across runner image changes
+            - uses: actions/setup-go@v5
+              with:
+                go-version-file: 'go.mod'
+                cache: true
+
+            - run: go build ./...
+            - run: go test ./...
+
+  - language: yaml
+    label: 'Explicit Go version pin'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-26.04
+          steps:
+            - uses: actions/checkout@v4
+
+            # Explicit pin — ubuntu-24.04 default = go 1.24, ubuntu-26.04 = go 1.26
+            - uses: actions/setup-go@v5
+              with:
+                go-version: '1.24.x'   # pin to known-working version
+                cache: true
+
+            - run: go build ./...
+            - run: go test -race ./...
+
+prevention:
+  - 'Always use `actions/setup-go` with `go-version-file: go.mod` or an explicit `go-version` — the pre-installed Go version differs between ubuntu-24.04 (1.24) and ubuntu-26.04 (1.26).'
+  - 'When migrating to ubuntu-26.04, run `go vet ./...` locally with Go 1.26 first — new analysis passes may surface latent bugs as build errors.'
+  - 'Audit `go.mod` for the `toolchain` directive — without it, Go 1.26 may attempt to auto-download a toolchain version matching the module requirement.'
+  - 'Check your CI for any direct `go` invocations that bypass setup-go and rely on the PATH default Go binary.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14226'
+    label: 'runner-images#14226: Ubuntu 26.04 public preview — Go toolchain differences table'
+  - url: 'https://github.com/actions/setup-go'
+    label: 'actions/setup-go — pin Go versions in workflows'
+  - url: 'https://go.dev/doc/toolchain'
+    label: 'Go toolchain management — go.mod toolchain directive'
