@@ -1,0 +1,87 @@
+id: caching-artifacts-135
+title: 'actions/cache permission denied when caching macports /opt/local on macOS'
+category: caching-artifacts
+severity: error
+tags:
+  - cache
+  - macports
+  - macos
+  - permission-denied
+  - sudo
+  - gtar
+patterns:
+  - regex: 'gtar.*Cannot mkdir.*Permission denied'
+    flags: 'i'
+  - regex: 'Cannot mkdir: Permission denied'
+    flags: 'i'
+  - regex: '/opt/local.*Cannot mkdir'
+    flags: 'i'
+error_messages:
+  - '/usr/local/bin/gtar: ../../../../../opt/local: Cannot mkdir: Permission denied'
+  - 'Cannot mkdir: Permission denied'
+root_cause: |
+  actions/cache runs gtar (GNU tar) without elevated privileges. When the cache
+  path includes directories outside the runner user's home — most commonly
+  /opt/local (the macports installation prefix) — gtar cannot create those
+  directories because they are owned by root.
+
+  During cache restoration, gtar attempts to extract the archive and recreate the
+  directory structure. For every path under /opt/local, it emits:
+    /usr/local/bin/gtar: ../../../../../opt/local: Cannot mkdir: Permission denied
+
+  The cache step fails entirely. actions/cache has no mechanism to run tar with
+  sudo. This is by design: the cache action runs in the context of the workflow
+  user and does not acquire elevated privileges.
+
+  This affects any workflow that tries to cache macports, homebrew prefixes, or
+  other system-owned directories on macOS runners.
+fix: |
+  There are three workarounds:
+
+  1. Cache a directory inside the runner's home, then symlink at restore time:
+     Store macports packages in a home-relative path, restore them, then run
+     sudo to move them to /opt/local. Combine with a custom install step.
+
+  2. Cache macports ports list only (not /opt/local), and reinstall from ports
+     on cache hit using `sudo port install`. This is faster than a full
+     cold install but still requires the macports base install to be present.
+
+  3. Skip caching /opt/local and instead use a Homebrew-based equivalent for
+     the packages you need, since Homebrew's default prefix on macOS is
+     /opt/homebrew (Apple Silicon) or /usr/local (Intel) — which may require
+     the same workaround depending on runner architecture and ownership.
+
+  The recommended pattern (sudo move after restore):
+fix_code:
+  - language: yaml
+    label: 'Cache macports to home dir, move to /opt/local at restore'
+    code: |
+      - name: Restore macports cache
+        id: cache-macports
+        uses: actions/cache@v4
+        with:
+          path: ~/macports-cache
+          key: ${{ runner.os }}-macports-${{ hashFiles('macos_build.txt') }}
+
+      - name: Move macports from cache to /opt/local
+        if: steps.cache-macports.outputs.cache-hit == 'true'
+        run: |
+          sudo mkdir -p /opt/local
+          sudo cp -a ~/macports-cache/. /opt/local/
+
+      - name: Save macports to home dir before caching
+        if: steps.cache-macports.outputs.cache-hit != 'true'
+        run: |
+          sudo cp -a /opt/local/. ~/macports-cache/
+prevention:
+  - 'Never set actions/cache path to /opt/local or other system-owned directories — the action cannot use sudo'
+  - 'Cache only directories the runner user owns (within $HOME or /home/runner)'
+  - 'Use Homebrew instead of macports where possible — homebrew prefix is in /opt/homebrew on Apple Silicon (runner-owned)'
+  - 'For macports, cache the ports list and reinstall on hit rather than caching /opt/local'
+docs:
+  - url: 'https://github.com/actions/cache/issues/629'
+    label: 'actions/cache#629 — Permission denied when caching macports'
+  - url: 'https://github.com/actions/cache?tab=readme-ov-file#cache-limits'
+    label: 'actions/cache — Usage notes and limitations'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows'
+    label: 'GitHub Docs — Caching dependencies to speed up workflows'

@@ -1,0 +1,95 @@
+id: known-unsolved-123
+title: 'actions/cache restoration is orders of magnitude slower on Windows than Linux'
+category: known-unsolved
+severity: limitation
+tags:
+  - cache
+  - windows
+  - performance
+  - tar
+  - ntfs
+  - slow-restore
+patterns:
+  - regex: 'Cache Size.*\d+ (MB|GB).*windows'
+    flags: 'i'
+  - regex: 'Received \d+ of \d+.*100\.0\%.*Cache Size'
+    flags: 'is'
+error_messages:
+  - 'Cache Size: ~244 MB (255723896 B)'
+  - 'Received 255723896 of 255723896 (100.0%), 105.3 MBs/sec'
+root_cause: |
+  actions/cache uses zstd-compressed tar archives for all platforms. On Linux
+  (ext4), tar extraction is fast because the filesystem handles sequential writes
+  efficiently. On Windows (NTFS), the same operation is significantly slower —
+  often 30–50x — for the following reasons:
+
+  1. NTFS per-file overhead: Each file creation involves metadata writes
+     (timestamps, ACLs, MFT records) that are far more expensive than ext4.
+
+  2. Windows Defender / antivirus: Real-time scanning of extracted files adds
+     latency for every file written to disk. Windows runners run with Defender
+     enabled by default.
+
+  3. Path canonicalization: tar must translate POSIX paths to Windows paths for
+     every extracted file.
+
+  4. No sendfile equivalent: Windows lacks the zero-copy I/O primitives that
+     accelerate large sequential writes on Linux.
+
+  The result: a ~300 MB cache that restores in ~10 seconds on ubuntu-latest
+  routinely takes 4–6 minutes on windows-latest. The download of the archive
+  from the cache backend is equally fast on both platforms; only extraction is
+  slow.
+
+  This is a fundamental limitation of Windows NTFS and runner anti-virus
+  configuration. GitHub has not provided a platform-specific extraction
+  implementation for the cache action.
+fix: |
+  There is no complete fix. Mitigation strategies:
+
+  1. Reduce the number of files cached: Many small files (e.g., node_modules)
+     are much slower to extract than fewer large files. Consider caching a
+     pre-compressed tarball as a single file, or excluding rarely-used files.
+
+  2. Exclude from cache, use preinstalled versions: Windows runner images include
+     many common tools pre-installed. Use `choco install` or preinstalled
+     toolcache versions instead of caching.
+
+  3. Use actions/cache's zstd compression level tuning: Setting a lower zstd
+     compression level reduces CPU time and may marginally improve total time.
+
+  4. Disable Windows Defender for the build directory (with caution):
+     Add the build directory to Windows Defender exclusions to reduce per-file
+     scan overhead. This has security implications on shared runners.
+
+  5. Use larger Windows runners with NVMe-backed storage — restore times improve
+     with faster IOPS.
+fix_code:
+  - language: yaml
+    label: 'Reduce node_modules cache file count using a tarball'
+    code: |
+      - name: Pack node_modules before caching (Windows)
+        if: runner.os == 'Windows' && steps.cache.outputs.cache-hit != 'true'
+        run: tar -czf node_modules.tar.gz node_modules
+
+      - name: Cache packed tarball (single file = fast Windows restore)
+        uses: actions/cache@v4
+        with:
+          path: node_modules.tar.gz
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+
+      - name: Unpack node_modules after restore
+        if: runner.os == 'Windows' && steps.cache.outputs.cache-hit == 'true'
+        run: tar -xzf node_modules.tar.gz
+prevention:
+  - 'Avoid caching directories with thousands of small files on Windows — cache extraction is 30-50x slower than on Linux'
+  - 'Benchmark cache restore time on Windows runners separately from Linux — do not assume parity'
+  - 'Consider whether caching is net positive on Windows for large node_modules or similar — a cold npm install may be faster'
+  - 'Use preinstalled toolchain versions on Windows runner images rather than caching to avoid extraction overhead'
+docs:
+  - url: 'https://github.com/actions/cache/issues/752'
+    label: 'actions/cache#752 — Cache restoration is orders of magnitude slower on Windows vs Linux'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows#usage-limits-and-eviction-policy'
+    label: 'GitHub Docs — Cache usage limits and eviction policy'
+  - url: 'https://github.com/actions/cache#windows-environment-variables'
+    label: 'actions/cache — Windows-specific notes'
