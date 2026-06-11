@@ -1,0 +1,97 @@
+id: runner-environment-442
+title: 'NuGet NU3012 Package Signing Certificate Revoked Breaks dotnet restore in CI'
+category: runner-environment
+severity: error
+tags:
+  - nuget
+  - dotnet
+  - package-restore
+  - signing
+  - certificate
+  - windows
+  - ubuntu
+  - ci-breakage
+patterns:
+  - regex: 'error NU3012:.*certificate revoked'
+    flags: 'i'
+  - regex: 'The author primary signature found a chain building issue: Revoked'
+    flags: 'i'
+  - regex: 'error NU3012:.*chain building issue'
+    flags: 'i'
+  - regex: 'NU3012.*revoked|revoked.*NU3012'
+    flags: 'i'
+error_messages:
+  - "error NU3012: Package 'Refit 10.1.6' from source 'https://api.nuget.org/v3/index.json': The author primary signature found a chain building issue: Revoked: certificate revoked"
+  - "error NU3012: Package 'X.Y.Z' from source '...': The author primary signature found a chain building issue: Revoked: certificate revoked"
+root_cause: |
+  NuGet package authors sign their packages with a code-signing certificate issued by a Certificate Authority
+  (e.g. DigiCert, Sectigo). When that certificate is revoked by the CA — due to key compromise, administrative
+  action, or non-renewal — NuGet's signature verification fails with NU3012 on any machine that fetches or
+  restores the package.
+
+  In a GitHub Actions workflow, `dotnet restore` / `dotnet build` / `nuget restore` calls the NuGet client
+  which validates package signatures by default. If a package your project depends on was signed with a
+  now-revoked certificate, every CI run will fail with NU3012 even though the package itself (the bytes inside
+  the .nupkg) is unmodified and safe to use.
+
+  This is not a GitHub Actions or runner-image bug — it is an upstream dependency issue. However, it breaks
+  CI workflows silently from a developer's perspective: the workflow was working yesterday and today it fails
+  with a cryptic certificate error.
+
+  Example incident: Refit 10.1.6 (reactiveui/refit#2114, June 2026) — the package author's signing certificate
+  was revoked by the CA, causing NU3012 errors across hundreds of CI pipelines worldwide. The package was
+  re-signed and re-published as 10.1.7 the same day.
+fix: |
+  **Short-term (if a fixed version exists):** Upgrade the affected package to a version that uses a valid
+  signing certificate. Run `dotnet list package --outdated` to identify newer versions.
+
+  **Short-term (if no fixed version exists):** Disable NuGet signature verification for the affected package
+  source in your `NuGet.Config`:
+  ```xml
+  <configuration>
+    <config>
+      <add key="signatureValidationMode" value="accept" />
+    </config>
+  </configuration>
+  ```
+  Or pass `--no-verify` to the restore command (not available in all NuGet versions).
+
+  **Long-term:** Pin your package versions explicitly and monitor for certificate revocation events from your
+  dependency authors. Consider subscribing to the package author's release notifications or using Dependabot.
+fix_code:
+  - language: yaml
+    label: 'Upgrade affected package in workflow to get re-signed version'
+    code: |
+      - name: Restore dependencies
+        run: dotnet restore
+        # If NU3012 occurs: upgrade the affected package to the latest version
+        # e.g. dotnet add package Refit --version 10.1.7
+  - language: xml
+    label: 'NuGet.Config: set signatureValidationMode to accept (workaround)'
+    code: |
+      <?xml version="1.0" encoding="utf-8"?>
+      <configuration>
+        <config>
+          <!-- Disables signature verification — use only as temporary workaround -->
+          <add key="signatureValidationMode" value="accept" />
+        </config>
+      </configuration>
+  - language: yaml
+    label: 'Temporarily set NUGET_CERT_REVOCATION_MODE=offline to avoid revocation checks'
+    code: |
+      - name: Restore dependencies
+        env:
+          NUGET_CERT_REVOCATION_MODE: offline
+        run: dotnet restore
+prevention:
+  - 'Use Dependabot or Renovate to automatically get notified of new package versions that may include re-signed packages.'
+  - 'Monitor NuGet package changelogs and the package author''s GitHub issues for certificate-related announcements.'
+  - 'Consider setting NUGET_CERT_REVOCATION_MODE=offline in CI environments to avoid revocation check latency and surface issues earlier.'
+  - 'Pin dependencies to known-good versions in a lock file (packages.lock.json) so that certificate issues do not cause surprise failures on reruns.'
+docs:
+  - url: 'https://learn.microsoft.com/en-us/nuget/reference/errors-and-warnings/nu3012'
+    label: 'NuGet NU3012 Error Reference'
+  - url: 'https://learn.microsoft.com/en-us/nuget/consume-packages/installing-signed-packages'
+    label: 'NuGet: Installing Signed Packages'
+  - url: 'https://github.com/reactiveui/refit/issues/2114'
+    label: 'Refit#2114: Real-world NU3012 revocation incident (June 2026)'
