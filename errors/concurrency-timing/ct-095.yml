@@ -1,0 +1,156 @@
+id: ct-095
+title: '`push` and `pull_request` workflows cancel each other when sharing the same `${{ github.ref }}`-based concurrency group'
+category: concurrency-timing
+severity: error
+tags:
+  - concurrency
+  - push
+  - pull-request
+  - github-ref
+  - cancel-in-progress
+  - workflow-cancellation
+  - cross-event-cancel
+patterns:
+  - regex: 'concurrency.*github\.ref.*push.*pull_request|push.*pull_request.*github\.ref.*concurrency'
+    flags: 'i'
+  - regex: 'workflow.*cancel.*by.*newer.*run|concurrency.*group.*cancel.*same.*ref'
+    flags: 'i'
+error_messages:
+  - "This run was cancelled because another run with a newer commit is using the same concurrency group"
+  - "Workflow run cancelled due to concurrency group conflict between push and pull_request events"
+root_cause: |
+  When you push a commit to a branch that has an open pull request, GitHub fires
+  **two separate events simultaneously**:
+
+  1. A `push` event for the branch ref (e.g., `refs/heads/feature/my-pr`).
+  2. A `pull_request` event (with action `synchronize`) for the PR targeting the
+     base branch.
+
+  If both workflows (or a single workflow triggered by both events) use:
+  ```yaml
+  concurrency:
+    group: ${{ github.ref }}
+    cancel-in-progress: true
+  ```
+
+  ...both workflows receive the **same** `github.ref` value (`refs/heads/feature/my-pr`),
+  which means they share the **same concurrency group**. GitHub's concurrency system
+  cancels the earlier run when a newer one arrives in the same group, so the `push`
+  and `pull_request` runs cancel each other depending on which one GitHub schedules last.
+
+  **Affected patterns:**
+  - A single workflow with both `push` and `pull_request` as `on:` triggers.
+  - Two separate workflow files: one for `on: push` and one for `on: pull_request`,
+    both using `concurrency: group: ${{ github.ref }}`.
+  - `push` to a PR branch from Dependabot/Renovate bots where PRs and branch
+    pushes overlap.
+
+  **Why it is confusing:**
+  The cancellation appears as "cancelled" in the workflow run UI with the message
+  "This run was cancelled because another run with a newer commit is using the same
+  concurrency group." The developer sees their push CI pass (because the push event
+  won the race), but the PR checks on the pull_request event show "cancelled", causing
+  required status checks to fail and blocking the PR from merging.
+
+  Alternatively, the pull_request run wins, the push run is cancelled, but branch
+  protection rules requiring specific workflow checks against the push event fail.
+fix: |
+  **Option 1 (Recommended) — Include the event name in the concurrency group:**
+  Append `${{ github.event_name }}` to the concurrency group key. This ensures
+  `push` and `pull_request` events always get distinct concurrency groups, even
+  when they share the same ref.
+
+  **Option 2 — Scope to PR number for pull_request events:**
+  For `pull_request` events, use `github.event.pull_request.number` in the group
+  key to ensure each PR has its own group independent of branch name.
+
+  **Option 3 — Use a single unified workflow key:**
+  Use `github.workflow` combined with `github.ref` to scope cancellations to the
+  specific workflow file + branch, preventing cross-workflow cancellations.
+
+fix_code:
+  - language: yaml
+    label: 'Broken — push and pull_request share concurrency group via github.ref alone'
+    code: |
+      on:
+        push:
+          branches: ['**']
+        pull_request:
+          branches: [main]
+
+      concurrency:
+        group: ${{ github.ref }}   # ✗ Same ref for both push and pull_request events
+        cancel-in-progress: true   #   → they cancel each other when PR branch is pushed
+
+      jobs:
+        ci:
+          runs-on: ubuntu-latest
+          steps:
+            - run: npm test
+
+  - language: yaml
+    label: 'Fixed — include event name to distinguish push from pull_request groups'
+    code: |
+      on:
+        push:
+          branches: ['**']
+        pull_request:
+          branches: [main]
+
+      concurrency:
+        # ✓ push gets group "ci-refs/heads/feat-my-pr-push"
+        # ✓ pull_request gets group "ci-refs/heads/feat-my-pr-pull_request"
+        # → no cross-event cancellation
+        group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+        cancel-in-progress: true
+
+      jobs:
+        ci:
+          runs-on: ubuntu-latest
+          steps:
+            - run: npm test
+
+  - language: yaml
+    label: 'Fixed — per-PR concurrency for pull_request, per-branch for push'
+    code: |
+      on:
+        push:
+          branches: ['**']
+        pull_request:
+          branches: [main]
+
+      concurrency:
+        # pull_request → group on PR number; push → group on branch ref
+        group: >-
+          ${{ github.workflow }}-
+          ${{ github.event.pull_request.number || github.ref }}
+        cancel-in-progress: true
+
+      jobs:
+        ci:
+          runs-on: ubuntu-latest
+          steps:
+            - run: npm test
+
+prevention:
+  - 'Never use `${{ github.ref }}` alone as a concurrency group key when a workflow
+    is triggered by both `push` and `pull_request` events. Always include at least
+    `${{ github.event_name }}` or `${{ github.workflow }}` to distinguish event types.'
+  - 'Use `${{ github.event.pull_request.number || github.ref }}` as the group key
+    to get per-PR concurrency for pull_request events while still cancelling redundant
+    push runs on the same branch.'
+  - 'When using two separate workflow files (one for push, one for pull_request) that
+    both use `cancel-in-progress: true`, ensure their group keys cannot collide by
+    including the workflow file name or event type in the key.'
+  - 'After adding a concurrency group, test with a branch that has an open PR. Push
+    two commits in quick succession and verify that only the push runs are cancelled
+    by each other, not the pull_request run.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/control-the-concurrency-of-workflows-and-jobs'
+    label: 'GitHub Docs: Controlling the concurrency of workflows and jobs'
+  - url: 'https://github.blog/changelog/2021-04-19-github-actions-limit-workflow-run-or-job-concurrency/'
+    label: 'GitHub Changelog: Limit workflow run or job concurrency (April 2021)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#concurrency'
+    label: 'GitHub Docs: Workflow syntax — concurrency'
+  - url: 'https://github.com/orgs/community/discussions/5435'
+    label: 'GitHub Community #5435: Concurrency group cancels pull_request checks when pushing to PR branch'

@@ -1,0 +1,130 @@
+id: sf-201
+title: '`workflow_dispatch` `required: true` inputs bypassed silently via API and CLI — workflow runs with empty input'
+category: silent-failures
+severity: silent-failure
+tags:
+  - workflow-dispatch
+  - required-inputs
+  - api
+  - cli
+  - gh-cli
+  - silent-failure
+  - inputs-context
+patterns:
+  - regex: 'workflow_dispatch.*required.*true.*api|required.*input.*bypass.*api'
+    flags: 'i'
+  - regex: 'inputs\.[a-zA-Z_]+.*empty.*workflow.dispatch|dispatch.*required.*not.*enforced'
+    flags: 'i'
+error_messages:
+  - "inputs.my_required_input is empty string despite required: true"
+  - "Required input was not provided but workflow was triggered successfully via API"
+root_cause: |
+  GitHub Actions enforces `required: true` on `workflow_dispatch` inputs **only in
+  the GitHub web UI**. When a workflow is triggered programmatically via:
+
+  - The REST API (`POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches`)
+  - The GitHub CLI (`gh workflow run <workflow.yml>`)
+  - Another workflow using `workflow_call` (not applicable — inputs are different)
+  - GitHub Mobile, third-party CI dashboards, or custom tooling
+
+  ...the `required: true` constraint is silently ignored. The API accepts the
+  request and triggers the workflow even if required inputs are missing entirely
+  from the request body.
+
+  **What happens to missing inputs at runtime:**
+  - If `default:` is defined: the input receives the default value.
+  - If `default:` is not defined: the input resolves to an empty string `""`.
+
+  This is **not** an error — the workflow is triggered successfully and exits 0 if
+  it doesn't explicitly validate inputs. Steps that use `${{ inputs.my_required }}`
+  receive `""` and may silently produce wrong artifacts, skip critical steps, or
+  fail at a much later stage with confusing unrelated errors.
+
+  This is documented behavior in the official GitHub Actions docs (as of May 2026)
+  but is easy to miss: "If `required: true` is set for an input, the person running
+  the workflow must set a value. However, any events triggering the workflow
+  programmatically can bypass this requirement."
+
+  **Impact:** CI pipelines that rely on `required: true` for correctness guarantees
+  (e.g., version tags, environment names, deployment targets) are vulnerable to
+  misconfiguration when triggered via automation scripts that omit the required
+  inputs.
+fix: |
+  **Always validate required inputs explicitly at the start of the workflow:**
+
+  Add a validation step at the top of your `workflow_dispatch` job that checks
+  for empty/missing inputs and fails early with a clear error message. This is the
+  only reliable way to enforce required inputs across all trigger methods.
+
+fix_code:
+  - language: yaml
+    label: 'Unreliable — required: true only enforced in GitHub UI, bypassed by API/CLI'
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            environment:
+              description: 'Target environment (prod/staging)'
+              required: true   # ✗ only enforced in GitHub UI; API callers can omit this
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Deploy to ${{ inputs.environment }}  # receives "" when called via API without input
+              run: ./deploy.sh ${{ inputs.environment }}
+
+  - language: yaml
+    label: 'Reliable — explicit validation step guards against empty inputs from API/CLI'
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            environment:
+              description: 'Target environment (prod/staging)'
+              required: true
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Validate required inputs
+              run: |
+                if [ -z "${{ inputs.environment }}" ]; then
+                  echo "::error::Required input 'environment' is empty. Provide via --field environment=<value>"
+                  exit 1
+                fi
+
+            - name: Deploy to ${{ inputs.environment }}
+              run: ./deploy.sh ${{ inputs.environment }}
+
+  - language: yaml
+    label: 'CLI trigger — always provide required inputs explicitly'
+    code: |
+      # ✗ omitting required input — workflow runs with empty string
+      gh workflow run deploy.yml
+
+      # ✓ providing required input via --field
+      gh workflow run deploy.yml --field environment=prod
+
+prevention:
+  - 'Never rely solely on `required: true` as a runtime safety guard — always add
+    an explicit shell validation step that checks `${{ inputs.my_input }}` is
+    non-empty and fails immediately with a descriptive `::error::` annotation.'
+  - 'Document in your workflow file that API/CLI callers must pass all required
+    inputs explicitly. Add a comment block near `workflow_dispatch:` listing which
+    `gh workflow run --field` parameters are mandatory.'
+  - 'In CI/CD scripts that trigger workflows programmatically, lint the gh/API
+    call to ensure all required inputs are passed before executing the dispatch.'
+  - 'For strict enforcement across all callers, set a `default:` of a recognizable
+    sentinel value (e.g. `"REQUIRED_NOT_SET"`) and fail if the sentinel is
+    received at runtime.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_dispatch'
+    label: 'GitHub Docs: workflow_dispatch — note on required inputs and API behavior'
+  - url: 'https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event'
+    label: 'GitHub REST API: Create a workflow dispatch event'
+  - url: 'https://cli.github.com/manual/gh_workflow_run'
+    label: 'GitHub CLI: gh workflow run — --field parameter usage'
+  - url: 'https://github.com/orgs/community/discussions/15452'
+    label: 'GitHub Community #15452: Feature request — enforce required inputs for API dispatch'
