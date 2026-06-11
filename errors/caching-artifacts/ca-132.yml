@@ -1,0 +1,163 @@
+id: ca-132
+title: '`actions/cache` perpetual miss when GitHub-hosted runner (has zstd) saves cache
+  and self-hosted runner (no zstd) tries to restore — compression-method suffix
+  causes different SHA-256 key hash'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - actions-cache
+  - zstd
+  - gzip
+  - compression-method
+  - self-hosted
+  - cache-miss
+  - cache-key
+  - sha256
+patterns:
+  - regex: 'Cache not found for input keys.*self.hosted|self.hosted.*Cache not found'
+    flags: 'i'
+  - regex: 'zstd.*not.*found|zstd.*not.*available|zstd.*command.*not.*found'
+    flags: 'i'
+  - regex: 'Warning: Cache restore failed'
+    flags: 'i'
+error_messages:
+  - "Cache not found for input keys: my-cache-key-abc123"
+  - "Warning: Cache restore failed."
+  - "zstd: command not found"
+root_cause: |
+  `actions/cache` (all versions) includes the **compression method** as a suffix
+  component when computing the final SHA-256 hash of the cache key. The compression
+  method used depends on whether `zstd` is installed on the runner:
+
+  ```
+  zstd available?
+    ├── yes → CompressionMethod = "zstd-without-long"
+    └── no  → CompressionMethod = "gzip"
+  ```
+
+  The SHA-256 hash is computed over:
+  `paths | compressionMethod | key`
+
+  So the **same explicit `key:` value** produces **two different SHA-256 hashes**
+  depending on the runner:
+
+  | Runner             | Components hashed                         | Final hash |
+  |--------------------|-------------------------------------------|------------|
+  | GitHub-hosted (has zstd) | `paths + "zstd-without-long" + key` → SHA256 | hash A |
+  | Self-hosted (no zstd)    | `paths + "gzip"              + key` → SHA256 | hash B |
+
+  When a GitHub-hosted runner saves a cache entry under hash A, a self-hosted
+  runner that lacks `zstd` will compute hash B and find no entry — even though
+  the user-visible `key:` value matches exactly and both runners point to the
+  **same `ACTIONS_CACHE_URL` cache backend**.
+
+  This is distinct from the cross-backend issue (see ca-075) where the cache URL
+  endpoints differ. This issue occurs even when both runners share the same
+  GitHub-hosted cache backend — the mismatch is purely in the key hash.
+
+  Commonly encountered when:
+  1. A GitHub-hosted runner saves a warm cache once a week.
+  2. Self-hosted runners (e.g., bare-metal Linux, custom container, ARC pods
+     without zstd) try to restore and always get a miss.
+  3. The explicit `key:` matches in the workflow YAML, so the developer cannot
+     see why the cache is never found.
+fix: |
+  **Option 1 (Recommended) — Install `zstd` on self-hosted runners:**
+  Ensure `zstd` is available on all self-hosted runners that share a cache with
+  GitHub-hosted runners. This makes both runners compute the same
+  `zstd-without-long` suffix and thus the same SHA-256 hash.
+
+  Ubuntu/Debian:  `sudo apt-get install -y zstd`
+  CentOS/RHEL:    `sudo yum install -y zstd`
+  macOS:          `brew install zstd`
+  Windows:        `choco install zstandard` or `winget install Facebook.Zstandard`
+
+  **Option 2 — Use separate keys for each runner type:**
+  Explicitly add the compression method (or runner type) to the cache key so
+  GitHub-hosted and self-hosted entries never collide or get confused:
+
+  ```yaml
+  key: myapp-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/lock') }}
+  ```
+
+  **Option 3 — Pin all cache-sharing jobs to the same runner type:**
+  If mixing runner types is unavoidable, have the self-hosted runner save its
+  own cache entry on first miss. Subsequent runs will hit the self-hosted entry.
+fix_code:
+  - language: yaml
+    label: 'Broken — GitHub-hosted saves cache; self-hosted always misses (no zstd)'
+    code: |
+      jobs:
+        warm-cache:
+          runs-on: ubuntu-latest          # GitHub-hosted — has zstd → key hash A
+          steps:
+            - uses: actions/cache@v4
+              with:
+                path: ~/.npm
+                key: npm-${{ hashFiles('**/package-lock.json') }}
+            - run: npm ci
+
+        test:
+          runs-on: self-hosted            # No zstd → computes key hash B → always misses
+          needs: warm-cache
+          steps:
+            - uses: actions/cache@v4
+              with:
+                path: ~/.npm
+                key: npm-${{ hashFiles('**/package-lock.json') }}  # looks same, hash differs
+
+  - language: yaml
+    label: 'Fixed Option 1 — install zstd in self-hosted runner startup step'
+    code: |
+      jobs:
+        test:
+          runs-on: self-hosted
+          steps:
+            - name: Ensure zstd is installed
+              run: |
+                if ! command -v zstd &>/dev/null; then
+                  sudo apt-get update -qq && sudo apt-get install -y zstd
+                fi
+
+            - uses: actions/cache@v4
+              with:
+                path: ~/.npm
+                key: npm-${{ hashFiles('**/package-lock.json') }}
+                # ✓ zstd now available → same hash A as GitHub-hosted runner
+
+  - language: yaml
+    label: 'Fixed Option 2 — include runner type in key to keep entries separate'
+    code: |
+      jobs:
+        test:
+          runs-on: self-hosted
+          steps:
+            - uses: actions/cache@v4
+              with:
+                path: ~/.npm
+                # Include runner identifier so GitHub-hosted and self-hosted
+                # entries are stored under different keys intentionally:
+                key: npm-selfhosted-${{ hashFiles('**/package-lock.json') }}
+                restore-keys: |
+                  npm-selfhosted-
+
+prevention:
+  - 'Install `zstd` on every self-hosted runner that shares a cache backend with
+    GitHub-hosted runners — mismatched compression methods produce different key
+    hashes even when the user-visible `key:` string is identical.'
+  - 'When diagnosing an unexpected cache miss, run `which zstd` (Linux/macOS) or
+    `where zstd` (Windows) in the restore job to confirm compression parity.'
+  - 'Include a runner-type discriminator (e.g. `runner.os`/`runner.arch` or a
+    custom label) in your `key:` when intentionally mixing GitHub-hosted and
+    self-hosted runners, so cache entries never silently diverge.'
+  - 'Set `ACTIONS_RUNNER_DEBUG=true` to see the full internal key hash in the
+    cache restore log, which makes the compression-method suffix visible for
+    debugging.'
+docs:
+  - url: 'https://github.com/actions/cache/issues/1755'
+    label: 'actions/cache#1755: Cache saved by GitHub-hosted runner not found from
+      self-hosted runner — zstd vs gzip compression key mismatch (May 2026)'
+  - url: 'https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows'
+    label: 'GitHub Docs: Caching dependencies to speed up workflows'
+  - url: 'https://github.com/actions/cache#inputs'
+    label: 'actions/cache README: key input and restore-keys'
