@@ -1,0 +1,137 @@
+id: re-438
+title: 'Git 2.54.0 `gc.auto = 0` no longer prevents background GC — `maintenance.auto` replaces `gc` strategy, causing `fatal: shallow file has changed`'
+category: runner-environment
+severity: error
+tags:
+  - git
+  - git-2-54
+  - gc-auto
+  - maintenance-auto
+  - shallow-clone
+  - runner-image
+  - ubuntu-24.04
+  - macos-26
+  - background-gc
+patterns:
+  - regex: 'fatal: shallow file has changed since we read it'
+    flags: 'i'
+  - regex: 'error: could not read.*shallow|shallow.*changed.*since.*read'
+    flags: 'i'
+  - regex: 'git.*maintenance.*auto|maintenance\.auto.*true'
+    flags: 'i'
+error_messages:
+  - "fatal: shallow file has changed since we read it"
+  - "error: could not read .git/shallow"
+root_cause: |
+  Git 2.54.0 (released March 2026, shipped in ubuntu-24.04 image 20260310+,
+  macOS 26 Homebrew git, and macOS 15 Homebrew git as of May 2026) changed the
+  **default maintenance strategy** from `gc` to `geometric`:
+
+  > Commit: git/git@50d742576 "maintenance: default strategy to geometric"
+
+  Prior to 2.54.0:
+  - Background maintenance was controlled by `gc.auto` (default `6700`).
+  - `gc.auto = 0` fully disabled automatic background GC.
+  - `actions/checkout` sets `gc.auto = 0` to prevent background GC from racing
+    with subsequent git operations.
+
+  From 2.54.0 onwards:
+  - Background maintenance is controlled by `maintenance.auto` (default `true`)
+    using the `geometric` maintenance strategy.
+  - `gc.auto = 0` has **no effect** on `maintenance.auto`.
+  - The background maintenance process spawned by git can conflict with
+    operations that re-write `.git/shallow` (e.g. `git fetch --deepen`,
+    `git checkout --deepen`), producing:
+    ```
+    fatal: shallow file has changed since we read it
+    ```
+
+  `actions/checkout@v4` and earlier set only `gc.auto = 0`, which is now
+  insufficient on runners with git 2.54.0+. The result is an intermittent race
+  condition that is very hard to reproduce locally (where older git is common)
+  but reproducible in CI (where runner images carry the latest git).
+fix: |
+  **Option 1 (Recommended) — Disable `maintenance.auto` in addition to `gc.auto`:**
+  Add a step before `actions/checkout` (or in the `with` block of a custom
+  checkout) to configure both settings:
+
+  ```bash
+  git config --global maintenance.auto false
+  git config --global gc.auto 0
+  ```
+
+  **Option 2 — Pin `actions/checkout` to a version that has been updated:**
+  The checkout action maintainers have been notified (checkout#2437). Once a fix
+  ships that sets `maintenance.auto = false`, upgrading to that version is the
+  cleanest solution.
+
+  **Option 3 — Avoid shallow clones when using `--deepen`:**
+  If shallow clones are not required by your workflow, use `fetch-depth: 0` in
+  `actions/checkout` to get a full clone. Full clones do not use `.git/shallow`
+  and are not affected by this race.
+fix_code:
+  - language: yaml
+    label: 'Broken — git 2.54.0 maintenance.auto races with --deepen; gc.auto=0 insufficient'
+    code: |
+      jobs:
+        analyze:
+          runs-on: ubuntu-latest  # git 2.54.0+ — maintenance.auto=true by default
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                fetch-depth: 1      # shallow clone; gc.auto=0 set by action, NOT maintenance.auto
+
+            - name: Deepen to find merge base
+              run: git fetch --deepen=50
+              # ✗ Intermittently: fatal: shallow file has changed since we read it
+
+  - language: yaml
+    label: 'Fixed — disable maintenance.auto before checkout'
+    code: |
+      jobs:
+        analyze:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Disable git background maintenance (git 2.54+ compatibility)
+              run: |
+                git config --global maintenance.auto false
+                git config --global gc.auto 0
+
+            - uses: actions/checkout@v4
+              with:
+                fetch-depth: 1
+
+            - name: Deepen to find merge base
+              run: git fetch --deepen=50
+              # ✓ No background GC — shallow file cannot be modified concurrently
+
+  - language: yaml
+    label: 'Alternative fix — full clone avoids shallow file race entirely'
+    code: |
+      jobs:
+        analyze:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                fetch-depth: 0  # full clone — no .git/shallow file, no race
+
+prevention:
+  - 'After any major git version bump in runner images, check the git changelog
+    for changes to default maintenance or GC strategy that may affect your
+    shallow-clone workflows.'
+  - 'If your workflow calls `git fetch --deepen` or `git checkout --deepen`,
+    always disable both `gc.auto` AND `maintenance.auto` globally before the
+    checkout step, since different git versions use different settings.'
+  - 'Run `git --version` in your workflow to confirm the git version on the
+    runner; if >= 2.54.0, ensure `maintenance.auto = false` is set.'
+  - 'Prefer `fetch-depth: 0` (full clones) for workflows that need to compute
+    merge bases or diff against arbitrary branches — it eliminates the entire
+    class of shallow-file race conditions.'
+docs:
+  - url: 'https://github.com/actions/checkout/issues/2437'
+    label: 'actions/checkout#2437: Should set maintenance.auto=false in addition to gc.auto=0 (May 2026)'
+  - url: 'https://github.com/git/git/commit/50d742576777503eebd9f0f2c6410f64a872a10a'
+    label: 'git/git commit 50d742576: maintenance: default strategy to geometric (git 2.54.0)'
+  - url: 'https://git-scm.com/docs/git-maintenance'
+    label: 'Git documentation: git-maintenance — background repo maintenance'
