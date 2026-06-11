@@ -1,0 +1,150 @@
+id: silent-failures-198
+title: 'ubuntu-26.04 Has No Pre-cached Python — setup-python Always Downloads and May Fail for Unlisted Versions'
+category: silent-failures
+severity: silent-failure
+tags:
+  - ubuntu-26.04
+  - setup-python
+  - python
+  - toolcache
+  - manifest
+  - migration
+  - performance
+  - silent-failure
+patterns:
+  - regex: "Error: Version '?[23]\\.[0-9]+.*'? with architecture.*was not found.*operating system"
+    flags: 'i'
+  - regex: 'Failing to find Python.*ubuntu.*26|ubuntu.*26.*python.*not.*toolcache'
+    flags: 'i'
+  - regex: 'No Python version found for.*26\.04|python.*26\.04.*manifest.*missing'
+    flags: 'i'
+  - regex: 'setup-python.*downloading.*26\.04|toolcache.*python.*miss.*ubuntu-26'
+    flags: 'i'
+error_messages:
+  - "Error: Version '3.10' with architecture 'x64' was not found for this operating system."
+  - "Error: Version '3.12.7' with architecture 'x64' was not found for this operating system."
+  - 'Unable to find python version in hostedtoolcache'
+  - 'Downloading from https://github.com/actions/python-versions/releases/download/...-ubuntu-26.04-...'
+root_cause: |
+  The ubuntu-26.04 GitHub Actions runner image ships with an empty Python toolcache —
+  no Python versions are pre-installed at build time. This is documented in
+  `runner-images/images/ubuntu/toolsets/toolset-2604.json`:
+
+    "toolcache": [
+      {
+        "name": "Python",
+        "platform_version": "26.04",
+        "versions": []          # <-- EMPTY on ubuntu-26.04
+      }
+    ]
+
+  By contrast, ubuntu-24.04 pre-caches Python 3.10.*, 3.11.*, 3.12.*, 3.13.*, and
+  3.14.* in the toolcache, so `actions/setup-python` finds the requested version
+  immediately without a network download.
+
+  On ubuntu-26.04, `actions/setup-python` ALWAYS triggers a network download from
+  the `actions/python-versions` manifest. Two failure modes result:
+
+  **Mode 1 — Version Not Found (error):**
+  If the `actions/python-versions` release pipeline has not yet published a pre-built
+  binary for `ubuntu/26.04` for the version you requested, setup-python fails with
+  "version not found". This is most common for older Python versions (3.9, 3.10)
+  that may never receive ubuntu-26.04 builds.
+
+  **Mode 2 — Silent performance regression (silent failure):**
+  Even when the version IS available in the manifest, setup-python must download
+  and extract a ~40-50 MB archive on every run. On ubuntu-24.04 this was a
+  sub-second toolcache hit. On ubuntu-26.04 it adds 30-90 seconds to every job.
+  Workflows that are not monitoring job duration will not notice.
+
+  Additionally, workflows that previously used `pip-cache` as a cache key based
+  on toolcache Python paths may see cache misses on ubuntu-26.04 because the
+  Python installation path differs on first download vs subsequent runs.
+fix: |
+  Option 1 — Specify a Python version that has ubuntu-26.04 builds (recommended):
+  Check https://github.com/actions/python-versions/releases for ubuntu-26.04 builds.
+  Python 3.11+, 3.12+, 3.13+ typically receive current Ubuntu LTS builds.
+  Older versions (3.9, 3.10) may not have ubuntu-26.04 builds.
+
+  Option 2 — Add a caching layer around setup-python (mitigates performance regression):
+  Use actions/cache to persist the Python toolcache directory across runs.
+
+  Option 3 — Use pyenv to install and manage Python (independent of toolcache):
+  If you need a specific Python version that doesn't have manifest builds for
+  ubuntu-26.04, pyenv can build from source. This adds build time (5-10 min)
+  but is reliable.
+
+  Option 4 — Pin to ubuntu-24.04 until your required Python version has ubuntu-26.04 builds:
+  ubuntu-24.04 has full Python toolcache coverage and remains supported until April 2034.
+fix_code:
+  - language: yaml
+    label: 'setup-python with explicit version known to have ubuntu-26.04 builds'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-26.04
+          steps:
+            - uses: actions/checkout@v4
+
+            # Python 3.12+ is safe — has ubuntu-26.04 builds in python-versions manifest
+            # Avoid 3.9 / 3.10 which may not have ubuntu-26.04 pre-built binaries
+            - uses: actions/setup-python@v5
+              with:
+                python-version: '3.13'
+
+            - run: pip install -r requirements.txt
+
+  - language: yaml
+    label: 'Cache the Python toolcache directory to avoid repeated downloads'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-26.04
+          steps:
+            - uses: actions/checkout@v4
+
+            # Cache the Python toolcache so subsequent runs skip the 40-90s download
+            - name: Cache Python toolcache
+              uses: actions/cache@v4
+              with:
+                path: /opt/hostedtoolcache/Python
+                key: python-3.13-ubuntu-26.04-${{ runner.arch }}
+
+            - uses: actions/setup-python@v5
+              with:
+                python-version: '3.13'
+
+            - run: pip install -r requirements.txt
+
+  - language: yaml
+    label: 'Use ubuntu-24.04 as fallback for Python versions without ubuntu-26.04 builds'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              include:
+                - os: ubuntu-24.04
+                  python-version: '3.10'  # only ubuntu-24.04 has 3.10 toolcache
+                - os: ubuntu-26.04
+                  python-version: '3.13'  # ubuntu-26.04 builds available for 3.13
+          runs-on: ${{ matrix.os }}
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-python@v5
+              with:
+                python-version: ${{ matrix.python-version }}
+            - run: pip install -r requirements.txt && python -m pytest
+
+prevention:
+  - 'Test your Python version against the ubuntu-26.04 image early — before ubuntu-latest aliases ubuntu-26.04 — to verify the version is available in the manifest.'
+  - 'Use Python 3.11 or higher when targeting ubuntu-26.04; older versions may never receive ubuntu-26.04 prebuilt binaries in the python-versions manifest.'
+  - 'Add setup-python run time to your job duration monitoring; an unexpected 60s overhead on ubuntu-26.04 likely indicates a toolcache miss requiring a network download.'
+  - 'Cache the Python toolcache directory (`/opt/hostedtoolcache/Python`) with actions/cache to avoid repeated downloads on ubuntu-26.04.'
+docs:
+  - url: 'https://github.com/actions/runner-images/blob/main/images/ubuntu/toolsets/toolset-2604.json'
+    label: 'ubuntu-26.04 toolset JSON — Python toolcache versions is empty array'
+  - url: 'https://github.com/actions/python-versions/releases'
+    label: 'actions/python-versions releases — check for ubuntu-26.04 builds'
+  - url: 'https://github.com/actions/setup-python'
+    label: 'actions/setup-python documentation — version lookup and caching behavior'

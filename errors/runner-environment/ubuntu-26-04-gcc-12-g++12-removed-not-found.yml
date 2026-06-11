@@ -1,0 +1,137 @@
+id: runner-environment-435
+title: 'ubuntu-26.04 Removes GCC 12 — g++-12 / gcc-12 Not Found on Migration'
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-26.04
+  - gcc
+  - g++
+  - compiler
+  - c-cpp
+  - breaking-change
+  - runner-image
+  - migration
+patterns:
+  - regex: 'g\+\+-12:\s*(command not found|not found)'
+    flags: 'i'
+  - regex: 'gcc-12:\s*(command not found|not found)'
+    flags: 'i'
+  - regex: '/usr/bin/g\+\+-12:\s*No such file or directory'
+    flags: 'i'
+  - regex: 'c\+\+: error: .*g\+\+-12.*not found'
+    flags: 'i'
+  - regex: 'cmake.*g\+\+-12.*not found|COMPILER.*g\+\+-12.*cannot find'
+    flags: 'i'
+error_messages:
+  - 'g++-12: command not found'
+  - 'gcc-12: command not found'
+  - '/usr/bin/g++-12: No such file or directory'
+  - 'error: Unable to find the requested Clang toolchain: g++-12'
+  - 'CMake Error: CMAKE_CXX_COMPILER not found, required g++-12'
+root_cause: |
+  The ubuntu-26.04 GitHub Actions hosted runner image ships GCC versions
+  13, 14, and 15 — but does NOT include GCC 12 (g++-12 / gcc-12).
+
+  This differs from ubuntu-24.04 which included GCC 12, 13, and 14. Workflows
+  that migrated from ubuntu-22.04 to ubuntu-24.04 often relied on gcc-12 being
+  available (ubuntu-22.04 shipped gcc-11/gcc-12 and ubuntu-24.04 added gcc-13/14
+  while keeping gcc-12). When those same workflows migrate to ubuntu-26.04 (or
+  when ubuntu-latest eventually aliases ubuntu-26.04), gcc-12 is silently absent.
+
+  Common failure patterns:
+  - Workflows that hardcode `CC=gcc-12 CXX=g++-12` in environment variables
+  - CMake configurations specifying `-DCMAKE_C_COMPILER=gcc-12`
+  - Autotools `./configure CC=gcc-12`
+  - Makefile `CC ?= gcc-12` patterns
+  - `update-alternatives --install` scripts referencing gcc-12
+
+  The ubuntu-26.04 GCC toolset (from runner-images/toolsets/toolset-2604.json):
+    gcc: g++-13, g++-14, g++-15 (default: gcc system default from Ubuntu 26.04 LTS)
+
+  The ubuntu-24.04 GCC toolset includes: g++-12, g++-13, g++-14.
+
+  Source: actions/runner-images toolsets/toolset-2604.json (committed May 2026)
+fix: |
+  Option 1 — Upgrade compiler reference to GCC 14 or GCC 15 (recommended):
+  Ubuntu 26.04 ships GCC 14 and GCC 15. If your project compiles successfully with
+  GCC 14, update your compiler references:
+
+  Option 2 — Install GCC 12 explicitly on ubuntu-26.04:
+  GCC 12 may be installable via apt if the ubuntu-26.04 repo carries it as a legacy
+  version. Use `sudo apt-get install gcc-12 g++-12` as a step. Note this may not be
+  available in later ubuntu-26.04 images as the package ages out of repos.
+
+  Option 3 — Pin the runner to ubuntu-24.04 short-term:
+  If updating the compiler is high-risk, stay on ubuntu-24.04 (supported until
+  April 2034) while migrating your build to compile cleanly with GCC 14.
+
+  Option 4 — Use the system default GCC:
+  Remove explicit compiler version pinning and use the system default `gcc`/`g++`
+  symlinks which point to the most recent installed version.
+fix_code:
+  - language: yaml
+    label: 'Upgrade to GCC 14 — drop hardcoded gcc-12 reference'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-26.04
+          env:
+            CC: gcc-14
+            CXX: g++-14
+          steps:
+            - uses: actions/checkout@v4
+            - name: Configure
+              run: cmake -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 -B build .
+            - name: Build
+              run: cmake --build build
+
+  - language: yaml
+    label: 'Matrix over multiple GCC versions across Ubuntu images'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              include:
+                - os: ubuntu-24.04
+                  gcc: 'gcc-12'
+                  gxx: 'g++-12'
+                - os: ubuntu-26.04
+                  gcc: 'gcc-14'
+                  gxx: 'g++-14'
+          runs-on: ${{ matrix.os }}
+          env:
+            CC: ${{ matrix.gcc }}
+            CXX: ${{ matrix.gxx }}
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build
+              run: make CC=$CC CXX=$CXX
+
+  - language: yaml
+    label: 'Install gcc-12 explicitly on ubuntu-26.04 (short-term workaround)'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-26.04
+          steps:
+            - uses: actions/checkout@v4
+            - name: Install gcc-12 (workaround — may not be available long-term)
+              run: |
+                sudo apt-get update
+                sudo apt-get install -y gcc-12 g++-12
+            - name: Build
+              run: make CC=gcc-12 CXX=g++-12
+
+prevention:
+  - 'Never hardcode a specific GCC version number in CI — use `CC=gcc` and `CXX=g++` and rely on the system default, or pin via a parameter that you increment with each Ubuntu generation.'
+  - 'Include the GCC version as a matrix variable so future Ubuntu image upgrades only require updating one place.'
+  - 'Test on ubuntu-26.04 explicitly before ubuntu-latest aliases it — run a short-lived parallel job to catch compiler version issues early.'
+  - 'Check the runner-images toolsets JSON (toolset-2604.json) when migrating to a new Ubuntu generation to see exactly which compilers are pre-installed.'
+docs:
+  - url: 'https://github.com/actions/runner-images/blob/main/images/ubuntu/toolsets/toolset-2604.json'
+    label: 'ubuntu-26.04 toolset — GCC versions installed'
+  - url: 'https://github.com/actions/runner-images/blob/main/images/ubuntu/toolsets/toolset-2404.json'
+    label: 'ubuntu-24.04 toolset — GCC versions installed (includes gcc-12)'
+  - url: 'https://github.com/actions/runner-images/issues/13964'
+    label: 'runner-images #13964: Add Ubuntu 26.04 LTS (announcement issue)'
