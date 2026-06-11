@@ -1,0 +1,117 @@
+id: permissions-auth-114
+title: 'GITHUB_TOKEN Cannot Access Dependabot Alerts API — Resource Not Accessible by Integration'
+category: permissions-auth
+severity: limitation
+tags:
+  - github-token
+  - dependabot
+  - security-events
+  - permissions
+  - rest-api
+  - 403
+  - resource-not-accessible
+patterns:
+  - regex: 'Resource not accessible by integration'
+    flags: 'i'
+  - regex: 'gh: Resource not accessible by integration \(HTTP 403\)'
+    flags: 'i'
+  - regex: 'dependabot/alerts.*403|403.*dependabot/alerts'
+    flags: 'i'
+error_messages:
+  - 'gh: Resource not accessible by integration (HTTP 403)'
+  - '{"message":"Resource not accessible by integration","documentation_url":"https://docs.github.com/rest/reference/dependabot#list-dependabot-alerts-for-a-repository"}'
+  - 'Error: Resource not accessible by integration'
+root_cause: |
+  GITHUB_TOKEN (the automatically generated workflow token) fundamentally cannot
+  access the Dependabot Alerts API endpoints regardless of the permissions block
+  declared in the workflow.
+
+  The Dependabot API (e.g., `GET /repos/{owner}/{repo}/dependabot/alerts`) is a
+  security-sensitive endpoint that requires a PAT with `security_events` scope
+  or a GitHub App installation token with the `vulnerability_alerts: read`
+  repository permission. The GITHUB_TOKEN permission model does not include a
+  `vulnerability_alerts` grant — even `permissions: write-all` or
+  `permissions: security-events: write` has no effect because GITHUB_TOKEN is an
+  installation-level token for the Actions integration and the Dependabot API
+  is restricted to user- or app-level authentication.
+
+  The same restriction applies to:
+  - `GET /repos/{owner}/{repo}/dependabot/alerts`
+  - `GET /orgs/{org}/dependabot/alerts`
+  - `GET /repos/{owner}/{repo}/dependabot/secrets`
+  - `PATCH /repos/{owner}/{repo}/dependabot/alerts/{alert_number}`
+
+  The GitHub REST documentation states that a `security_events` scope is
+  required, but this refers to OAuth/PAT scopes — not the GITHUB_TOKEN
+  `security-events` permission level, which is a different concept. This
+  conflation causes significant confusion for workflow authors.
+
+  GraphQL `vulnerabilityAlerts` appears to work (returns empty rather than 403)
+  but silently returns no data for workflows using GITHUB_TOKEN.
+fix: |
+  Replace GITHUB_TOKEN with a PAT or GitHub App installation token that has
+  the required security_events scope / vulnerability_alerts permission.
+
+  Option 1 — PAT with security_events scope (simplest):
+  Store a PAT as a repository/org secret and use it instead of github.token.
+
+  Option 2 — GitHub App (preferred for org-level automation):
+  Create a GitHub App with `vulnerability_alerts: read` permission, install it
+  on the repo, and generate a token using `actions/create-github-app-token`.
+
+  Option 3 — GraphQL (limited workaround):
+  Use the GraphQL `vulnerabilityAlerts` field, which respects `read:repo` scope
+  and works with some PAT configurations, though results may be incomplete.
+fix_code:
+  - language: yaml
+    label: 'Use a PAT secret instead of GITHUB_TOKEN for Dependabot alerts'
+    code: |
+      name: Check Dependabot Alerts
+
+      on:
+        workflow_dispatch:
+
+      jobs:
+        check-alerts:
+          runs-on: ubuntu-latest
+          steps:
+            - name: List Dependabot alerts
+              env:
+                # Use a PAT with security_events scope, NOT github.token
+                GH_TOKEN: ${{ secrets.DEPENDABOT_READ_PAT }}
+              run: |
+                gh api '/repos/{owner}/{repo}/dependabot/alerts' \
+                  --jq '.[] | .number + " " + .state + " " + .security_advisory.summary'
+
+  - language: yaml
+    label: 'Use GitHub App token for org-level Dependabot access'
+    code: |
+      jobs:
+        check-alerts:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Generate app token
+              id: app-token
+              uses: actions/create-github-app-token@v1
+              with:
+                app-id: ${{ secrets.APP_ID }}
+                private-key: ${{ secrets.APP_PRIVATE_KEY }}
+                # App must have vulnerability_alerts: read permission
+
+            - name: List Dependabot alerts
+              env:
+                GH_TOKEN: ${{ steps.app-token.outputs.token }}
+              run: |
+                gh api '/repos/{owner}/{repo}/dependabot/alerts'
+prevention:
+  - 'Do not use github.token for Dependabot or security advisory API endpoints — these require PAT or GitHub App tokens.'
+  - 'The workflow permissions.security-events field controls SARIF upload access, not Dependabot alert read access.'
+  - 'Store a PAT with security_events scope as an org-level secret for reuse across repositories.'
+  - 'Prefer GitHub App tokens over PATs for org-wide automation — apps can be scoped per-repo.'
+docs:
+  - url: 'https://docs.github.com/en/rest/dependabot/alerts?apiVersion=2022-11-28'
+    label: 'Dependabot Alerts REST API — authentication requirements'
+  - url: 'https://github.com/orgs/community/discussions/60612'
+    label: 'GitHub Community: Can''t access Dependabot alerts API via GitHub Action default token (19 upvotes)'
+  - url: 'https://docs.github.com/en/actions/security-guides/automatic-token-authentication#permissions-for-the-github_token'
+    label: 'GITHUB_TOKEN permissions reference — no vulnerability_alerts scope'
