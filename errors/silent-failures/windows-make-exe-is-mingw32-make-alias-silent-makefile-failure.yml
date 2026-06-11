@@ -1,0 +1,105 @@
+id: sf-204
+title: 'windows runners: make.exe is a copy of mingw32-make — MSYS2/Cygwin makefiles silently misbehave'
+category: silent-failures
+severity: silent-failure
+tags:
+  - windows
+  - windows-latest
+  - windows-2025
+  - make
+  - mingw
+  - mingw32-make
+  - msys2
+  - makefile
+  - silent-failure
+patterns:
+  - regex: 'make\[1\].*Nothing to be done|make.*Entering directory.*make.*Leaving directory'
+    flags: 'i'
+  - regex: 'Makefile.*recipe.*for.*target.*failed|make.*Error.*ignored'
+    flags: 'i'
+  - regex: 'MSYS.*make|msys2.*make\.exe|/usr/bin/make.*not found'
+    flags: 'i'
+error_messages:
+  - "make[1]: Nothing to be done for 'all'."
+  - "Makefile:42: *** missing separator.  Stop."
+  - "make: *** [all] Error 1"
+  - "'make' (which expands to 'mingw32-make')"
+root_cause: |
+  On all Windows GitHub Actions runner images, the pre-installed `make.exe` in
+  `C:\ProgramData\Chocolatey\lib\mingw\tools\install\mingw64\bin\` is a direct copy of
+  `mingw32-make.exe` — not a Cygwin-based GNU Make.
+
+  `mingw32-make` and POSIX/Cygwin GNU Make have significant behavioral differences:
+
+  - **Path separators**: mingw32-make treats `\` and `/` differently from Cygwin make.
+  - **Shell**: mingw32-make uses `cmd.exe` as its default shell; Cygwin make uses
+    `/bin/sh` (bash). Recipe commands that use POSIX shell syntax (`&&`, `||`, `$(...)`,
+    subshells) silently fail or execute incorrectly under `cmd.exe`.
+  - **Special variables**: `$<`, `$^`, `$@` behave differently; automatic prerequisite
+    expansion may produce unexpected results.
+  - **Include path resolution**: Relative `include` directives resolve differently.
+  - **Makefile quirks**: MSYS2's `mingw-packages` documents known mingw32-make bugs
+    (e.g. recursive target expansion, `MAKECMDGOALS` propagation) that differ from
+    Cygwin GNU Make.
+
+  The issue is masked because `make` appears to exist and runs without a "command not
+  found" error. Workflows that install MSYS2 via `msys2/setup-msys2@v2` get a Cygwin
+  `make` at `/usr/bin/make`, but if the build script invokes `make` outside a `shell:
+  msys2 {0}` context (e.g. in a `run:` step with `shell: bash`), the pre-installed
+  mingw32-make.exe can shadow the MSYS2 one depending on PATH ordering.
+
+  Reported in: https://github.com/actions/runner-images/issues/14023 (May 2026)
+fix: |
+  **Option 1 — Use MSYS2 shell for all make invocations:**
+  Install MSYS2 and run `make` inside an MSYS2 shell context so the correct
+  Cygwin-based make is used.
+
+  **Option 2 — Explicitly call MSYS2 make:**
+  After installing MSYS2, call `C:\msys64\usr\bin\make.exe` explicitly or ensure
+  `/usr/bin` is prepended to PATH before Chocolatey's mingw path.
+
+  **Option 3 — Install GNU make via a Windows port:**
+  If MSYS2 is not needed, install Cygwin or use `choco install make` to get a
+  standalone Cygwin-based `make.exe` that shadows the mingw32-make copy.
+
+  **Option 4 — Avoid relying on pre-installed make:**
+  Ensure your build step uses an MSYS2 shell or explicitly references the full path
+  to the correct make binary.
+fix_code:
+  - language: yaml
+    label: 'Use MSYS2 shell so the correct make is in PATH'
+    code: |
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: make
+      # make invocations in msys2 shell use /usr/bin/make (Cygwin-based)
+      - shell: msys2 {0}
+        run: make all
+  - language: yaml
+    label: 'Explicitly prepend MSYS2 /usr/bin to PATH before mingw64/bin'
+    code: |
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: make
+      - name: Prepend MSYS2 bin to PATH
+        run: echo "C:\msys64\usr\bin" >> $env:GITHUB_PATH
+        shell: pwsh
+      - name: Build
+        run: make all
+        shell: bash
+prevention:
+  - 'Always invoke make inside a `shell: msys2 {0}` context when using MSYS2-style makefiles on Windows runners.'
+  - 'Do not rely on the pre-installed `make.exe` for POSIX-compatible makefile features — it is `mingw32-make` which lacks Cygwin shell semantics.'
+  - 'Use `which make` or `make --version` in a debug step to verify which make binary is on PATH before your build step.'
+  - 'If migrating a project from Linux/macOS CI to Windows, audit all Makefile recipe lines for POSIX shell constructs that differ under mingw32-make.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14023'
+    label: 'runner-images#14023: make should not be an alias for mingw32-make'
+  - url: 'https://github.com/msys2/setup-msys2'
+    label: 'msys2/setup-msys2 GitHub Action'
+  - url: 'https://www.gnu.org/software/make/manual/make.html'
+    label: 'GNU Make manual'
+  - url: 'https://github.com/msys2/mingw-packages/issues/17735'
+    label: 'mingw32-make-specific quirk: MAKECMDGOALS recursion difference'
