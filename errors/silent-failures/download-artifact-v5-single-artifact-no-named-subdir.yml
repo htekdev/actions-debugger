@@ -1,0 +1,97 @@
+id: silent-failures-205
+title: 'download-artifact@v5 Skips Named Subdirectory When Only One Artifact Exists'
+category: silent-failures
+severity: silent-failure
+tags:
+  - download-artifact
+  - v5
+  - artifact
+  - path
+  - breaking-change
+  - single-artifact
+patterns:
+  - regex: 'No input name.*downloading all artifacts'
+    flags: 'i'
+  - regex: 'download-artifact@v5'
+    flags: 'i'
+  - regex: 'An extra directory with the artifact name will be created'
+    flags: 'i'
+error_messages:
+  - 'No input name, artifact-ids or pattern filtered specified, downloading all artifacts'
+  - 'An extra directory with the artifact name will be created for each download'
+root_cause: |
+  In `actions/download-artifact@v5`, a behaviour change alters how artifacts are
+  extracted when downloading all artifacts (no `name`, `artifact-ids`, or `pattern`
+  input supplied). When there is only ONE artifact in the run, v5 extracts its
+  contents directly into the `path` directory — silently omitting the named
+  subdirectory (e.g. `artifacts/MyArtifact/`).
+
+  In v4 and earlier, every artifact always received its own named subdirectory
+  regardless of how many artifacts existed. Downstream steps that reference
+  `artifacts/MyArtifact/file.bin` therefore receive `No such file or directory`
+  errors, while the action itself exits 0 with misleading log output:
+
+    "An extra directory with the artifact name will be created for each download"
+
+  The log implies the named directory will be created, but the implementation
+  diverges when the artifact count is 1. This is tracked in
+  actions/download-artifact#426 (reported August 2025).
+fix: |
+  Two reliable workarounds:
+
+  1. **Always specify `name:` explicitly** — when you specify the artifact name
+     directly, v5 always creates the named subdirectory. This is the recommended
+     upgrade path.
+
+  2. **Merge-path workaround** — leave the `name` input blank but reference the
+     `path` directly rather than the subdirectory.
+
+  If your workflow has been working with multiple artifacts but breaks intermittently
+  after an artifact is removed or consolidated, this is the root cause.
+fix_code:
+  - language: yaml
+    label: 'Wrong: relying on "download all" to create subdirectory (v5 breaks with 1 artifact)'
+    code: |
+      # Uploads one artifact called 'dist'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      # Downloads all artifacts — with v5 and only 1 artifact,
+      # contents land at artifacts/ NOT artifacts/dist/
+      - uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+
+      # This fails — artifacts/dist/app.js does not exist
+      - run: cp artifacts/dist/app.js /deploy/
+  - language: yaml
+    label: 'Correct: specify artifact name explicitly (always creates named subdirectory)'
+    code: |
+      - uses: actions/download-artifact@v5
+        with:
+          name: dist          # explicitly name the artifact
+          path: artifacts/dist  # contents extracted here directly
+
+      # Reliable across v4 and v5 regardless of artifact count
+      - run: cp artifacts/dist/app.js /deploy/
+  - language: yaml
+    label: 'Alternative: reference path directly (no subdirectory assumption)'
+    code: |
+      - uses: actions/download-artifact@v5
+        with:
+          path: artifacts      # all artifacts downloaded here
+
+      # Adapt downstream path to not assume the named subdirectory
+      - run: cp artifacts/app.js /deploy/
+prevention:
+  - 'Always specify `name:` in download-artifact@v5 to guarantee a consistent extraction path.'
+  - 'When upgrading from v4 to v5, audit workflows that use "download all" and have single-artifact jobs.'
+  - 'Add a debug step (`ls -lR artifacts/`) after download to catch path mismatches early.'
+  - 'Pin download-artifact to v4 via SHA if you cannot audit all downstream path references immediately.'
+docs:
+  - url: 'https://github.com/actions/download-artifact/issues/426'
+    label: 'actions/download-artifact#426 — v5 omits named directory for single artifact (10 comments)'
+  - url: 'https://github.com/actions/download-artifact/releases/tag/v5.0.0'
+    label: 'actions/download-artifact v5.0.0 release notes'

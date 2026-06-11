@@ -1,0 +1,104 @@
+id: known-unsolved-122
+title: 'ARC Kubernetes Mode: Silent Step Advance When Long-Running Process Produces No Logs for ~5 Minutes'
+category: known-unsolved
+severity: silent-failure
+tags:
+  - arc
+  - kubernetes
+  - actions-runner-controller
+  - websocket
+  - long-running
+  - log-stream
+  - step-advance
+  - kubernetes-mode
+patterns:
+  - regex: 'arc.*kubernetes.*mode|kubernetes.*mode.*arc'
+    flags: 'i'
+  - regex: 'step.*log.*silent|log.*silent.*5.*min'
+    flags: 'i'
+  - regex: 'next step.*started.*previous.*still.*running'
+    flags: 'i'
+error_messages:
+  - 'Step proceeds while previous step process still running in pod'
+  - 'No log output for several minutes — step marked Success prematurely'
+root_cause: |
+  In ARC Kubernetes mode, the runner communicates with the job container via
+  a Node.js WebSocket connection that streams log output in real time. The
+  runner determines step completion by monitoring this WebSocket stream.
+
+  When a long-running process produces no stdout/stderr output for approximately
+  5 minutes (common with pg_dump, large test suites, or silent compilation jobs),
+  the WebSocket idle timer fires and the connection is dropped from the Node.js
+  side. The runner interprets the WebSocket closure as step completion and
+  marks the step as `Success`, then immediately starts the next step.
+
+  The actual process continues running inside the workflow pod — both the
+  "completed" step and the next step can run concurrently, causing data corruption
+  (e.g. pg_restore starting while pg_dump is still writing), partial results,
+  or resource conflicts that are extremely difficult to diagnose because the
+  workflow log shows normal success.
+
+  This is a known limitation of the Node.js WebSocket library used in ARC
+  Kubernetes mode. It does not affect Docker-in-Docker mode or GitHub-hosted
+  runners. Tracked in actions/actions-runner-controller#4020 (April 2025,
+  26 comments).
+fix: |
+  No complete fix exists for ARC Kubernetes mode. Workarounds:
+
+  1. **Force periodic log output** — wrap silent processes in a progress
+     loop that prints a heartbeat line at least every 3 minutes:
+
+       pg_dump ... &
+       PG_PID=$!
+       while kill -0 $PG_PID 2>/dev/null; do
+         echo "[heartbeat] pg_dump running, $(date)"
+         sleep 120
+       done
+       wait $PG_PID
+
+  2. **Switch to Docker-in-Docker (DinD) mode** — DinD mode uses a different
+     execution path that does not rely on the WebSocket log-stream for step
+     completion signalling.
+
+  3. **Use `timeout` + explicit wait** — for processes that must run silently,
+     use shell-level `wait` with a timeout and check exit code explicitly.
+
+  4. **Split into separate jobs** — move long-running silent processes into their
+     own job to prevent contaminating downstream steps.
+fix_code:
+  - language: yaml
+    label: 'Workaround: heartbeat wrapper to keep WebSocket connection alive'
+    code: |
+      - name: Long pg_dump with heartbeat
+        shell: bash
+        run: |
+          # Start pg_dump in background
+          pg_dump -Fc -v "$DATABASE_URL" > dump.bin &
+          PG_PID=$!
+
+          # Print heartbeat every 2 minutes to keep WebSocket alive
+          while kill -0 "$PG_PID" 2>/dev/null; do
+            echo "[heartbeat] pg_dump still running at $(date --iso-8601=seconds)"
+            sleep 120
+          done
+
+          # Capture exit code of pg_dump
+          wait "$PG_PID"
+          echo "pg_dump finished with exit code $?"
+  - language: yaml
+    label: 'Workaround: switch ARC runner to Docker-in-Docker mode'
+    code: |
+      # In your gha-runner-scale-set Helm values.yaml, use DinD container mode
+      # instead of Kubernetes mode to avoid the WebSocket log-stream issue
+      containerMode:
+        type: dind
+prevention:
+  - 'Never run silent long-duration processes (>3 min with no output) in ARC Kubernetes mode without a heartbeat wrapper.'
+  - 'Monitor step timing — if step A takes 2 min but the actual process requires 2 hours, this bug is likely the cause.'
+  - 'Use `set -x` or verbose flags on long-running commands to produce continuous output and keep the WebSocket alive.'
+  - 'Consider switching ARC to DinD mode if your workflows heavily rely on long silent processes.'
+docs:
+  - url: 'https://github.com/actions/actions-runner-controller/issues/4020'
+    label: 'actions-runner-controller#4020 — Step getting stuck or prematurely advancing (26 comments)'
+  - url: 'https://github.com/actions/actions-runner-controller/blob/master/docs/gha-runner-scale-set-controller/README.md#using-custom-kubernetes-runner-mode'
+    label: 'ARC Kubernetes mode documentation'
