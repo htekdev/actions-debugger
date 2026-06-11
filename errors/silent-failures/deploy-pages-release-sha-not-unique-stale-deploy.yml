@@ -1,0 +1,110 @@
+id: silent-failures-206
+title: 'deploy-pages serves stale artifact on release event due to non-unique pages_build_version'
+category: silent-failures
+severity: silent-failure
+tags:
+  - deploy-pages
+  - release
+  - github-pages
+  - pages-build-version
+  - github-sha
+  - stale-deployment
+  - silent-failure
+patterns:
+  - regex: 'Creating Pages deployment.*pages_build_version.*[0-9a-f]{40}'
+    flags: 'i'
+  - regex: 'Reported success.*pages.*deployment'
+    flags: 'i'
+error_messages:
+  - 'Creating Pages deployment with payload:'
+  - '"pages_build_version": "ae0b6be8565bc05ecef5aaa6c88c48ac2877ce46"'
+  - 'Reported success!'
+root_cause: |
+  actions/deploy-pages uses GITHUB_SHA as the pages_build_version field in the
+  Pages deployment API call. This value also serves as the deployment identifier.
+
+  For release events (and historically for workflow_dispatch), GITHUB_SHA is the
+  SHA of the commit that the release was tagged from — which is often the same
+  SHA as a previous push event that already deployed Pages. The GitHub Pages API
+  treats a duplicate pages_build_version as an idempotent no-op: it returns
+  success without deploying the new artifact.
+
+  The deploy-pages step logs "Reported success!" and exits 0. No error is shown.
+  But the site continues to serve the artifact from the earlier push deployment,
+  not the newly-uploaded release artifact.
+
+  From the Pages deployment API docs:
+  > pages_build_version: A unique string that represents the version of the
+  > build for this deployment.
+
+  Because GITHUB_SHA is reused across events on the same commit, the uniqueness
+  requirement is violated for release and certain workflow_dispatch runs.
+
+  Issue tracked in actions/deploy-pages#383 (open). As of June 2026, the release
+  event still exhibits this behavior. The workflow_dispatch case appears to have
+  been partially improved in later versions.
+fix: |
+  Workaround: After publishing a release, push an empty commit to trigger a
+  push event, which generates a fresh GITHUB_SHA and forces a new deployment.
+
+    git commit --allow-empty -m "Trigger Pages deployment"
+    git push
+
+  Or add a workflow_dispatch trigger to your deployment workflow so you can
+  manually re-run it with a unique run context after the release.
+
+  Alternative: Avoid triggering deploy-pages directly from the release event.
+  Use a workflow_run that fires after the release workflow completes, or
+  restructure so Pages is always deployed via push events rather than release.
+fix_code:
+  - language: yaml
+    label: 'Trigger fresh Pages deploy after release via workflow_run'
+    code: |
+      # Separate the release publish from the Pages deployment.
+      # deploy-pages.yml triggered by push ensures GITHUB_SHA is always unique.
+      name: Deploy Pages
+      on:
+        push:
+          branches: [main]
+        workflow_dispatch:
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          permissions:
+            pages: write
+            id-token: write
+          environment:
+            name: github-pages
+            url: ${{ steps.deploy.outputs.page_url }}
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build site
+              run: ./build.sh
+            - uses: actions/upload-pages-artifact@v4
+              with:
+                path: ./_site
+            - id: deploy
+              uses: actions/deploy-pages@v4
+  - language: yaml
+    label: 'Workaround — push empty commit after release to trigger new SHA'
+    code: |
+      # In your release workflow, after the release is published:
+      - name: Trigger fresh Pages deployment (unique SHA workaround)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "chore: trigger pages deploy post-release [skip ci]"
+          git push
+prevention:
+  - 'Do not trigger deploy-pages directly from the release event if the release commit is the same as a recent push — pages_build_version will not be unique'
+  - 'Always deploy Pages from push events to main to guarantee GITHUB_SHA uniqueness'
+  - 'After publishing a release, verify the deployed site content matches the release artifact, not a prior push'
+  - 'Monitor deploy-pages step output for the artifact_id vs the deployed version to detect stale deployments'
+docs:
+  - url: 'https://github.com/actions/deploy-pages/issues/383'
+    label: 'actions/deploy-pages#383 — pages_build_version not unique for release events'
+  - url: 'https://docs.github.com/en/rest/pages/pages?apiVersion=2022-11-28#create-a-github-pages-deployment'
+    label: 'GitHub REST API — Create a GitHub Pages deployment'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#release'
+    label: 'GitHub Docs — release event trigger'

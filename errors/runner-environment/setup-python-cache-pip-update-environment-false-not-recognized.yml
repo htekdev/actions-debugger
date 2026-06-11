@@ -1,0 +1,105 @@
+id: runner-environment-448
+title: 'setup-python cache fails with "pip not recognized" when update-environment is false on self-hosted Windows'
+category: runner-environment
+severity: error
+tags:
+  - setup-python
+  - cache
+  - pip
+  - windows
+  - self-hosted
+  - update-environment
+  - path
+patterns:
+  - regex: 'Command failed: pip cache dir'
+    flags: 'i'
+  - regex: "'pip' is not recognized as an internal or external command"
+    flags: 'i'
+  - regex: 'pip.*is not recognized.*operable program or batch file'
+    flags: 'i'
+error_messages:
+  - "[error]Command failed: pip cache dir"
+  - "'pip' is not recognized as an internal or external command,"
+  - "operable program or batch file."
+root_cause: |
+  When actions/setup-python is configured with update-environment: false, it
+  skips adding Python, pip, and related executables to the PATH. This is useful
+  on self-hosted runners where modifying PATH would interfere with other tools
+  (e.g., cmake, pkg-config) installed in the runner environment.
+
+  However, the cache detection code in setup-python unconditionally invokes
+  `pip cache dir` as a bare command to determine the pip cache directory.
+  It does not use the full path to the freshly-installed pip — it assumes pip
+  is already available in PATH.
+
+  On self-hosted Windows runners where pip is not pre-installed globally, or
+  when update-environment: false explicitly prevents PATH modification, the
+  `pip cache dir` call fails immediately with:
+
+    'pip' is not recognized as an internal or external command,
+    operable program or batch file.
+    [error]Command failed: pip cache dir
+
+  The action then exits with an error before completing setup. The pip
+  executable IS present in the toolcache — it is simply not in PATH because
+  update-environment: false was honored for everything except the cache lookup.
+
+  This bug is tracked in actions/setup-python#1050. The fix is to use the
+  explicit pip path (via the freshly installed Python) rather than relying on
+  the global PATH, as is already done in other parts of the action.
+fix: |
+  Workaround 1 — Disable pip caching (most reliable):
+  Set cache: '' or omit the cache input when using update-environment: false.
+  The Python installation will still complete; only the pip cache detection
+  is skipped.
+
+  Workaround 2 — Add pip to PATH manually before setup-python:
+  If pip is installed on your self-hosted runner, ensure it is in PATH before
+  the setup-python step runs, even when update-environment: false is set.
+
+  Workaround 3 — Set update-environment: true and manually clean up PATH:
+  Accept PATH modification, then use a subsequent step to reset environment
+  variables that were incorrectly overwritten.
+fix_code:
+  - language: yaml
+    label: 'Disable pip caching when using update-environment: false'
+    code: |
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          update-environment: false
+          # Do NOT set cache: 'pip' when update-environment is false on
+          # self-hosted Windows — pip is not in PATH and cache detection fails.
+          # cache: 'pip'  <-- omit this line
+
+      - name: Run pip via explicit path (not relying on global PATH)
+        run: python -m pip install -r requirements.txt
+  - language: yaml
+    label: 'Add pip to PATH explicitly before setup-python (if pip pre-installed)'
+    code: |
+      - name: Ensure pip is in PATH for setup-python cache detection
+        shell: pwsh
+        run: |
+          $pipPath = (Get-Command python -ErrorAction SilentlyContinue) |
+            Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue
+          if ($pipPath) {
+            $pipDir = Split-Path $pipPath
+            echo "$pipDir" | Out-File -Append -FilePath $env:GITHUB_PATH
+          }
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+          update-environment: false
+prevention:
+  - 'Do not combine cache: pip with update-environment: false on self-hosted Windows runners — pip cache detection requires pip in PATH'
+  - 'Use python -m pip instead of bare pip in run steps when PATH modification is suppressed'
+  - 'When update-environment: false is required, test on a clean self-hosted runner to verify pip is discoverable'
+docs:
+  - url: 'https://github.com/actions/setup-python/issues/1050'
+    label: 'actions/setup-python#1050 — Fails on self-hosted Windows if pip is not in PATH'
+  - url: 'https://github.com/actions/setup-python?tab=readme-ov-file#caching-packages-dependencies'
+    label: 'actions/setup-python — Caching packages and dependencies'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows'
+    label: 'GitHub Docs — Caching dependencies'
