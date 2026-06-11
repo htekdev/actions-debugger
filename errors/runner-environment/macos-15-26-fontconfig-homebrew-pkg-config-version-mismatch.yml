@@ -1,0 +1,109 @@
+id: runner-environment-443
+title: 'macOS-15/26 Homebrew fontconfig 2.18 Installed but pkg-config Returns 2.17 Library Path — fontconfig-rs Builds Fail'
+category: runner-environment
+severity: error
+tags:
+  - macos
+  - macos-15
+  - macos-26
+  - homebrew
+  - fontconfig
+  - pkg-config
+  - rust
+  - runner-image
+  - breaking-change
+patterns:
+  - regex: 'fontconfig.*2\.17.*not found|pkg-config.*fontconfig.*2\.17'
+    flags: 'i'
+  - regex: 'error.*failed.*run.*custom.*build.*command.*fontconfig'
+    flags: 'i'
+  - regex: 'Could not find fontconfig.*fontconfig.*in.*pkg.config.*search.*path'
+    flags: 'i'
+  - regex: 'Package.*fontconfig.*version.*2\.17.*not.*found'
+    flags: 'i'
+error_messages:
+  - "error: failed to run custom build command for `fontconfig v0.7.5`"
+  - "pkg-config: Package 'fontconfig', required by 'virtual:world', not found"
+  - "Package check for fontconfig >= 2.18 failed"
+  - "Could not find fontconfig in pkg-config search path."
+root_cause: |
+  macOS-15 and macOS-26 runner images updated Homebrew's `fontconfig` formula to version
+  2.18 (image ≥ 20260525). However, the `pkg-config` metadata for the formula was not
+  regenerated correctly after the upgrade: `pkg-config --libs fontconfig` returns a library
+  path pointing to the old 2.17 prefix (`/opt/homebrew/Cellar/fontconfig/2.17.x/`) which
+  does not exist on the image.
+
+  Any build system that consults `pkg-config` to locate fontconfig — most commonly the
+  `fontconfig-sys` Rust crate (used by `fontconfig-rs`, `servo`, and many other Rust
+  projects), as well as C/C++ CMake/Meson projects — fails to find the library and aborts
+  the build.
+
+  The mismatch was introduced during the runner-images `20260525` release cycle when the
+  formula was upgraded without invalidating the cached `.pc` files.
+fix: |
+  **Option 1 — Re-link fontconfig (fastest):**
+  Add a step before your build to re-link the formula so pkg-config picks up the correct
+  path:
+
+  ```yaml
+  - name: Fix fontconfig pkg-config path
+    run: brew link --overwrite fontconfig
+  ```
+
+  **Option 2 — Reinstall fontconfig:**
+  A full reinstall regenerates all `.pc` metadata:
+
+  ```yaml
+  - name: Reinstall fontconfig
+    run: brew reinstall fontconfig
+  ```
+
+  **Option 3 — Pin the runner image (temporary workaround):**
+  Pin to an image version known to work (`20260520` or earlier) while waiting for a
+  GitHub-side fix:
+
+  ```yaml
+  jobs:
+    build:
+      runs-on: macos-15@20260520
+  ```
+  Note: `@version` pinning is not universally available; fall back to reinstall if needed.
+
+  **Option 4 — Set PKG_CONFIG_PATH explicitly:**
+  Override the search path to point at the correct 2.18 prefix:
+
+  ```yaml
+  - name: Set fontconfig pkg-config path
+    run: |
+      echo "PKG_CONFIG_PATH=$(brew --prefix fontconfig)/lib/pkgconfig" >> "$GITHUB_ENV"
+  ```
+fix_code:
+  - language: yaml
+    label: 'Re-link fontconfig before the Rust/C++ build step'
+    code: |
+      - name: Fix fontconfig pkg-config path
+        run: brew link --overwrite fontconfig
+
+      - name: Build
+        run: cargo build --release
+  - language: yaml
+    label: 'Override PKG_CONFIG_PATH for the build job'
+    code: |
+      - name: Set correct fontconfig pkg-config path
+        run: |
+          echo "PKG_CONFIG_PATH=$(brew --prefix fontconfig)/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --release
+prevention:
+  - 'Avoid depending on system pkg-config metadata for Homebrew packages; use `$(brew --prefix fontconfig)` directly in build scripts rather than relying on `pkg-config --libs fontconfig`.'
+  - 'Pin the Homebrew formula version explicitly in CI: `brew install fontconfig@2.18` (if the versioned formula is available) to prevent future upgrade surprises.'
+  - 'Add a pre-build validation step that runs `pkg-config --modversion fontconfig` and asserts the returned version matches the installed Homebrew version.'
+  - 'Watch the runner-images release notes for Homebrew formula upgrades that may invalidate cached `.pc` metadata.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14176'
+    label: 'runner-images #14176: fontconfig Homebrew package broken on updated macOS 15 and 26 images (Jun 2026)'
+  - url: 'https://docs.brew.sh/Manpage#link-ln-options-formula'
+    label: 'Homebrew: brew link documentation'
+  - url: 'https://github.com/rust-x-bindings/rust-fontconfig'
+    label: 'fontconfig-rs: Rust bindings to fontconfig'

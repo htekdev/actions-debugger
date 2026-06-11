@@ -1,0 +1,108 @@
+id: runner-environment-444
+title: 'ubuntu-24.04 Kernel 6.17.0-1015-azure Oopses in ublk_drv — io_uring UBLK_U_CMD_ADD_DEV Hangs Forever'
+category: runner-environment
+severity: error
+tags:
+  - ubuntu
+  - ubuntu-24.04
+  - kernel
+  - ublk
+  - io_uring
+  - azure-kernel
+  - block-device
+  - regression
+  - runner-image
+patterns:
+  - regex: 'RIP.*ublk_init_queues.*\[ublk_drv\]'
+    flags: 'i'
+  - regex: 'ublk_ctrl_add_dev.*ublk_drv|ublk_ctrl_uring_cmd.*ublk_drv'
+    flags: 'i'
+  - regex: 'note: iou-wrk.*exited with irqs disabled'
+    flags: 'i'
+  - regex: 'Oops.*ublk|BUG.*ublk_drv'
+    flags: 'i'
+error_messages:
+  - "RIP: 0010:ublk_init_queues+0x4e/0x1e0 [ublk_drv]"
+  - "ublk_ctrl_add_dev+0x31a/0x5e0 [ublk_drv]"
+  - "note: iou-wrk-* exited with irqs disabled"
+  - "UBLK_U_CMD_ADD_DEV never completes"
+root_cause: |
+  The `ubuntu-24.04` GitHub Actions runner image ships Linux kernel `6.17.0-1015-azure`
+  (introduced in the `20260525.161.1` image release). This Azure kernel revision has a
+  regression in the `ublk_drv` driver: a single `UBLK_U_CMD_ADD_DEV` io_uring command
+  triggers a kernel Oops inside `ublk_init_queues()`, causing the io_uring worker thread
+  to exit with IRQs disabled.
+
+  After the Oops, userspace waits indefinitely for the CQE (completion queue entry) that
+  never arrives — effectively hanging the job forever (or until the runner's job timeout
+  fires).
+
+  The bug is specific to kernel `6.17.0-1015-azure` on `ubuntu-24.04`. The same code
+  passes on `ubuntu-22.04` with kernel `6.8.0-1052-azure`.
+
+  Kernel Oops excerpt from `dmesg`:
+  ```
+  RIP: 0010:ublk_init_queues+0x4e/0x1e0 [ublk_drv]
+  Call Trace:
+   ublk_ctrl_add_dev+0x31a/0x5e0 [ublk_drv]
+   ublk_ctrl_uring_cmd+0x7f/0x754 [ublk_drv]
+   io_uring_cmd+0xa3/0x140
+   io_wq_submit_work+0xcc/0x330
+   io_wq_worker+0xfd/0x380
+  note: iou-wrk-* exited with irqs disabled
+  ```
+
+  This affects any workflow that loads `ublk_drv` and attempts to create a ublk device
+  via `UBLK_U_CMD_ADD_DEV`, including projects testing userspace block device drivers,
+  storage stacks, or io_uring-based block I/O.
+fix: |
+  **Workaround — Pin to ubuntu-22.04:**
+  Use `ubuntu-22.04` instead of `ubuntu-24.04` (or `ubuntu-latest`) for jobs that require
+  ublk/io_uring block device functionality:
+
+  ```yaml
+  jobs:
+    test:
+      runs-on: ubuntu-22.04   # kernel 6.8.0-1052-azure — ublk works correctly
+  ```
+
+  Note: `ubuntu-22.04` reaches GitHub-hosted end-of-life in Q2 2027; monitor kernel
+  updates to `ubuntu-24.04` for a fix (track runner-images #14175).
+
+  **Alternative — Use a self-hosted runner or Docker container:**
+  If ubuntu-24.04 is required for other reasons, consider running the ublk test suite
+  inside a privileged Docker container that provides its own kernel modules, or switch to
+  a self-hosted runner with a known-good kernel version.
+fix_code:
+  - language: yaml
+    label: 'Pin to ubuntu-22.04 where ublk_drv works correctly'
+    code: |
+      jobs:
+        test-ublk:
+          # ubuntu-24.04 kernel 6.17.0-1015-azure Oopses in ublk_drv (runner-images#14175)
+          # Pin to ubuntu-22.04 until a fixed kernel ships on ubuntu-24.04
+          runs-on: ubuntu-22.04
+          steps:
+            - uses: actions/checkout@v6
+            - name: Load ublk_drv
+              run: |
+                sudo modprobe ublk_drv || {
+                  sudo apt-get update -qq
+                  sudo apt-get install -y --no-install-recommends \
+                    "linux-modules-extra-$(uname -r)"
+                  sudo modprobe ublk_drv
+                }
+            - name: Run ublk tests
+              run: sudo ./ublk_tests
+prevention:
+  - 'Pin ublk CI jobs to `ubuntu-22.04` until runner-images confirms a fixed kernel ships on ubuntu-24.04.'
+  - 'Add a `uname -r` step at the start of ublk-dependent jobs to log the exact kernel version; compare against the known-bad `6.17.0-1015-azure` revision.'
+  - 'Subscribe to runner-images #14175 for upstream resolution updates.'
+  - 'Add a pre-flight `modprobe ublk_drv && echo ADD_DEV_WORKS` health-check step; if it hangs within a timeout, skip ublk tests and emit a workflow warning rather than failing.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14175'
+    label: 'runner-images #14175: ubuntu-24.04 amd64 runner kernel 6.17.0-1015-azure Oopses in ublk_drv (Jun 2026)'
+  - url: 'https://docs.kernel.org/block/ublk.html'
+    label: 'Linux Kernel Docs: UBLK userspace block device driver'
+  - url: 'https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2204-Readme.md'
+    label: 'Ubuntu 22.04 runner image — included software'
