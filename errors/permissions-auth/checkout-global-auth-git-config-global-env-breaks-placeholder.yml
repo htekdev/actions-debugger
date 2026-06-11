@@ -1,0 +1,118 @@
+id: permissions-auth-111
+title: "actions/checkout Global Auth Fails with 'Unable to replace auth placeholder' When GIT_CONFIG_GLOBAL Is Set"
+category: permissions-auth
+severity: error
+tags:
+  - checkout
+  - submodules
+  - GIT_CONFIG_GLOBAL
+  - git-config
+  - self-hosted
+  - auth
+  - credential
+  - persist-credentials
+patterns:
+  - regex: 'Unable to replace auth placeholder in .+\.gitconfig'
+    flags: 'i'
+  - regex: 'configureTempGlobalConfig|replaceTokenPlaceholder'
+    flags: 'i'
+error_messages:
+  - "##[error]Unable to replace auth placeholder in /home/runner/_temp/<uuid>/.gitconfig"
+  - "Unable to replace auth placeholder in /runner/_work/_temp/.gitconfig"
+root_cause: |
+  When `GIT_CONFIG_GLOBAL` is set in the environment (a common practice on self-hosted runners
+  to isolate git configuration per job), `actions/checkout` fails to inject the GITHUB_TOKEN
+  credential into its temporary gitconfig, producing "Unable to replace auth placeholder".
+
+  `checkout`'s `configureTempGlobalConfig` function works in three steps:
+  1. Copy `~/.gitconfig` into a temporary directory and override `HOME` to point there.
+  2. Run `git config --global` to write an auth token placeholder into the temp config.
+  3. Read the temp config and replace the placeholder with the real token.
+
+  The bug: **`GIT_CONFIG_GLOBAL` overrides `HOME`** when git resolves the global config file.
+  If `GIT_CONFIG_GLOBAL` is already set in the environment, step 2 writes the placeholder to
+  *that* external file instead of the temp config. Step 3 then reads the temp config, finds no
+  placeholder, and throws "Unable to replace auth placeholder in .../.gitconfig".
+
+  This affects any checkout scenario that uses global auth — primarily `submodules: true` and
+  `persist-credentials: true` (the default) combined with `submodules`. The `HOME`-only override
+  predates v6 so it affects v4, v5, and v6 equally.
+
+  Common trigger: self-hosted runner startup scripts that set
+  `GIT_CONFIG_GLOBAL=/shared/git/config` to isolate global git settings per job/runner.
+  Container-based runners that set `GIT_CONFIG_GLOBAL` in their base image are also affected.
+fix: |
+  **Workaround (works today):** Unset `GIT_CONFIG_GLOBAL` in the checkout step's `env` block
+  so that checkout's `HOME` override takes effect:
+
+    - uses: actions/checkout@v6
+      with:
+        submodules: true
+      env:
+        GIT_CONFIG_GLOBAL: ''   # unset so checkout's HOME override takes effect
+
+  **Permanent fix:** A patch is open (actions/checkout#2449) that pins `GIT_CONFIG_GLOBAL`
+  to the temp config alongside the `HOME` override. Use the version that ships this fix once
+  it is merged and released.
+
+  If you cannot modify the checkout step, as an alternative use `submodules: false` and
+  authenticate submodule access in a separate step after checkout.
+fix_code:
+  - language: yaml
+    label: 'Broken: GIT_CONFIG_GLOBAL set by runner causes auth placeholder failure'
+    code: |
+      # Self-hosted runner has GIT_CONFIG_GLOBAL=/etc/gitconfig set in its environment.
+      # checkout writes the placeholder to /etc/gitconfig (via GIT_CONFIG_GLOBAL),
+      # then reads the temp config and finds no placeholder → error.
+      jobs:
+        build:
+          runs-on: self-hosted
+          steps:
+            - uses: actions/checkout@v6
+              with:
+                submodules: true
+              # ERROR: "Unable to replace auth placeholder in /tmp/runner/_temp/.gitconfig"
+  - language: yaml
+    label: 'Fixed: unset GIT_CONFIG_GLOBAL in the checkout step env'
+    code: |
+      jobs:
+        build:
+          runs-on: self-hosted
+          steps:
+            - uses: actions/checkout@v6
+              with:
+                submodules: true
+              env:
+                GIT_CONFIG_GLOBAL: ''   # ← force checkout to use its own HOME override
+                                        #   instead of the runner-injected global config
+  - language: yaml
+    label: 'Alternative: authenticate submodules separately without submodules: true'
+    code: |
+      jobs:
+        build:
+          runs-on: self-hosted
+          steps:
+            - uses: actions/checkout@v6
+              with:
+                submodules: false
+                persist-credentials: true
+
+            - name: Init and update submodules manually
+              run: |
+                git submodule init
+                git submodule update --recursive
+              env:
+                # Explicitly set the token for git operations in this step
+                GIT_CONFIG_GLOBAL: ''
+prevention:
+  - "If your self-hosted runner sets `GIT_CONFIG_GLOBAL` in the environment (e.g. via /etc/environment or a container base image), always add `env: { GIT_CONFIG_GLOBAL: '' }` to checkout steps that use `submodules: true`."
+  - "The error 'Unable to replace auth placeholder in .../.gitconfig' always indicates a `GIT_CONFIG_GLOBAL` conflict — it never means the GITHUB_TOKEN is missing or invalid."
+  - "Audit self-hosted runner startup scripts and container base images for `GIT_CONFIG_GLOBAL` — it is a common source of intermittent checkout credential failures."
+  - "Use `persist-credentials: false` on checkout steps that do not need long-lived credentials after checkout, to avoid global auth setup entirely."
+docs:
+  - url: 'https://github.com/actions/checkout/issues/2449'
+    label: 'actions/checkout #2449 — GIT_CONFIG_GLOBAL override breaks global auth (configureTempGlobalConfig)'
+  - url: 'https://git-scm.com/docs/git-config#Documentation/git-config.txt-GIT_CONFIG_GLOBAL'
+    label: 'git-scm.com — GIT_CONFIG_GLOBAL env var: overrides the global config file location, takes precedence over $HOME/.gitconfig'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/using-secrets-in-github-actions'
+    label: 'GitHub Docs — Using secrets in GitHub Actions (credential management)'

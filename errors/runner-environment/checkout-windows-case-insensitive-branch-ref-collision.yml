@@ -1,0 +1,123 @@
+id: runner-environment-432
+title: "actions/checkout Fails on Windows When Repository Contains Branch Name Prefixes Differing Only by Case"
+category: runner-environment
+severity: error
+tags:
+  - checkout
+  - windows
+  - case-insensitive
+  - git-refs
+  - branch-naming
+  - filesystem
+  - ntfs
+  - case-collision
+patterns:
+  - regex: 'cannot lock ref.*exists.*cannot create'
+    flags: 'i'
+  - regex: 'fatal: cannot create.+directory.+[Ff]ile exists'
+    flags: 'i'
+  - regex: 'error: refs/remotes/origin/.+: cannot lock ref'
+    flags: 'i'
+error_messages:
+  - "error: cannot lock ref 'refs/remotes/origin/Feature/tarun': 'refs/remotes/origin/feature' exists; cannot create 'refs/remotes/origin/Feature'"
+  - "fatal: cannot create directory at 'Feature': File exists."
+  - "error: Your local changes to the following files would be overwritten by checkout"
+root_cause: |
+  On Windows runners, `actions/checkout` fails during the "Determining the checkout info"
+  or subsequent git fetch phase when the repository contains branch names whose path
+  components differ only by case — for example, `feature/manu` and `Feature/tarun`.
+
+  The root cause is that Windows uses the NTFS filesystem, which is case-insensitive
+  (case-preserving but not case-sensitive). Git stores remote-tracking refs as directory
+  structures: `refs/remotes/origin/feature/` and `refs/remotes/origin/Feature/` would
+  map to the same directory on Windows. When git attempts to create both, the second
+  ref creation fails with a lock error or "cannot create directory" error.
+
+  Linux runners are not affected because Linux filesystems (ext4, etc.) are case-sensitive
+  and can store both `feature/` and `Feature/` as distinct directories simultaneously.
+
+  This is ultimately a Git-on-Windows limitation rather than an actions/checkout bug, but
+  checkout surfaces it as an opaque error during the checkout phase. The issue affects
+  any version of actions/checkout (v4, v5, v6) on Windows runners.
+
+  Common branch naming patterns that trigger this issue:
+  - `feature/foo` and `Feature/bar` (mixed case in the directory component)
+  - `fix/issue-1` and `Fix/issue-2`
+  - `release/v1` and `Release/v2`
+fix: |
+  The fix requires changing branch names in the repository to avoid case-only collisions
+  in path prefixes. On Windows, two branches cannot coexist if their path components
+  are identical when lowercased.
+
+  **Option 1 (recommended):** Rename branches to use a consistent case convention.
+  Most teams standardize on all-lowercase branch prefixes:
+
+    git branch -m Feature/tarun feature/tarun-2
+
+  **Option 2:** Run the Windows CI workflow only after avoiding the fetch of conflicting
+  refs using a sparse fetch:
+
+    - uses: actions/checkout@v6
+      with:
+        fetch-depth: 1
+        # fetch-depth: 1 avoids fetching all remote refs, which may avoid the collision
+
+  Note: this only helps if the checkout target branch is not itself one of the conflicting
+  refs. All remote-tracking refs are still fetched by default.
+
+  **Option 3:** Run Windows CI on Linux or macOS where the case collision does not apply,
+  and file a repository convention to standardize branch name casing.
+fix_code:
+  - language: yaml
+    label: 'Broken: repo has feature/manu and Feature/tarun — fails on Windows'
+    code: |
+      # This workflow fails on windows-latest when the repo has:
+      #   branch: feature/manu
+      #   branch: Feature/tarun
+      # Git cannot create both refs/remotes/origin/feature/ and
+      # refs/remotes/origin/Feature/ on Windows NTFS.
+      jobs:
+        build:
+          runs-on: windows-latest
+          steps:
+            - uses: actions/checkout@v6
+              # ERROR on Windows:
+              # error: cannot lock ref 'refs/remotes/origin/Feature/tarun':
+              #   'refs/remotes/origin/feature' exists; cannot create 'refs/remotes/origin/Feature'
+  - language: yaml
+    label: 'Workaround: use fetch-depth: 1 to limit which remote refs are fetched'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-latest
+          steps:
+            - uses: actions/checkout@v6
+              with:
+                fetch-depth: 1    # fetch only the checked-out commit, not all remote refs
+                # This avoids fetching the conflicting case refs from origin.
+                # Note: git log history and other branch refs are unavailable.
+  - language: yaml
+    label: 'Fix: enforce lowercase branch naming convention via branch protection'
+    code: |
+      # In GitHub repository settings, add a branch name pattern rule that
+      # requires all new branches to match a lowercase pattern, preventing
+      # future case collisions:
+      #
+      # Repository Settings → Branches → Branch protection rules → Add rule
+      # Branch name pattern: [^A-Z]*   (no uppercase letters allowed)
+      #
+      # To fix existing conflicting branches, rename them:
+      # git push origin :Feature/tarun   # delete remote branch
+      # git push origin Feature/tarun:feature/tarun-v2  # recreate with lowercase
+prevention:
+  - "Establish a branch naming convention that disallows uppercase letters in the path prefix component (e.g., always use `feature/`, never `Feature/`)."
+  - "Add a GitHub Actions workflow or branch protection rule that rejects branch names with uppercase in the prefix to prevent future case collisions."
+  - "Before migrating Windows runners into a repository's CI, audit branch names for case-insensitive prefix collisions using `git branch -r | sort -f`."
+  - "If your repository may have case-conflicting branches (e.g., from contributors on macOS/Linux who don't notice), use `fetch-depth: 1` on Windows checkout steps to reduce the risk."
+docs:
+  - url: 'https://github.com/actions/checkout/issues/2448'
+    label: 'actions/checkout #2448 — checkout fails on Windows when branches differ only by case'
+  - url: 'https://git-scm.com/docs/git-fetch#Documentation/git-fetch.txt-ltrefspecgt'
+    label: 'git-scm.com — git fetch refspec: how remote-tracking refs are stored as directory trees'
+  - url: 'https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches'
+    label: 'GitHub Docs — Protected branches: enforcing naming conventions'
