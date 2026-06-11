@@ -1,0 +1,110 @@
+id: runner-environment-467
+title: 'macOS 15 / 15-arm64 Runner Hostname .local mDNS Not Resolvable — ping Cannot Resolve Hostname'
+category: runner-environment
+severity: error
+tags:
+  - macos-15
+  - macos-15-arm64
+  - hostname
+  - mdns
+  - dns
+  - networking
+patterns:
+  - regex: 'ping: cannot resolve [A-Za-z0-9-]+\.local: Unknown host'
+    flags: 'i'
+  - regex: 'cannot resolve.*\.local.*Unknown host'
+    flags: 'i'
+  - regex: 'hostname.*\.local.*not.*resolv'
+    flags: 'i'
+error_messages:
+  - "ping: cannot resolve Mac-1752083390647.local: Unknown host"
+  - "ping -c 1 $(hostname) — ping: cannot resolve {runner-hostname}.local: Unknown host"
+root_cause: |
+  macOS 15 / 15-arm64 GitHub-hosted runners receive a dynamically generated hostname
+  of the form `Mac-{timestamp}.local` on each run. Resolving this hostname via
+  mDNS (Bonjour/mDNSResponder) is unreliable in the Azure VM environment because
+  the runner VM does not participate in a full multicast network where `.local`
+  addresses are advertised and resolved by mDNSResponder.
+
+  The hostname itself is set on the machine, but the mDNS multicast advertisement
+  that other processes rely on to resolve `{hostname}.local` is either not sent or
+  not reachable within the sandboxed runner VM. Consequently, `hostname` returns
+  the correct string, but `ping -c 1 $(hostname)` fails because the DNS/mDNS lookup
+  for the `.local` address cannot be completed.
+
+  The failure is intermittent: some runner instances resolve the hostname successfully
+  (the mDNS service happens to be ready), while others fail consistently for the
+  entire job duration. Re-running the same workflow on a different runner host may
+  succeed.
+
+  This is a regression from macOS 14 (Sonoma) where `.local` hostname resolution
+  was more reliable in the runner environment. The issue was introduced with
+  macOS 15 (Sequoia) image changes and affects both `macos-15` (x64/Intel) and
+  `macos-15-arm64` runner images.
+fix: |
+  Do not use the runner's dynamic `.local` hostname to address local services in
+  CI. Use `localhost` (127.0.0.1 / [::1]) instead, which always resolves correctly.
+
+  If your workflow truly needs the runner's IP address for a listening service
+  (e.g., to test from a remote client or to bind to a specific interface), retrieve
+  the IP address directly rather than resolving via the hostname:
+
+  Option 1: Replace hostname-based addressing with localhost:
+    - Change `ping -c 1 $(hostname)` to `ping -c 1 localhost`
+    - Change service URL from `http://$(hostname):PORT` to `http://localhost:PORT`
+    - Change service URL from `http://$(hostname -f):PORT` to `http://127.0.0.1:PORT`
+
+  Option 2: Retrieve the runner IP via ifconfig (more reliable than hostname lookup):
+    RUNNER_IP=$(ifconfig en0 | grep 'inet ' | awk '{print $2}')
+
+  Option 3: Pin to macOS 14 runners while this is investigated (provides the old behavior):
+    runs-on: macos-14-arm64  # or macos-14
+fix_code:
+  - language: yaml
+    label: 'Use localhost instead of hostname for local service connectivity'
+    code: |
+      - name: Start local service
+        run: ./start-service.sh &
+
+      # ❌ Unreliable on macOS 15 — .local hostname DNS can fail
+      # - name: Test service
+      #   run: curl http://$(hostname):8080/health
+
+      # ✅ Use localhost (127.0.0.1) — always resolvable
+      - name: Test service
+        run: curl http://localhost:8080/health
+
+  - language: yaml
+    label: 'Retrieve runner IP via ifconfig if explicit IP binding is required'
+    code: |
+      - name: Get runner IP
+        id: runner-ip
+        run: |
+          RUNNER_IP=$(ifconfig en0 | grep 'inet ' | awk '{print $2}')
+          echo "ip=$RUNNER_IP" >> "$GITHUB_OUTPUT"
+
+      - name: Test service via IP
+        run: curl http://${{ steps.runner-ip.outputs.ip }}:8080/health
+
+  - language: yaml
+    label: 'Pin to macOS 14 as a workaround until macOS 15 mDNS is resolved'
+    code: |
+      jobs:
+        test:
+          # ✅ macOS 14 hostname .local resolution is more reliable
+          runs-on: macos-14-arm64
+          steps:
+            - name: Connectivity test
+              run: ping -c 1 $(hostname)  # works on macOS 14
+prevention:
+  - 'Never use `$(hostname)` or `$(hostname -f)` to address services in GitHub-hosted macOS CI — use `localhost` or `127.0.0.1` instead'
+  - 'Abstract your service URLs into a variable (e.g., `SERVICE_HOST=localhost`) so you can easily swap between hostname and IP in different environments'
+  - 'Avoid network tests that depend on mDNS `.local` resolution in ephemeral CI VMs — the multicast networking assumptions of Bonjour do not hold in sandboxed cloud runners'
+  - 'When running integration tests that bind to a network interface, prefer `0.0.0.0` or `127.0.0.1` binding and connect via `localhost`'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/12562'
+    label: 'runner-images#12562: macOS hostname DNS resolution failure on macOS 15 runners'
+  - url: 'https://github.com/actions/runner-images/issues/12560'
+    label: 'runner-images#12560: Related macOS 15 hostname resolution discussion'
+  - url: 'https://support.apple.com/guide/mac-help/use-network-preferences-on-mac-mchlp2718/mac'
+    label: 'Apple mDNS / Bonjour documentation'
