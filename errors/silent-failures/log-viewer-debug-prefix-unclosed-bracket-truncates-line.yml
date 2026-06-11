@@ -1,0 +1,110 @@
+id: silent-failures-209
+title: 'GitHub Actions Log Viewer Truncates Lines Containing [debug Without Closing Bracket'
+category: silent-failures
+severity: silent-failure
+tags:
+  - log-viewer
+  - debug
+  - annotation
+  - log-truncation
+  - maven
+  - gradle
+  - workflow-command
+  - ui-bug
+patterns:
+  - regex: '\[debug\b(?![^\[]*\])'
+    flags: 'i'
+  - regex: 'echo.*\[debug\s'
+    flags: 'i'
+error_messages:
+  - '[INFO] foo [debug bar'
+  - '[INFO] Compiling 2 source files with javac [debug release 25 module-path] to target/test-classes'
+root_cause: |
+  The GitHub Actions log viewer in the web UI parses log lines for
+  workflow command annotations. When a line contains `[debug` (or `[warning`,
+  `[error`, `[notice`) followed by content, the viewer treats it as an
+  annotation command prefix and strips the opening bracket and keyword,
+  displaying only the remainder of the line after the annotation marker.
+
+  Specifically: any log line matching `[debug ` (with a trailing space or
+  bracket) causes the log viewer to:
+  1. Highlight the line in the debug annotation style (grey/purple)
+  2. Strip the prefix up to and including the annotation keyword
+  3. Display only the text after the bracket and keyword
+
+  Example: the Maven log line
+  `[INFO] Compiling 2 source files with javac [debug release 25 module-path] to target/test-classes`
+  is displayed as:
+  `release 25 module-path] to target/test-classes`
+
+  The raw log file (downloadable as .zip) is unaffected and contains the
+  complete line. Only the web UI viewer truncates the display.
+
+  This affects any tool that emits debug-level annotations in square-bracket
+  format in its output:
+  - Maven: `[debug ...]` module-path resolution output
+  - Gradle: debug output with `[debug]` prefixes
+  - Custom CLI tools following Maven-style log formatting
+  - Any `echo` or `print` statement whose output happens to include `[debug`
+
+  The behavior is a known issue with the GitHub Actions log viewer parser
+  (community/discussions/197397, May 2026). The raw log data is preserved;
+  only the rendered display in the GitHub UI is affected.
+fix: |
+  The log viewer behavior cannot be changed by the workflow author. Workarounds:
+
+  1. **Download raw logs** — The complete log data is always available in the
+     raw log zip download. The truncation is display-only.
+
+  2. **Use `::debug::` syntax** for intentional debug annotations instead of
+     `[debug]`, to avoid ambiguity with the parser:
+     ```
+     echo "::debug::This is a proper debug message"
+     ```
+
+  3. **Prefix-escape tool output** — For tools you control, change the log
+     format prefix from `[debug` to `[DBG` or `[DEBUG-INFO` to avoid
+     triggering the parser.
+
+  4. **For Maven specifically** — The output is from Maven's `[debug release]`
+     module path resolution (Java 9+ `--module-path` flag). You cannot suppress
+     this Maven log line format, but you can filter it in post-processing or
+     simply reference the raw log download for full output.
+fix_code:
+  - language: yaml
+    label: 'Use ::debug:: syntax for intentional debug annotations (avoids parser conflict)'
+    code: |
+      - name: Debug step output
+        run: |
+          # WRONG: triggers log viewer annotation parser
+          echo "[debug] module path resolved to /usr/lib/jvm"
+
+          # CORRECT: use GitHub Actions workflow command syntax
+          echo "::debug::module path resolved to /usr/lib/jvm"
+
+          # Also correct: change prefix to avoid triggering parser
+          echo "[DBG] module path resolved to /usr/lib/jvm"
+
+  - language: yaml
+    label: 'Download raw logs to see untruncated output (GitHub CLI)'
+    code: |
+      - name: Download run logs after failure
+        run: |
+          # Fetch logs for current run (raw zip contains complete untruncated lines)
+          gh run download ${{ github.run_id }} --dir ./logs
+          # Or view raw logs:
+          gh run view ${{ github.run_id }} --log
+        env:
+          GH_TOKEN: ${{ github.token }}
+prevention:
+  - 'Avoid printing log lines that start with or contain [debug, [warning, [error, or [notice followed by a space — these trigger the GitHub Actions log viewer annotation parser.'
+  - 'Use the ::debug:: workflow command syntax (echo "::debug::message") for intentional GitHub Actions debug annotations.'
+  - 'Always download the raw log zip when debugging log output that appears truncated in the GitHub UI — the raw file is always complete.'
+  - 'When using Maven, Gradle, or other JVM build tools, be aware that module-path debug output may be partially hidden in the UI log viewer; use --debug flag output for offline analysis.'
+docs:
+  - url: 'https://github.com/orgs/community/discussions/197397'
+    label: 'GitHub Community: Log lines containing [debug without closing ] get truncated in GitHub Actions logs viewer'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions#setting-a-debug-message'
+    label: 'Workflow commands — Setting a debug message (::debug:: syntax)'
+  - url: 'https://docs.github.com/en/actions/monitoring-and-troubleshooting-workflows/using-workflow-run-logs'
+    label: 'Using workflow run logs — downloading raw logs'

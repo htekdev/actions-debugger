@@ -1,0 +1,118 @@
+id: known-unsolved-127
+title: 'Orphaned or Phantom Workflow Stuck in Queued State — Cannot Cancel or Delete, Blocks All Runs'
+category: known-unsolved
+severity: error
+tags:
+  - queued
+  - stuck-run
+  - phantom-workflow
+  - orphaned-workflow
+  - startup-failure
+  - incident
+  - github-support
+  - cannot-cancel
+patterns:
+  - regex: 'Cannot cancel a workflow run that is completed'
+    flags: 'i'
+  - regex: 'Cannot cancel a workflow re-run that has not yet queued'
+    flags: 'i'
+  - regex: 'startup_failure.*jobs.*\[\]|state.*queued.*conclusion.*null.*jobs.*0'
+    flags: 'i'
+  - regex: 'Could not delete the workflow run'
+    flags: 'i'
+  - regex: 'Unable to disable a workflow that is not active'
+    flags: 'i'
+error_messages:
+  - 'Cannot cancel a workflow run that is completed'
+  - 'Cannot cancel a workflow re-run that has not yet queued'
+  - 'gh run cancel: 409 Cannot cancel a workflow re-run that has not yet queued'
+  - 'gh run delete: 403 Could not delete the workflow run'
+  - 'startup_failure: this job was not successful'
+  - 'Unable to disable a workflow that is not active (HTTP 422)'
+root_cause: |
+  GitHub Actions stores workflow run records and workflow registry entries in a
+  backend database. Under two distinct conditions, orphaned records can appear
+  that cannot be resolved through the normal API:
+
+  **Type 1 — Orphaned queued run after a GitHub incident:**
+  During or after a GitHub Actions platform incident (e.g., authentication
+  failures causing run-start failures), some workflow reruns may enter a
+  `queued` state with `conclusion: null` and `jobs: []`. The backend
+  believes the run is "completed" (to the cancel API) yet simultaneously
+  reports it as "not yet queued" (to the force-cancel API), creating an
+  unresolvable paradox. These phantom runs:
+  - Show as `status: queued, conclusion: null` in the API
+  - Have zero associated jobs (`total_count: 0`)
+  - Report "Cannot cancel a workflow run that is completed" when you attempt cancel
+  - Report "Cannot cancel a workflow re-run that has not yet queued" to force-cancel
+  - Cannot be deleted via `DELETE /repos/{owner}/{repo}/actions/runs/{run_id}`
+  - Block new runs of the same workflow in some configurations
+
+  **Type 2 — Phantom deleted workflow blocks all runs repo-wide:**
+  When a workflow file is created via the GitHub Actions web editor and then
+  partially deleted (web editor "delete" button that leaves a dangling registry
+  entry), a phantom workflow with `state: deleted` and an empty `path` or
+  `name` remains in the backend. This orphaned registry entry:
+  - Triggers a `startup_failure` run on EVERY push/PR/dispatch event
+  - Consumes no runner and takes ~1 second (zero billable minutes)
+  - Prevents ALL other real workflows from running in the affected repository
+  - Cannot be disabled via `PUT .../workflows/{id}/disable` (403 "Unable to
+    disable a workflow that is not active")
+  - Cannot be removed from git (git log shows no commits for the file)
+
+  Both conditions require GitHub Staff/Support intervention to clear.
+fix: |
+  There is no self-service fix. Both scenarios require GitHub Support to purge
+  the orphaned backend records.
+
+  **Immediate mitigations:**
+  - File a GitHub Support ticket at https://support.github.com — include
+    the run ID or workflow ID from the API and the error messages you receive.
+  - Post in GitHub Community (orgs/community/discussions) with the run ID —
+    GitHub staff sometimes monitor and can escalate.
+  - For Type 2 (phantom workflow): Try renaming your repository or temporarily
+    making it private to interrupt the event routing (unconfirmed workaround).
+
+  **Prevention:**
+  - Avoid using the GitHub Actions web editor to create and then immediately
+    delete workflow files — always commit/delete through git.
+  - After a GitHub Actions incident, if a workflow run shows as queued with no
+    jobs, wait 24 hours before filing a support ticket; some orphaned runs
+    auto-resolve.
+fix_code:
+  - language: yaml
+    label: 'Diagnostic commands to identify orphaned run or phantom workflow'
+    code: |
+      # Identify stuck queued runs with no jobs:
+      # gh run view {RUN_ID} --repo {owner}/{repo}
+      # → shows status=queued, conclusion=null
+      #
+      # gh api repos/{owner}/{repo}/actions/runs/{RUN_ID}/jobs
+      # → returns: {"total_count":0,"jobs":[]}
+      #
+      # Identify phantom deleted workflow:
+      # gh api repos/{owner}/{repo}/actions/workflows \
+      #   --jq '.workflows[] | select(.state == "deleted") | {id, name, path, state}'
+      # → returns record with state=deleted and empty/broken path
+      #
+      # Attempt cancel (shows the error message):
+      # gh run cancel {RUN_ID} --repo {owner}/{repo}
+      # → Error: Cannot cancel a workflow run that is completed
+      #
+      # gh api --method POST \
+      #   repos/{owner}/{repo}/actions/runs/{RUN_ID}/force-cancel
+      # → 409: Cannot cancel a workflow re-run that has not yet queued
+prevention:
+  - 'Never create workflow files in the GitHub Actions web editor and immediately delete them without also deleting the commit.'
+  - 'After a GitHub Actions incident, monitor https://githubstatus.com and wait for full recovery before rerunning failed workflows.'
+  - 'Monitor your active workflow list for entries with state=deleted using: gh api repos/{owner}/{repo}/actions/workflows --jq ''.workflows[] | select(.state == "deleted")'''
+  - 'If a workflow run shows queued with 0 jobs after an incident, open a GitHub Support ticket immediately — do not retry indefinitely.'
+docs:
+  - url: 'https://github.com/orgs/community/discussions/197015'
+    label: 'GitHub Community: GitHub Actions run stuck queued for 12+ hours and blocks new workflow runs (6 upvotes)'
+  - url: 'https://github.com/orgs/community/discussions/197048'
+    label: 'GitHub Community: Phantom deleted workflow blocks all Actions runs in private repo'
+  - url: 'https://support.github.com/contact'
+    label: 'GitHub Support — file a ticket for orphaned run/workflow removal'
+  - url: 'https://docs.github.com/en/rest/actions/workflow-runs?apiVersion=2022-11-28#force-cancel-a-workflow-run'
+    label: 'Force-cancel a workflow run — REST API docs'
