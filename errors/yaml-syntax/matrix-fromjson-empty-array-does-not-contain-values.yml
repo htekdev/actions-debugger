@@ -1,0 +1,191 @@
+id: yaml-syntax-112
+title: 'fromJSON of Empty Array Used as Matrix Value Fails with "Matrix vector does not contain any values"'
+category: yaml-syntax
+severity: error
+tags:
+  - matrix
+  - fromJSON
+  - empty-array
+  - strategy
+  - dynamic-matrix
+  - job-outputs
+patterns:
+  - regex: 'Matrix vector .+ does not contain any values'
+    flags: 'i'
+  - regex: 'fromJSON\(needs\.\w+\.outputs\.\w+\).*matrix'
+    flags: 'i'
+  - regex: 'Error when evaluating ''strategy'' for job'
+    flags: 'i'
+error_messages:
+  - "Matrix vector 'target' does not contain any values"
+  - "Matrix vector 'chart' does not contain any values"
+  - "Error when evaluating 'strategy' for job 'build': Matrix vector 'target' does not contain any values"
+root_cause: |
+  When a job uses a dynamic matrix via `${{ fromJSON(needs.upstream.outputs.array) }}`,
+  and the upstream job outputs an EMPTY JSON array `[]`, the `strategy` block evaluation
+  fails with "Matrix vector 'X' does not contain any values".
+
+  GitHub Actions requires at least one value in every matrix dimension. If `fromJSON`
+  resolves to an empty array `[]` at runtime, the workflow engine cannot generate ANY
+  job instances and throws an error — it does NOT gracefully skip the job.
+
+  **Common trigger:** A path-filter upstream job (e.g. using `dorny/paths-filter`) detects
+  no file changes and outputs `charts=[]` or `targets=[]`. The downstream matrix job
+  then fails immediately at strategy evaluation before any step runs.
+
+  **Why the `if:` guard does not help:** Even if the downstream job has:
+  ```yaml
+  if: ${{ needs.upstream.outputs.has_changes == 'true' }}
+  ```
+  GitHub evaluates the `strategy.matrix` FIRST and fails BEFORE evaluating the `if:`
+  condition. The job errors before the conditional skip can take effect.
+
+  The error appears in the "Set up job" phase, not in a user-defined step.
+
+  Source: Stack Overflow Q#78343514 (score 1, 1,980 views — Apr 2024), Q#78821409
+  (score 1, 198 views — Aug 2024).
+fix: |
+  **Option 1 (recommended): Use a safe fallback JSON in the output — never emit `[]`.**
+
+  Output a sentinel value like `["__none__"]` when there are no items, then add a step
+  to exit early inside the matrix job:
+
+  ```yaml
+  # Upstream job
+  - run: |
+      CHARTS=$(get_charts)
+      if [ -z "$CHARTS" ]; then
+        echo 'charts=["__none__"]' >> $GITHUB_OUTPUT
+      else
+        echo "charts=$CHARTS" >> $GITHUB_OUTPUT
+      fi
+  ```
+  Inside the matrix job:
+  ```yaml
+  - if: matrix.chart == '__none__'
+    run: exit 0   # or just skip all real steps
+  ```
+
+  **Option 2: Guard the downstream job with `if:` AND use a non-empty default.**
+
+  Ensure the upstream job always outputs a non-empty array, and use a separate output
+  flag to indicate whether real work needs to be done:
+
+  ```yaml
+  - run: |
+      echo "has_changes=false" >> $GITHUB_OUTPUT
+      echo 'charts=["placeholder"]' >> $GITHUB_OUTPUT
+  ```
+
+  **Option 3 (GitHub-supported workaround): combine `if:` + `fromJSON` with `||`.**
+
+  If the array might be empty, provide a single-item fallback so strategy always has
+  at least one value, then use `if:` inside the job step to skip real work:
+  This approach is verbose but avoids the strategy failure.
+fix_code:
+  - language: yaml
+    label: 'Broken: fromJSON([]) used as matrix → strategy fails immediately'
+    code: |
+      jobs:
+        get-charts:
+          outputs:
+            charts: ${{ steps.filter.outputs.changes }}
+            has_changes: ${{ steps.filter.outputs.has_changes }}
+          steps:
+            - uses: dorny/paths-filter@v3
+              id: filter
+              with:
+                filters: |
+                  charts:
+                    - 'charts/**'
+            # When no charts changed: outputs charts=[], has_changes=false
+
+        deploy:
+          needs: get-charts
+          if: ${{ needs.get-charts.outputs.has_changes == 'true' }}  # ❌ evaluated AFTER strategy!
+          strategy:
+            matrix:
+              chart: ${{ fromJSON(needs.get-charts.outputs.charts) }}  # ❌ fails on []
+          steps:
+            - run: helm upgrade ${{ matrix.chart }}
+  - language: yaml
+    label: 'Fixed option 1: emit ["__none__"] sentinel instead of [], skip inside job'
+    code: |
+      jobs:
+        get-charts:
+          outputs:
+            charts: ${{ steps.set-charts.outputs.charts }}
+          steps:
+            - uses: dorny/paths-filter@v3
+              id: filter
+              with:
+                filters: |
+                  charts:
+                    - 'charts/**'
+            - id: set-charts
+              run: |
+                CHARTS='${{ steps.filter.outputs.changes }}'
+                if [ "$CHARTS" = "[]" ] || [ -z "$CHARTS" ]; then
+                  echo 'charts=["__none__"]' >> $GITHUB_OUTPUT
+                else
+                  echo "charts=$CHARTS" >> $GITHUB_OUTPUT
+                fi
+
+        deploy:
+          needs: get-charts
+          strategy:
+            matrix:
+              chart: ${{ fromJSON(needs.get-charts.outputs.charts) }}
+          steps:
+            - if: matrix.chart != '__none__'  # ✅ real work only for real charts
+              run: helm upgrade ${{ matrix.chart }}
+  - language: yaml
+    label: 'Fixed option 2: separate has_changes guard, always output a non-empty array'
+    code: |
+      jobs:
+        get-charts:
+          outputs:
+            has_changes: ${{ steps.filter.outputs.charts }}
+            charts: ${{ steps.set-charts.outputs.charts }}
+          steps:
+            - uses: dorny/paths-filter@v3
+              id: filter
+              with:
+                filters: |
+                  charts:
+                    - 'charts/**'
+            - id: set-charts
+              # Always output at least one item so strategy never sees []
+              run: |
+                CHANGES='${{ steps.filter.outputs.changes }}'
+                if [ "$CHANGES" = "[]" ]; then
+                  echo 'charts=["skip"]' >> $GITHUB_OUTPUT
+                else
+                  echo "charts=$CHANGES" >> $GITHUB_OUTPUT
+                fi
+
+        deploy:
+          needs: get-charts
+          # ✅ if: evaluated based on outputs.has_changes BEFORE strategy is computed
+          # This only works because the condition is on has_changes, not on the matrix
+          if: ${{ needs.get-charts.outputs.has_changes == 'true' }}
+          strategy:
+            matrix:
+              chart: ${{ fromJSON(needs.get-charts.outputs.charts) }}
+          steps:
+            - run: helm upgrade ${{ matrix.chart }}
+prevention:
+  - 'Never output an empty JSON array `[]` from a job that feeds a matrix — always include a sentinel value like `["__none__"]` as a fallback.'
+  - 'Remember that GitHub evaluates `strategy.matrix` BEFORE `if:` conditions — a job-level `if:` guard CANNOT prevent the strategy evaluation error from an empty array.'
+  - 'Use `dorny/paths-filter` outputs that include at least a `["placeholder"]` fallback; handle the placeholder with `if: matrix.X != ''placeholder''` inside the job.'
+  - 'Test your dynamic matrix outputs locally: verify that when no paths match, the upstream job outputs a non-empty JSON array.'
+  - 'Consider using `needs.job.result == ''success''` as an extra guard in addition to checking output values.'
+docs:
+  - url: 'https://stackoverflow.com/questions/78343514/issue-with-conditionals-in-empty-matrix-in-github-actions'
+    label: 'Stack Overflow — Empty matrix fromJSON fails with "does not contain any values" (Apr 2024, 1,980 views)'
+  - url: 'https://stackoverflow.com/questions/78821409/github-actions-matrix-job-running-despite-false-conditions'
+    label: 'Stack Overflow — Matrix job running despite false conditions when all excluded (Aug 2024)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-a-matrix-for-your-jobs'
+    label: 'GitHub Docs — Using a matrix for your jobs'
+  - url: 'https://github.com/dorny/paths-filter'
+    label: 'dorny/paths-filter — path-based workflow trigger filtering'

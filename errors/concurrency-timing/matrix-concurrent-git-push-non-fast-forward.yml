@@ -1,0 +1,164 @@
+id: concurrency-timing-094
+title: 'Matrix Strategy Concurrent Jobs All Push to Same Branch — Non-Fast-Forward Rejection'
+category: concurrency-timing
+severity: error
+tags:
+  - matrix
+  - git-push
+  - concurrent
+  - non-fast-forward
+  - race-condition
+  - commit
+patterns:
+  - regex: 'non-fast-forward'
+    flags: 'i'
+  - regex: 'Updates were rejected because the tip of your current branch is behind'
+    flags: 'i'
+  - regex: 'error: failed to push some refs.+hint: Updates were rejected'
+    flags: 'is'
+error_messages:
+  - "! [rejected]        main -> main (non-fast-forward)"
+  - "error: failed to push some refs to 'https://github.com/org/repo'"
+  - "hint: Updates were rejected because the tip of your current branch is behind"
+  - "hint: its remote counterpart. If you want to integrate the remote changes,"
+  - "hint: use 'git pull' before pushing again."
+root_cause: |
+  When a `strategy.matrix` job contains a `git commit && git push` step, ALL matrix
+  instances run concurrently and each one independently checks out the repository at the
+  SAME commit SHA at job startup.
+
+  If two or more instances try to push to the same branch:
+  - Instance A checks out at commit X, makes changes, pushes → creates commit Y
+  - Instance B checked out at commit X (before A pushed), makes its own changes, pushes
+    → rejected because the branch tip is now Y, not X. Instance B's push is
+    behind the remote and non-fast-forward.
+
+  This fails for ANY workflow that uses a matrix to generate commits — for example:
+  - Updating generated documentation files per each matrix target
+  - Writing per-target outputs back to the repository
+  - Version file updates or artifact manifests shared across matrix entries
+
+  The problem is structurally inherent to matrix parallelism: git push requires a
+  linear history, but multiple concurrent runners checking out the same base commit
+  and each pushing will create divergent histories. Only the first runner to push wins;
+  all subsequent runners are rejected.
+
+  **Even with `concurrency:` at the workflow level**, this race condition occurs at the
+  JOB level — concurrent matrix instances within the SAME workflow run share no
+  synchronisation mechanism around git operations.
+
+  Source: Stack Overflow Q#78277579 (score 1, 520 views — Apr 2024) and
+  Q#79047635 (score 3, 191 views — Oct 2024).
+fix: |
+  **The canonical fix: separate the "matrix work" job from the "commit" job.**
+
+  Matrix jobs do their work and write outputs or upload artifacts. A separate downstream
+  job (`needs: matrix-job`) runs ONCE after all matrix instances complete and performs
+  a single `git commit && git push`.
+
+  This eliminates the race condition entirely — only one job ever touches the repository.
+
+  If matrix instances need to write files back, use `actions/upload-artifact` from each
+  matrix instance, then download all artifacts in the commit job.
+
+  **Alternative: apply a `concurrency:` group at the job level** to serialise pushes
+  (only one matrix instance pushes at a time). Each instance must also `git pull` before
+  its push to incorporate the previous instance's commit.
+fix_code:
+  - language: yaml
+    label: 'Broken: matrix instances all push to main concurrently'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          strategy:
+            matrix:
+              target: [a, b, c]
+          steps:
+            - uses: actions/checkout@v4
+            - name: Generate file for ${{ matrix.target }}
+              run: echo "${{ matrix.target }}" > output/${{ matrix.target }}.txt
+            - name: Commit and push
+              run: |
+                git config user.name github-actions
+                git config user.email github-actions@github.com
+                git add .
+                git commit -m "Add ${{ matrix.target }}"
+                git push  # ❌ Instances B and C fail — A pushed first
+  - language: yaml
+    label: 'Fixed: matrix uploads artifacts, a single downstream job commits once'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          strategy:
+            matrix:
+              target: [a, b, c]
+          steps:
+            - uses: actions/checkout@v4
+            - name: Generate file for ${{ matrix.target }}
+              run: |
+                mkdir -p output
+                echo "${{ matrix.target }}" > output/${{ matrix.target }}.txt
+            - name: Upload artifact
+              uses: actions/upload-artifact@v4
+              with:
+                name: output-${{ matrix.target }}
+                path: output/${{ matrix.target }}.txt
+
+        commit:
+          runs-on: ubuntu-latest
+          needs: build   # runs AFTER all matrix instances complete
+          steps:
+            - uses: actions/checkout@v4
+            - name: Download all artifacts
+              uses: actions/download-artifact@v4
+              with:
+                path: output/
+                merge-multiple: true
+            - name: Commit and push once
+              run: |
+                git config user.name github-actions
+                git config user.email github-actions@github.com
+                git add output/
+                git diff --staged --quiet || git commit -m "Add generated outputs"
+                git push  # ✅ Only one runner, no race condition
+  - language: yaml
+    label: 'Alternative: serialise pushes with concurrency + pull-before-push'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          concurrency:
+            group: git-push-serialised
+            cancel-in-progress: false  # queue, don't cancel
+          strategy:
+            matrix:
+              target: [a, b, c]
+          steps:
+            - uses: actions/checkout@v4
+            - name: Generate file
+              run: echo "${{ matrix.target }}" > output/${{ matrix.target }}.txt
+            - name: Pull, commit, push serialised
+              run: |
+                git config user.name github-actions
+                git config user.email github-actions@github.com
+                git fetch origin main
+                git reset --hard origin/main   # sync with latest main
+                git add output/
+                git commit -m "Add ${{ matrix.target }}"
+                git push  # ✅ Serialised by concurrency group
+prevention:
+  - 'Never include `git push` inside a matrix job — use a separate downstream job that runs once after all matrix instances complete.'
+  - 'Use `actions/upload-artifact` / `actions/download-artifact` to collect matrix outputs; perform the single commit in a `needs:` downstream job.'
+  - 'If matrix instances MUST commit independently, serialise them with a `concurrency:` group and always `git fetch` + `git reset --hard origin/main` immediately before each push.'
+  - 'For simple file updates, consider passing the data via job outputs (`$GITHUB_OUTPUT`) to the downstream job instead of writing to the repository mid-matrix.'
+docs:
+  - url: 'https://stackoverflow.com/questions/78277579/how-can-i-commit-and-push-changes-to-a-repository-in-concurrent-github-actions-workflow-runs'
+    label: 'Stack Overflow — Commit/push in concurrent matrix runs: non-fast-forward rejection (Apr 2024)'
+  - url: 'https://stackoverflow.com/questions/79047635/running-a-step-after-a-matrix-step-is-done-executing-in-github-actions'
+    label: 'Stack Overflow — Running a step after matrix is done: commit race with git push (Oct 2024)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-a-matrix-for-your-jobs'
+    label: 'GitHub Docs — Using a matrix for your jobs'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-and-sharing-data-from-a-workflow'
+    label: 'GitHub Docs — Storing and sharing data from a workflow (artifacts)'
