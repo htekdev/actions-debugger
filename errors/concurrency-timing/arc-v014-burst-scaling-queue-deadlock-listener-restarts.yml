@@ -1,0 +1,103 @@
+id: concurrency-timing-096
+title: 'ARC v0.14.x Jobs Queue 10-15 Minutes Under Burst Load — Listener Restarts Stall Scaling'
+category: concurrency-timing
+severity: error
+tags:
+  - arc
+  - actions-runner-controller
+  - kubernetes
+  - gha-runner-scale-set
+  - scaling
+  - burst
+  - listener
+  - queue
+  - upgrade
+patterns:
+  - regex: 'listener.*restart|listener.*pod.*restart'
+    flags: 'i'
+  - regex: 'actions-runner-controller.*0\.14\.[01]'
+    flags: 'i'
+  - regex: 'gha-runner-scale-set.*0\.14'
+    flags: 'i'
+  - regex: 'jobs remain.*queued.*10.*minute|queued.*10.*15.*min'
+    flags: 'i'
+error_messages:
+  - 'jobs remain in queued state for 10-15 minutes'
+  - 'Scaling beyond the minimum runner count is significantly delayed'
+  - 'Listener pod restarts or becomes intermittently unavailable'
+root_cause: |
+  ARC v0.14.0 and v0.14.1 introduced changes to the listener scaling loop that
+  cause a self-reinforcing queue deadlock under bursty workflow loads:
+
+  1. A burst of concurrent workflow jobs arrives and exhausts the `minRunners`
+     pool faster than the listener can dispatch scale-up requests.
+  2. The listener pod experiences high broker message pressure, causing it to
+     restart intermittently (or consume elevated memory).
+  3. During listener restart, the scale-set controller cannot process new job
+     acquisition messages from the GitHub Actions broker.
+  4. Jobs accumulate in the queue and remain in the "Waiting for a runner to
+     pick up this job..." state for 10-15 minutes until the listener stabilises.
+  5. After the listener recovers, runners spin up and the backlog drains, but
+     the burst window has long passed — making latency spikes look transient and
+     hard to correlate.
+
+  The issue is most pronounced on scale sets with `minRunners >= 10` on AKS or
+  GKE clusters where the listener pod has limited CPU/memory during scale events.
+  Tracked in actions/actions-runner-controller#4470 (April 2026, 31 comments).
+fix: |
+  Short term: pin to ARC v0.13.1 (Helm chart `--version 0.13.1`) until v0.15.0
+  addresses the scaling loop regression.
+
+  If staying on v0.14.x is required:
+  1. Increase listener pod CPU/memory limits to reduce restart pressure.
+  2. Reduce `minRunners` to a lower floor and rely on `maxRunners` to absorb bursts —
+     smaller listener state means less memory pressure during scale events.
+  3. Set `listenerTemplate.spec.containers[0].resources` in the Helm values to give
+     the listener adequate headroom:
+       resources:
+         requests:
+           cpu: "500m"
+           memory: "256Mi"
+         limits:
+           cpu: "1"
+           memory: "512Mi"
+
+  Long term: upgrade to ARC v0.15.0+ once the scaling loop fix is released.
+fix_code:
+  - language: yaml
+    label: 'Pin ARC to v0.13.1 in Helm values (stable, no burst deadlock)'
+    code: |
+      # values.yaml for actions-runner-controller
+      # Pin controller version to avoid v0.14.x burst deadlock
+      image:
+        tag: "0.13.1"
+
+      # Scale set values.yaml
+      # Keep minRunners low to avoid listener memory pressure
+      minRunners: 5
+      maxRunners: 50
+  - language: yaml
+    label: 'Increase listener pod resources if staying on v0.14.x'
+    code: |
+      # gha-runner-scale-set Helm values.yaml
+      listenerTemplate:
+        spec:
+          containers:
+            - name: listener
+              resources:
+                requests:
+                  cpu: "500m"
+                  memory: "256Mi"
+                limits:
+                  cpu: "1000m"
+                  memory: "512Mi"
+prevention:
+  - 'After any ARC minor version upgrade, run a burst load test (e.g. 50+ concurrent jobs) before rolling out to production.'
+  - 'Monitor listener pod restart count (`kubectl get pods -n arc-system`) as a scaling health signal.'
+  - 'Keep minRunners conservatively low — a high floor means more listener state and more memory pressure.'
+  - 'Subscribe to ARC release notes to catch regression fixes before upgrading.'
+docs:
+  - url: 'https://github.com/actions/actions-runner-controller/issues/4470'
+    label: 'actions-runner-controller#4470 — v0.14.1 burst queue wait times (31 comments)'
+  - url: 'https://github.com/actions/actions-runner-controller/blob/master/docs/gha-runner-scale-set-controller/README.md'
+    label: 'ARC Scale Set Controller documentation'
