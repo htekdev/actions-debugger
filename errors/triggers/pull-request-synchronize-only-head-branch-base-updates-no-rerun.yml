@@ -1,0 +1,132 @@
+id: tr-112
+title: 'pull_request synchronize event only fires on head branch commits — base branch updates do not re-trigger PR CI'
+category: triggers
+severity: limitation
+tags:
+  - pull_request
+  - synchronize
+  - base-branch
+  - pr-ci
+  - not-triggering
+  - merge-conflicts
+  - stale-ci
+patterns:
+  - regex: 'on:\s*\n\s+pull_request:'
+    flags: 'im'
+  - regex: 'types:\s*[\[\n].*synchronize'
+    flags: 'im'
+error_messages:
+  - '(PR CI is stale — head branch CI passed but base branch received new commits since last run)'
+  - '(PR CI not re-triggered after merge to base branch — synchronize event not fired)'
+  - '(CI result outdated — base branch has diverged from PR merge base)'
+root_cause: |
+  The `pull_request: synchronize` event fires ONLY when new commits are pushed to the
+  **head branch** of the pull request. It does NOT fire when the **base branch** receives
+  new commits (e.g., when another PR is merged to `main` while your PR is open).
+
+  This means:
+  1. PR #1 opens targeting `main`. CI runs (synchronize fires).
+  2. PR #2 merges to `main`, adding new commits to the base branch.
+  3. PR #1's CI result remains "success" from before PR #2 was merged — even though
+     `main` now has new commits that could conflict with or break PR #1.
+  4. No new CI run fires for PR #1 — the branch protection check is satisfied by
+     the stale result.
+
+  This is expected GitHub Actions behaviour, not a bug. GitHub's branch protection
+  "Require branches to be up to date before merging" option (in branch protection rules)
+  can enforce that a PR's head branch is rebased/merged with base before merging — but
+  this is a separate UI setting, not controlled by the `synchronize` trigger.
+
+  The `synchronize` event fires for these head branch actions:
+  - New commit pushed to the PR branch
+  - Force-push to the PR branch
+  - Commit squashed or rebased on the PR branch
+
+  The `synchronize` event does NOT fire for:
+  - New commits on the base branch (`main`, `develop`, etc.)
+  - Base branch force-pushes
+  - Target branch changes via the GitHub UI
+
+  This is a frequent source of false confidence in CI status — the PR appears green
+  but is tested against an outdated version of the base branch.
+fix: |
+  There is no direct trigger fix. Use one or more of the following approaches:
+
+  1. **Require up-to-date branches** (branch protection setting):
+     Enable "Require branches to be up to date before merging" in the repo's
+     branch protection settings. GitHub then blocks merge until the PR is rebased
+     or merged with the current base branch — at which point a new `synchronize`
+     fires and CI re-runs.
+
+  2. **Merge queue (`merge_group`)**: Use GitHub's merge queue feature. The merge
+     queue creates a synthetic merge commit for each PR and runs CI against it before
+     merging — ensuring CI runs against the latest base branch state.
+
+  3. **Periodic PR re-validation**: A separate scheduled workflow can call the GitHub
+     API to re-request a workflow run on open PRs if the base branch has diverged.
+
+  4. **Push trigger on base branch**: Add a separate workflow with `on: push: branches:
+     [main]` that re-validates open PRs. Requires programmatic API calls to trigger
+     runs for each open PR — cannot be done with a single trigger.
+fix_code:
+  - language: yaml
+    label: 'Use merge queue to guarantee CI against latest base branch'
+    code: |
+      on:
+        pull_request:
+          branches: [main]
+        merge_group:          # Merge queue: CI runs against synthetic merge commit
+          branches: [main]
+
+      jobs:
+        ci:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./run-tests.sh
+  - language: yaml
+    label: 'Require up-to-date branches via branch protection (UI setting)'
+    code: |
+      # In your repository:
+      # Settings → Branches → Branch protection rules → Edit 'main'
+      # ✅ Require status checks to pass before merging
+      #   ✅ Require branches to be up to date before merging
+      #
+      # This blocks merge until the PR head branch is rebased or merged
+      # with the current base, triggering a new synchronize event and CI run.
+      #
+      # No YAML change needed — this is a repository settings configuration.
+  - language: yaml
+    label: 'Periodic re-validation of open PRs after base branch push'
+    code: |
+      # .github/workflows/revalidate-prs.yml
+      on:
+        push:
+          branches: [main]   # Fire whenever main gets new commits
+
+      jobs:
+        revalidate:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Re-run CI on open PRs targeting main
+              env:
+                GH_TOKEN: ${{ github.token }}
+              run: |
+                # List all open PRs targeting main
+                gh pr list --base main --state open --json number --jq '.[].number' \
+                  | xargs -I{} gh workflow run ci.yml \
+                      --ref "$(gh pr view {} --json headRefName --jq '.headRefName')"
+prevention:
+  - 'Enable "Require branches to be up to date before merging" in branch protection to prevent merging stale PRs.'
+  - 'Adopt GitHub merge queue (`merge_group` trigger) for critical branches — guarantees CI against the latest base.'
+  - 'Communicate to your team that a green CI badge on a PR does not guarantee the branch is compatible with the current base.'
+  - 'Consider adding a "PR is X commits behind main" check using the GitHub API to surface stale PRs proactively.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request'
+    label: 'GitHub Docs: pull_request event — synchronize type'
+  - url: 'https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-status-checks-before-merging'
+    label: 'GitHub Docs: Require branches to be up to date before merging'
+  - url: 'https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/incorporating-changes-from-a-pull-request/merging-a-pull-request-with-a-merge-queue'
+    label: 'GitHub Docs: Merging a pull request with a merge queue'
+  - url: 'https://github.com/orgs/community/discussions/13662'
+    label: 'GitHub Community: synchronize event not firing when base branch changes'

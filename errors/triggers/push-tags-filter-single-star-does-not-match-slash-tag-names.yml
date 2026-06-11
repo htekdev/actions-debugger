@@ -1,0 +1,107 @@
+id: tr-113
+title: 'on: push tags: filter with single * glob does not match tag names containing a slash'
+category: triggers
+severity: silent-failure
+tags:
+  - tags-filter
+  - glob
+  - on-push
+  - slash
+  - tag-name
+  - workflow-not-triggering
+  - monorepo
+patterns:
+  - regex: 'tags:\s*\n\s+-\s+''?\*''?\s*$'
+    flags: 'im'
+  - regex: 'tags:\s*\[.*\*.*\]'
+    flags: 'im'
+  - regex: 'tags-ignore:\s*\n\s+-\s+''?[^/\n]*\*[^/\n]*''?\s*$'
+    flags: 'im'
+error_messages:
+  - '(workflow not triggered for tag push — tag name contains a slash and the tags: filter uses a single * glob)'
+  - '(release workflow silent — tag format "releases/v1.0.0" does not match tags: ["v*"])'
+root_cause: |
+  The `*` (single star) glob character matches any sequence of characters EXCEPT a
+  forward slash `/`. This applies equally to the `branches:`, `branches-ignore:`,
+  `tags:`, and `tags-ignore:` filter patterns in GitHub Actions.
+
+  For `branches:` filters, this limitation is well-known: `branches: ['*']` does not
+  match branch names like `feature/my-feature`. However, the same restriction applies
+  to `tags:` filters and is less commonly understood — despite tags following the same
+  glob matching rules.
+
+  Examples of tag names that DO NOT match common glob patterns:
+  - `releases/v1.0.0` does NOT match `'v*'` (contains slash)
+  - `service/api/v2.1.0` does NOT match `'*'` (contains slashes)
+  - `hotfix/2026-06-11` does NOT match `'hotfix-*'` (slash vs hyphen)
+
+  This is a frequent source of silent failures in monorepo tag strategies, release
+  tooling that prefixes tags with a component name (e.g., `frontend/v3.0.0`,
+  `backend/v2.1.0`), or any tagging convention that includes a path separator.
+
+  The failure is completely silent: the workflow simply does not appear in the
+  Actions tab after a matching tag is pushed. No error is emitted.
+
+  Note: `**` (double star) DOES match slashes. Replacing `*` with `**` in a tags
+  filter causes it to match across path separators, fixing the slash-in-tag issue.
+fix: |
+  Replace single-star `*` with double-star `**` in `tags:` and `tags-ignore:` patterns
+  when tag names can contain slashes. Alternatively, restructure the tag naming convention
+  to avoid slashes if the goal is CI/CD simplification.
+fix_code:
+  - language: yaml
+    label: 'Replace * with ** to match tags containing slashes'
+    code: |
+      # WRONG — v* does not match tags like "releases/v1.0.0"
+      # on:
+      #   push:
+      #     tags:
+      #       - 'v*'
+
+      # CORRECT — v** matches "v1.0.0", "releases/v1.0.0", "v1.0.0-beta.1"
+      on:
+        push:
+          tags:
+            - 'v**'
+  - language: yaml
+    label: 'Monorepo component tags — match "service/v*" pattern'
+    code: |
+      on:
+        push:
+          tags:
+            - '**/v[0-9]*'   # Matches frontend/v3.0.0, backend/v2.1.0, v1.0.0
+
+      jobs:
+        release:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Extract component from tag
+              run: |
+                TAG="${{ github.ref_name }}"  # e.g., "frontend/v3.0.0"
+                COMPONENT="${TAG%/v*}"        # e.g., "frontend"
+                VERSION="${TAG#*/}"           # e.g., "v3.0.0"
+                echo "COMPONENT=$COMPONENT" >> $GITHUB_ENV
+                echo "VERSION=$VERSION" >> $GITHUB_ENV
+  - language: yaml
+    label: 'Avoid slashes in tags — use hyphens for flat namespace'
+    code: |
+      # Alternative: use hyphens instead of slashes in tag names
+      # Tag format: "frontend-v3.0.0" instead of "frontend/v3.0.0"
+      on:
+        push:
+          tags:
+            - 'frontend-v*'
+            - 'backend-v*'
+            - 'v*'
+prevention:
+  - 'Use `**` instead of `*` in `tags:` filter patterns whenever tag names may contain slashes.'
+  - 'Apply the same `**` vs `*` awareness to `tags-ignore:`, `branches:`, and `branches-ignore:` filters.'
+  - 'Test tag filter patterns locally using `actionlint` or by pushing a test tag before finalising the workflow.'
+  - 'If adopting a path-style tag naming convention (component/vX.Y.Z), document the required `**` glob in your tag workflow template.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#filter-pattern-cheat-sheet'
+    label: 'GitHub Docs: Filter pattern cheat sheet — * vs ** behaviour'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#onpushtags'
+    label: 'GitHub Docs: on.push.tags filter'
+  - url: 'https://github.com/orgs/community/discussions/25202'
+    label: 'GitHub Community: tags filter not matching slash-containing tag names'

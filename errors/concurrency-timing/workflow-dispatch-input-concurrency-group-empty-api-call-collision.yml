@@ -1,0 +1,100 @@
+id: ct-097
+title: 'workflow_dispatch input used in concurrency group is empty string when not supplied via API — all API-triggered runs share one slot'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - workflow_dispatch
+  - inputs
+  - github.event.inputs
+  - api
+  - cancel-in-progress
+  - group-collision
+patterns:
+  - regex: 'github\.event\.inputs\.[a-zA-Z_][a-zA-Z0-9_]*'
+    flags: 'i'
+  - regex: 'concurrency:\s*\n\s+group:.*github\.event\.inputs'
+    flags: 'im'
+error_messages:
+  - '(Run was cancelled by a concurrent API-triggered run — no explicit inputs were supplied)'
+  - '(All API-triggered runs without inputs share the same concurrency slot)'
+root_cause: |
+  When a `workflow_dispatch` workflow uses `github.event.inputs.PARAM` in its concurrency
+  group expression, the behaviour differs between trigger sources:
+
+  - **GitHub UI trigger**: All inputs with no default are required and filled before dispatch.
+    The concurrency group evaluates to a non-empty value.
+  - **REST API / `gh workflow run`**: If the `inputs` key is omitted from the API payload,
+    GitHub sets each input to its `default:` value. If the input has **no `default:` defined**,
+    `github.event.inputs.PARAM` evaluates to an **empty string `''`**.
+
+  The result: every API-triggered run that omits the input shares a concurrency group that
+  ends with an empty string (e.g., `deploy-`). With `cancel-in-progress: true`, each new
+  API call without inputs silently cancels the previous one. With `cancel-in-progress: false`,
+  they all queue in the same single slot — only one runs at a time, defeating parallelism.
+
+  This also affects the `inputs` context (available in `concurrency.group` since March 2023).
+  `inputs.PARAM` and `github.event.inputs.PARAM` behave identically in this regard.
+
+  Common pattern that triggers this:
+  ```yaml
+  concurrency:
+    group: deploy-${{ github.event.inputs.environment }}
+    cancel-in-progress: true
+  ```
+  If `environment` input has no `default:` and an API caller omits it, group = `deploy-`.
+fix: |
+  Always define a `default:` for any input used in a concurrency group expression.
+  Alternatively, use a fallback expression with `||` to ensure the group is never empty.
+fix_code:
+  - language: yaml
+    label: 'Provide a default value for the input'
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            environment:
+              description: 'Target environment'
+              required: false
+              default: 'staging'   # Ensures group is never empty
+              type: choice
+              options: [staging, production]
+
+      concurrency:
+        group: deploy-${{ github.event.inputs.environment }}
+        cancel-in-progress: true
+  - language: yaml
+    label: 'Use || fallback to prevent empty concurrency group'
+    code: |
+      on:
+        workflow_dispatch:
+          inputs:
+            environment:
+              description: 'Target environment'
+              required: false
+              type: string
+
+      concurrency:
+        # Falls back to github.ref when input is empty
+        group: deploy-${{ github.event.inputs.environment || github.ref }}
+        cancel-in-progress: true
+  - language: yaml
+    label: 'Use inputs context (preferred since March 2023)'
+    code: |
+      concurrency:
+        group: deploy-${{ inputs.environment || 'default' }}
+        cancel-in-progress: true
+prevention:
+  - 'Always define a non-empty `default:` for any `workflow_dispatch` input referenced in a concurrency group.'
+  - 'Use the `inputs` context with a `||` fallback: `${{ inputs.env || github.ref }}` to guarantee a non-empty group name.'
+  - 'Test concurrency groups by triggering the workflow via the REST API without the `inputs` field to verify group names are distinct.'
+  - 'Audit all workflows that use `github.event.inputs.*` or `inputs.*` in `concurrency.group` — check that each input has a `default:` value.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency'
+    label: 'GitHub Docs: Using concurrency'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#onworkflow_dispatchinputs'
+    label: 'GitHub Docs: workflow_dispatch inputs'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#inputs-context'
+    label: 'GitHub Docs: inputs context'
+  - url: 'https://github.com/orgs/community/discussions/14606'
+    label: 'GitHub Community: workflow_dispatch inputs empty via API'
