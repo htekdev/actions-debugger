@@ -1,0 +1,100 @@
+id: sf-212
+title: 'docker/build-push-action GHA Cache mode=min Skips Pre-Stage Layers in Multi-Stage Builds'
+category: silent-failures
+severity: silent-failure
+tags:
+  - docker
+  - build-push-action
+  - cache
+  - multi-stage
+  - buildkit
+  - gha-cache
+  - mode-min
+  - intermediate-stages
+patterns:
+  - regex: 'CACHED \[build-env'
+    flags: 'i'
+  - regex: 'importing cache manifest from gha'
+    flags: ''
+  - regex: '#\d+ \[build.* CACHED\]'
+    flags: 'i'
+error_messages:
+  - "importing cache manifest from gha"
+  - "CACHED [build-env 1/4]"
+root_cause: |
+  When using `docker/build-push-action` with `cache-from: type=gha` and `cache-to: type=gha`,
+  the default cache mode is `mode=min`. In `min` mode, BuildKit only exports the layers of the
+  **final stage** of a multi-stage Dockerfile to the cache. Intermediate builder stages (e.g.,
+  `FROM golang:1.19 as build-env`) are NOT exported to the GHA cache.
+
+  On the next workflow run, when the cache is restored:
+  - The final stage layers are found in cache and restored (CACHED).
+  - The intermediate build-env stage layers are NOT in cache.
+  - BuildKit must fully re-pull and re-execute the intermediate stages from scratch.
+
+  This causes seemingly random cache misses on pre-stages. From the workflow logs, the build
+  appears to use cache (the final stage shows "CACHED"), but actual build time is barely reduced
+  because the expensive intermediate compilation step runs from scratch every time.
+
+  The fix is to use `mode=max` which exports ALL stage layers (including intermediate named
+  stages) to the GHA cache. The downside of `max` is larger cache size usage.
+
+  Source: docker/build-push-action#829 (opened Mar 2023, still open).
+fix: |
+  Add `mode=max` to the `cache-to` parameter. This instructs BuildKit to export ALL stage
+  layers (not just the final image) to the GitHub Actions cache.
+
+  **Trade-off**: `mode=max` uses more cache storage (counts against the 10 GB GHA cache limit
+  per repository). For large multi-stage builds, this can exhaust the cache budget faster.
+  Monitor cache usage via the Actions > Caches page in your repository settings.
+fix_code:
+  - language: yaml
+    label: 'Broken — mode=min (default) skips pre-stage layers'
+    code: |
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: myapp:latest
+          # Default mode=min — only exports final stage layers
+          # Pre-stages like 'AS build-env' are NOT cached
+          cache-from: type=gha
+          cache-to: type=gha,mode=min
+  - language: yaml
+    label: 'Fixed — mode=max caches all stages including pre-stages'
+    code: |
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: myapp:latest
+          # mode=max exports ALL stage layers to GHA cache
+          # Intermediate stages like 'AS build-env' are now cached
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+  - language: yaml
+    label: 'Alternative — use registry cache to avoid GHA cache size limits'
+    code: |
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: myapp:latest
+          # Registry cache supports max mode without GHA cache budget concerns
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true
+prevention:
+  - 'Always explicitly specify `mode=max` in `cache-to: type=gha,mode=max` when using multi-stage Dockerfiles to ensure pre-stage layers are cached.'
+  - 'Check build times across runs — if intermediate compile stages always show full execution time despite "cache hit" on final stages, the cache mode is likely `min`.'
+  - 'Monitor GHA cache usage in repository Settings > Actions > Caches when using `mode=max`; large images may consume the 10 GB per-repo cache limit quickly.'
+  - 'For large multi-stage builds, consider registry-based caching (type=registry) instead of type=gha to avoid GHA cache size constraints.'
+docs:
+  - url: 'https://github.com/docker/build-push-action/issues/829'
+    label: 'docker/build-push-action#829 — GHA Cache Not Caching for Pre-Stages (multi-stage builds)'
+  - url: 'https://docs.docker.com/build/cache/backends/gha/'
+    label: 'Docker Docs — GitHub Actions cache backend (mode=min vs mode=max)'
+  - url: 'https://docs.docker.com/build/guide/multi-stage/'
+    label: 'Docker Docs — Multi-stage builds'

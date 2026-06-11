@@ -1,0 +1,105 @@
+id: re-468
+title: 'setup-python Binary Non-Portable: sudo python Fails and LD_LIBRARY_PATH Required'
+category: runner-environment
+severity: error
+tags:
+  - setup-python
+  - sudo
+  - LD_LIBRARY_PATH
+  - libpython
+  - non-portable
+  - rpath
+  - self-hosted
+  - ubuntu
+patterns:
+  - regex: 'error while loading shared libraries: libpython3\.\d+\.so\.\d+: cannot open shared object file'
+    flags: 'i'
+  - regex: 'libpython3\.\d+\.so\.\d+ => not found'
+    flags: 'i'
+  - regex: 'sudo: python3?: command not found'
+    flags: 'i'
+error_messages:
+  - "error while loading shared libraries: libpython3.12.so.1.0: cannot open shared object file: No such file or directory"
+  - "libpython3.12.so.1.0 => not found"
+  - "/home/runner/_work/_tool/Python/3.12.3/x64/bin/python3: error while loading shared libraries: libpython3.12.so.1.0: cannot open shared object file"
+root_cause: |
+  The Python binary installed by `actions/setup-python` is compiled with an rpath pointing to
+  `/opt/hostedtoolcache/Python` (the original build path). However, GitHub Actions runners
+  install Python into `$RUNNER_TOOL_CACHE/Python` which resolves to
+  `/home/runner/_work/_tool/Python/` on GitHub-hosted runners.
+
+  The installed binary therefore has a stale rpath. At runtime, when Python is invoked:
+
+  1. **Directly in PATH**: Works because `setup-python` prepends the Python bin to `PATH` and
+     also sets `LD_LIBRARY_PATH` to the correct lib directory in the runner's environment.
+     The dynamic linker finds `libpython3.12.so.1.0` via `LD_LIBRARY_PATH`.
+
+  2. **Via `sudo`**: Fails. By default, `sudo` strips `LD_LIBRARY_PATH` for security reasons
+     (PAM sudoers `env_reset` is on by default). The rpath in the binary doesn't resolve to
+     the actual installation location, so `libpython3.12.so.1.0` is not found and the process
+     aborts with a shared library loading error.
+
+  3. **In child processes that don't inherit env**: Any subprocess launched without the parent's
+     environment (common in build tools) also fails.
+
+  This is a known bug tracked at actions/setup-python#871 (opened May 2024). The root fix
+  requires either compiling Python with the correct rpath at install time or using
+  `patchelf --set-rpath` post-install.
+fix: |
+  **Fix 1 — Use `sudo -E` to preserve environment variables:**
+  Pass `-E` to sudo to preserve the current user's environment, including `LD_LIBRARY_PATH`.
+
+  **Fix 2 — Explicitly set LD_LIBRARY_PATH in the sudo invocation:**
+  Pass `LD_LIBRARY_PATH` directly when invoking sudo.
+
+  **Fix 3 — Use a virtual environment:**
+  Create a venv and use the venv's Python, which links against the venv's libraries correctly.
+
+  **Fix 4 — Use system Python for sudo commands:**
+  If you need to run Python with elevated privileges, use the system Python (`/usr/bin/python3`)
+  rather than the setup-python version for sudo commands.
+fix_code:
+  - language: yaml
+    label: 'Fix — preserve LD_LIBRARY_PATH with sudo -E'
+    code: |
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Wrong: sudo strips LD_LIBRARY_PATH, libpython not found
+      # - name: Run with sudo (broken)
+      #   run: sudo python3 script.py
+
+      # Correct: preserve environment with -E
+      - name: Run with sudo (fixed)
+        run: sudo -E python3 script.py
+  - language: yaml
+    label: 'Fix — pass LD_LIBRARY_PATH explicitly to sudo'
+    code: |
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run with sudo passing LD_LIBRARY_PATH
+        run: sudo LD_LIBRARY_PATH="$LD_LIBRARY_PATH" python3 script.py
+  - language: yaml
+    label: 'Fix — use venv to avoid rpath issue'
+    code: |
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Create and use venv
+        run: |
+          python3 -m venv /opt/my-venv
+          sudo /opt/my-venv/bin/python3 script.py
+prevention:
+  - 'Avoid running `actions/setup-python`-installed Python with `sudo` without `-E` or explicit `LD_LIBRARY_PATH`.'
+  - 'Use system Python (`/usr/bin/python3`) for operations that require elevated privileges.'
+  - 'When building tools that call Python via subprocess, ensure the subprocess inherits the parent environment including LD_LIBRARY_PATH.'
+  - 'Track actions/setup-python#871 for a permanent fix involving correct rpath or patchelf at install time.'
+docs:
+  - url: 'https://github.com/actions/setup-python/issues/871'
+    label: 'setup-python#871 — Non Portable binary, doesn''t work with sudo or without LD_LIBRARY_PATH'
+  - url: 'https://docs.github.com/en/actions/use-cases-and-examples/building-and-testing/building-and-testing-python'
+    label: 'GitHub Docs — Building and testing Python'
