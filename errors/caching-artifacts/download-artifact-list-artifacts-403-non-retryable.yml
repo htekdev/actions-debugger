@@ -1,0 +1,79 @@
+id: caching-artifacts-136
+title: "download-artifact ListArtifacts intermittent 403 classified as non-retryable fails immediately"
+category: caching-artifacts
+severity: error
+tags:
+  - download-artifact
+  - artifact
+  - 403
+  - retry
+  - v5
+  - transient-error
+patterns:
+  - regex: 'Failed to ListArtifacts.*non-retryable.*403|ListArtifacts.*403.*Forbidden'
+    flags: i
+  - regex: 'Received non-retryable error.*Failed request.*403.*Forbidden'
+    flags: i
+error_messages:
+  - "Unable to download artifact(s): Failed to ListArtifacts: Received non-retryable error: Failed request: (403) Forbidden: Error from intermediary with HTTP status code 403 \"Forbidden\""
+  - "Failed to ListArtifacts: Received non-retryable error: Failed request: (403)"
+root_cause: |
+  `actions/download-artifact` v5 calls the GitHub Artifacts API to list available
+  artifacts before downloading. When an intermediary (load balancer, CDN edge node,
+  or GitHub's own infrastructure) returns a transient HTTP 403, the action classifies
+  it as a **non-retryable error** and fails immediately rather than retrying.
+
+  A 403 from an intermediary is semantically different from a 403 from the GitHub API
+  itself (which would indicate a genuine permission denial). Intermediary 403s are
+  transient and would succeed on retry. Because the artifact client treats all 403s as
+  permanent, a single intermittent infrastructure hiccup permanently fails the
+  download step with no diagnostic information.
+
+  This is tracked in actions/download-artifact#464 (Feb 2026, 5 👍 reactions).
+fix: |
+  The most reliable fix is to **re-run the failed job**. The 403 is transient and
+  the retry will usually succeed.
+
+  For automated pipelines, add retry logic at the workflow level:
+fix_code:
+  - language: yaml
+    label: "Mitigation: Add job-level retry with re-run on failure"
+    code: |
+      - name: Download artifacts (with retry)
+        id: download
+        uses: actions/download-artifact@v5
+        with:
+          name: my-artifact
+          path: dist/
+        continue-on-error: true
+
+      - name: Retry download on 403 failure
+        if: steps.download.outcome == 'failure'
+        uses: actions/download-artifact@v5
+        with:
+          name: my-artifact
+          path: dist/
+  - language: yaml
+    label: "Mitigation: Use a retry wrapper action"
+    code: |
+      - name: Download artifacts with retry
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 5
+          max_attempts: 3
+          command: |
+            gh run download ${{ github.run_id }} \
+              --name my-artifact \
+              --dir dist/
+        env:
+          GH_TOKEN: ${{ github.token }}
+prevention:
+  - "Add continue-on-error: true and a retry step for artifact downloads in critical workflows"
+  - "Consider using the gh CLI with --repo flag which also supports retry via scripting"
+  - "If 403s are frequent, check that GITHUB_TOKEN has the correct artifact:read permission"
+  - "Track actions/download-artifact#464 for an upstream fix that retries on 403"
+docs:
+  - url: "https://github.com/actions/download-artifact/issues/464"
+    label: "actions/download-artifact#464 — intermittent 403s with no retry"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-github-cli-in-workflows"
+    label: "GitHub CLI in workflows — gh run download"

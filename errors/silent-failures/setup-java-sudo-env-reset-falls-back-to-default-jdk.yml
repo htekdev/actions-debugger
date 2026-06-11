@@ -1,0 +1,98 @@
+id: silent-failures-208
+title: "setup-java configured JDK silently reverts to default JDK 17 when commands run with sudo"
+category: silent-failures
+severity: silent-failure
+tags:
+  - setup-java
+  - sudo
+  - JAVA_HOME
+  - env-reset
+  - ubuntu
+  - silent-failure
+  - sudoers
+patterns:
+  - regex: 'java.*version.*17|openjdk.*17.*2[0-9]{3}|JAVA_HOME.*sudo.*reset'
+    flags: i
+  - regex: 'sudo.*env_reset|sudoers.*secure_path.*java'
+    flags: i
+error_messages:
+  - "openjdk version \"17"
+  - "java version \"17"
+root_cause: |
+  `actions/setup-java` sets `JAVA_HOME` and prepends to `PATH` via `$GITHUB_ENV`
+  and `$GITHUB_PATH`. This correctly configures the Java version for all subsequent
+  **non-sudo** steps.
+
+  However, on Ubuntu runners, the `sudoers` configuration enables `env_reset` and
+  `secure_path` by default. When a workflow step runs commands with `sudo`, these
+  policies **strip the user environment** (including `JAVA_HOME`) and replace `PATH`
+  with a minimal secure path. The result is that `sudo java -version` uses the
+  **system-default JDK** (JDK 17 on Ubuntu 22.04/24.04 images) rather than the
+  version requested via `setup-java`.
+
+  This is a **silent failure**: the workflow succeeds, compilation may succeed using
+  the intended JDK (for non-sudo steps), but any build step that invokes `sudo mvn`,
+  `sudo ant`, `sudo gradle`, or similar will unknowingly use the wrong Java version.
+  The Debian-packaged `ant` further complicates this because its `java-wrappers.sh`
+  re-detects Java via system alternatives, completely ignoring `JAVA_HOME` even when
+  passed explicitly to `sudo`.
+
+  Confirmed in actions/setup-java#997 (Apr 2026) — GitHub Actions team acknowledged
+  it as expected OS behaviour due to `env_reset`/`secure_path`.
+fix: |
+  Pass `JAVA_HOME` and `JAVACMD` directly to the sudo invocation:
+
+  ```bash
+  sudo JAVA_HOME="$JAVA_HOME" JAVACMD="$JAVA_HOME/bin/java" ant build
+  ```
+
+  For Maven/Gradle, passing `JAVA_HOME` alone is typically sufficient:
+
+  ```bash
+  sudo JAVA_HOME="$JAVA_HOME" mvn package
+  ```
+
+  Alternatively, avoid `sudo` entirely by using a container image with the correct
+  JDK pre-installed, or configure the step to run as root using a Docker container.
+fix_code:
+  - language: yaml
+    label: "Fix: Pass JAVA_HOME and JAVACMD to sudo invocations"
+    code: |
+      - name: Set up Java 25
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Build with sudo (propagate JAVA_HOME)
+        run: |
+          # Pass JAVA_HOME explicitly — sudo env_reset strips it otherwise
+          sudo JAVA_HOME="$JAVA_HOME" JAVACMD="$JAVA_HOME/bin/java" ant build
+
+      - name: Maven with sudo (propagate JAVA_HOME)
+        run: |
+          sudo JAVA_HOME="$JAVA_HOME" mvn -B package
+  - language: yaml
+    label: "Workaround: Run build in container to avoid sudo entirely"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          container:
+            image: eclipse-temurin:25-jdk-noble
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build
+              run: mvn -B package   # No sudo needed; already root in container
+prevention:
+  - "Avoid sudo for build tool invocations — prefer running in a container image with the correct JDK"
+  - "When sudo is required, always pass JAVA_HOME and JAVACMD as explicit sudo environment overrides"
+  - "Verify the effective Java version in sudo context with: sudo java -version"
+  - "Check for Debian-packaged tools (apt install ant) that use java-wrappers.sh — they ignore JAVA_HOME and need JAVACMD"
+docs:
+  - url: "https://github.com/actions/setup-java/issues/997"
+    label: "actions/setup-java#997 — ubuntu-latest uses wrong JDK version under sudo"
+  - url: "https://github.com/actions/runner-images/blob/main/images/ubuntu/scripts/build/install-java-tools.sh"
+    label: "Runner image JDK installation — default JDK 17 set via update-alternatives"
+  - url: "https://www.sudo.ws/docs/man/sudoers.man/#SUDOERS_OPTIONS"
+    label: "sudoers manual — env_reset and secure_path"
