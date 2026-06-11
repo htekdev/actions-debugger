@@ -1,0 +1,111 @@
+id: permissions-auth-112
+title: 'GITHUB_TOKEN Release Creation Returns 422 Validation Failed in New Repositories'
+category: permissions-auth
+severity: error
+tags:
+  - GITHUB_TOKEN
+  - 422
+  - releases
+  - validation-failed
+  - new-repo
+  - workflow-permissions
+  - contents-write
+patterns:
+  - regex: 'HttpError: Validation Failed.*status.*422'
+    flags: 'i'
+  - regex: 'RequestError.*Validation Failed.*releases'
+    flags: 'i'
+  - regex: 'Validation Failed.*422.*releases'
+    flags: 'is'
+  - regex: 'Error.*422.*POST.*releases'
+    flags: 'i'
+error_messages:
+  - "RequestError [HttpError]: Validation Failed - https://api.github.com/repos/:owner/:repo/releases"
+  - "Error: HttpError: Validation Failed"
+  - "status: 422"
+  - "GitHub Release creation failed with status 422"
+root_cause: |
+  Starting in mid-November 2025, GitHub changed the default GITHUB_TOKEN permissions
+  for newly created repositories and new organizations from read-write to restricted
+  read-only. This affects the "Workflow permissions" setting under Settings → Actions →
+  General in the repository.
+
+  When a workflow calls the GitHub REST API to create a release (POST /repos/.../releases)
+  using the built-in GITHUB_TOKEN, new repos return HTTP 422 "Validation Failed" instead
+  of the expected 201 Created. This differs from the 403 "Permission denied" error seen
+  when using git push or other endpoints — the releases API returns 422 when the token
+  lacks write authorization for release creation.
+
+  Crucially, adding `permissions: contents: write` to the workflow YAML is NOT sufficient
+  if the repository or organization has enforced a read-only policy at a higher level
+  (Settings → Actions → General → Workflow permissions → "Read repository contents and
+  packages permissions"). Workflow-level `permissions:` blocks can only grant up to the
+  maximum allowed by the repo/org policy, not override it.
+
+  Repositories created before November 2025 retain their original read-write default
+  and are unaffected unless an admin explicitly tightened the policy.
+
+  Reported in GitHub Community Discussion #180355 (29 upvotes, Nov 2025) and
+  in ncipollo/release-action#570.
+fix: |
+  Option 1 (recommended): Enable read-write permissions in repo settings.
+    Settings → Actions → General → Workflow permissions → select
+    "Read and write permissions" → Save.
+
+  Option 2: Add explicit permissions block in the workflow file.
+    If the repo-level policy allows it, add `permissions: contents: write` to the
+    job or workflow. This won't help if the repo enforces read-only at org level.
+
+  Option 3: Use a Personal Access Token (PAT) with `repo` scope as a secret
+    instead of GITHUB_TOKEN for release creation — this bypasses the default policy.
+
+  Option 4 (for org admins): Set the org default to allow read-write. Navigate to
+    Organization Settings → Actions → General → Workflow permissions → "Read and
+    write permissions".
+fix_code:
+  - language: yaml
+    label: 'Fix 1: Add explicit permissions block (works if repo policy allows write)'
+    code: |
+      name: Release
+      on:
+        push:
+          tags:
+            - 'v*'
+
+      permissions:
+        contents: write   # ✅ required for release creation
+
+      jobs:
+        release:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Create Release
+              uses: softprops/action-gh-release@v2
+              # or: uses: ncipollo/release-action@v1
+  - language: yaml
+    label: 'Fix 2: Use a PAT secret as a fallback when org enforces read-only'
+    code: |
+      jobs:
+        release:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Create GitHub Release
+              uses: softprops/action-gh-release@v2
+              with:
+                token: ${{ secrets.RELEASE_PAT }}   # ✅ PAT with repo scope bypasses policy
+prevention:
+  - "After creating a new repository, immediately verify its workflow permissions: Settings → Actions → General → Workflow permissions"
+  - "For organizations, set the org-level default to 'Read and write permissions' if release workflows are part of your standard CI/CD"
+  - "Always include explicit `permissions: contents: write` in workflows that create releases so the intent is documented even if the default changes again"
+  - "Test release workflows in a new repo before relying on them in production pipelines — the repo creation date determines which default applies"
+docs:
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#modifying-the-permissions-for-the-github_token'
+    label: 'Modifying GITHUB_TOKEN permissions — GitHub Actions Security Guides'
+  - url: 'https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository#setting-the-permissions-of-the-github_token-for-your-repository'
+    label: "Setting GITHUB_TOKEN permissions for your repository"
+  - url: 'https://github.com/orgs/community/discussions/180355'
+    label: 'GitHub Community Discussion #180355 — Error 422 Validation Failed with GITHUB_TOKEN in new repos'
+  - url: 'https://github.com/ncipollo/release-action/issues/570'
+    label: 'ncipollo/release-action#570 — 422 Validation Failed on release creation'

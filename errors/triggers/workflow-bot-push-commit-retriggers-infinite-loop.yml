@@ -1,0 +1,130 @@
+id: triggers-110
+title: 'Workflow That Commits Back to Repository Re-Triggers via Push Event — Infinite Loop'
+category: triggers
+severity: error
+tags:
+  - push
+  - infinite-loop
+  - self-trigger
+  - github-actions-bot
+  - git-push
+  - workflow-loop
+  - skip-ci
+patterns:
+  - regex: 'github\.actor\s*==\s*[''"]github-actions\[bot\][''"]'
+    flags: 'i'
+  - regex: 'Queued\s+\d+ runs? (are|is) waiting'
+    flags: 'i'
+  - regex: 'Run limit reached.*workflow'
+    flags: 'i'
+  - regex: '500 queued or in-progress runs'
+    flags: 'i'
+error_messages:
+  - "Workflow re-triggered by push from github-actions[bot]"
+  - "500 queued or in-progress runs have been reached for this workflow"
+  - "Queued workflow runs are being blocked because the maximum number of queued or in-progress runs has been reached"
+root_cause: |
+  When a GitHub Actions workflow uses `git commit` and `git push` to write files back
+  to the repository (e.g., committing generated assets, version bumps, changelogs, or
+  build artifacts), the resulting push triggers the `on: push` event — which re-runs
+  the same workflow. This creates an infinite loop:
+
+    1. Developer pushes code → workflow starts
+    2. Workflow generates a file and commits it back to the branch
+    3. The new commit fires a `push` event
+    4. Workflow starts again from step 1
+    5. Repeat until workflow is manually disabled or GitHub enforces a 500-run limit
+
+  The loop is not obvious because each run appears to complete successfully — it only
+  fails or draws attention when billing minutes are exhausted, the Actions history fills
+  up with hundreds of identical runs, or GitHub blocks new runs at the 500-run limit.
+
+  GitHub does NOT automatically detect or break push-triggered self-loops. The
+  `github-actions[bot]` actor (used for GITHUB_TOKEN commits) has the same trigger
+  eligibility as a human actor by default.
+
+  Reported in GitHub Community Discussion #74772 (89 upvotes, 102 comments).
+fix: |
+  Option 1 (recommended): Skip the workflow if the triggering actor is the bot.
+    Add an `if:` condition to the job or a top-level workflow condition:
+      `if: github.actor != 'github-actions[bot]'`
+    This prevents the workflow from running when the push came from a bot commit.
+
+  Option 2: Include `[skip ci]` or `[skip actions]` in the commit message.
+    GitHub Actions recognizes `[skip ci]`, `[ci skip]`, `[skip actions]`, and
+    `[actions skip]` as special flags that suppress push/PR workflow runs.
+    Add the flag in the commit message of the bot-generated commit.
+
+  Option 3: Check the head commit author name.
+    Use `${{ github.event.head_commit.author.name }}` and skip if it equals
+    "github-actions" or your custom bot identity.
+
+  Option 4: Use a concurrency group with `cancel-in-progress: false` and skip
+    if the workflow was triggered by its own previous run (for complex pipelines).
+fix_code:
+  - language: yaml
+    label: 'Fix 1: Skip job when triggered by github-actions[bot] push'
+    code: |
+      on:
+        push:
+          branches: [main]
+
+      jobs:
+        build:
+          # ✅ prevent the bot's push from re-triggering the workflow
+          if: github.actor != 'github-actions[bot]'
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Generate artifact
+              run: ./scripts/generate.sh
+
+            - name: Commit and push generated files
+              run: |
+                git config user.name "github-actions[bot]"
+                git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+                git add generated/
+                git commit -m "chore: regenerate artifacts [skip ci]"
+                git push
+  - language: yaml
+    label: 'Fix 2: Use [skip ci] in the bot commit message'
+    code: |
+      - name: Commit generated PDF
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add output.pdf
+          # ✅ [skip ci] prevents the push from re-triggering workflows
+          git commit -m "docs: update generated PDF [skip ci]"
+          git push
+  - language: yaml
+    label: 'Fix 3: Check head commit author name at workflow level'
+    code: |
+      on:
+        push:
+          branches: [main]
+
+      # ✅ skip entire workflow if the last commit was by the bot
+      jobs:
+        generate:
+          if: >-
+            ${{ github.event.head_commit.author.name != 'github-actions[bot]' &&
+                github.event.head_commit.author.name != 'GitHub Actions' }}
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: ./generate-and-commit.sh
+prevention:
+  - "Any workflow that uses `git push` to write back to the repository must guard against re-triggering using `github.actor != 'github-actions[bot]'` or `[skip ci]`"
+  - "Prefer `[skip ci]` in bot commit messages as a belt-and-suspenders approach that works independently of how the trigger actor is evaluated"
+  - "Monitor your Actions billing minutes and job history immediately after adding any step that commits back to the repository"
+  - "Consider committing to a separate branch (e.g., `artifacts/`) that is not covered by the push trigger's `branches:` filter to avoid re-triggering"
+  - "When using `secrets.GITHUB_TOKEN` for bot commits, the actor will be `github-actions[bot]`; when using a PAT, the actor will be the PAT owner — adjust the `if:` condition accordingly"
+docs:
+  - url: 'https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-workflow-runs/skipping-workflow-runs'
+    label: 'Skipping workflow runs — using [skip ci] and [skip actions]'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context'
+    label: 'github context — github.actor and github.event.head_commit.author.name'
+  - url: 'https://github.com/orgs/community/discussions/74772'
+    label: 'GitHub Community Discussion #74772 — Endless cycle of GitHub Actions initiated by a build (89 upvotes)'

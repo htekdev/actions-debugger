@@ -1,0 +1,142 @@
+id: ku-116
+title: 'GitHub Pages Deployment Stuck in "deployment_queued" State — Times Out With No Runner'
+category: known-unsolved
+severity: error
+tags:
+  - deploy-pages
+  - github-pages
+  - deployment-queued
+  - timeout
+  - pages-infrastructure
+  - known-limitation
+patterns:
+  - regex: 'Current status: deployment_queued'
+    flags: 'i'
+  - regex: 'Error: Timeout reached, aborting!'
+    flags: 'i'
+  - regex: 'Canceling Pages deployment'
+    flags: 'i'
+  - regex: 'Getting Pages deployment status\.\.\.\s*Current status: deployment_queued'
+    flags: 'is'
+error_messages:
+  - "Current status: deployment_queued"
+  - "Getting Pages deployment status..."
+  - "Error: Timeout reached, aborting!"
+  - "Canceling Pages deployment..."
+  - "Canceled deployment with ID <deployment-id>"
+root_cause: |
+  When a workflow uses `actions/deploy-pages` to publish a GitHub Pages site, the
+  action uploads the built artifact and then polls the GitHub Pages API waiting for
+  the deployment to transition from `deployment_queued` through `deployment_in_progress`
+  to `deployment_response_ready` (success).
+
+  Occasionally, the deployment remains permanently in `deployment_queued` because
+  GitHub's Pages backend infrastructure fails to allocate a deployment slot or runner
+  for the job. This happens despite the upload completing successfully and the
+  workflow otherwise having no errors.
+
+  After approximately 10 minutes of polling `deployment_queued` with no state change,
+  `actions/deploy-pages` times out and cancels the deployment:
+    "Error: Timeout reached, aborting! Canceling Pages deployment..."
+
+  Root causes (all GitHub-side, non-deterministic):
+  1. GitHub Pages deployment queue is saturated at peak times
+  2. Transient infrastructure issues with the Pages CDN or deployment pipeline
+  3. The deployment slot was allocated but the internal job never reached the runner
+  4. Pages backend is experiencing a degraded state not reflected on githubstatus.com
+
+  This is distinct from `deploy-pages-in-progress-deployment-wedged.yml` (ct-020),
+  which covers a PREVIOUS deployment stuck in `in_progress` blocking new deploys.
+  Here, the deployment never leaves `deployment_queued` at all.
+
+  Reported widely in GitHub Community Discussions #184211 (14 upvotes) and #196717
+  (7 upvotes) across 2025-2026, with no consistent user-controllable root cause.
+fix: |
+  There is no guaranteed fix since the root cause is GitHub Pages infrastructure.
+
+  Workarounds that often resolve the issue:
+  1. Re-run the failed workflow — the deployment queue typically clears between runs
+     and the new attempt will often succeed.
+
+  2. Wait and retry — the issue usually resolves within minutes to an hour.
+
+  3. Temporarily switch Pages source to "Deploy from a branch":
+     Settings → Pages → Build and deployment → Source → Deploy from a branch
+     This uses the legacy branch-based Pages deployment which bypasses the Actions
+     deployment queue entirely.
+
+  4. Cancel any in-progress Pages deployments in the repository before re-running:
+     gh api -X POST /repos/:owner/:repo/pages/deployments/:deployment_id/cancel
+     (This may help if a previous deployment is still occupying the queue slot.)
+
+  5. Add a `timeout-minutes:` safeguard to auto-retry instead of hanging indefinitely.
+
+  This is a known GitHub Pages infrastructure limitation. File a GitHub Support
+  ticket if it recurs frequently or persists for more than a few hours.
+fix_code:
+  - language: yaml
+    label: 'Workaround: add timeout-minutes and retry logic to reduce impact'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          timeout-minutes: 15   # ✅ prevents indefinite hang if queued state persists
+          steps:
+            - name: Deploy to GitHub Pages
+              uses: actions/deploy-pages@v4
+              with:
+                timeout: 600000      # 10 minutes in milliseconds (default)
+                error_count: 5       # number of errors before failing
+                reporting_interval: 15000  # ms between status polls (default: 5000)
+  - language: yaml
+    label: 'Workaround: full Pages workflow with deploy-pages retry context'
+    code: |
+      name: Deploy Pages
+      on:
+        push:
+          branches: [main]
+
+      permissions:
+        contents: read
+        pages: write
+        id-token: write
+
+      concurrency:
+        group: pages
+        cancel-in-progress: false   # ✅ do not cancel previous deploy; let it finish or time out
+
+      jobs:
+        deploy:
+          environment:
+            name: github-pages
+            url: ${{ steps.deployment.outputs.page_url }}
+          runs-on: ubuntu-latest
+          timeout-minutes: 20
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Setup Pages
+              uses: actions/configure-pages@v5
+
+            - name: Upload artifact
+              uses: actions/upload-pages-artifact@v3
+              with:
+                path: ./dist
+
+            - name: Deploy to GitHub Pages
+              id: deployment
+              uses: actions/deploy-pages@v4
+prevention:
+  - "Add `timeout-minutes:` to the deploy job as a safeguard against indefinite hangs in deployment_queued state"
+  - "Use `concurrency: cancel-in-progress: false` on Pages deployments to avoid canceling a previous deployment that may still be in the queue (canceling it could make room for the new one)"
+  - "Monitor gh-status.com during deployments — Pages outages sometimes don't appear on githubstatus.com immediately"
+  - "Consider adding re-run logic via GitHub Actions retry mechanisms if Pages deployment is critical to your release pipeline"
+docs:
+  - url: 'https://docs.github.com/en/pages/getting-started-with-github-pages/about-github-pages#publishing-with-a-custom-github-actions-workflow'
+    label: 'GitHub Pages — Publishing with a custom GitHub Actions workflow'
+  - url: 'https://github.com/actions/deploy-pages'
+    label: 'actions/deploy-pages — GitHub Pages deployment action'
+  - url: 'https://github.com/orgs/community/discussions/184211'
+    label: 'GitHub Community Discussion #184211 — Pages deployment stuck in deployment_queued'
+  - url: 'https://github.com/orgs/community/discussions/196717'
+    label: 'GitHub Community Discussion #196717 — Actions/Pages workflows stuck in Queued state'
