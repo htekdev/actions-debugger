@@ -1,0 +1,102 @@
+id: known-unsolved-117
+title: 'deploy-pages stuck in syncing_files status — intermittent deployment timeout'
+category: known-unsolved
+severity: error
+tags:
+  - deploy-pages
+  - github-pages
+  - syncing_files
+  - timeout
+  - intermittent
+  - flaky
+patterns:
+  - regex: 'Current status: syncing_files'
+    flags: 'i'
+  - regex: 'Timeout reached, aborting deployment'
+    flags: 'i'
+  - regex: 'deploy-pages.*syncing_files.*syncing_files.*syncing_files'
+    flags: 'si'
+  - regex: 'Error: Timeout waiting for pages deployment'
+    flags: 'i'
+error_messages:
+  - "Current status: syncing_files"
+  - "Timeout reached, aborting deployment"
+  - "Error: Timeout waiting for pages deployment"
+root_cause: |
+  `actions/deploy-pages` polls the GitHub Pages deployment status API every few
+  seconds after creating the deployment. On occasion the Pages CDN infrastructure
+  enters a prolonged `syncing_files` state where file propagation to edge nodes
+  stalls or proceeds far more slowly than normal.
+
+  This is a server-side Pages infrastructure condition — the workflow has already
+  created the deployment successfully (you can see "Created deployment for …") and
+  the artifact is valid. The stuck state is caused by Pages' internal CDN sync
+  pipeline backing up, which is unrelated to the workflow or artifact content.
+
+  The `timeout` input (default: 600000 ms) is eventually exhausted and the step
+  fails with a timeout error. The deployment may ultimately succeed on GitHub's
+  side minutes later, even though the workflow job is marked as failed.
+
+  This has been an intermittent issue since at least January 2026 across many
+  repositories (actions/deploy-pages#406). It occurs in bursts — multiple failed
+  runs within minutes, then normal operation resumes.
+fix: |
+  There is no reliable fix because the root cause is server-side Pages CDN
+  congestion. Mitigation options:
+
+  1. **Re-run the failed job** — the Pages sync usually clears within a few minutes
+     and a re-run often succeeds.
+
+  2. **Increase the timeout** — set `timeout: 1800000` (30 minutes) to give the
+     sync more time. This does not fix the problem but reduces false failures:
+
+     ```yaml
+     - uses: actions/deploy-pages@v4
+       with:
+         timeout: 1800000
+     ```
+
+  3. **Accept flakiness** — use `continue-on-error: true` on the deploy step if
+     the live site is not critical to the workflow's success gate, and alert
+     separately if `outcome == 'failure'`.
+
+  4. **Check GitHub Status** — visit https://www.githubstatus.com/ to confirm
+     whether a Pages infrastructure incident is active during the outage window.
+fix_code:
+  - language: yaml
+    label: 'Increase timeout to reduce false failures during slow syncs'
+    code: |
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
+        with:
+          timeout: 1800000   # 30 minutes — gives syncing_files more time to clear
+          error_count: 10
+          reporting_interval: 5000
+  - language: yaml
+    label: 'Continue on error and report separately if not gating on deploy'
+    code: |
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
+        continue-on-error: true
+        with:
+          timeout: 900000
+
+      - name: Fail if deploy failed
+        if: steps.deploy.outcome == 'failure'
+        run: |
+          echo "::warning::Pages deployment timed out in syncing_files state."
+          echo "Check https://www.githubstatus.com/ for a Pages CDN incident."
+          exit 1
+prevention:
+  - "Monitor https://www.githubstatus.com/ for GitHub Pages incidents if deployment pipelines are time-sensitive."
+  - "Increase the `timeout` input beyond the 600-second default for large sites or during known high-traffic periods."
+  - "Use `re-run jobs` in the GitHub UI before investigating further — most syncing_files timeouts resolve on retry."
+  - "Schedule non-urgent Pages deploys at off-peak hours to reduce the chance of hitting CDN congestion."
+docs:
+  - url: 'https://github.com/actions/deploy-pages/issues/406'
+    label: 'Intermittent Deploy Failures starting 2026-01-13 (actions/deploy-pages#406)'
+  - url: 'https://www.githubstatus.com/'
+    label: 'GitHub Status page — Pages CDN incidents'
+  - url: 'https://docs.github.com/en/pages/getting-started-with-github-pages/about-github-pages'
+    label: 'About GitHub Pages — official documentation'
