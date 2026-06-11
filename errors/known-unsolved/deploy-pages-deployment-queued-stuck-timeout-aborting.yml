@@ -1,0 +1,109 @@
+id: known-unsolved-125
+title: 'deploy-pages Job Times Out With "Timeout Reached, Aborting!" When Deployment Stuck in deployment_queued State'
+category: known-unsolved
+severity: error
+tags:
+  - actions/deploy-pages
+  - pages
+  - deployment_queued
+  - timeout
+  - intermittent
+  - github-pages
+  - infrastructure
+patterns:
+  - regex: 'Timeout reached, aborting!'
+    flags: 'i'
+  - regex: 'Current status: deployment_queued'
+    flags: 'i'
+  - regex: 'Deployment failed, try again later'
+    flags: 'i'
+  - regex: 'Current status: syncing_files.*Deployment failed, try again later'
+    flags: 'is'
+error_messages:
+  - "Error: Timeout reached, aborting!"
+  - "Error: Deployment failed, try again later."
+  - "Current status: deployment_queued"
+root_cause: |
+  `actions/deploy-pages` creates a Pages deployment then polls the GitHub Pages API
+  until the deployment reaches a terminal status (`succeeded` or `failed`). The two
+  most common intermittent failure modes are:
+
+  **Mode 1 — deployment_queued stall:** The deployment is accepted by GitHub Pages but
+  never transitions out of `deployment_queued` into `syncing_files`. After the action's
+  `timeout` elapses (default: 600 000 ms = 10 min), it cancels the queued deployment
+  and throws:
+
+    Error: Timeout reached, aborting!
+
+  **Mode 2 — syncing_files failure:** The deployment progresses to `syncing_files` but
+  the backend reports a hard failure rather than completing the sync:
+
+    Error: Deployment failed, try again later.
+
+  Both modes are caused by transient instability in GitHub's Pages deployment
+  infrastructure. They are not caused by incorrect workflow configuration, artifact
+  corruption, or permissions issues. The same artifact and the same workflow succeeds
+  when re-run minutes or hours later.
+
+  These intermittent failures have been reported repeatedly:
+  - deploy-pages#406 (opened 2026-01-14 — `deployment_queued` stall + `syncing_files` failure)
+  - deploy-pages#418 (opened 2026-05-24 — `syncing_files` → "Deployment failed, try again later")
+
+  There is no user-side fix. The deployment infrastructure is fully managed by GitHub.
+  Retry is the only reliable mitigation.
+fix: |
+  Re-run the failed workflow job. GitHub Pages deployment infrastructure is typically
+  recovered within a few minutes to a few hours.
+
+  Intermediate steps to take:
+    1. Check https://www.githubstatus.com for "GitHub Pages" incidents.
+    2. Re-run the failed job from the Actions UI ("Re-run failed jobs").
+    3. If failures are persistent (multiple consecutive runs, multiple hours), open
+       a support ticket at https://support.github.com.
+
+  To reduce impact in high-churn pipelines, add a retry wrapper using a composite
+  action or loop until Pages deployment succeeds. Note: the `deploy-pages` action does
+  not have a built-in retry parameter.
+fix_code:
+  - language: yaml
+    label: "Re-run the failed job (primary fix)"
+    code: |
+      # No workflow changes required.
+      # In the GitHub Actions UI: Re-run failed jobs.
+      # Or via CLI:
+      #   gh run rerun <run-id> --failed
+  - language: yaml
+    label: "Wrap deploy-pages in a retry loop"
+    code: |
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
+        continue-on-error: true
+      - name: Retry deploy on timeout
+        if: steps.deploy.outcome == 'failure'
+        uses: actions/deploy-pages@v4
+        with:
+          timeout: 600000
+  - language: yaml
+    label: "Increase timeout for large sites that legitimately take longer"
+    code: |
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
+        with:
+          timeout: 1200000       # 20 min for large sites
+          error_count: 10
+          reporting_interval: 5000
+prevention:
+  - "Monitor https://www.githubstatus.com and set up incident notifications for 'GitHub Pages'"
+  - "Add `continue-on-error: true` + a manual re-run step for Pages deployments in release-critical pipelines"
+  - "Do not re-upload or re-create the artifact in response to this error — the artifact is not the cause"
+  - "Do not modify permissions or Pages settings when you see 'Timeout reached, aborting!' — the cause is server-side"
+docs:
+  - url: "https://github.com/actions/deploy-pages/issues/406"
+    label: "actions/deploy-pages #406 — Intermittent deploy failures: deployment_queued and syncing_files stalls (opened 2026-01-14)"
+  - url: "https://github.com/actions/deploy-pages/issues/418"
+    label: "actions/deploy-pages #418 — Error: Deployment failed, try again later (opened 2026-05-24)"
+  - url: "https://www.githubstatus.com"
+    label: "GitHub Status — check for active Pages deployment incidents"
+  - url: "https://docs.github.com/en/pages/getting-started-with-github-pages/about-github-pages"
+    label: "GitHub Pages documentation"
