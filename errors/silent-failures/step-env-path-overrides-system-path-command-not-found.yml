@@ -1,0 +1,110 @@
+id: sf-202
+title: '`env: PATH:` in a step overrides the system $PATH, causing "command not found" for installed tools'
+category: silent-failures
+severity: silent-failure
+tags:
+  - env
+  - PATH
+  - composite-action
+  - command-not-found
+  - shell
+  - bash
+  - env-variable
+  - path-override
+  - silent-failure
+patterns:
+  - regex: 'aws.*command not found|jq.*command not found|docker.*command not found'
+    flags: 'i'
+  - regex: 'bash.*command not found.*env.*PATH|PATH.*overridden.*shell'
+    flags: 'i'
+  - regex: 'No such file or directory.*usr/local/bin|usr/bin.*not in PATH'
+    flags: 'i'
+error_messages:
+  - 'aws: command not found'
+  - 'jq: command not found'
+  - 'docker: command not found'
+  - 'git: command not found'
+  - '/usr/bin/env: ''aws'': No such file or directory'
+root_cause: |
+  In GitHub Actions YAML, the `env:` block of a step sets environment
+  variables by name. If you name an environment variable `PATH`, you
+  completely replace the system `$PATH` with the value you supply. This
+  removes all standard directories such as `/usr/local/bin`, `/usr/bin`,
+  `/bin`, etc. from the shell search path.
+
+  Any shell command that relies on `$PATH` to locate its binary — `aws`,
+  `jq`, `docker`, `git`, `python3`, etc. — will fail with
+  "command not found" even though the tool is installed on the runner.
+
+  This frequently occurs in composite actions where an input is named
+  `path` (referring to, for example, an SSM parameter store path prefix,
+  a file system path, or a URL path segment) and the author passes it to
+  a step via:
+
+    env:
+      PATH: ${{ inputs.path }}
+
+  The intent is to create a variable named PATH holding a path string, but
+  the effect is to clobber the shell PATH.
+
+  The issue is completely silent: the step that sets `env: PATH:` and
+  runs inline `run:` commands may work fine because `run:` commands use
+  the current environment at step start. The breakage appears in steps that
+  execute external script files (e.g., `run: ./my-script.sh`) where the
+  script's subshell inherits the overridden `PATH`.
+
+  This was observed breaking AWS CLI and jq calls inside a bash script
+  executed from a composite action step, while the same commands worked
+  correctly in the preceding inline `run:` steps that had not yet set the
+  env override (runner-images#14220, June 2026).
+fix: |
+  Rename the step environment variable to avoid colliding with the reserved
+  system variable `PATH`.
+
+  If you need a variable that holds a filesystem path string, use a
+  descriptive name that cannot conflict with system environment variables:
+  - APP_PATH, SCRIPT_PATH, INPUT_PATH, SSM_PATH, BASE_PATH, etc.
+  - Avoid: PATH, HOME, USER, SHELL, LANG, LC_ALL, LD_LIBRARY_PATH
+
+  If you are maintaining a composite action and an existing input is named
+  `path`, pass it to steps under a different env key to avoid the conflict.
+fix_code:
+  - language: yaml
+    label: 'BROKEN — env: PATH: inadvertently overwrites system PATH'
+    code: |
+      # composite action step — DO NOT DO THIS
+      - shell: bash
+        env:
+          PATH: ${{ inputs.path }}     # ← replaces system $PATH!
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          ${{ github.action_path }}/my-script.sh  # aws/jq/docker fail inside script
+  - language: yaml
+    label: 'FIXED — rename to avoid clobbering system PATH'
+    code: |
+      # composite action step — use a distinct variable name
+      - shell: bash
+        env:
+          SSM_PATH: ${{ inputs.path }}   # ← safe: does not clobber $PATH
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          ${{ github.action_path }}/my-script.sh  # aws/jq/docker work correctly
+  - language: yaml
+    label: 'If you genuinely need to extend PATH, prepend instead of replace'
+    code: |
+      - shell: bash
+        run: |
+          echo "/my/custom/bin" >> $GITHUB_PATH  # extends PATH for all subsequent steps
+prevention:
+  - 'Never use `PATH` as an env variable name in a step. Use descriptive alternatives like `APP_PATH`, `SCRIPT_PATH`, or `SSM_PATH`.'
+  - 'Avoid naming composite action inputs `path` if they will be passed to `env:` blocks without renaming.'
+  - 'When commands fail with "command not found" for tools you know are installed, check all `env:` blocks in the current step and any preceding steps for accidental `PATH` redefinitions.'
+  - 'Use `echo $PATH` as a debug step to verify the effective PATH before the failing step.'
+  - 'To extend the PATH for subsequent steps, append to `$GITHUB_PATH` rather than setting `env: PATH:`.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/store-information-in-variables#using-the-env-context-to-access-environment-variable-values'
+    label: 'GitHub Docs: Using environment variables in steps'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions#adding-a-system-path'
+    label: 'GitHub Docs: Adding to system PATH via $GITHUB_PATH'
+  - url: 'https://github.com/actions/runner-images/issues/14220'
+    label: 'runner-images#14220 — aws/jq commands no longer available in bash sub shell'

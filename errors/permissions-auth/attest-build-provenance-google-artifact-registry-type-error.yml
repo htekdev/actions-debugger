@@ -1,0 +1,111 @@
+id: permissions-auth-113
+title: 'attest-build-provenance TypeError ERR_INVALID_ARG_TYPE when push-to-registry targets Google Artifact Registry'
+category: permissions-auth
+severity: error
+tags:
+  - attest-build-provenance
+  - google-artifact-registry
+  - gar
+  - oci
+  - push-to-registry
+  - supply-chain
+  - attestation
+  - bundle
+patterns:
+  - regex: 'ERR_INVALID_ARG_TYPE.*The first argument must be of type string or an instance of Buffer'
+    flags: 'i'
+  - regex: 'TypeError.*attest.*push.*registry|attest.*bundle.*undefined'
+    flags: 'i'
+  - regex: 'push-to-registry.*true.*TypeError|TypeError.*push.*registry.*GAR'
+    flags: 'i'
+error_messages:
+  - 'Error: TypeError [ERR_INVALID_ARG_TYPE]: The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received undefined'
+  - 'Error: TypeError: The "data" argument must be of type string or an instance of Buffer'
+root_cause: |
+  When `actions/attest-build-provenance` is used with `push-to-registry: true`
+  targeting Google Artifact Registry (GAR), the OCI push code path in
+  `@actions/attest` retrieves a signed bundle from the Sigstore transparency
+  log and then constructs an OCI manifest to push to the registry.
+
+  For GitHub Container Registry (ghcr.io) and other OCI-conformant registries,
+  the bundle is returned as a serialized string or Buffer. However, when the GAR
+  OCI client receives the attestation API response, it returns an unexpected
+  response format in which the bundle field resolves to `undefined`. The
+  downstream call to create the OCI layer blob receives `undefined` as the first
+  argument where a string or Buffer is required, triggering:
+
+    TypeError [ERR_INVALID_ARG_TYPE]: The first argument must be of type string
+    or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object.
+    Received undefined
+
+  Root cause traced to attest.ts line ~40 in @actions/attest:
+  `bundle` is `undefined` because GAR's OCI API returns a response body that
+  the client cannot parse into the expected bundle structure.
+
+  This affects workflows that:
+  1. Use `actions/attest-build-provenance` with `push-to-registry: true`
+  2. Target a Google Artifact Registry (GAR) URL as the registry host
+  3. Use any version of attest-build-provenance that hasn't incorporated the
+     GAR-specific bundle parsing fix
+fix: |
+  Work around until a fix is merged into actions/attest-build-provenance:
+
+  Option 1 — Skip GAR push and use GitHub's attestation store only:
+  Remove `push-to-registry: true` (or set it to `false`). The attestation
+  is still recorded in GitHub's OIDC-backed transparency log and can be
+  verified with `gh attestation verify` without being stored in GAR.
+
+  Option 2 — Push the attestation to GitHub Container Registry instead:
+  First push the image to ghcr.io and attest there, then re-tag and push
+  to GAR separately. The attestation bundle in ghcr.io remains valid for
+  the image digest regardless of the registry the image is ultimately served
+  from.
+
+  Option 3 — Pin to a patched version once available:
+  Track the upstream issue at actions/attest-build-provenance#666 and
+  upgrade when a release includes the GAR client fix.
+fix_code:
+  - language: yaml
+    label: 'Disable push-to-registry to unblock the pipeline'
+    code: |
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          # Remove or set to false: push-to-registry: true
+          # Attestation is still stored in GitHub Sigstore — verifiable via gh CLI
+  - language: yaml
+    label: 'Attest on ghcr.io, then re-tag to GAR'
+    code: |
+      - name: Build and push to ghcr.io
+        id: build-ghcr
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
+
+      - name: Attest on ghcr.io (works correctly)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.build-ghcr.outputs.digest }}
+          push-to-registry: true
+
+      - name: Re-tag and push to GAR (no attest-push needed)
+        run: |
+          docker pull ghcr.io/${{ github.repository }}:${{ github.sha }}
+          docker tag  ghcr.io/${{ github.repository }}:${{ github.sha }} \
+                      ${{ env.GAR_HOST }}/${{ env.GAR_PROJECT }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker push ${{ env.GAR_HOST }}/${{ env.GAR_PROJECT }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+prevention:
+  - 'When targeting Google Artifact Registry for attestation push, test with a simple smoke workflow before adding to production pipelines.'
+  - 'Check actions/attest-build-provenance release notes for GAR compatibility before upgrading.'
+  - 'Use `push-to-registry: false` (the default) if registry-stored attestations are not required — GitHub Sigstore is sufficient for most audit workflows.'
+docs:
+  - url: 'https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds'
+    label: 'GitHub Docs: Artifact Attestations'
+  - url: 'https://github.com/actions/attest-build-provenance/issues/666'
+    label: 'actions/attest-build-provenance#666 — TypeError uploading to Google Artifact Registry'
+  - url: 'https://github.com/actions/attest/blob/main/src/attest.ts'
+    label: 'attest.ts source — bundle construction'
