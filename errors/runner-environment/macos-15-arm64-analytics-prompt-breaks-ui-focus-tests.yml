@@ -1,0 +1,134 @@
+id: runner-environment-431
+title: "macOS 15 Arm64 Runner Shows Analytics Setup Prompt — Breaks UI Focus-Dependent Tests"
+category: runner-environment
+severity: error
+tags:
+  - macos
+  - macos-15
+  - analytics
+  - arm64
+  - electron
+  - ui-tests
+  - focus
+  - prompt
+  - runner-image
+  - regression
+patterns:
+  - regex: 'runs-on:\s*macos-15'
+    flags: 'i'
+  - regex: 'macos-15[-_]arm64'
+    flags: 'i'
+  - regex: 'BrowserWindow.*focus|element.*not.*interactable.*macos'
+    flags: 'si'
+error_messages:
+  - "Error: BrowserWindow can't grab focus on macos-15-arm64 runner"
+  - "element not interactable: Element is not reachable by keyboard"
+  - "Accessibility test failed: application window does not have focus"
+  - "osascript: unable to activate application: window focus stolen by system dialog"
+root_cause: |
+  Starting with macOS 15 arm64 runner image version `20260520.0085.1`, a macOS system dialog
+  prompts to "Set Up Analytics" (or a similar OS-level analytics/privacy onboarding prompt)
+  when the runner VM session starts. This dialog appears in the foreground, captures keyboard
+  focus, and causes any CI test that requires the foreground window or keyboard/mouse focus
+  to fail.
+
+  Affected test categories include:
+  - Electron app tests using `BrowserWindow.focus()` or any call that expects the app window
+    to have foreground focus
+  - Eclipse IDE tests (confirmed: Eclipse GEF, Eclipse SWT)
+  - Browser-based UI tests using focus APIs (`element.focus()`, `sendKeys`, etc.)
+  - Screenshot-based or accessibility tests that depend on the active window
+  - Any test using macOS accessibility APIs or `osascript` to interact with windows
+
+  The prompt behavior is a regression introduced in image `20260520.0085.1` on
+  macOS 15 arm64. Image version `20260428.0039.1` and earlier did not show this prompt.
+  macOS 14 (arm64), macOS 26, and all x64 macOS runners are **not** affected.
+
+  Multiple major projects confirmed the regression:
+  - GitHub Electron (actions/runs/26368726651)
+  - Eclipse GEF (eclipse-gef/gef-classic#1123)
+  - Eclipse SWT (eclipse-platform/eclipse.platform.swt#3327)
+fix: |
+  **Option 1 (recommended):** Add a step to dismiss the macOS Analytics prompt
+  programmatically before running UI tests:
+
+    - name: Dismiss macOS system prompts (prevents focus theft in UI tests)
+      run: |
+        osascript -e 'tell application "System Events" to key code 53' 2>/dev/null || true
+        sleep 1
+
+  `key code 53` is the Escape key — pressing Escape dismisses the Analytics/privacy dialog.
+  Adding `|| true` prevents the step from failing if no dialog is present.
+
+  **Option 2:** Switch to macOS 14 or macOS 26 (neither is affected by this regression):
+
+    runs-on: macos-14   # or: macos-26
+
+  Note: `macos-latest` will switch to macOS 26 in mid-June 2026, which also avoids
+  the regression.
+
+  **Option 3:** If your workflow specifically requires macOS 15 and you cannot switch,
+  disable analytics at the system level in a setup step:
+
+    - name: Disable macOS analytics (prevents prompts)
+      run: |
+        defaults write com.apple.assistant.support 'Assistant Enabled' -bool false
+        defaults write com.apple.SubmitDiagInfo AutoSubmit -bool false
+fix_code:
+  - language: yaml
+    label: 'Workaround: dismiss the Analytics prompt before UI tests'
+    code: |
+      jobs:
+        test:
+          runs-on: macos-15
+          steps:
+            - uses: actions/checkout@v6
+
+            - name: Dismiss macOS system prompts (prevents focus theft in UI tests)
+              run: |
+                # Dismiss analytics/setup dialogs introduced in image 20260520.0085.1
+                osascript -e 'tell application "System Events" to key code 53' 2>/dev/null || true
+                sleep 1   # allow the dismiss to take effect
+
+            - name: Run UI tests
+              run: npm test   # or your test command
+  - language: yaml
+    label: 'Workaround: switch to macOS 14 or macOS 26 (unaffected runners)'
+    code: |
+      jobs:
+        test:
+          # macOS 14 arm64 and macOS 26 do not show the Analytics prompt
+          runs-on: macos-14   # or: runs-on: macos-26
+          steps:
+            - uses: actions/checkout@v6
+            - name: Run UI tests
+              run: npm test
+  - language: yaml
+    label: 'Workaround: disable analytics via defaults write in setup step'
+    code: |
+      jobs:
+        test:
+          runs-on: macos-15
+          steps:
+            - uses: actions/checkout@v6
+
+            - name: Disable macOS analytics (prevents onboarding prompts from appearing)
+              run: |
+                defaults write com.apple.assistant.support 'Assistant Enabled' -bool false
+                defaults write com.apple.SubmitDiagInfo AutoSubmit -bool false
+                defaults write com.apple.PrivacyPreferences OptedOutForDiagnosticSubmission -bool true
+
+            - name: Run UI tests
+              run: npm test
+prevention:
+  - "If your macOS 15 CI runs UI tests that require window focus, always add a prompt-dismissal step before the test runner."
+  - "Monitor the actions/runner-images issue tracker for macOS image regressions — subscribe to announcements before major image version bumps."
+  - "Consider switching to `macos-26` instead of `macos-15` for new pipelines; macOS 26 is unaffected and will become the `macos-latest` default in June 2026."
+  - "Pin a specific macOS image version in your runner config if you need to reproduce test failures across image versions."
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14161'
+    label: 'actions/runner-images #14161 — macOS 15 arm64 runner shows Analytics prompt (regression since 20260520.0085.1)'
+  - url: 'https://github.com/electron/electron/actions/runs/26368726651/job/77802729527'
+    label: 'Electron CI example run — tests fail due to Analytics prompt stealing focus'
+  - url: 'https://github.com/eclipse-gef/gef-classic/issues/1123'
+    label: 'Eclipse GEF — several IDE tests fail on macOS due to Analytics prompt'
