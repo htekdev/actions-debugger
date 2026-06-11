@@ -1,0 +1,152 @@
+id: permissions-auth-115
+title: 'GITHUB_TOKEN cannot approve pull requests it authored — same actor as author restriction'
+category: permissions-auth
+severity: error
+tags:
+  - github-token
+  - pull-request-review
+  - approve
+  - github-actions-bot
+  - automation
+  - 422
+patterns:
+  - regex: 'Reviews are not allowed when the reviewer is the same actor as the author'
+    flags: 'i'
+  - regex: 'You cannot approve a pull request you authored'
+    flags: 'i'
+  - regex: 'github-actions\[bot\].*approve|approve.*github-actions\[bot\]'
+    flags: 'i'
+error_messages:
+  - 'Reviews are not allowed when the reviewer is the same actor as the author.'
+  - 'You cannot approve a pull request you authored.'
+  - 'POST /repos/{owner}/{repo}/pulls/{pull_number}/reviews failed with HTTP 422'
+root_cause: |
+  GitHub prevents an actor (user or bot) from approving a pull request that the same
+  actor created. This is a deliberate anti-self-approval safeguard in the GitHub REST
+  API for pull request reviews.
+
+  In GitHub Actions, the GITHUB_TOKEN authenticates as `github-actions[bot]`. When a
+  workflow uses this token to create a PR (e.g., opening a Dependabot-equivalent
+  automated PR, updating a changelog, or creating a release PR) and then attempts to
+  approve that same PR — either in a subsequent step or a downstream workflow — the
+  REST API call to POST /pulls/{n}/reviews with event: APPROVE returns HTTP 422 with:
+
+    "Reviews are not allowed when the reviewer is the same actor as the author."
+
+  This is a common pattern in automated PR pipelines:
+  1. Workflow A creates a PR using GITHUB_TOKEN → PR is authored by github-actions[bot]
+  2. Workflow B (or another step in A) attempts to auto-approve the PR using GITHUB_TOKEN
+  3. GitHub rejects the approval — same actor cannot approve its own PR
+
+  The restriction applies regardless of repository admin status or GITHUB_TOKEN
+  permissions. Even `pull-requests: write` + `contents: write` does not bypass it.
+  Fine-grained PATs scoped to a bot account have the same restriction if that account
+  authored the PR.
+
+  Source: GitHub REST API docs (pull request reviews endpoint), GitHub Community
+  discussions about automated PR approval workflows, Stack Overflow questions on
+  auto-approving PRs created by github-actions[bot].
+fix: |
+  Use a separate identity for the approval step — an identity different from the one
+  that created the PR:
+
+  Option 1 — GitHub App token: Create a GitHub App (separate from github-actions[bot])
+  with pull-requests: write permission and generate a token for it. The App's bot
+  account is a different actor, so it can approve PRs created by github-actions[bot].
+
+  Option 2 — Personal Access Token (PAT) from a service account: Create a dedicated
+  bot user account, generate a PAT with repo scope, store it as a repository secret,
+  and use it only for the approval step. The bot user must be a repo collaborator.
+
+  Option 3 — GitHub App with separate approval job: Split creation and approval into
+  two separate jobs. The creation job uses GITHUB_TOKEN; the approval job uses a
+  different token (GitHub App or service account PAT).
+
+  Note: The restriction also applies to PR review COMMENT and REQUEST_CHANGES — only
+  APPROVE is commonly attempted in automation, but all review event types that affect
+  the PR's merge status are subject to the same check.
+fix_code:
+  - language: yaml
+    label: 'Wrong — same GITHUB_TOKEN creates and approves the PR'
+    code: |
+      jobs:
+        create-and-approve:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Create PR
+              id: create-pr
+              uses: peter-evans/create-pull-request@v7
+              with:
+                token: ${{ secrets.GITHUB_TOKEN }}  # github-actions[bot] authors PR
+
+            - name: Approve PR (FAILS — same actor as author)
+              uses: hmarr/auto-approve-action@v4
+              with:
+                github-token: ${{ secrets.GITHUB_TOKEN }}  # 422: same actor
+                pull-request-number: ${{ steps.create-pr.outputs.pull-request-number }}
+
+  - language: yaml
+    label: 'Correct — separate token (GitHub App) approves the PR'
+    code: |
+      jobs:
+        create-pr:
+          runs-on: ubuntu-latest
+          outputs:
+            pr-number: ${{ steps.create-pr.outputs.pull-request-number }}
+          steps:
+            - name: Create PR using GITHUB_TOKEN
+              id: create-pr
+              uses: peter-evans/create-pull-request@v7
+              with:
+                token: ${{ secrets.GITHUB_TOKEN }}  # github-actions[bot] creates PR
+
+        approve-pr:
+          runs-on: ubuntu-latest
+          needs: create-pr
+          steps:
+            - name: Generate GitHub App token (different actor)
+              id: app-token
+              uses: actions/create-github-app-token@v1
+              with:
+                app-id: ${{ vars.APPROVER_APP_ID }}
+                private-key: ${{ secrets.APPROVER_APP_PRIVATE_KEY }}
+
+            - name: Approve PR using App token (different actor — succeeds)
+              uses: hmarr/auto-approve-action@v4
+              with:
+                github-token: ${{ steps.app-token.outputs.token }}
+                pull-request-number: ${{ needs.create-pr.outputs.pr-number }}
+
+  - language: yaml
+    label: 'Alternative — PAT from a dedicated service account'
+    code: |
+      jobs:
+        create-and-approve:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Create PR using GITHUB_TOKEN
+              id: create-pr
+              uses: peter-evans/create-pull-request@v7
+              with:
+                token: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Approve PR using service account PAT (different actor)
+              env:
+                GH_TOKEN: ${{ secrets.SERVICE_ACCOUNT_PAT }}  # different user
+                PR_NUMBER: ${{ steps.create-pr.outputs.pull-request-number }}
+              run: |
+                gh pr review "$PR_NUMBER" --approve --repo "$GITHUB_REPOSITORY"
+prevention:
+  - 'Never use the same token to both create and approve a PR — the GITHUB_TOKEN identity is github-actions[bot] for both operations'
+  - 'Use a GitHub App with a distinct bot identity for the approval step; GitHub Apps are first-class actors separate from github-actions[bot]'
+  - 'Audit your automation workflows: any step that calls POST /pulls/{n}/reviews with GITHUB_TOKEN will fail if that token also created the PR'
+  - 'Consider branch protection rules that require human approval in addition to or instead of automated approval to reduce self-approval automation needs'
+docs:
+  - url: 'https://docs.github.com/en/rest/pulls/reviews?apiVersion=2022-11-28#create-a-review-for-a-pull-request'
+    label: 'GitHub REST API: Create a review for a pull request'
+  - url: 'https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/making-authenticated-api-requests-with-a-github-app-in-a-github-actions-workflow'
+    label: 'Making authenticated API requests with a GitHub App in a GitHub Actions workflow'
+  - url: 'https://github.com/actions/create-github-app-token'
+    label: 'actions/create-github-app-token — generate a token for a GitHub App'
+  - url: 'https://github.com/hmarr/auto-approve-action'
+    label: 'hmarr/auto-approve-action — popular auto-approval action'
