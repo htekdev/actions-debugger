@@ -1,0 +1,157 @@
+id: triggers-114
+title: 'issue_comment trigger fires for comments on both issues AND pull requests — no native PR-only filter'
+category: triggers
+severity: silent-failure
+tags:
+  - issue_comment
+  - pull_request
+  - issues
+  - bot-commands
+  - slash-commands
+  - event-filtering
+patterns:
+  - regex: 'on:\s*\n\s*issue_comment:'
+    flags: 'ms'
+  - regex: 'on:\s*\[.*issue_comment.*\]'
+    flags: 'i'
+error_messages:
+  - 'Workflow triggered by issue comment instead of pull request comment'
+  - 'Bot command /deploy fired on an unrelated issue comment'
+  - 'issue_comment workflow running for comments on issues, not just PRs'
+root_cause: |
+  In GitHub's data model, pull requests ARE issues — every PR has an associated issue
+  number. As a result, the `issue_comment` event fires for comments added to BOTH regular
+  issues AND pull requests. There is no native trigger or filter that restricts
+  `issue_comment` to comments only on pull requests.
+
+  This surprises developers who add bot-command workflows (e.g., `/deploy`, `/approve`,
+  `/test`) expecting them to respond only to PR comments. The workflow also runs for
+  every comment on a regular issue in the repository — bug reports, feature requests,
+  and discussions — triggering unnecessary (and sometimes harmful) bot actions.
+
+  Common failure modes:
+  - A `/deploy` command handler runs when someone types "/deploy" in a bug report
+  - A bot that labels or modifies PRs runs on issue comments and fails when trying to
+    access PR-only context (e.g., `github.event.issue.pull_request` is undefined for
+    pure issues, but the step runs anyway)
+  - Workflow billing: every issue comment in an active repo triggers a workflow run,
+    consuming Actions minutes for no useful work
+  - Rate limiting: bots that make API calls per comment quickly exhaust rate limits
+
+  Note: The `pull_request_review_comment` event (not `issue_comment`) fires specifically
+  for comments on a pull request's diff/review thread. However, comments on the PR's
+  general "Conversation" tab (timeline comments) are fired as `issue_comment`, not
+  `pull_request_review_comment`.
+
+  Source: GitHub Actions documentation, GitHub Community Forum, Stack Overflow questions
+  on restricting `issue_comment` to pull requests.
+fix: |
+  Add an `if:` condition that checks `github.event.issue.pull_request` to restrict the
+  workflow (or specific jobs/steps) to comments on pull requests only.
+
+  `github.event.issue.pull_request` is a URL object present only when the issue is a
+  pull request. For regular issues, this field is undefined (falsy). Use the `toJSON`
+  function or a truthy check:
+
+    if: github.event.issue.pull_request != null
+
+  Apply this check at the job level to avoid even starting runner allocation for issue
+  comments, or at the step level to skip only the bot-command handling logic.
+
+  For commands that should run on BOTH issue and PR comments, no filter is needed —
+  but explicitly document this in the workflow file to avoid future confusion.
+fix_code:
+  - language: yaml
+    label: 'Wrong — bot command handler runs for all issue AND PR comments'
+    code: |
+      on:
+        issue_comment:
+          types: [created]
+
+      jobs:
+        handle-command:
+          runs-on: ubuntu-latest
+          # PROBLEM: runs for every comment on every issue AND every PR
+          steps:
+            - name: Check for /deploy command
+              if: contains(github.event.comment.body, '/deploy')
+              run: ./scripts/deploy.sh
+
+  - language: yaml
+    label: 'Correct — filter to PR comments only using pull_request context check'
+    code: |
+      on:
+        issue_comment:
+          types: [created]
+
+      jobs:
+        handle-command:
+          runs-on: ubuntu-latest
+          # Only run for comments on pull requests (not regular issues)
+          if: github.event.issue.pull_request != null
+          steps:
+            - name: Check for /deploy command
+              if: contains(github.event.comment.body, '/deploy')
+              run: ./scripts/deploy.sh
+
+  - language: yaml
+    label: 'Correct — alternative check using startsWith on the pull_request URL'
+    code: |
+      on:
+        issue_comment:
+          types: [created]
+
+      jobs:
+        handle-slash-command:
+          runs-on: ubuntu-latest
+          if: >
+            github.event.issue.pull_request != null &&
+            startsWith(github.event.comment.body, '/')
+          steps:
+            - name: Parse and execute slash command
+              env:
+                COMMENT: ${{ github.event.comment.body }}
+                PR_NUMBER: ${{ github.event.issue.number }}
+              run: |
+                echo "Command received on PR #$PR_NUMBER: $COMMENT"
+                case "$COMMENT" in
+                  /deploy*) ./scripts/deploy.sh ;;
+                  /test*)   ./scripts/run-tests.sh ;;
+                  *)        echo "Unknown command: $COMMENT" ;;
+                esac
+
+  - language: yaml
+    label: 'For PR-only bot commands — prefer pull_request_review_comment for diff comments'
+    code: |
+      # Use pull_request_review_comment for comments on code diffs (review threads)
+      # Use issue_comment (with PR filter) for comments on the PR conversation tab
+      on:
+        pull_request_review_comment:
+          types: [created]   # Only fires for diff/review thread comments on PRs
+        issue_comment:
+          types: [created]   # Fires for conversation-tab comments on both issues & PRs
+
+      jobs:
+        handle-review-command:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Diff comment: ${{ github.event.comment.body }}"
+
+        handle-pr-conversation-command:
+          runs-on: ubuntu-latest
+          if: github.event.issue.pull_request != null
+          steps:
+            - run: echo "PR conversation comment: ${{ github.event.comment.body }}"
+prevention:
+  - 'Always add `if: github.event.issue.pull_request != null` to jobs in issue_comment workflows that should run only for pull requests'
+  - 'Use pull_request_review_comment (not issue_comment) for workflows that respond to code review thread comments'
+  - 'Add a comment in the workflow file explaining the PR filter — the issue_comment-fires-for-PRs behavior is non-obvious'
+  - 'Test your issue_comment workflow by posting a comment on a regular issue (not a PR) to verify it does not trigger unintended actions'
+  - 'Consider rate limiting bot-command handlers to avoid exhausting GitHub API rate limits when a repo has high issue/PR activity'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#issue_comment'
+    label: 'issue_comment event — activity types and payload'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request_review_comment'
+    label: 'pull_request_review_comment event'
+  - url: 'https://docs.github.com/en/rest/issues/comments?apiVersion=2022-11-28'
+    label: 'GitHub REST API: Issue comments (covers both issues and PRs)'

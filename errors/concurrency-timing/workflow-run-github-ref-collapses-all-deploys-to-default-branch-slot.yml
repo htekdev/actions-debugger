@@ -1,0 +1,143 @@
+id: concurrency-timing-098
+title: 'workflow_run context: github.ref always resolves to default branch — concurrency groups collapse across all branches'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - workflow_run
+  - concurrency
+  - github-ref
+  - default-branch
+  - head-branch
+  - deployment
+  - cross-branch-cancellation
+patterns:
+  - regex: 'on:\s+workflow_run:'
+    flags: 'si'
+  - regex: 'github\.event\.workflow_run'
+    flags: 'i'
+error_messages:
+  - 'Unexpected cancellation of deploy workflow triggered by workflow_run'
+  - 'All workflow_run-triggered deploys sharing the same concurrency slot'
+  - 'Deploy for feature branch cancelled by deploy for main branch via workflow_run'
+root_cause: |
+  When a workflow is triggered by the `workflow_run` event, the `github.ref` context
+  variable is set to the default branch ref of the repository (e.g., `refs/heads/main`),
+  NOT the branch where the source (triggering) workflow ran.
+
+  This means that a concurrency group expression using `github.ref` on a `workflow_run`-
+  triggered workflow produces the same key for ALL triggering branches:
+
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      # Every workflow_run trigger (from any branch) produces:
+      # "deploy-refs/heads/main" ← always main, never the source branch
+
+  Developers commonly copy a concurrency group pattern from a `push`-triggered workflow
+  to a `workflow_run`-triggered downstream workflow (e.g., a build → deploy pipeline).
+  On push events, `github.ref` correctly identifies the pushed branch. On `workflow_run`
+  events, `github.ref` identifies the REPOSITORY default branch regardless of what branch
+  the source workflow ran on.
+
+  The result: every `workflow_run`-triggered deployment shares a single concurrency slot.
+  When the main branch deploys while a feature branch deployment is in progress (or
+  queued), the feature branch deployment is silently cancelled — and vice versa. The
+  cancellation looks like a normal concurrency group cancellation with no indication
+  that the wrong ref was used.
+
+  The correct context path for the source workflow's branch is:
+    github.event.workflow_run.head_branch  (branch name, e.g., "feature/my-feature")
+    github.event.workflow_run.head_sha     (the commit SHA)
+
+  Source: GitHub Actions documentation on workflow_run event context; GitHub Community
+  discussions about workflow_run deploys unexpectedly cancelling each other.
+fix: |
+  Replace `github.ref` with `github.event.workflow_run.head_branch` (or head_sha for
+  commit-level uniqueness) in the concurrency group expression of `workflow_run`-
+  triggered workflows.
+
+  github.event.workflow_run.head_branch is the branch name (e.g., "main", "feature/xyz")
+  of the workflow that triggered this run — the value you likely intended when using
+  github.ref in a push-triggered workflow.
+
+  If the workflow_run can be triggered by tag pushes (where head_branch may be the tag
+  name or empty), use github.event.workflow_run.head_sha for guaranteed uniqueness.
+fix_code:
+  - language: yaml
+    label: 'Wrong — github.ref always resolves to the default branch'
+    code: |
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+
+      # WRONG: github.ref is always "refs/heads/main" in workflow_run context
+      # All branches share the same concurrency slot → cross-branch cancellations
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: true
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          if: github.event.workflow_run.conclusion == 'success'
+          steps:
+            - run: echo "Deploying ${{ github.ref }}"  # always "refs/heads/main"
+
+  - language: yaml
+    label: 'Correct — use github.event.workflow_run.head_branch for source branch'
+    code: |
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+
+      # CORRECT: head_branch is the branch that triggered the source CI workflow
+      # Each source branch gets its own concurrency slot
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.event.workflow_run.head_branch }}
+        cancel-in-progress: true
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          if: github.event.workflow_run.conclusion == 'success'
+          steps:
+            - name: Deploy for the correct branch
+              run: |
+                echo "Deploying branch: ${{ github.event.workflow_run.head_branch }}"
+                echo "Commit SHA: ${{ github.event.workflow_run.head_sha }}"
+
+  - language: yaml
+    label: 'Alternative — use head_sha for commit-level uniqueness (avoids parallel deploys of the same branch)'
+    code: |
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+
+      concurrency:
+        # head_sha is unique per commit — safe for both branch and tag triggers
+        group: deploy-${{ github.event.workflow_run.head_sha }}
+        cancel-in-progress: false  # each commit deploy is unique; don't cancel
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          if: github.event.workflow_run.conclusion == 'success'
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.workflow_run.head_sha }}
+            - run: ./deploy.sh
+prevention:
+  - 'Never use github.ref in a workflow_run-triggered workflow for branch-discriminating logic — it always points to the default branch'
+  - 'Use github.event.workflow_run.head_branch for branch name and github.event.workflow_run.head_sha for the commit SHA in all workflow_run context expressions'
+  - 'When porting a concurrency group from a push-triggered workflow to a workflow_run-triggered workflow, replace github.ref with github.event.workflow_run.head_branch'
+  - 'Add a debug step that logs github.ref and github.event.workflow_run.head_branch side-by-side to verify the expected values during initial setup'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run'
+    label: 'workflow_run event — available context and payload'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context'
+    label: 'GitHub context — available variables by event type'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idconcurrency'
+    label: 'Workflow syntax: concurrency'

@@ -1,0 +1,158 @@
+id: yaml-syntax-115
+title: '`on:` workflow trigger key parsed as YAML 1.1 boolean `true` by third-party tools — duplicate key error or silent corruption'
+category: yaml-syntax
+severity: warning
+tags:
+  - yaml-1.1
+  - on-key
+  - boolean
+  - pyyaml
+  - third-party-tools
+  - linting
+  - parsing
+patterns:
+  - regex: 'found duplicate key'
+    flags: 'i'
+  - regex: "mapping key .?true.? already defined"
+    flags: 'i'
+  - regex: 'while constructing a mapping.*duplicate key'
+    flags: 'i'
+error_messages:
+  - 'found duplicate key "True" in mapping'
+  - 'mapping key "true" already defined at line 1'
+  - 'while constructing a mapping: duplicate key'
+  - 'yaml.constructor.ConstructorError: found duplicate key'
+root_cause: |
+  In YAML 1.1 (the spec used by PyYAML 5.x and older, and many YAML libraries), the
+  bare scalars `on`, `off`, `yes`, `no`, `y`, `n`, `true`, and `false` are all treated
+  as boolean values. Specifically, `on` resolves to `true`.
+
+  GitHub Actions correctly handles `on:` as a workflow trigger key and does not
+  interpret it as a boolean. However, third-party tools that read `.github/workflows/*.yml`
+  files using YAML 1.1-compliant parsers will parse `on:` as `true:`, producing a
+  mapping with the key `True` instead of the string `"on"`.
+
+  This breaks third-party tooling in two ways:
+
+  1. **Duplicate key error**: A workflow file with both an `on:` trigger block and any
+     other key that evaluates to `true` in YAML 1.1 raises a duplicate-key parse error:
+       yaml.constructor.ConstructorError: found duplicate key "True"
+     In practice, `on:` is the only such key in workflow files, so this error is rare
+     but occurs when tools enforce strict duplicate-key detection.
+
+  2. **Silent data corruption**: The parsed mapping contains key `True` (Python bool)
+     instead of key `"on"` (string). Tools that look up `workflow["on"]` get `None` or
+     raise a `KeyError`, causing them to misreport the workflow as having no triggers or
+     fail to process the triggers correctly.
+
+  Affected tools include:
+  - Scripts using `yaml.safe_load()` or `yaml.load()` in Python with PyYAML ≤ 5.4
+  - GitHub Actions self-hosted runners that validate workflow files with custom scripts
+  - Workflow analysis tools, compliance scanners, and custom CI generators built on
+    PyYAML (actionlint is NOT affected — it uses a purpose-built parser)
+  - GitHub Workflow parser comparisons and workflow generators written in Ruby/Go that
+    use YAML 1.1-mode parsers
+
+  Python example of the failure:
+    import yaml
+    # With PyYAML 5.x (YAML 1.1 mode):
+    data = yaml.safe_load(workflow_content)
+    print(data.keys())  # dict_keys([True, 'jobs'])  ← "on" became True (bool)
+    data['on']          # KeyError: 'on' — the key is True, not the string "on"
+
+  GitHub Actions' own runner is NOT affected — it uses a YAML parser that correctly
+  handles `on:` as the workflow trigger key string. Workflows run normally on GitHub.
+
+  Source: PyYAML issue tracker, GitHub Community discussions, Stack Overflow questions
+  about parsing GitHub Actions workflow files with Python.
+fix: |
+  For workflow files themselves: no change is needed — GitHub Actions correctly reads
+  `on:` as the trigger key. Your workflows will run as intended.
+
+  For tooling/scripts that parse workflow files:
+
+  Option 1 — Quote the `on:` key when writing workflow files used by tools that parse
+  them (this does NOT affect GitHub Actions execution):
+    'on':      # quoted — parsed as string "on" by all YAML parsers
+
+  Option 2 — Use PyYAML in YAML 1.2 mode (ruamel.yaml):
+    from ruamel.yaml import YAML
+    yaml = YAML()
+    yaml.version = (1, 2)   # YAML 1.2: "on" is NOT a boolean
+    data = yaml.load(workflow_content)
+    data['on']   # works correctly
+
+  Option 3 — Post-process the parsed dict if using PyYAML:
+    import yaml
+    data = yaml.safe_load(workflow_content)
+    # Normalize: move True key back to 'on' if present
+    if True in data and 'on' not in data:
+        data['on'] = data.pop(True)
+
+  Option 4 — Use a purpose-built workflow parser:
+    # actionlint, tj-actions/verify-changed-files, or GitHub's own schema validator
+    # all correctly handle the 'on:' trigger key without YAML 1.1 boolean conflicts
+fix_code:
+  - language: yaml
+    label: 'Workflow with unquoted on: (safe for GitHub Actions, may break PyYAML tools)'
+    code: |
+      # .github/workflows/ci.yml
+      # GitHub Actions handles this correctly; some YAML 1.1 parsers may not
+      on:
+        push:
+          branches: [main]
+        pull_request:
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+
+  - language: yaml
+    label: 'Workflow with quoted on: (universally safe for all YAML parsers)'
+    code: |
+      # .github/workflows/ci.yml
+      # Quoting 'on:' makes it unambiguous for all YAML parsers
+      'on':
+        push:
+          branches: [main]
+        pull_request:
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+
+  - language: yaml
+    label: 'Python script fix — use ruamel.yaml with YAML 1.2 to parse workflow files'
+    code: |
+      # Instead of:
+      # import yaml
+      # data = yaml.safe_load(open('.github/workflows/ci.yml'))
+      # data['on']  # KeyError or returns None with PyYAML
+
+      # Use ruamel.yaml in YAML 1.2 mode:
+      from ruamel.yaml import YAML
+      ryaml = YAML()
+      ryaml.version = (1, 2)  # YAML 1.2: bare 'on' is a string, not boolean
+      with open('.github/workflows/ci.yml') as f:
+          data = ryaml.load(f)
+      print(data['on'])  # works correctly: {'push': {'branches': ['main']}, ...}
+prevention:
+  - "When writing workflow-parsing scripts, use ruamel.yaml (YAML 1.2 mode) instead of PyYAML to avoid the 'on' = boolean issue"
+  - "Quote the 'on:' key in workflow files used by tooling: `'on':` is valid YAML and works identically in GitHub Actions"
+  - "Validate workflow-parsing tools against a test fixture containing 'on:' to detect this issue early"
+  - "Check PyYAML version: PyYAML ≥ 6.0 raises ConstructorError on duplicate keys by default; earlier versions silently produce a True key"
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#on'
+    label: "GitHub Actions workflow syntax: on (trigger definition)"
+  - url: 'https://yaml.org/type/bool.html'
+    label: 'YAML 1.1 bool type — lists on/off/yes/no as boolean aliases'
+  - url: 'https://yaml.org/spec/1.2.2/#failsafe-schema'
+    label: 'YAML 1.2 spec — no boolean aliases for on/off/yes/no'
+  - url: 'https://pypi.org/project/ruamel.yaml/'
+    label: 'ruamel.yaml — YAML 1.2 compatible Python YAML library'
