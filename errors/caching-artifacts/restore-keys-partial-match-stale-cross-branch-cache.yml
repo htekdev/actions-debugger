@@ -1,0 +1,86 @@
+id: caching-artifacts-137
+title: '`restore-keys` partial match silently restores stale cache from wrong branch or lock file'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - restore-keys
+  - cache-key
+  - stale-cache
+  - cross-branch
+  - partial-match
+  - cache-poisoning
+patterns:
+  - regex: 'Cache restored from key:.*restore-key\b'
+    flags: i
+  - regex: 'restore-keys.*partial.*match|partial.*match.*restore.key'
+    flags: i
+  - regex: 'Restored cache from.*fallback'
+    flags: i
+error_messages:
+  - 'Cache restored from key: Linux-node-'
+  - 'Cache restored using a key that does not exactly match the requested key. The cache may be stale.'
+root_cause: |
+  When `actions/cache` uses `restore-keys`, it falls back to the most recently saved cache whose
+  key starts with the given prefix if no exact key match is found. This fallback is SILENT — the
+  action reports a cache hit and does not warn that the restored cache may be outdated or from a
+  different branch.
+
+  Common scenario: a feature branch updates a lock file (e.g. `package-lock.json`) and saves a
+  new cache with a different hash in the key. When the main branch next runs, its exact cache key
+  (containing the old lock file hash) does not exist. The `restore-keys` fallback finds the feature
+  branch's cache — which has incompatible or newer dependency versions — and restores it silently.
+  Subsequent build steps may behave unexpectedly because the restored node_modules contains packages
+  from the wrong lock file.
+
+  The `cache-hit` output is set to `true` even for partial matches in some versions, making it
+  impossible to distinguish a real hit from a stale fallback without checking the full key.
+
+  This is a known design tradeoff in actions/cache: fallback keys enable faster CI at the cost of
+  potentially serving wrong caches.
+fix: |
+  Include the operating system AND lock file hash in the primary key so stale caches from different
+  branches produce different keys. Use `restore-keys` only as a broad fallback, and always re-run
+  the install step after a restore-key partial match rather than relying on the cached content being
+  correct.
+
+  To detect a partial match, check the `cache-hit` output: it returns `false` when a restore-key
+  fallback was used (as of actions/cache v3.3.0+). Run a full install step whenever `cache-hit`
+  is not `true`.
+fix_code:
+  - language: yaml
+    label: 'Include OS and lock file hash in key; conditional install on partial hit'
+    code: |
+      - name: Cache dependencies
+        id: cache-deps
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install dependencies
+        # Always install if exact cache key not found (partial hit = stale cache)
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        run: npm ci
+  - language: yaml
+    label: 'Safer: always run install even on cache hit to validate integrity'
+    code: |
+      - uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          # No restore-keys — accept only exact matches; pay the penalty of a full install on misses
+      - run: npm ci  # npm ci is idempotent; the cache only speeds up the download phase
+prevention:
+  - 'Always include the lock file hash in the primary cache key: `${{ hashFiles("**/package-lock.json") }}`.'
+  - 'Check `steps.<id>.outputs.cache-hit == "true"` (not just truthy) to distinguish exact hits from fallbacks.'
+  - 'Be conservative with `restore-keys`: a broad prefix like `Linux-node-` may match any branch''s cache.'
+  - 'Consider using `save-always: true` to ensure your branch always saves its own correct cache, reducing stale fallback hits.'
+docs:
+  - url: https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows#using-the-cache-action
+    label: GitHub Docs — Using the cache action
+  - url: https://github.com/actions/cache?tab=readme-ov-file#outputs
+    label: 'actions/cache README: cache-hit output semantics'
+  - url: https://github.com/actions/cache/blob/main/tips-and-workarounds.md#update-a-cache
+    label: 'actions/cache tips: updating a cache'
