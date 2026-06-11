@@ -1,0 +1,91 @@
+id: silent-failures-203
+title: 'checkout checks out wrong PR merge ref when same source branch has two open PRs targeting different bases'
+category: silent-failures
+severity: silent-failure
+tags:
+  - checkout
+  - pull_request
+  - merge-ref
+  - GITHUB_REF
+  - same-head-branch
+  - silent
+patterns:
+  - regex: 'refs/remotes/pull/\d+/merge'
+    flags: 'i'
+  - regex: 'Switched to branch .refs/remotes/pull/\d+/merge.'
+    flags: 'i'
+error_messages:
+  - "No error is displayed — the wrong PR branch is silently checked out"
+  - "Switched to branch 'refs/remotes/pull/924/merge'"
+root_cause: |
+  When a repository has two open pull requests sharing the same head branch but
+  targeting different base branches (e.g. `update` → `development` as PR 924 and
+  `update` → `main` as PR 925), GitHub creates a merge commit for each PR under
+  `refs/pull/{N}/merge`.
+
+  When a `pull_request` event fires for PR 925, `GITHUB_REF` is set to
+  `refs/pull/925/merge`. However, `actions/checkout` fetches remote refs and may
+  resolve the local tracking ref `refs/remotes/pull/X/merge` to the wrong PR's
+  merge commit — particularly when both PRs were recently updated and the local
+  ref cache is stale or ambiguous.
+
+  The action does not emit an error or warning. Code from PR 924's merge commit
+  (which may include conflicts or differences against its base) silently lands in
+  the workspace intended for PR 925. CI results (lint, tests, code-style checks)
+  run against the wrong diff, and false failures or false passes propagate to the
+  wrong PR's status check.
+
+  This is tracked in GitHub Community discussion #59551 and relates to how GitHub
+  manages multiple merge refs for the same head SHA.
+fix: |
+  Explicitly pass the `ref` input to `actions/checkout` using `github.ref` (the
+  PR's exact ref) rather than relying on the default auto-detection:
+
+  ```yaml
+  - uses: actions/checkout@v4
+    with:
+      ref: ${{ github.event.pull_request.head.sha }}
+  ```
+
+  Using `head.sha` instead of `github.ref` eliminates ambiguity — it fetches the
+  exact commit rather than a potentially-colliding merge ref.
+
+  Alternatively, use `github.head_ref` combined with a full fetch to ensure the
+  correct branch is checked out:
+
+  ```yaml
+  - uses: actions/checkout@v4
+    with:
+      ref: ${{ github.head_ref }}
+      fetch-depth: 0
+  ```
+fix_code:
+  - language: yaml
+    label: 'Pin checkout to the exact PR head SHA to avoid merge-ref collision'
+    code: |
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Use head SHA instead of GITHUB_REF to avoid collision when
+          # the same source branch targets multiple base branches
+          ref: ${{ github.event.pull_request.head.sha }}
+  - language: yaml
+    label: 'Alternative: checkout head_ref by branch name'
+    code: |
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+prevention:
+  - "Always pass an explicit `ref` to `actions/checkout` in pull_request workflows that check out to run tests or lint."
+  - "Use `github.event.pull_request.head.sha` (not `github.sha` or `github.ref`) for unambiguous checkout when dealing with merge refs."
+  - "Avoid repository setups where the same branch name is simultaneously the head of multiple open PRs targeting different bases — this pattern introduces merge-ref ambiguity."
+  - "In pull_request workflows, log `github.ref` and `github.sha` at the start to catch unexpected values early."
+docs:
+  - url: 'https://github.com/actions/checkout/issues/2415'
+    label: 'checkout: Action switches to wrong ref when same source branch targets two bases'
+  - url: 'https://github.com/orgs/community/discussions/59551'
+    label: 'GitHub Community: wrong PR merge ref with same head branch'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context'
+    label: 'GitHub context — github.ref vs github.event.pull_request.head.sha'
