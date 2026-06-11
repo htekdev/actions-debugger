@@ -1,0 +1,137 @@
+id: ys-113
+title: 'Matrix `include` entry with no matching base combination creates orphan standalone job instead of extending existing job'
+category: yaml-syntax
+severity: silent-failure
+tags:
+  - matrix
+  - include
+  - standalone-job
+  - matrix-include
+  - unexpected-job
+  - yaml-config
+  - strategy
+patterns:
+  - regex: 'matrix.*include.*no.*match|include.*matrix.*orphan|include.*does.*not.*match.*combination'
+    flags: 'i'
+  - regex: 'unexpected.*matrix.*job|matrix.*extra.*job.*include'
+    flags: 'i'
+error_messages:
+  - "Unexpected standalone matrix job created from include entry with no matching base combination"
+  - "Matrix include entry creates new job because no base matrix combination matches"
+root_cause: |
+  GitHub Actions matrix `include:` entries have two distinct behaviors depending on
+  whether they match an existing base matrix combination:
+
+  1. **Match found**: If an `include` entry's keys exactly match an existing matrix
+     combination, the extra keys in the `include` entry are *merged* into that job.
+  2. **No match found**: If an `include` entry does not match ANY existing combination
+     (i.e., the keys don't correspond to any entry in the base matrix arrays), GitHub
+     Actions creates a **brand-new standalone job** with only the properties from
+     the `include` entry itself.
+
+  This second behavior is frequently unexpected. Common triggers:
+
+  - **Typo in the include key**: `os: windows-latest` in include but `os: [ubuntu-latest]`
+    in the base matrix — the include key value doesn't match any base entry, so a new
+    standalone Windows job is created with only the include properties.
+  - **Intent to add a one-off job**: Some developers intentionally use `include` to
+    add a non-matrix standalone job (e.g., add a `docs-build` job via include). This
+    works but surprises reviewers who don't expect `include` to create new jobs.
+  - **Variable rename**: Renaming a matrix variable (e.g., `runner` → `os`) without
+    updating `include:` entries breaks the match, silently creating orphan jobs with
+    only the old variable set.
+  - **Partial include**: Including only some keys of a multi-dimensional matrix
+    (e.g., `{os: ubuntu-latest}` in include when base has `{os: [...], node: [...]}`).
+    GitHub requires ALL base matrix dimensions to match — a partial key match creates
+    a standalone job, not a merge.
+
+  The orphan job runs successfully but lacks the expected matrix variables, causing
+  steps that reference those variables to use empty strings, evaluate incorrectly,
+  or skip silently.
+fix: |
+  **To merge include properties into existing jobs**: Ensure ALL base matrix dimension
+  keys are present in the include entry with values that exactly match an existing
+  base combination.
+
+  **To intentionally create a standalone job**: Use an explicit separate job in the
+  workflow rather than an `include` entry — this makes intent clear to reviewers.
+
+  **To debug**: Check the workflow run's job list in the GitHub UI. Orphan include
+  entries appear as jobs with fewer variables than expected, or with different
+  `matrix.*` context values than the base jobs.
+
+fix_code:
+  - language: yaml
+    label: 'Broken — include key value mismatches base matrix; creates orphan standalone job'
+    code: |
+      jobs:
+        test:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, macos-latest]
+              node: [18, 20]
+              include:
+                # ✗ No base combination has os: windows-latest
+                # → creates a STANDALONE job {os: windows-latest, node: 22}
+                # instead of merging node: 22 into an existing os combo
+                - os: windows-latest
+                  node: 22
+          runs-on: ${{ matrix.os }}
+          steps:
+            - uses: actions/setup-node@v4
+              with:
+                node-version: ${{ matrix.node }}
+
+  - language: yaml
+    label: 'Fixed — include matches existing base combination for property injection'
+    code: |
+      jobs:
+        test:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, macos-latest, windows-latest]  # add windows to base
+              node: [18, 20]
+              include:
+                # ✓ os: windows-latest IS in the base matrix → node: 22 added ONLY to Windows jobs
+                - os: windows-latest
+                  node: 22
+                  extra-flag: '--no-sandbox'  # extra prop injected into windows combos
+          runs-on: ${{ matrix.os }}
+
+  - language: yaml
+    label: 'Intentional standalone job — use separate job, not include'
+    code: |
+      jobs:
+        test:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, macos-latest]
+              node: [18, 20]
+          runs-on: ${{ matrix.os }}
+          steps:
+            - run: npm test
+
+        windows-special:
+          runs-on: windows-latest   # ✓ separate job, intent is clear
+          steps:
+            - run: npm test -- --no-sandbox
+
+prevention:
+  - 'When writing `include:` entries intended to merge into existing jobs, always
+    include ALL base matrix dimensions as keys, with values that exactly match an
+    existing combination. Partial key matches create orphan jobs, not merges.'
+  - 'After modifying a matrix strategy, verify the expected job count in the GitHub
+    Actions UI. Count should equal (product of base matrix sizes) + (standalone
+    include entries that have no base match).'
+  - 'Use a separate named job (not include) for any job that intentionally differs
+    from the matrix pattern — this makes the intent obvious to reviewers and avoids
+    confusing the include merge mechanism.'
+  - 'When renaming matrix variables, update ALL `include:` entries that reference
+    the old variable name simultaneously to avoid silently creating orphan jobs.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/running-variations-of-jobs-in-a-workflow#adding-configurations'
+    label: 'GitHub Docs: Adding configurations to matrix — include behavior with and without matches'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idstrategymatrixinclude'
+    label: 'GitHub Docs: Workflow syntax — jobs.<job_id>.strategy.matrix.include'
+  - url: 'https://github.com/orgs/community/discussions/7835'
+    label: 'GitHub Community #7835: Matrix include adds unexpected standalone job (orphan behavior)'

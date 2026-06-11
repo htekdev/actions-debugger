@@ -1,0 +1,120 @@
+id: ca-134
+title: '`actions/upload-artifact@v4` fails with "EPERM: operation not permitted, stat" on Windows runners'
+category: caching-artifacts
+severity: error
+tags:
+  - upload-artifact
+  - windows
+  - eperm
+  - stat
+  - file-permissions
+  - windows-runner
+  - v4
+patterns:
+  - regex: 'EPERM: operation not permitted, stat'
+    flags: 'i'
+  - regex: 'Error: EPERM: operation not permitted, stat .D:\\\\a\\\\'
+    flags: 'i'
+  - regex: 'upload-artifact.*EPERM|EPERM.*upload-artifact'
+    flags: 'i'
+error_messages:
+  - "Error: EPERM: operation not permitted, stat 'D:\\a\\<repo>\\<repo>\\<file>'"
+  - "Error: EPERM: operation not permitted, stat 'D:\\a\\_temp\\...'"
+root_cause: |
+  `actions/upload-artifact@v4` (and v5+) calls Node.js `fs.stat()` on every file
+  it discovers while walking the upload path. On Windows NTFS, certain files and
+  directories are protected at the OS level — notably:
+
+  - **System/hidden junctions**: Directories like `D:\a\<repo>` may contain
+    hidden NTFS reparse points (junctions) created by the runner or previous
+    steps. The runner account (`SYSTEM` or a restricted service account) has
+    read-write access to the workspace but may lack `TRAVERSE` rights on certain
+    OS-managed junction targets.
+  - **Antivirus-locked files**: AV software (Windows Defender, third-party) can
+    hold exclusive locks on files it is scanning, causing `stat()` to return
+    `EACCES` or `EPERM` on Windows.
+  - **Files created by Docker steps**: When a workflow step runs a Docker-based
+    action on Windows (e.g., a Windows container action), files created inside
+    the container may be owned by the container user, making them unreadable to
+    the host runner service account.
+
+  The `stat()` call is used by the upload action to determine file size and
+  existence before uploading. When `stat()` throws `EPERM`, the action does not
+  catch the error gracefully and propagates it as an unhandled exception, failing
+  the step with the raw Node.js `EPERM` message.
+
+  The root cause tracked in `actions/upload-artifact#295` ("V4 no longer relies
+  on the stat command in any way") was about the shell `stat` command. The Node.js
+  `fs.stat()` issue (`#758`) is a separate regression unique to Windows and
+  specific file/directory states in the workspace.
+fix: |
+  **Option 1 (Most common) — Exclude the problematic path:**
+  Use the `path` input with explicit exclusions or target only the specific files
+  you want to upload rather than the entire workspace:
+
+  **Option 2 — Pin to a known-working upload-artifact version:**
+  Check the `actions/upload-artifact` releases page. Some patch versions have
+  temporarily resolved the EPERM handling. Pin to the latest patch of v4 or
+  migrate to v6+.
+
+  **Option 3 — Upload from a specific subdirectory:**
+  Instead of uploading `${{ github.workspace }}` or the root, narrow the `path`
+  to only the build output directory where you control file creation.
+
+  **Option 4 — Disable Windows real-time protection during upload:**
+  Add a step to disable Windows Defender real-time monitoring immediately before
+  the upload step (requires Administrator privileges on self-hosted runners):
+  `Set-MpPreference -DisableRealtimeMonitoring $true`
+
+fix_code:
+  - language: yaml
+    label: 'Broken — uploading entire workspace hits EPERM on protected Windows paths'
+    code: |
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: ${{ github.workspace }}   # ✗ EPERM on junctions, AV-locked, or container-owned files
+
+  - language: yaml
+    label: 'Fixed — narrow path to specific build output directory'
+    code: |
+      - name: Build
+        run: cmake --build build/ --config Release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: build/Release/            # ✓ only upload files you own and created
+
+  - language: yaml
+    label: 'Fixed — exclude known problematic directories'
+    code: |
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artifacts
+          path: |
+            ${{ github.workspace }}/dist/
+            !${{ github.workspace }}/.git/
+            !${{ github.workspace }}/_work/
+
+prevention:
+  - 'Always specify a precise `path` in `upload-artifact` targeting only directories
+    you write to during the build — avoid uploading the entire `${{ github.workspace }}`
+    or `D:\a\<repo>` root on Windows runners.'
+  - 'Be aware that Windows container actions (Docker-based) create files owned by
+    the container user. Those files may be inaccessible to the host runner service
+    account when stat() or read operations are attempted.'
+  - 'On self-hosted Windows runners, ensure the runner service account has full
+    NTFS permissions on the workspace directory tree, including traverse rights
+    on all subdirectory ACLs.'
+  - 'Upgrade to `actions/upload-artifact@v5` or later which has improved error
+    handling and retry logic around file access errors on Windows.'
+docs:
+  - url: 'https://github.com/actions/upload-artifact/issues/758'
+    label: 'actions/upload-artifact#758: EPERM operation not permitted stat on Windows v4 (Feb 2026)'
+  - url: 'https://github.com/actions/upload-artifact/issues/295'
+    label: 'actions/upload-artifact#295: V4 no longer relies on stat command'
+  - url: 'https://github.com/actions/upload-artifact/issues/324'
+    label: 'actions/upload-artifact#324: Windows EPERM follow-up'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-workflow-data-as-artifacts'
+    label: 'GitHub Docs: Storing workflow data as artifacts'
