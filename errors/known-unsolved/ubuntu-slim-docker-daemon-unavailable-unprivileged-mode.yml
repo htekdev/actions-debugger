@@ -1,0 +1,123 @@
+id: known-unsolved-134
+title: '`ubuntu-slim` Runner Cannot Run Docker Daemon or Docker-Based Actions — Unprivileged Mode Limitation'
+category: known-unsolved
+severity: limitation
+tags:
+  - ubuntu-slim
+  - docker
+  - unprivileged-mode
+  - docker-daemon
+  - docker-based-actions
+  - marketplace
+  - iptables
+  - single-cpu-runner
+  - docker-socket
+patterns:
+  - regex: 'failed to connect to the docker API at unix:///var/run/docker\.sock.*no such file or directory'
+    flags: 'i'
+  - regex: 'failed to start daemon.*iptables not found|iptables.*nf_tables.*Permission denied.*you must be root'
+    flags: 'i'
+  - regex: 'Docker pull failed with exit code 1.*docker\.sock'
+    flags: 'i'
+  - regex: 'dial unix /var/run/docker\.sock: connect: no such file or directory'
+    flags: 'i'
+error_messages:
+  - "failed to connect to the docker API at unix:///var/run/docker.sock; check if the path is correct and if the daemon is running: dial unix /var/run/docker.sock: connect: no such file or directory"
+  - "Docker pull failed with exit code 1, back off 3.782 seconds before retry."
+  - "failed to start daemon: Error initializing network controller: error obtaining controller instance: failed to register \"bridge\" driver: failed to create NAT chain DOCKER: iptables not found"
+  - "iptables v1.8.10 (nf_tables): Could not fetch rule set generation id: Permission denied (you must be root)"
+root_cause: |
+  `ubuntu-slim` is a **single-CPU, low-cost runner image** designed for simple, fast
+  Node.js or shell-only workflows. It runs in **unprivileged (rootless) mode** — without
+  the Linux capabilities required to start a Docker daemon (`CAP_NET_ADMIN`,
+  `CAP_SYS_ADMIN`) or create iptables NAT chains for Docker networking.
+
+  Although `ubuntu-slim` ships with the Docker CLI binary installed (which makes the
+  error messages confusing), the Docker daemon (`dockerd`) cannot be started because:
+
+  1. `iptables` is either absent or cannot create NAT chains in the unprivileged container.
+  2. Docker bridge networking requires `CAP_NET_ADMIN` which is not granted to the runner.
+  3. The Docker socket at `/var/run/docker.sock` does not exist or cannot be created.
+
+  Workflows that fail on `ubuntu-slim` with these errors include:
+  - Any `run:` step that calls `docker pull`, `docker run`, or `docker build`
+  - Marketplace actions implemented as **Docker container actions** (those with
+    `using: docker` in `action.yml`) — the runner tries to pull/run the action image
+  - `docker/setup-docker-action` and `docker/setup-buildx-action`
+  - Any action that dynamically pulls container images as part of its logic
+
+  This limitation is **by design** and is documented in GitHub's single-CPU runner docs.
+  GitHub acknowledged the issue in actions/runner-images#13583 and noted they will
+  remove Docker components from the image to eliminate false expectations. Until then,
+  the Docker CLI is present but practically non-functional on `ubuntu-slim`.
+fix: |
+  There is no fix that enables Docker on `ubuntu-slim`. The Docker socket does not
+  exist and privileged access cannot be granted.
+
+  **Option 1 (recommended)**: Use `ubuntu-latest` or `ubuntu-24.04`. These images run in
+  privileged mode with full Docker daemon support.
+
+  **Option 2**: Audit your workflow for Docker-based marketplace actions. If an action
+  has `using: docker` in its `action.yml`, it will not work on `ubuntu-slim`. Replace
+  with a JavaScript/composite equivalent if available.
+
+  **Option 3**: Use a self-hosted runner with Docker installed if you need `ubuntu-slim`
+  speed/cost characteristics combined with Docker.
+
+  To verify whether a marketplace action requires Docker, inspect its `action.yml` file:
+  if `runs.using` equals `docker`, it is a Docker container action and will fail on
+  `ubuntu-slim`.
+fix_code:
+  - language: yaml
+    label: 'Switch from ubuntu-slim to ubuntu-latest for Docker-dependent workflows'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest  # ✅ Full Docker support — privileged mode
+          # runs-on: ubuntu-slim  # ❌ Docker daemon unavailable — unprivileged mode
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Build Docker image
+              run: docker build -t myapp:latest .
+
+            - name: Run Docker-based marketplace action
+              uses: some-org/some-docker-action@v1  # uses: docker in action.yml
+
+  - language: yaml
+    label: 'Identify Docker-based actions before choosing ubuntu-slim'
+    code: |
+      # In the action repository, look at action.yml:
+      #
+      # ❌ Docker-based — CANNOT run on ubuntu-slim:
+      # runs:
+      #   using: docker
+      #   image: Dockerfile
+      #
+      # ✅ JavaScript-based — CAN run on ubuntu-slim:
+      # runs:
+      #   using: node20
+      #   main: dist/index.js
+      #
+      # ✅ Composite action (shell steps only) — CAN run on ubuntu-slim:
+      # runs:
+      #   using: composite
+      #   steps:
+      #     - run: echo hello
+      #       shell: bash
+
+      # Safe on ubuntu-slim: Node.js actions, composite shell-only actions
+      # Not safe on ubuntu-slim: Docker container actions, docker CLI in run steps
+
+prevention:
+  - 'Before switching to `ubuntu-slim`, audit all `uses:` steps in your workflow. Check each action'"'"'s `action.yml` for `using: docker` — any Docker-based action will fail on `ubuntu-slim`.'
+  - 'Use `ubuntu-slim` only for lightweight workflows: linting, formatting, Node.js scripts, and composite shell actions that have no Docker dependency.'
+  - 'If you discover a marketplace action is Docker-based, look for a Node.js alternative or fork the action to create a Node.js implementation.'
+  - 'Run a test workflow with `docker info || echo "Docker unavailable"` on `ubuntu-slim` to confirm Docker is not available before migrating a full workflow.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/13583'
+    label: 'actions/runner-images#13583 — Docker pull failed on ubuntu-slim (acknowledged design limitation)'
+  - url: 'https://docs.github.com/en/actions/reference/runners/github-hosted-runners#single-cpu-runners'
+    label: 'GitHub Docs — Single-CPU runners (ubuntu-slim) specifications and limitations'
+  - url: 'https://github.com/actions/runner-images/pull/13542'
+    label: 'actions/runner-images#13542 — ubuntu-slim introduction PR'
