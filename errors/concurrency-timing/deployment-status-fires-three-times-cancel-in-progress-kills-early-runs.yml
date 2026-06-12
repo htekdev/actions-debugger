@@ -1,0 +1,153 @@
+id: ct-101
+title: '`deployment_status` Event Fires Up to Three Times per Deployment — `cancel-in-progress` Cancels Setup and Mid-Deploy Runs'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - deployment_status
+  - cancel-in-progress
+  - deployment
+  - webhook
+  - three-events
+patterns:
+  - regex: 'on:\s*\n\s+deployment_status'
+    flags: 'si'
+  - regex: 'deployment_status.*cancel|cancel.*deployment_status'
+    flags: 'i'
+  - regex: 'github\.event\.deployment_status\.state'
+    flags: 'i'
+error_messages:
+  - 'This run was automatically cancelled'
+  - 'Canceling since a higher priority waiting run was found'
+  - 'Deployment notification workflow never completes'
+root_cause: |
+  The `deployment_status` webhook event fires up to THREE times for a single
+  deployment, corresponding to each state transition in the deployment lifecycle:
+
+    1. `pending`   — deployment created, waiting to start
+    2. `in_progress` — deployment has started executing
+    3. `success` / `failure` / `error` — deployment has completed
+
+  Each state transition triggers a separate `deployment_status` event, which
+  creates a separate workflow run. If those runs share the same concurrency
+  group (e.g., keyed on `github.event.deployment.environment`) and
+  `cancel-in-progress: true` is set, the sequence is:
+
+    Run #1 triggered by `pending` state → starts
+    Run #2 triggered by `in_progress` state → cancels Run #1, starts
+    Run #3 triggered by `success` state → cancels Run #2, starts and completes
+
+  Consequence: workflow runs triggered by `pending` and `in_progress` events
+  are ALWAYS cancelled before completion. Only the final `success`/`failure`
+  run completes. Users whose workflow is supposed to send a "deploy started"
+  Slack notification (triggered on `in_progress`) never see the notification,
+  or see it followed immediately by a cancellation.
+
+  Additionally, using `github.event.deployment_status.state` to branch logic
+  within a single workflow run is unaffected — but using a shared concurrency
+  group across all state transitions wipes out state-specific runs.
+
+  This is distinct from the normal concurrency serialization pattern because
+  the three events are not user-triggered: GitHub's deployment API fires them
+  automatically as the external CD system updates the deployment status.
+fix: |
+  Option 1 — Include the deployment status state in the concurrency group key
+  so each state transition gets its own slot:
+
+    concurrency:
+      group: deploy-notification-${{ github.event.deployment.environment }}-${{ github.event.deployment_status.state }}
+      cancel-in-progress: false
+
+  Option 2 — Filter which states trigger the workflow using an `if` condition
+  at the workflow level, and only trigger on the final state:
+
+    on:
+      deployment_status:
+    jobs:
+      notify:
+        if: github.event.deployment_status.state == 'success' || github.event.deployment_status.state == 'failure'
+
+  Option 3 — Remove `cancel-in-progress: true` from workflows that are
+  intentionally triggered by `deployment_status` across multiple states.
+  Each state produces a distinct run that should complete independently.
+
+  Option 4 — Handle all state transitions in a single workflow using an
+  `if` condition per job, not per workflow run, to process each state:
+
+    jobs:
+      on-pending:
+        if: github.event.deployment_status.state == 'pending'
+      on-in-progress:
+        if: github.event.deployment_status.state == 'in_progress'
+      on-completed:
+        if: contains(fromJSON('["success","failure","error"]'), github.event.deployment_status.state)
+fix_code:
+  - language: yaml
+    label: 'Incorrect: shared concurrency group cancels pending and in_progress runs'
+    code: |
+      on:
+        deployment_status:
+      concurrency:
+        group: deploy-${{ github.event.deployment.environment }}
+        cancel-in-progress: true  # Kills pending/in_progress state runs!
+      jobs:
+        notify:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "Deploy state is ${{ github.event.deployment_status.state }}"
+  - language: yaml
+    label: 'Option A: include state in concurrency key so each transition gets its own slot'
+    code: |
+      on:
+        deployment_status:
+      concurrency:
+        group: deploy-${{ github.event.deployment.environment }}-${{ github.event.deployment_status.state }}
+        cancel-in-progress: false
+      jobs:
+        notify:
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./notify.sh "${{ github.event.deployment_status.state }}"
+  - language: yaml
+    label: 'Option B: filter to only final states — avoid triggering on transient states'
+    code: |
+      on:
+        deployment_status:
+      jobs:
+        notify:
+          if: |
+            github.event.deployment_status.state == 'success' ||
+            github.event.deployment_status.state == 'failure'
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./notify.sh "${{ github.event.deployment_status.state }}"
+  - language: yaml
+    label: 'Option C: single workflow, per-job state filtering — no shared concurrency needed'
+    code: |
+      on:
+        deployment_status:
+      jobs:
+        notify-started:
+          if: github.event.deployment_status.state == 'in_progress'
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./notify-started.sh
+        notify-complete:
+          if: |
+            github.event.deployment_status.state == 'success' ||
+            github.event.deployment_status.state == 'failure'
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./notify-complete.sh "${{ github.event.deployment_status.state }}"
+prevention:
+  - 'Never use `cancel-in-progress: true` with a `deployment_status` workflow that handles multiple state transitions via the same concurrency group'
+  - 'Always include `github.event.deployment_status.state` in your concurrency group key, or filter by state using `if` conditions'
+  - 'Test `deployment_status` workflows by watching the Actions tab during a real deployment — expect 3 runs to appear for a successful deployment'
+  - 'Document the expected number of runs per deployment in your workflow YAML comments'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#deployment_status'
+    label: 'GitHub Docs: Events that trigger workflows — deployment_status'
+  - url: 'https://docs.github.com/en/rest/deployments/statuses'
+    label: 'GitHub REST API: Deployment statuses'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency'
+    label: 'GitHub Docs: Using concurrency'
