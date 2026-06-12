@@ -1,0 +1,88 @@
+id: ku-131
+title: 'setup-node mirror input is only a download fallback — node pulled from github.com when version is found in manifest'
+category: known-unsolved
+severity: limitation
+tags:
+  - setup-node
+  - mirror
+  - artifactory
+  - nexus
+  - self-hosted
+  - known-limitation
+  - node-distribution
+  - air-gapped
+patterns:
+  - regex: 'Downloading node from.*github\.com|node-versions.*releases.*download'
+    flags: 'i'
+  - regex: 'Found in cache.*node|Resolved node version.*from manifest'
+    flags: 'i'
+error_messages:
+  - '(no error — node is silently downloaded from github.com instead of the configured mirror URL)'
+  - 'Downloading node from https://github.com/actions/node-versions/releases/download/...'
+root_cause: |
+  The `mirror` and `mirror-token` inputs in `actions/setup-node` are intended to
+  support authenticated artifact mirrors (e.g., JFrog Artifactory, Sonatype Nexus).
+  However, the action's resolution logic always consults the GitHub-hosted versions
+  manifest FIRST. When the requested version is found in the manifest, node is
+  downloaded directly from `github.com/actions/node-versions` — the mirror URL is
+  never used.
+
+  The mirror is only consulted in these cases:
+  1. The requested version is NOT present in the GitHub versions manifest (e.g., nightly,
+     RC versions, custom versions).
+  2. The primary download from GitHub fails (network error, timeout).
+
+  This means that for all stable Node.js releases (which are all in the manifest),
+  setup-node bypasses the configured mirror entirely. Organizations using mirrors
+  for security compliance, bandwidth optimization, or air-gapped environments cannot
+  force setup-node to use their mirror as the primary download source.
+
+  This is by design per setup-node maintainers (confirmed in issue #1412): "The mirror
+  input is intended as an alternative source and is used only as a fallback when the
+  required version is not present in the manifest or cannot be downloaded."
+fix: |
+  There is no supported way to force setup-node to always download from a mirror for
+  versions present in the GitHub manifest. The following workarounds exist:
+
+  Option A — Block github.com at the network level (forces mirror fallback):
+    When the primary download fails due to network policy, setup-node falls back to
+    the mirror automatically. Requires network-level controls outside of GitHub Actions.
+
+  Option B — Pre-install node in a custom runner image:
+    Bundle the required Node.js version into your self-hosted runner or ARC container
+    image; setup-node will detect the cached version and skip the download entirely.
+
+  Option C — Use runner cache with a pre-populated tool cache:
+    Place node binaries in the runner's RUNNER_TOOL_CACHE directory; setup-node skips
+    download when the exact version is found in the tool cache.
+
+  Track upstream: actions/setup-node#1412 — there is no current ETA for mirror-first support.
+fix_code:
+  - language: yaml
+    label: 'Current behavior — mirror is configured but node still downloads from github.com'
+    code: |
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.20.0'
+          mirror: 'https://artifactory.example.com/nodejs-remote'
+          mirror-token: ${{ secrets.MIRROR_TOKEN }}
+          # NOTE: For stable versions in the manifest, this still downloads from
+          # github.com/actions/node-versions — the mirror is NOT used as primary source.
+  - language: yaml
+    label: 'Workaround — pre-populate runner tool cache to skip download entirely'
+    code: |
+      # On your self-hosted runner or ARC image, pre-download node binaries to:
+      # $RUNNER_TOOL_CACHE/node/<version>/<arch>/
+      #
+      # setup-node checks this directory first and skips network download
+      # if the exact version+arch is found, regardless of mirror configuration.
+prevention:
+  - 'Do not rely on the mirror input for compliance enforcement — it is a fallback only'
+  - 'For true mirror-first enforcement, block outbound access to github.com at the network level'
+  - 'Use pre-built runner images with node bundled in RUNNER_TOOL_CACHE for air-gapped environments'
+  - 'Track actions/setup-node#1412 for upstream progress on mirror-as-primary support'
+docs:
+  - url: 'https://github.com/actions/setup-node/issues/1412'
+    label: 'setup-node#1412 — Node distributions not pulled from authenticated mirrors'
+  - url: 'https://github.com/actions/setup-node#usage'
+    label: 'setup-node usage documentation — mirror input'

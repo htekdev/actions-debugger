@@ -1,0 +1,84 @@
+id: re-480
+title: 'envsubst: command not found on ARC and ubuntu-slim runners — gettext package not pre-installed'
+category: runner-environment
+severity: error
+tags:
+  - arc
+  - ubuntu-slim
+  - envsubst
+  - gettext
+  - self-hosted
+  - container-runner
+  - cosign-installer
+patterns:
+  - regex: 'envsubst: command not found'
+    flags: 'i'
+  - regex: 'line \d+: envsubst: not found|envsubst.*No such file or directory'
+    flags: 'i'
+error_messages:
+  - '/home/runner/_work/_temp/0de125e0-863d-4a86-bd04-b315399dc938.sh: line 3: envsubst: command not found'
+  - 'envsubst: command not found'
+  - 'line 3: envsubst: not found'
+root_cause: |
+  The `envsubst` binary (part of the GNU `gettext` package) substitutes environment
+  variable references in text templates. It is pre-installed on standard GitHub-hosted
+  runners (ubuntu-22.04, ubuntu-24.04) but is absent from:
+
+  - GitHub Actions Runner Controller (ARC) container images
+    (`ghcr.io/actions/actions-runner`) — minimal container with no `gettext`
+  - `ubuntu-slim` GitHub-hosted runner — stripped Ubuntu 24.04 image that omits
+    many packages present in the standard ubuntu-24.04 runner
+
+  Several popular GitHub Actions invoke `envsubst` internally during their setup
+  steps, including `sigstore/cosign-installer@v4`. When any such action runs on ARC
+  or ubuntu-slim, the step immediately fails with "command not found" even though the
+  workflow configuration looks correct and works on standard runners.
+
+  The `gettext-base` Debian package (which provides `envsubst`) is a ~2 MB install
+  with no complex dependencies — it is straightforward to add as a pre-step.
+fix: |
+  Install the `gettext-base` apt package as an early workflow step before any action
+  that requires `envsubst`. For ARC, consider building a custom runner image with
+  `gettext-base` pre-installed to avoid the per-job overhead.
+fix_code:
+  - language: yaml
+    label: 'Add gettext-base install step before actions that use envsubst (ARC or ubuntu-slim)'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-slim  # or your ARC runner label
+          steps:
+            - name: Install gettext-base (provides envsubst)
+              run: sudo apt-get install -y --no-install-recommends gettext-base
+
+            - name: Install cosign
+              uses: sigstore/cosign-installer@v4
+
+            - name: Checkout
+              uses: actions/checkout@v4
+  - language: yaml
+    label: 'Alternative — use a custom ARC base image with gettext pre-installed'
+    code: |
+      # In your ARC RunnerDeployment spec:
+      # spec:
+      #   template:
+      #     spec:
+      #       containers:
+      #         - name: runner
+      #           image: your-org/custom-runner:latest  # built with gettext-base
+      #
+      # Dockerfile:
+      # FROM ghcr.io/actions/actions-runner:latest
+      # RUN sudo apt-get update && sudo apt-get install -y --no-install-recommends gettext-base
+prevention:
+  - 'Before using ubuntu-slim or ARC runners, audit the ubuntu-slim-Readme.md to verify all required tools are pre-installed'
+  - 'Add a workflow-level check step: command -v envsubst || sudo apt-get install -y gettext-base'
+  - 'Build custom ARC runner images with gettext-base, jq, curl, and other commonly-needed tools'
+  - 'File issues upstream with actions that call envsubst without checking for its presence'
+docs:
+  - url: 'https://github.com/sigstore/cosign-installer/issues/222'
+    label: 'cosign-installer#222 — envsubst not found on ARC and ubuntu-slim'
+  - url: 'https://github.com/actions/runner-images/blob/main/images/ubuntu-slim/ubuntu-slim-Readme.md'
+    label: 'ubuntu-slim software manifest — check pre-installed packages'
+  - url: 'https://manpages.debian.org/unstable/gettext-base/envsubst.1.en.html'
+    label: 'envsubst man page — GNU gettext-base package'
