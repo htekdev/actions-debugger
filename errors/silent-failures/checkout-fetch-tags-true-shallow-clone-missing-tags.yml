@@ -1,0 +1,142 @@
+id: silent-failures-219
+title: '`fetch-tags: true` With Default `fetch-depth: 1` Only Fetches Tags at HEAD — All Other Tags Silently Missing'
+category: silent-failures
+severity: silent-failure
+tags:
+  - checkout
+  - fetch-tags
+  - shallow-clone
+  - fetch-depth
+  - tags
+  - git-describe
+  - silent
+  - incomplete
+patterns:
+  - regex: 'fetch-tags.*true.*fetch-depth.*1'
+    flags: 'i'
+  - regex: 'No tags can describe the given commit'
+    flags: 'i'
+  - regex: 'fatal: No names found, cannot describe anything'
+    flags: 'i'
+error_messages:
+  - "fatal: No names found, cannot describe anything."
+  - "No tags can describe the given commit."
+  - "warning: tag ''v1.2.3'' is not reachable from any HEAD"
+root_cause: |
+  `actions/checkout` with `fetch-tags: true` and the default `fetch-depth: 1`
+  produces a **shallow clone** that contains only the single commit at HEAD.
+  `fetch-tags: true` fetches **tag objects** that point to commits reachable
+  within the fetched history — but with `fetch-depth: 1`, only HEAD is
+  reachable.
+
+  The result: only tags that point DIRECTLY at HEAD are fetched. Any other
+  tags — version tags on ancestor commits, tags on parallel branches, or
+  any tag that does not point at the exact HEAD SHA — are **silently absent**
+  from the working copy.
+
+  This is a silent failure because:
+  - The workflow step shows `fetch-tags: true` set and completes with no error
+  - `git tag` and `git tag --list` return only zero or one tag
+  - `git describe` fails with "No names found, cannot describe anything" or
+    returns an error — giving no indication that `fetch-tags` was partially
+    satisfied
+  - The action does not log which tags were or were not fetched
+
+  Common downstream symptoms:
+  - `git describe --tags` fails or produces wrong results in changelog scripts
+  - Semantic version scripts that rely on `git tag -l ''v*''` return empty or
+    incomplete lists
+  - Release automation that checks for the latest tag picks up nothing or
+    the wrong tag
+  - npm/cargo/gradle version detection based on git tags returns 0.0.0 or fails
+
+  Root technical detail: Git''s fetch protocol respects shallow boundaries.
+  With `--depth 1`, the server only sends commit objects reachable from HEAD
+  within depth 1. Tag objects that reference commits outside this graph are
+  excluded. `fetch-tags: true` instructs the checkout action to pass `--tags`
+  to the git fetch command, but `--tags` + `--depth 1` only materializes tags
+  whose tagged object is the HEAD commit or within the shallow boundary.
+fix: |
+  **Option 1 (recommended)**: Combine `fetch-tags: true` with `fetch-depth: 0`
+  to fetch the full history and all reachable tags:
+
+  This is the most reliable approach. The full-history fetch allows ALL tags
+  to be fetched and all to be reachable via `git describe`.
+
+  **Option 2**: Use a partial deep fetch with a large `fetch-depth` value.
+  This fetches more history and therefore more tags, but may miss old tags
+  if `fetch-depth` is not large enough to reach them.
+
+  **Option 3**: Fetch only tags explicitly after a shallow checkout using
+  `git fetch --tags --unshallow`. This converts the shallow clone to a full
+  clone and then fetches all tags.
+
+  **Note**: If the repository is very large and `fetch-depth: 0` is
+  too slow, use Option 3 to avoid checking out all content while still
+  getting all tags.
+fix_code:
+  - language: yaml
+    label: 'Use fetch-depth: 0 with fetch-tags: true for complete tag coverage'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                fetch-depth: 0      # ✅ Full history — makes all tags reachable
+                fetch-tags: true    # ✅ Fetch all tag objects
+
+            - name: List all tags (should show full tag history)
+              run: git tag --list
+
+            - name: Run changelog generator (relies on all tags)
+              run: npx conventional-changelog -p angular -i CHANGELOG.md -s
+
+  - language: yaml
+    label: 'Unshallow after checkout to get all tags without full clone'
+    code: |
+      jobs:
+        release:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                fetch-depth: 1   # Shallow for speed
+
+            - name: Fetch all tags (unshallow just tags, not full history)
+              run: |
+                git fetch --tags --unshallow
+
+            - name: Use git describe now that all tags are available
+              run: |
+                git describe --tags --abbrev=0  # ✅ Returns latest semver tag
+
+  - language: yaml
+    label: 'Example showing the broken pattern vs fixed pattern'
+    code: |
+      # ❌ BROKEN — fetch-tags: true with default depth does not fetch all tags:
+      - uses: actions/checkout@v4
+        with:
+          fetch-tags: true   # Only fetches tags at HEAD; all other tags missing
+
+      # ✅ FIXED — combine with fetch-depth: 0:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0      # Full history — required for complete tag coverage
+          fetch-tags: true    # Fetch all reachable tag objects
+
+prevention:
+  - 'When using `fetch-tags: true`, always pair it with `fetch-depth: 0` unless you have a specific reason to use a shallow clone. `fetch-tags: true` alone with the default depth is effectively a no-op for most use cases.'
+  - 'Add `git tag --list | wc -l` as a diagnostic step in workflows that depend on tags. A count of 0 or 1 indicates the shallow clone is silently excluding most tags.'
+  - 'In release workflows, use `git fetch --tags --unshallow` as an explicit step rather than relying on the checkout action''s `fetch-tags` input — it is more predictable.'
+  - 'Document the `fetch-depth: 0` requirement in your workflow comments so future maintainers understand why full history is needed for the tag-dependent steps.'
+docs:
+  - url: 'https://github.com/actions/checkout/issues/2199'
+    label: 'actions/checkout#2199 — fetch-tags: true doesn''t work without fetch-depth: 0 (12 reactions)'
+  - url: 'https://github.com/actions/checkout/issues/701'
+    label: 'actions/checkout#701 — fetch-tags: true with shallow clone only fetches reachable tags'
+  - url: 'https://git-scm.com/docs/git-fetch#Documentation/git-fetch.txt---tags'
+    label: 'git-fetch --tags documentation — tags fetched only for reachable objects'
+  - url: 'https://github.com/actions/checkout#usage'
+    label: 'actions/checkout README — fetch-tags and fetch-depth input documentation'
