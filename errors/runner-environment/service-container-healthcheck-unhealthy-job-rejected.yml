@@ -1,0 +1,114 @@
+id: re-471
+title: 'Service container with Docker HEALTHCHECK causes "Job is rejected because service container is unhealthy"'
+category: runner-environment
+severity: error
+tags:
+  - service-container
+  - healthcheck
+  - docker
+  - postgres
+  - redis
+  - mysql
+  - unhealthy
+  - startup-period
+patterns:
+  - regex: 'Job is rejected because service container .+ is unhealthy'
+    flags: 'i'
+  - regex: 'service container .* is unhealthy'
+    flags: 'i'
+  - regex: '##\[error\]Job is rejected because service container'
+    flags: 'i'
+error_messages:
+  - "Error: Job is rejected because service container 'postgres' is unhealthy"
+  - "Error: Job is rejected because service container 'redis' is unhealthy"
+  - "##[error]Job is rejected because service container 'mysql' is unhealthy"
+root_cause: |
+  GitHub Actions monitors the health status of service containers that have a Docker
+  HEALTHCHECK defined (either in the image itself or via the `options:` field). If
+  the container does not reach a healthy state within the configured health check
+  window, the runner rejects the job before it starts.
+
+  Official database images (postgres, redis, mysql, mariadb) include a built-in
+  Docker HEALTHCHECK that runs frequently with a short retry count. On GitHub-hosted
+  runners the container startup and initialization can take longer than the default
+  health check allows, especially when:
+
+  1. The database image runs initialization scripts (e.g., POSTGRES_DB creates a DB
+     on first start).
+  2. The runner experiences I/O contention during job setup.
+  3. The service container image is large and takes time to extract.
+  4. The `options:` field is absent, leaving the image's default tight health check
+     parameters (typically 10s interval × 3 retries = 30s total before unhealthy).
+
+  The container is killed and the job fails with "Job is rejected because service
+  container '<name>' is unhealthy" before any steps execute.
+fix: |
+  Override the health check parameters in the service's `options:` field to give
+  the container a longer window to become healthy. Always include `--health-start-period`
+  to give the container grace time before health checks begin counting failures.
+fix_code:
+  - language: yaml
+    label: 'PostgreSQL service with explicit health check options'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          services:
+            postgres:
+              image: postgres:16
+              env:
+                POSTGRES_USER: testuser
+                POSTGRES_PASSWORD: testpass
+                POSTGRES_DB: testdb
+              ports:
+                - 5432:5432
+              options: >-
+                --health-cmd pg_isready
+                --health-interval 10s
+                --health-timeout 5s
+                --health-retries 10
+                --health-start-period 40s
+  - language: yaml
+    label: 'Redis service with health check override'
+    code: |
+      services:
+        redis:
+          image: redis:7-alpine
+          ports:
+            - 6379:6379
+          options: >-
+            --health-cmd "redis-cli ping"
+            --health-interval 10s
+            --health-timeout 5s
+            --health-retries 10
+            --health-start-period 10s
+  - language: yaml
+    label: 'MySQL service with health check override'
+    code: |
+      services:
+        mysql:
+          image: mysql:8
+          env:
+            MYSQL_ROOT_PASSWORD: rootpass
+            MYSQL_DATABASE: testdb
+          ports:
+            - 3306:3306
+          options: >-
+            --health-cmd "mysqladmin ping --silent"
+            --health-interval 10s
+            --health-timeout 5s
+            --health-retries 10
+            --health-start-period 60s
+prevention:
+  - 'Always specify explicit health check options in all service definitions — never rely solely on the image default.'
+  - 'Use --health-start-period to grant containers a grace window before failures are counted; 30-60s is typical for databases.'
+  - 'Increase --health-retries to 10 or more to tolerate slow runner I/O during high-load periods.'
+  - 'Test service startup locally with docker run using the same --health-* flags to calibrate the values.'
+  - 'As a fallback, add a step to wait for the service to be ready using a retry loop (e.g., until pg_isready; do sleep 1; done).'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions'
+    label: 'Workflow commands — GitHub Actions docs'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/running-scripts-before-or-after-a-job'
+    label: 'Service containers — GitHub Actions docs'
+  - url: 'https://docs.docker.com/reference/dockerfile/#healthcheck'
+    label: 'Docker HEALTHCHECK instruction — Docker docs'

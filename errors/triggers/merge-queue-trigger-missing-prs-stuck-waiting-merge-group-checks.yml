@@ -1,0 +1,106 @@
+id: tr-116
+title: 'merge_queue event not added to workflow — PRs stuck waiting in merge queue with required checks never running'
+category: triggers
+severity: warning
+tags:
+  - merge-queue
+  - merge_queue
+  - merge_group
+  - required-status-checks
+  - branch-protection
+  - pull_request
+  - workflow-not-triggered
+patterns:
+  - regex: 'merge.queue.*required.*check|required.*check.*merge.queue|merge.group.*not.*trigger'
+    flags: 'i'
+  - regex: 'Waiting for merge group checks'
+    flags: 'i'
+error_messages:
+  - 'Waiting for merge group checks'
+  - 'Required status checks have not passed for this merge group entry'
+  - '# PRs stuck in merge queue indefinitely with no workflow run appearing'
+root_cause: |
+  GitHub merge queues fire the `merge_group` event (configured with `on: merge_queue:`)
+  when a pull request enters the merge queue. Required status checks on the protected
+  branch must pass for BOTH the pull_request context AND the merge_group context.
+
+  When a team enables merge queue protection without adding `on: merge_queue:` to
+  their CI workflows, all PRs will be stuck "Waiting for merge group checks"
+  indefinitely because no workflow runs to report a status for the merge group entry.
+
+  The merge queue synthesizes a temporary merge commit (the PR head merged with the
+  latest base branch tip) and fires `merge_group` events. GitHub expects the same
+  required status check names to pass. If no workflow subscribes to `merge_queue`,
+  no check ever runs and the required status is never satisfied.
+
+  Key differences between pull_request and merge_queue contexts:
+  - `github.event_name` is `merge_group` (not `pull_request`)
+  - `github.ref` is `refs/heads/gh-readonly-queue/<base>/<sha>` (a synthetic ref)
+  - `github.event.merge_group.head_ref` contains the queue ref
+  - The `pull_request` event does NOT fire while the PR is in the merge queue
+
+  This is a common trap when first enabling merge queues on a repository that already
+  has working CI on pull_request but hasn't added the merge_queue trigger.
+fix: |
+  Add `merge_queue:` to the `on:` block of all CI workflows that have required
+  status checks. The job names must exactly match the required check names configured
+  in branch protection settings.
+fix_code:
+  - language: yaml
+    label: 'Add merge_queue trigger alongside pull_request'
+    code: |
+      on:
+        pull_request:
+          branches: [main]
+        merge_queue:          # required: satisfies merge queue required checks
+          branches: [main]    # optional: restrict to specific base branches
+
+      jobs:
+        ci:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm ci
+            - run: npm test
+  - language: yaml
+    label: 'Handle merge_group context differently from pull_request'
+    code: |
+      on:
+        pull_request:
+        merge_queue:
+
+      jobs:
+        ci:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - run: npm test
+            - name: Deploy preview (skip in merge queue)
+              if: github.event_name != 'merge_group'
+              run: npm run deploy:preview
+  - language: yaml
+    label: 'Check required check names match the job name exactly'
+    code: |
+      # Branch protection required check: "CI / test"
+      # Job name in workflow must match: "test" (workflow name is "CI")
+      name: CI
+      on:
+        pull_request:
+        merge_queue:
+      jobs:
+        test:                  # This produces check "CI / test"
+          runs-on: ubuntu-latest
+          steps:
+            - run: npm test
+prevention:
+  - 'When enabling merge queue branch protection, immediately add merge_queue: to all CI workflows with required status checks.'
+  - 'Verify the required check names configured in branch protection exactly match the "<workflow-name> / <job-name>" format from your workflows.'
+  - 'Test merge queue behavior on a non-main branch before enabling on main.'
+  - 'If a PR is stuck waiting in the merge queue with no workflow running, the first thing to check is whether the CI workflow includes on: merge_queue.'
+docs:
+  - url: 'https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue'
+    label: 'Managing a merge queue — GitHub docs'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#merge_group'
+    label: 'merge_group event — GitHub Actions docs'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#about-merge-queue-events'
+    label: 'About merge queue events — GitHub Actions docs'

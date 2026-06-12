@@ -1,0 +1,101 @@
+id: sf-213
+title: 'matrix.include entries with keys not in base matrix silently create extra unintended jobs'
+category: silent-failures
+severity: silent-failure
+tags:
+  - matrix
+  - include
+  - extra-jobs
+  - strategy
+  - unexpected-combinations
+  - matrix-include
+  - silent
+patterns:
+  - regex: 'matrix.*include.*unmatched|include.*new.*combination|matrix.*extra.*job'
+    flags: 'i'
+error_messages:
+  - '# no error — unexpected extra matrix jobs are created silently without warning'
+root_cause: |
+  GitHub Actions matrix strategy `include:` is designed to add additional properties
+  to existing matrix combinations. However, when an `include` entry contains a key
+  that does NOT match any key-value pair in the base matrix, GitHub creates a brand-new
+  standalone job from that include entry instead of discarding it.
+
+  From the official docs: "If you provide an include value that isn't associated with
+  any of the existing matrix combinations, a new object is created and added to
+  the matrix combinations."
+
+  This silently creates unexpected extra jobs in several common situations:
+
+  1. Typo in an include key: `os: ubuntu-latest` vs `platform: ubuntu-latest`
+     (different key names → extra job instead of augmenting existing combination).
+
+  2. Refactoring matrix key names: you rename `node-version` to `node` in the base
+     matrix but forget to update `include` entries — every include entry spawns a new
+     standalone job.
+
+  3. Intentional but surprising: an `include` meant to pin a specific combination
+     uses a value not in the base set — creating an extra job rather than being
+     filtered out as one might expect.
+
+  The extra jobs may fail silently if they lack required environment variables or
+  tools that the base matrix combinations set up. They inflate billable minutes
+  and can produce confusing failure output in the Actions run summary.
+fix: |
+  Ensure every `include` entry contains at least one property whose key AND value
+  exactly match a combination in the base matrix. GitHub performs an exact-match
+  check: all properties in the include entry that overlap with base matrix keys must
+  match an existing combination.
+
+  To verify the matrix expansion, add a debug step that echoes all matrix context
+  keys and check the job count in the Actions UI before merging.
+fix_code:
+  - language: yaml
+    label: 'Broken: key mismatch creates extra unintended job'
+    code: |
+      # WRONG — include uses key 'runner' but base matrix uses key 'os'
+      # Result: one extra standalone job { runner: ubuntu-latest, node: 18 }
+      #         plus the two base jobs. Three total, not two.
+      strategy:
+        matrix:
+          os: [ubuntu-latest, windows-latest]
+          include:
+            - runner: ubuntu-latest   # key mismatch → extra job!
+              node: 18
+  - language: yaml
+    label: 'Fixed: include key exactly matches base matrix key'
+    code: |
+      # CORRECT — 'os' key matches base matrix; adds 'node: 18' only to ubuntu job
+      strategy:
+        matrix:
+          os: [ubuntu-latest, windows-latest]
+          include:
+            - os: ubuntu-latest       # exact key+value match
+              node: 18
+  - language: yaml
+    label: 'Verify matrix expansion with a debug step'
+    code: |
+      jobs:
+        build:
+          runs-on: ${{ matrix.os }}
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest]
+              include:
+                - os: ubuntu-latest
+                  node: 18
+          steps:
+            - name: Debug matrix context
+              run: |
+                echo "os=${{ matrix.os }}"
+                echo "node=${{ matrix.node }}"
+prevention:
+  - 'Include keys must exactly match property names in the base matrix for augmentation to work; a mismatch creates a new job.'
+  - 'After renaming matrix keys, search for all include entries and update them to match the new key names.'
+  - 'Run workflows on a test branch and inspect the Actions UI job list to confirm the expected number of matrix jobs.'
+  - 'Add a debug step echoing all matrix context values to make the expansion visible in logs.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/running-jobs-in-a-matrix#expanding-or-adding-matrix-configurations'
+    label: 'Expanding or adding matrix configurations — GitHub Actions docs'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idstrategymatrixinclude'
+    label: 'Workflow syntax: jobs.<job_id>.strategy.matrix.include — GitHub Actions docs'
