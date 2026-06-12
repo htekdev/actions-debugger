@@ -1,0 +1,114 @@
+id: caching-artifacts-144
+title: '`actions/setup-go` Cache Restore Fails With "Cannot open: File exists" When Called Twice in One Job'
+category: caching-artifacts
+severity: warning
+tags:
+  - setup-go
+  - cache
+  - tar
+  - file-exists
+  - go-mod-cache
+  - duplicate-invocation
+  - read-only
+  - composite-action
+patterns:
+  - regex: 'Cannot open: File exists'
+    flags: 'i'
+  - regex: 'Warning: Failed to restore.*tar.*failed.*exit code 2'
+    flags: 'i'
+  - regex: '/usr/bin/tar.*Exiting with failure status due to previous errors'
+    flags: 'i'
+  - regex: 'go/pkg/mod.*Cannot open: File exists'
+    flags: 'i'
+error_messages:
+  - "Warning: Failed to restore: \"/usr/bin/tar\" failed with error: The process '/usr/bin/tar' failed with exit code 2"
+  - "/usr/bin/tar: /home/runner/go/pkg/mod/cache/...: Cannot open: File exists"
+  - "/usr/bin/tar: Exiting with failure status due to previous errors"
+root_cause: |
+  When `actions/setup-go@v6` is invoked **twice in the same job** (or when a composite
+  action internally calls `setup-go` and the job also calls it), the second invocation's
+  cache restore fails with hundreds of "Cannot open: File exists" errors.
+
+  The underlying cause: Go module files under `~/go/pkg/mod/` are marked **read-only by
+  design** (the `go` toolchain removes write permissions from downloaded module files to
+  prevent accidental modification). When the first `setup-go` call restores the cached
+  module tree, `tar` extracts the archive and those read-only files land on disk. When
+  the second `setup-go` call tries to restore the same (or overlapping) cache, `tar`
+  attempts to overwrite the existing read-only files, fails with exit code 2
+  ("Cannot open: File exists"), and emits a warning.
+
+  Common scenarios:
+  - A composite action from the marketplace internally calls `setup-go` with caching, AND
+    the job also calls `setup-go` with caching for a different Go version.
+  - A matrix job step calls `setup-go` twice for cross-compilation setup.
+  - Any job that needs two different Go toolchain versions in sequence.
+
+  The failure produces a **warning**, not a hard error — the job continues — but the
+  second cache restore does not fully succeed, negating the cache benefit and adding
+  noise to the workflow log.
+fix: |
+  **Option 1 (recommended)**: Set `cache: false` on all but the first `setup-go` call.
+  Only one cache restore is needed per job; subsequent calls can skip the cache step.
+
+  **Option 2**: Clean Go module cache directories before the second `setup-go` invocation
+  so `tar` can write freely without conflicts.
+
+  **Option 3**: If the second `setup-go` is inside a composite action you don't control,
+  check whether the action accepts a `cache` input and pass `cache: false` to it.
+fix_code:
+  - language: yaml
+    label: 'Disable caching on the second setup-go invocation (recommended)'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            # First setup-go — with caching enabled (default)
+            - name: Set up Go (primary)
+              uses: actions/setup-go@v6
+              with:
+                go-version-file: go.mod
+
+            # Second setup-go (or composite action wrapping setup-go)
+            - name: Set up Go (secondary — cache disabled to avoid File exists conflict)
+              uses: actions/setup-go@v6
+              with:
+                go-version: '1.24'
+                cache: false  # ← prevents duplicate cache restore failure
+
+            - run: go test ./...
+
+  - language: yaml
+    label: 'Clean Go module cache before second setup-go call'
+    code: |
+      steps:
+        - uses: actions/setup-go@v6
+          with:
+            go-version-file: go.mod  # First restore — populates ~/go/pkg/mod
+
+        - run: go build ./...
+
+        - name: Clean Go module cache before second restore
+          run: |
+            chmod -R u+w ~/go/pkg/mod ~/.cache/go-build 2>/dev/null || true
+            rm -rf ~/go/pkg/mod ~/.cache/go-build
+
+        - uses: actions/setup-go@v6
+          with:
+            go-version: '1.24'
+            cache: true  # Now safe — no conflicting read-only files
+
+prevention:
+  - 'Call `actions/setup-go` only once per job with caching enabled. If a composite action also invokes `setup-go`, set `cache: false` on your outer call to avoid dual restore.'
+  - 'If you need two Go toolchain versions in one job, use `go env -w GOVERSION=...` after the first setup-go rather than invoking setup-go a second time.'
+  - 'When adding a composite action that wraps `setup-go`, review its source to check if it enables caching — if so, disable caching in your outer `setup-go` step.'
+  - 'Search your workflow for multiple `uses: actions/setup-go` steps in the same job as part of regular maintenance.'
+docs:
+  - url: 'https://github.com/actions/setup-go/issues/722'
+    label: 'actions/setup-go#722 — Cache restore fails with "File exists" when setup-go is called twice'
+  - url: 'https://github.com/actions/cache/issues/1104'
+    label: 'actions/cache#1104 — Underlying tar overwrite behavior for read-only files'
+  - url: 'https://github.com/actions/setup-go'
+    label: 'actions/setup-go README — cache input documentation'

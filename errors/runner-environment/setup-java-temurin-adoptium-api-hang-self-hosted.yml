@@ -1,0 +1,130 @@
+id: runner-environment-487
+title: '`actions/setup-java@v4` Hangs Indefinitely at "Trying to resolve the latest version from remote" on Self-Hosted Runners'
+category: runner-environment
+severity: error
+tags:
+  - setup-java
+  - temurin
+  - adoptium
+  - api-timeout
+  - self-hosted
+  - hang
+  - network
+  - aws
+  - java-version
+  - distribution
+patterns:
+  - regex: 'Trying to resolve the latest version from remote'
+    flags: 'i'
+  - regex: 'setup-java.*adoptium.*timeout|adoptium.*api.*hang|api\.adoptium\.net.*error'
+    flags: 'i'
+  - regex: 'Error: Java setup failed due to network issue or timeout'
+    flags: 'i'
+error_messages:
+  - "Trying to resolve the latest version from remote"
+  - "Error: Java setup failed due to network issue or timeout: read ECONNRESET"
+  - "Error: Java setup failed due to network issue or timeout: connect ECONNREFUSED api.adoptium.net:443"
+root_cause: |
+  `actions/setup-java@v4` (and v5) with `distribution: temurin` makes an HTTP request
+  to the Eclipse Adoptium API at `https://api.adoptium.net/v3/assets/version/[1.0,100.0]?
+  project=jdk&vendor=adoptium&...` to determine which JDK release matches the requested
+  `java-version`. This request is logged as "Trying to resolve the latest version from
+  remote" before it begins.
+
+  On **GitHub-hosted runners**, the step completes immediately because Temurin JDKs are
+  pre-installed in the runner's tool cache — `setup-java` detects the cached version and
+  skips the API call entirely.
+
+  On **self-hosted runners** (especially in AWS, GCP, or environments with strict egress
+  filtering), the runner does NOT have a Temurin tool cache and must contact the Adoptium
+  API. If the API is slow, rate-limiting the runner's IP, unreachable due to firewall
+  rules, or experiencing degraded performance, the HTTP request hangs indefinitely.
+
+  There is **no built-in timeout** in `setup-java` for this API call (issue tracked at
+  actions/setup-java#923). The step hangs until the job's `timeout-minutes` limit is
+  reached (default: 360 minutes), effectively freezing the entire CI pipeline.
+
+  Commonly observed in:
+  - Self-hosted runners in AWS (reported with 28 reactions in actions/setup-java#897)
+  - Corporate networks with restricted outbound access to `api.adoptium.net`
+  - Self-hosted runners that start from a minimal base image without a JDK tool cache
+  - ARC (Actions Runner Controller) pods without pre-warmed tool caches
+fix: |
+  **Option 1 (recommended)**: Pre-install the JDK in your self-hosted runner image so
+  `setup-java` detects it in the tool cache and skips the Adoptium API call entirely.
+  Install via the Adoptium apt/yum repository during image build, not at runtime.
+
+  **Option 2**: Set `timeout-minutes` at the job level to fail fast rather than hanging
+  for hours. Combined with automatic job rerun, this is the easiest immediate mitigation.
+
+  **Option 3**: Downgrade to `setup-java@v3` which queries `github.com/actions/java-
+  versions` (a GitHub-hosted file) instead of `api.adoptium.net` — more reliable in
+  network-restricted environments.
+
+  **Option 4**: Pin an exact Java version patch string (e.g., `java-version: '17.0.11'`
+  instead of `java-version: '17'`) to improve tool cache lookup specificity and reduce
+  reliance on the remote resolution API.
+
+  **Option 5**: Ensure outbound HTTPS to `api.adoptium.net:443` is explicitly allowed
+  in your self-hosted runner's firewall/security group rules.
+fix_code:
+  - language: yaml
+    label: 'Pin exact JDK patch version to improve tool cache hit rate'
+    code: |
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          # Pinned patch version → better tool cache match → skips Adoptium API call
+          java-version: '17.0.11'
+          distribution: temurin
+          cache: maven
+
+  - language: yaml
+    label: 'Set short job timeout to fail fast if setup-java hangs on Adoptium API'
+    code: |
+      jobs:
+        build:
+          runs-on: self-hosted
+          timeout-minutes: 15  # Fail fast — default 360 min hangs for 6 hours
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-java@v4
+              with:
+                java-version: '17'
+                distribution: temurin
+                cache: maven
+            - run: mvn package -DskipTests
+
+  - language: yaml
+    label: 'Pre-install Temurin JDK in self-hosted runner image (Debian/Ubuntu)'
+    code: |
+      # Run this during runner image build (not in the workflow):
+      # Adds Adoptium apt repository and installs Temurin 17 system-wide.
+      # setup-java detects system JDKs and skips the remote API call.
+
+      # apt-get install -y wget apt-transport-https gpg
+      # wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public | gpg --dearmor -o /etc/apt/trusted.gpg.d/adoptium.gpg
+      # echo "deb https://packages.adoptium.net/artifactory/deb $(. /etc/os-release && echo "$UBUNTU_CODENAME") main" | tee /etc/apt/sources.list.d/adoptium.list
+      # apt-get update && apt-get install -y temurin-17-jdk
+
+      # In your workflow (after pre-installation):
+      - name: Set up JDK 17 (from pre-installed tool cache — no API call)
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+prevention:
+  - 'On self-hosted runners, pre-install the JDK in the runner image to eliminate runtime Adoptium API calls. This also speeds up workflow start times significantly.'
+  - 'Always set `timeout-minutes` at the job level on self-hosted runners (e.g., 15-30) to prevent indefinite hangs when external API calls time out.'
+  - 'Verify outbound HTTPS access to `api.adoptium.net:443` from your self-hosted runner before relying on `distribution: temurin` without a pre-installed JDK.'
+  - 'Set `check-latest: false` (the default) on `setup-java` — `check-latest: true` always makes a remote API call even when a cached JDK version exists.'
+  - 'For ARC (Actions Runner Controller) deployments, configure runner pods with a Temurin JDK pre-installed in the container image.'
+docs:
+  - url: 'https://github.com/actions/setup-java/issues/897'
+    label: 'actions/setup-java#897 — Intermittent hang at "Trying to resolve the latest version from remote" (28 reactions)'
+  - url: 'https://github.com/actions/setup-java/issues/923'
+    label: 'actions/setup-java#923 — Error: Java setup failed due to network issue or timeout: read ECONNRESET'
+  - url: 'https://github.com/actions/setup-java/blob/main/docs/advanced-usage.md#hosted-tool-cache'
+    label: 'setup-java advanced usage — Hosted Tool Cache for self-hosted runners'
+  - url: 'https://adoptium.net/installation/linux/'
+    label: 'Eclipse Temurin — Install JDK on Linux (for pre-baking into runner images)'
