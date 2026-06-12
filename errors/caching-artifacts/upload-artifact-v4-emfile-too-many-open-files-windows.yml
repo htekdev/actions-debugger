@@ -1,0 +1,92 @@
+id: caching-artifacts-141
+title: 'upload-artifact v4+ Fails with "EMFILE: too many open files" When Uploading Thousands of Files on Windows'
+category: caching-artifacts
+severity: error
+tags:
+  - upload-artifact
+  - v4
+  - windows
+  - emfile
+  - file-descriptor
+  - large-upload
+  - too-many-files
+  - self-hosted
+patterns:
+  - regex: 'EMFILE: too many open files'
+    flags: 'i'
+  - regex: 'upload.*artifact.*EMFILE|EMFILE.*upload.*artifact'
+    flags: 'i'
+error_messages:
+  - 'Error: EMFILE: too many open files'
+  - 'EMFILE: too many open files, open ''C:\...\...\...'''
+root_cause: |
+  When `actions/upload-artifact` v4+ attempts to upload a very large number of files
+  (typically thousands — e.g., 8000+ individual files), the action reads multiple file
+  contents simultaneously using Node.js readable streams. On Windows runners (both
+  GitHub-hosted and self-hosted), the operating system has a process-level limit on
+  simultaneously open file handles. When the number of concurrently open read streams
+  exceeds this limit, Node.js throws `EMFILE: too many open files`.
+
+  The root cause is that the action opens many file streams in parallel during the
+  archive/upload phase without throttling the number of concurrently open file
+  descriptors. On Linux and macOS, the `ulimit -n` value is typically set high enough
+  (65536+) that this rarely triggers; Windows has a lower default file handle limit
+  that is more easily exceeded when uploading large file trees.
+
+  This affects workflows that upload directories containing thousands of individual
+  files, such as: npm node_modules directories, Unity project Assets folders, compiled
+  test output trees, or any recursively checked-out repo with a very large file count.
+  Tracked in actions/upload-artifact#485 (31+ reactions).
+fix: |
+  Primary fix: Compress or archive files before uploading to reduce the number of
+  individual file handles required by the action.
+
+  1. Zip or tar the directory before passing it to upload-artifact — the action opens
+     only a single archive file instead of thousands of individual files.
+  2. Split the upload into smaller batches with multiple upload-artifact steps, each
+     targeting a subset of the files.
+  3. On self-hosted Windows runners, if compression is not feasible, check and increase
+     the system-level file handle limit if possible (requires administrator access).
+fix_code:
+  - language: yaml
+    label: 'Compress directory before uploading to avoid EMFILE on large file trees (Windows/PowerShell)'
+    code: |
+      steps:
+        - name: Build (produces thousands of files)
+          run: make build
+
+        - name: Compress output directory to avoid EMFILE with upload-artifact
+          shell: pwsh
+          run: |
+            # Zip the output tree — upload-artifact handles a single zip file
+            # much better than thousands of individual files.
+            Compress-Archive -Path dist\* -DestinationPath dist.zip
+
+        - name: Upload compressed artifact
+          uses: actions/upload-artifact@v4
+          with:
+            name: build-output
+            path: dist.zip   # single archive file, no EMFILE risk
+  - language: yaml
+    label: 'Use tar to create a single archive before upload (cross-platform bash)'
+    code: |
+      steps:
+        - name: Create tar archive to avoid EMFILE with large file count
+          shell: bash
+          run: tar -czf output.tar.gz -C dist .
+
+        - name: Upload tar archive
+          uses: actions/upload-artifact@v4
+          with:
+            name: build-output
+            path: output.tar.gz
+prevention:
+  - 'When uploading more than a few thousand files with upload-artifact on Windows, always compress into a single archive before uploading to avoid EMFILE errors.'
+  - 'Structure build outputs to produce fewer files — for example, bundle JavaScript outputs instead of uploading individual source files and dependencies.'
+  - 'Avoid uploading node_modules or vendor directories directly; instead, generate a lockfile hash-keyed cache and restore it in downstream jobs.'
+  - 'Add a step that counts upload candidates before the artifact step; if the count exceeds 5000 on Windows, compress first.'
+docs:
+  - url: 'https://github.com/actions/upload-artifact/issues/485'
+    label: 'actions/upload-artifact#485 — EMFILE: too many open files (31+ reactions, Windows + v4)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-workflow-data-as-artifacts'
+    label: 'GitHub Docs — Storing workflow data as artifacts'
