@@ -1,0 +1,112 @@
+id: sf-217
+title: '`add-mask` with `${{ expression }}` Leaks Value in "Run" Step Log Header Before Masking Applies'
+category: silent-failures
+severity: silent-failure
+tags:
+  - add-mask
+  - secrets
+  - masking
+  - expression-expansion
+  - log-leak
+  - sensitive-data
+  - security
+patterns:
+  - regex: 'echo "::add-mask::\$\{\{.*\}\}"'
+    flags: 'i'
+  - regex: "Run echo.*::add-mask::(?!\\*\\*\\*)"
+    flags: 'i'
+error_messages:
+  - "Run echo \"::add-mask::actual-secret-value\""
+  - "Run echo \"::add-mask::password\""
+  - "echo ::add-mask:: (value visible in step header)"
+root_cause: |
+  GitHub Actions evaluates `${{ expression }}` templates **before** the runner executes
+  the shell script. When a `run:` step contains `echo "::add-mask::${{ github.event.inputs.secret }}"`,
+  the runner substitutes the expression value into the shell command text, then logs the
+  full command as a "Run ..." header in the step output — before any `::add-mask::` command
+  is processed.
+
+  The resulting log shows:
+  ```
+  Run echo "::add-mask::actual-secret-value"
+    echo "::add-mask::actual-secret-value"
+    shell: /bin/bash -e {0}
+  ```
+
+  Even though `echo` then outputs `::add-mask::actual-secret-value` and future occurrences
+  are redacted, the "Run" header line already contains the plaintext value and it persists
+  in the log for the full retention period (90 days by default).
+
+  This affects any `${{ }}` expression referencing non-secret values:
+  - `${{ github.event.inputs.X }}` (workflow_dispatch inputs)
+  - `${{ steps.STEP.outputs.Y }}` (step outputs)
+  - `${{ env.X }}` (env variables not from secrets context)
+
+  Values from `secrets.*` context ARE automatically masked in expression substitution,
+  so `echo "::add-mask::${{ secrets.TOKEN }}"` does NOT leak.
+fix: |
+  Use an `env:` block to inject the sensitive value as a shell environment variable
+  instead of embedding it directly in the `run:` script with `${{ }}`. Shell variable
+  references in `run:` scripts do NOT appear in the "Run" log header — only the shell
+  variable name is shown, not its value.
+
+  Replace `${{ expression }}` inside the `run:` with a `$SHELL_VAR` that comes from
+  `env:`. The "Run" header will then show `echo "::add-mask::$VALUE"` with the variable
+  name, not the value.
+
+  Note: Even env variable values may appear in the "Run" header in some runner versions.
+  For maximum safety, use a separate step to export the value to GITHUB_ENV after masking,
+  or use `secrets.*` context directly (which is always auto-masked).
+fix_code:
+  - language: yaml
+    label: 'BROKEN — expression expanded in run script reveals value in "Run" log header'
+    code: |
+      steps:
+        - name: Mask dynamic value  # ✗ LEAKS value in "Run echo..." log line
+          run: echo "::add-mask::${{ steps.get-token.outputs.value }}"
+
+        - name: Mask dispatch input  # ✗ LEAKS input value in log header
+          run: echo "::add-mask::${{ github.event.inputs.my-secret }}"
+
+  - language: yaml
+    label: 'FIXED — use env: block to avoid expanding sensitive value in run script text'
+    code: |
+      steps:
+        - name: Mask dynamic value safely
+          env:
+            VALUE_TO_MASK: ${{ steps.get-token.outputs.value }}
+          run: echo "::add-mask::$VALUE_TO_MASK"
+          # "Run" header shows: echo "::add-mask::$VALUE_TO_MASK" — name only, not value
+
+        - name: Mask dispatch input safely
+          env:
+            INPUT_SECRET: ${{ github.event.inputs.my-secret }}
+          run: |
+            echo "::add-mask::$INPUT_SECRET"
+            echo "INPUT_SECRET=$INPUT_SECRET" >> "$GITHUB_ENV"
+
+  - language: yaml
+    label: 'BEST — prefer secrets context which is always auto-masked everywhere'
+    code: |
+      steps:
+        - name: Use secret directly (auto-masked in all log positions)
+          env:
+            API_TOKEN: ${{ secrets.API_TOKEN }}
+          run: |
+            echo "::add-mask::$API_TOKEN"  # belt-and-suspenders; secrets.* already masked
+            curl -H "Authorization: Bearer $API_TOKEN" https://api.example.com/data
+
+prevention:
+  - 'Never use `${{ steps.X.outputs.Y }}` or `${{ github.event.inputs.X }}` directly inside `add-mask` `run:` scripts — always pass via `env:` block.'
+  - 'Use `secrets.*` context for sensitive values where possible — it is auto-masked at expression expansion time, not just at output time.'
+  - 'Audit workflows for `echo "::add-mask::${{` pattern — any match is a potential log leak.'
+  - 'Prefer `actions/github-script` or shell-only logic to avoid mixing expression evaluation with masking commands.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions#masking-a-value-in-a-log'
+    label: 'GitHub Docs: Masking a value in a log (add-mask)'
+  - url: 'https://github.com/actions/runner/issues/475'
+    label: 'actions/runner#475: usage of add-mask still echoes the value to the log (68 reactions)'
+  - url: 'https://github.com/actions/runner/issues/643'
+    label: 'actions/runner#643: add-mask does not work with workflow_dispatch inputs (40 reactions)'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions#using-secrets'
+    label: 'GitHub Docs: Security hardening — using secrets'
