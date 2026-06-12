@@ -1,0 +1,124 @@
+id: ct-100
+title: 'Matrix Job-Level Concurrency Group Missing Matrix Variable Serializes All Legs Behind a Single Slot'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - matrix
+  - job-level
+  - serialized
+  - parallel
+  - slow-build
+patterns:
+  - regex: 'strategy:\s*\n\s+matrix:'
+    flags: 'si'
+  - regex: 'jobs\.[a-zA-Z_-]+:\s*\n(?:.*\n)*?\s+concurrency:\s*\n\s+group:'
+    flags: 'si'
+error_messages:
+  - 'Matrix jobs running sequentially instead of in parallel'
+  - 'Build taking 3x longer since adding concurrency to matrix job'
+root_cause: |
+  When a job has both a `strategy.matrix` and a `concurrency` block, and the
+  concurrency `group` key does NOT include any matrix variable (such as
+  `matrix.os`, `matrix.node-version`, etc.), all matrix legs generate the
+  SAME concurrency group key and compete for a single slot.
+
+  Because concurrency groups serialize at the job level, only one matrix leg
+  runs at a time — even if `max-parallel` is not set or set to a high value.
+  The `strategy.max-parallel` setting controls how many jobs GitHub will queue
+  and schedule; the concurrency group controls how many can actually run. The
+  concurrency group wins: all legs queue behind the first.
+
+  Example:
+    - Matrix: [ubuntu-latest, windows-latest, macos-latest]
+    - Concurrency group: ${{ github.workflow }}-${{ github.ref }}
+    - Result: ubuntu-latest starts, windows and macos are queued.
+      When ubuntu finishes, windows starts, then macos. Total wall clock
+      time is 3x a single run instead of 1x.
+
+  This is commonly introduced when a developer copies a concurrency block
+  from a non-matrix workflow into a matrix job. The intent is usually to
+  prevent concurrent deploys from different branches, not to serialize matrix
+  legs. But without a matrix-differentiating variable, all legs collapse to
+  the same slot.
+
+  Note: `cancel-in-progress: true` in this scenario causes each new leg
+  that becomes queued to cancel the currently running leg — resulting in
+  only the LAST leg ever completing successfully.
+fix: |
+  Include the relevant matrix variable(s) in the concurrency group key so each
+  leg gets its own slot:
+
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.os }}
+      cancel-in-progress: true
+
+  If you have multiple matrix dimensions, combine them:
+
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.os }}-${{ matrix.node-version }}
+      cancel-in-progress: true
+
+  If you only want to prevent the same environment/branch combination from
+  deploying concurrently (the common intent), keep the group based on ref but
+  remove the concurrency from the build/test job and apply it only to the
+  deploy job (which typically doesn't use matrix).
+fix_code:
+  - language: yaml
+    label: 'Incorrect: all matrix legs share the same concurrency slot — runs serially'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest, macos-latest]
+          runs-on: ${{ matrix.os }}
+          concurrency:
+            group: ${{ github.workflow }}-${{ github.ref }}   # Same for all legs!
+            cancel-in-progress: true
+          steps:
+            - run: make test
+  - language: yaml
+    label: 'Correct: include matrix.os in the group key so each leg gets its own slot'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest, macos-latest]
+          runs-on: ${{ matrix.os }}
+          concurrency:
+            group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.os }}
+            cancel-in-progress: true
+          steps:
+            - run: make test
+  - language: yaml
+    label: 'Better: apply concurrency only to the deploy job, not the matrix build job'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest, macos-latest]
+          runs-on: ${{ matrix.os }}
+          # No concurrency here — let matrix legs run in parallel
+          steps:
+            - run: make test
+        deploy:
+          needs: build
+          runs-on: ubuntu-latest
+          concurrency:
+            group: deploy-${{ github.ref }}  # Only deploy job is serialized
+            cancel-in-progress: false
+          steps:
+            - run: ./deploy.sh
+prevention:
+  - 'Always include at least one matrix variable in the concurrency group key when applying job-level concurrency to a matrix job'
+  - 'Check build duration after adding concurrency to a matrix job — a 3x slowdown usually indicates all legs are serializing'
+  - 'Apply concurrency to deploy jobs only; leave build/test jobs unrestricted to benefit from matrix parallelism'
+  - 'Use `cancel-in-progress: false` for matrix jobs if serialization is intended — prevents legs from cancelling each other'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency'
+    label: 'GitHub Docs: Using concurrency'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/running-variations-of-jobs-in-a-workflow'
+    label: 'GitHub Docs: Running variations of jobs in a workflow (matrix)'

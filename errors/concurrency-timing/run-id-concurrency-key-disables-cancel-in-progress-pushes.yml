@@ -1,0 +1,105 @@
+id: ct-099
+title: '`github.run_id` in Concurrency Group Key Makes Every Run Unique — Disables `cancel-in-progress` for Concurrent Pushes'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - run_id
+  - cancel-in-progress
+  - rerun
+  - concurrent-pushes
+  - misconfiguration
+patterns:
+  - regex: 'group:.*github\.run_id'
+    flags: 'i'
+  - regex: 'group:.*\$\{\{.*github\.run_id.*\}\}'
+    flags: 'i'
+error_messages:
+  - 'Multiple concurrent deployments running on the same branch'
+  - 'cancel-in-progress has no effect'
+root_cause: |
+  A widely-shared fix for the "Re-run failed jobs bypasses concurrency group" issue
+  (actions/runner#2294) recommends including `github.run_id` in the concurrency
+  group key:
+
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-${{ github.run_id }}
+      cancel-in-progress: false
+
+  While this does prevent reruns from being cancelled, it has a critical side effect:
+  `github.run_id` is UNIQUE for every workflow run — even independent pushes from
+  different commits get different run IDs. As a result, every run occupies its own
+  concurrency slot and `cancel-in-progress: true` never cancels any run.
+
+  This means:
+  - Rapid pushes to the same branch each spawn independent workflow runs.
+  - Deployment workflows run concurrently for every push, potentially deploying
+    multiple commits in parallel.
+  - The serialization benefit of concurrency groups is completely lost.
+
+  The confusion arises because `github.run_attempt` (the correct value for the
+  rerun fix) is distinct from `github.run_id`. `run_attempt` increments per
+  attempt of the same run and is 1 for all fresh push-triggered runs, so it
+  does not make groups unique across pushes. `run_id`, by contrast, is a
+  globally unique integer that increments monotonically across all workflow runs.
+
+  Common scenario:
+    1. Developer reads about the rerun bypass and adds `github.run_id` to their
+       concurrency group, intending to prevent reruns from being cancelled.
+    2. They set `cancel-in-progress: true` thinking it will still cancel queued
+       runs from concurrent pushes.
+    3. Three pushes in rapid succession each get unique concurrency groups and
+       run simultaneously — potentially three concurrent production deploys.
+fix: |
+  Use `github.run_attempt` instead of `github.run_id` to prevent reruns from being
+  cancelled, while preserving cross-push serialization:
+
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-${{ github.run_attempt }}
+      cancel-in-progress: false
+
+  With `run_attempt`, each fresh push-triggered run gets `run_attempt: 1`, which
+  still collapses to the same group key as other fresh runs on the same branch.
+  Only reruns of the same run increment `run_attempt`, so reruns get their own
+  slot without disabling cancellation between independent pushes.
+
+  If you want BOTH rerun protection AND cancel-in-progress for concurrent pushes,
+  use a two-layer approach: workflow-level concurrency for push serialization, plus
+  environment protection rules for deployment serialization — not run_id in the key.
+fix_code:
+  - language: yaml
+    label: 'Correct: use run_attempt (not run_id) to protect reruns while keeping cross-push cancellation'
+    code: |
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}-${{ github.run_attempt }}
+        cancel-in-progress: false
+  - language: yaml
+    label: 'Incorrect: using run_id makes every run unique — cancel-in-progress has no effect'
+    code: |
+      # BAD: every push gets a new run_id, so no two runs ever share a group
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}-${{ github.run_id }}
+        cancel-in-progress: true  # This cancel-in-progress is always a no-op
+  - language: yaml
+    label: 'Two-layer defense: workflow-level cancel-in-progress + environment protection for deploys'
+    code: |
+      concurrency:
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: true
+      jobs:
+        deploy:
+          environment: production  # Environment review gate serializes even if concurrency cancels
+          steps:
+            - run: ./deploy.sh
+prevention:
+  - 'Never use `github.run_id` in a concurrency group key if you want cancel-in-progress to work between concurrent pushes'
+  - 'Use `github.run_attempt` when protecting reruns from cancellation — it is 1 for fresh runs, >1 only for reruns'
+  - 'Verify your concurrency behavior by triggering two rapid pushes and confirming the first run is actually cancelled'
+  - 'Add a comment in your workflow YAML explaining the intent of each variable in the concurrency group key'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency'
+    label: 'GitHub Docs: Using concurrency'
+  - url: 'https://github.com/actions/runner/issues/2294'
+    label: 'actions/runner#2294: Re-run failed jobs bypasses concurrency group'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency#example-using-a-fallback-value'
+    label: 'GitHub Docs: Concurrency — using a fallback value'
