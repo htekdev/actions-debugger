@@ -1,0 +1,159 @@
+id: caching-artifacts-142
+title: '`actions/cache` Fails with "zstd -d: Cannot exec: No such file or directory" on Self-Hosted Linux Runners'
+category: caching-artifacts
+severity: error
+tags:
+  - actions-cache
+  - zstd
+  - self-hosted
+  - linux
+  - amazon-linux
+  - alpine
+  - tar
+  - compression
+  - path
+  - custom-runner
+patterns:
+  - regex: 'zstd -d: Cannot exec: No such file or directory'
+    flags: 'i'
+  - regex: 'tar.*child.*zstd.*Cannot exec|Cannot exec.*zstd.*tar'
+    flags: 'i'
+  - regex: 'Tar failed with error: The process.*tar.*failed with exit code 2'
+    flags: 'i'
+  - regex: '--use-compress-program zstd.*Cannot exec'
+    flags: 'i'
+error_messages:
+  - 'tar (child): zstd -d: Cannot exec: No such file or directory'
+  - 'tar (child): Error is not recoverable: exiting now'
+  - '/bin/tar: Child returned status 2'
+  - '/bin/tar: Error is not recoverable: exiting now'
+  - 'Warning: Tar failed with error: The process ''/bin/tar'' failed with exit code 2'
+root_cause: |
+  `actions/cache` v3+ uses **zstd** as its default compression algorithm. When saving or
+  restoring a cache, the action calls:
+
+  ```
+  /bin/tar --use-compress-program zstd -d -xf /path/to/cache.tzst ...
+  ```
+
+  The `--use-compress-program` flag tells `tar` to spawn `zstd` as a child process for
+  decompression. For this to work, `zstd` must be findable in the `PATH` that the `tar`
+  child process inherits.
+
+  On many **self-hosted Linux runners** (Amazon Linux 2, Alpine, minimal Ubuntu/Debian
+  containers, RHEL, custom images), `zstd` may be installed in a non-standard location
+  such as `/usr/local/bin/` rather than `/usr/bin/`. When `tar` forks the child process
+  to run `zstd`, it uses a **restricted PATH** that often only includes standard system
+  directories (`/bin:/usr/bin`). If `/usr/local/bin` is not in that PATH, `tar` cannot
+  find the `zstd` binary and fails with:
+
+  ```
+  tar (child): zstd -d: Cannot exec: No such file or directory
+  ```
+
+  This failure cascades to:
+  ```
+  /bin/tar: Child returned status 2
+  /bin/tar: Error is not recoverable: exiting now
+  Warning: Tar failed with error: The process '/bin/tar' failed with exit code 2
+  ```
+
+  The root cause is a **PATH mismatch** between where `zstd` is installed and where
+  `tar`'s child process looks for it. This does not occur on GitHub-hosted runners
+  because those images have `zstd` pre-installed in `/usr/bin/`.
+
+  Commonly affected environments:
+  - Amazon Linux 2 — `zstd` installed via `amazon-linux-extras` lands in `/usr/local/bin/`
+  - Alpine Linux — `zstd` may be in a custom path after manual installation
+  - Minimal Debian/Ubuntu containers where `zstd` was compiled from source
+  - Any self-hosted runner where `which zstd` returns a path other than `/usr/bin/zstd`
+fix: |
+  **Option 1 (recommended): Install zstd from the distribution package manager** so it
+  lands in `/usr/bin/`:
+
+  ```bash
+  # Amazon Linux 2 / RHEL / CentOS
+  sudo yum install -y zstd
+
+  # Debian / Ubuntu
+  sudo apt-get install -y zstd
+
+  # Alpine
+  apk add --no-cache zstd
+  ```
+
+  This ensures `zstd` is at `/usr/bin/zstd`, which is always in `tar`'s default PATH.
+
+  **Option 2: Symlink the existing zstd binary to `/usr/bin/`**:
+
+  ```bash
+  sudo ln -sf "$(which zstd)" /usr/bin/zstd
+  ```
+
+  Add this as a runner setup step or in the runner's launch script.
+
+  **Option 3: Ensure `/usr/local/bin` is in PATH before the cache step**:
+
+  ```yaml
+  - name: Add /usr/local/bin to PATH for zstd
+    run: echo "/usr/local/bin" >> $GITHUB_PATH
+  ```
+
+  Note: `$GITHUB_PATH` additions apply to subsequent steps, so place this step before
+  any step that uses `actions/cache`.
+
+  **Option 4: Use `actions/cache` v4** — the v4 release improved how it detects and
+  invokes zstd, and may handle non-standard PATH locations more gracefully on some
+  distributions.
+fix_code:
+  - language: yaml
+    label: 'Ensure zstd is installed in /usr/bin before using actions/cache (Amazon Linux 2)'
+    code: |
+      jobs:
+        build:
+          runs-on: self-hosted
+          steps:
+            - name: Ensure zstd is available in standard PATH
+              run: |
+                if ! command -v /usr/bin/zstd &>/dev/null; then
+                  sudo yum install -y zstd 2>/dev/null || \
+                  sudo apt-get install -y zstd 2>/dev/null || \
+                  sudo ln -sf "$(which zstd)" /usr/bin/zstd
+                fi
+
+            - name: Cache Maven dependencies
+              uses: actions/cache@v4
+              with:
+                path: ~/.m2/repository
+                key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+                restore-keys: |
+                  ${{ runner.os }}-maven-
+
+            - name: Build
+              run: mvn package -DskipTests
+
+  - language: yaml
+    label: 'Add /usr/local/bin to PATH so tar can find zstd installed there'
+    code: |
+      steps:
+        - name: Add /usr/local/bin to PATH (ensures tar can find zstd)
+          run: echo "/usr/local/bin" >> $GITHUB_PATH
+
+        # Must come AFTER the PATH step — $GITHUB_PATH changes apply to next steps only
+        - name: Restore cache
+          uses: actions/cache@v4
+          with:
+            path: ~/.npm
+            key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+prevention:
+  - 'On self-hosted Linux runners, always install `zstd` via the distribution package manager (`yum install zstd`, `apt-get install zstd`) to ensure it lands in `/usr/bin/`, which is in `tar`''s default child process PATH.'
+  - 'Run `which zstd` on the self-hosted runner machine before enabling caching. If the output is not `/usr/bin/zstd`, create a symlink or reinstall from the package manager.'
+  - 'Add a pre-flight step to your self-hosted runner setup script that installs/verifies zstd in a standard location.'
+  - 'Use `actions/cache@v4` rather than v3 — v4 has improved handling for some PATH edge cases on self-hosted runners.'
+docs:
+  - url: 'https://github.com/actions/cache/issues/811'
+    label: 'actions/cache#811 — Cache fails with zstd error: Cannot exec: No such file or directory (47 comments)'
+  - url: 'https://github.com/actions/cache/blob/main/README.md#self-hosted-runner-requirements'
+    label: 'actions/cache README — Self-hosted runner requirements'
+  - url: 'https://man7.org/linux/man-pages/man1/tar.1.html'
+    label: 'tar(1) — --use-compress-program behavior and child process PATH'

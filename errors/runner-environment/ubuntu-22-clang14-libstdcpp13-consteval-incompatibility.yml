@@ -1,0 +1,171 @@
+id: runner-environment-486
+title: 'Clang 14 + libstdc++13 Headers Cause `consteval` Compilation Failures on Ubuntu 22.04 Runners'
+category: runner-environment
+severity: error
+tags:
+  - clang
+  - clang-14
+  - libstdc++
+  - gcc-13
+  - ubuntu-22-04
+  - consteval
+  - chrono
+  - c++20
+  - runner-image
+  - self-hosted
+  - incompatibility
+patterns:
+  - regex: 'call to consteval function.*is not a constant expression'
+    flags: 'i'
+  - regex: 'undefined function.*cannot be used in a constant expression'
+    flags: 'i'
+  - regex: 'error:.*consteval.*chrono|chrono.*consteval.*error'
+    flags: 'i'
+  - regex: 'clang.*include/c\+\+/13.*error: call to consteval'
+    flags: 'i'
+  - regex: '_S_fractional_width.*not a constant expression'
+    flags: 'i'
+error_messages:
+  - "error: call to consteval function 'std::chrono::hh_mm_ss::_S_fractional_width' is not a constant expression"
+  - "note: undefined function '_S_fractional_width' cannot be used in a constant expression"
+  - "In file included from ... /include/c++/13/chrono:2320:48: error: call to consteval function"
+  - "clang-14: error: call to consteval function ... is not a constant expression"
+root_cause: |
+  Ubuntu 22.04 (`ubuntu-latest` and `ubuntu-22.04`) GitHub-hosted runner images
+  periodically receive package updates that install or upgrade **libstdc++ from GCC 13**
+  (`libstdc++-13-dev`) alongside **Clang 14** (the default clang on Ubuntu 22.04).
+
+  The incompatibility arises because:
+
+  1. **GCC 13's libstdc++ headers** (`/usr/include/c++/13/`) use **C++20 `consteval`**
+     features in core headers like `<chrono>`. Specifically, `std::chrono::hh_mm_ss`
+     uses a `consteval` member function `_S_fractional_width()`.
+
+  2. **Clang 14** has **incomplete C++20 `consteval` support**. It cannot call certain
+     consteval functions in constant expressions when those functions contain complex
+     control flow, even if GCC accepts them.
+
+  The mismatch means that any C++ project that:
+  - `#include <chrono>` (directly or transitively, e.g., via logging or time utilities)
+  - Compiles with the default `clang` or `clang-14` on an Ubuntu 22.04 runner
+  - Uses the libstdc++13 headers (present after `apt-get upgrade` or when `g++-13` is
+    installed as a transitive dependency)
+
+  …fails to compile with errors like:
+  ```
+  /usr/bin/../lib/gcc/x86_64-linux-gnu/13/../../../../include/c++/13/chrono:2320:48:
+  error: call to consteval function 'std::chrono::hh_mm_ss::_S_fractional_width'
+  is not a constant expression
+  ```
+
+  This failure is **intermittent** — it depends on which version of the runner image is
+  deployed. Image updates that upgrade libstdc++ from GCC 12 to GCC 13 headers trigger
+  this failure on workflows that previously compiled cleanly.
+
+  The issue does **not** affect GCC builds because GCC 13 supports its own `consteval`
+  semantics correctly. It is clang-14 (and to a lesser extent clang-15) that lacks full
+  support for GCC 13's consteval usage patterns.
+fix: |
+  **Option 1 (recommended): Install and use Clang 17 or newer**, which fully supports
+  C++20 consteval as used by GCC 13 headers:
+
+  ```yaml
+  - name: Install clang-17
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y clang-17 lld-17
+  ```
+
+  Then build with:
+  ```bash
+  CC=clang-17 CXX=clang++-17 cmake ...
+  ```
+
+  **Option 2: Pin GCC 12 headers** to avoid the GCC 13 libstdc++ mismatch:
+
+  ```yaml
+  - name: Force GCC 12 libstdc++ headers
+    run: |
+      sudo apt-get install -y g++-12
+      # Remove or de-prioritize GCC 13 headers
+      sudo apt-get remove -y libstdc++-13-dev || true
+  ```
+
+  Then compile with `-stdlib=libstdc++` pointing to GCC 12 includes — or simply use
+  `g++-12` / `clang-17` which both handle GCC 12 headers correctly.
+
+  **Option 3: Switch to GCC for compilation**, which is always compatible with its own
+  libstdc++ headers:
+
+  ```yaml
+  - name: Install GCC 13
+    run: sudo apt-get install -y g++-13
+  ```
+  Then compile with `CC=gcc-13 CXX=g++-13`.
+
+  **Option 4: Pin the runner image** to a specific version before the GCC 13 headers
+  were deployed (short-term workaround only — not recommended for new workflows).
+fix_code:
+  - language: yaml
+    label: 'Install clang-17 and use it instead of default clang-14 on Ubuntu 22.04'
+    code: |
+      name: Build C++ project
+      on: [push, pull_request]
+
+      jobs:
+        build:
+          runs-on: ubuntu-22.04
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Install clang-17 (compatible with libstdc++13 consteval)
+              run: |
+                sudo apt-get update
+                sudo apt-get install -y clang-17 lld-17
+
+            - name: Configure with CMake using clang-17
+              run: |
+                cmake -B build \
+                  -DCMAKE_C_COMPILER=clang-17 \
+                  -DCMAKE_CXX_COMPILER=clang++-17 \
+                  -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld-17"
+
+            - name: Build
+              run: cmake --build build --parallel
+
+  - language: yaml
+    label: 'Use GCC 13 instead of clang to avoid clang-14 consteval incompatibility'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-22.04
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Install GCC 13
+              run: |
+                sudo apt-get update
+                sudo apt-get install -y g++-13
+
+            - name: Configure with CMake using GCC 13
+              run: |
+                cmake -B build \
+                  -DCMAKE_C_COMPILER=gcc-13 \
+                  -DCMAKE_CXX_COMPILER=g++-13
+
+            - name: Build
+              run: cmake --build build --parallel
+prevention:
+  - 'Avoid relying on the default `clang` symlink (which points to `clang-14`) on Ubuntu 22.04 for C++20 projects. Explicitly install and specify `clang-17` or `clang-18` in your workflow.'
+  - 'When upgrading to GCC 13 headers (or installing `g++-13` as a dependency), verify that your clang version supports all consteval usage patterns in GCC 13''s `<chrono>` and related headers.'
+  - 'Add a CI step that checks the clang version: `clang --version`. If it reports clang 14 on a runner that also has libstdc++13, switch to clang-17+'
+  - 'Use `ubuntu-24.04` for new C++20 projects — it ships Clang 18 and GCC 14, which are fully compatible.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/8659'
+    label: 'actions/runner-images#8659 — ubuntu-latest: incompatible clang 14 + libstdc++13 (58 reactions)'
+  - url: 'https://github.com/llvm/llvm-project/issues/57276'
+    label: 'LLVM Issue — clang-14 consteval incomplete support with GCC 13 headers'
+  - url: 'https://releases.llvm.org/17.0.0/tools/clang/docs/ReleaseNotes.html'
+    label: 'Clang 17 Release Notes — improved consteval support'
+  - url: 'https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2204-Readme.md'
+    label: 'Ubuntu 22.04 runner image software manifests — installed clang versions'
