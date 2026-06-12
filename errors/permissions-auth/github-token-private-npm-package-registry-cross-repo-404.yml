@@ -1,0 +1,186 @@
+id: permissions-auth-120
+title: '`GITHUB_TOKEN` Returns 404 Installing Private GitHub Packages from a Different Repository'
+category: permissions-auth
+severity: error
+tags:
+  - github-token
+  - npm
+  - github-packages
+  - npm-pkg-github-com
+  - 404
+  - private-packages
+  - cross-repo
+  - registry-url
+  - node-auth-token
+  - setup-node
+patterns:
+  - regex: '404 Not Found.*npm\.pkg\.github\.com.*@[a-zA-Z0-9-]+/'
+    flags: 'i'
+  - regex: 'E404.*npm\.pkg\.github\.com|npm\.pkg\.github\.com.*E404'
+    flags: 'i'
+  - regex: 'Package.*not found.*npm\.pkg\.github\.com'
+    flags: 'i'
+  - regex: 'npm error 404.*github\.com.*is not in this registry'
+    flags: 'i'
+error_messages:
+  - "npm error code E404"
+  - "npm error 404 Not Found - GET https://npm.pkg.github.com/@org/package"
+  - "npm error 404  '@org/package@*' is not in this registry."
+  - "npm ERR! code E404"
+  - "npm ERR! 404 Not Found - GET https://npm.pkg.github.com/download/@org%2fpackage/..."
+root_cause: |
+  `GITHUB_TOKEN` is a **repository-scoped** token automatically created for each workflow
+  run. Its package permissions are restricted to the repository (and owner) where the
+  workflow is running.
+
+  When you configure `actions/setup-node` with `registry-url: 'https://npm.pkg.github.com'`
+  and pass `NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}`, the token is written to
+  `.npmrc` as the credential for the GitHub Packages npm registry. However:
+
+  - `GITHUB_TOKEN` for a workflow in `org-a/repo-x` can **only** authenticate against
+    packages published under `org-a` (the same organization/user).
+  - Installing packages from `org-b/@org-b/some-package`, or even packages published by
+    a **different repository** under the same organization (`org-a/repo-y`) can fail with
+    `404 Not Found`.
+
+  The `404` (rather than `401`) occurs because GitHub Packages returns a "not found"
+  response when the requesting token doesn't have read access to the package, rather than
+  an unauthorized error, to avoid leaking the existence of private packages.
+
+  This is a **by-design limitation** of `GITHUB_TOKEN`:
+  - It has `packages: read` permission scoped to the current workflow's repository context.
+  - It **cannot** be used to access packages from repositories where it was not generated.
+
+  Common scenarios that trigger this error:
+  1. A monorepo's CI installs private scoped packages that are published from a separate
+     repository in the same org.
+  2. A shared library published from `org/lib-repo` is used by `org/app-repo`, but the
+     CI in `app-repo` uses `GITHUB_TOKEN` to authenticate to GitHub Packages.
+  3. An action in a public repo tries to install a private package using `GITHUB_TOKEN`
+     from the consumer's repo, which has no access to the package publisher's repo.
+fix: |
+  Replace `GITHUB_TOKEN` with a token that has cross-repository `read:packages` access:
+
+  **Option 1 (recommended for organizations): GitHub App token**
+
+  Generate a GitHub App installation token with `packages: read` permissions that spans
+  the relevant repositories:
+
+  ```yaml
+  - name: Generate GitHub App token
+    id: app-token
+    uses: actions/create-github-app-token@v1
+    with:
+      app-id: ${{ vars.APP_ID }}
+      private-key: ${{ secrets.APP_PRIVATE_KEY }}
+      owner: ${{ github.repository_owner }}
+
+  - name: Setup Node.js with GitHub Packages auth
+    uses: actions/setup-node@v4
+    with:
+      node-version: '20'
+      registry-url: 'https://npm.pkg.github.com'
+
+  - run: npm ci
+    env:
+      NODE_AUTH_TOKEN: ${{ steps.app-token.outputs.token }}
+  ```
+
+  **Option 2: Personal Access Token (PAT) with `read:packages` scope**
+
+  Create a PAT with `read:packages` scope, store it as a secret (e.g.,
+  `secrets.NPM_READ_TOKEN`), and use it in place of `GITHUB_TOKEN`:
+
+  ```yaml
+  - uses: actions/setup-node@v4
+    with:
+      node-version: '20'
+      registry-url: 'https://npm.pkg.github.com'
+
+  - run: npm ci
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_READ_TOKEN }}
+  ```
+
+  **Option 3: Make the packages public**
+
+  If the packages do not need to be private, changing visibility to public in the GitHub
+  Package Registry settings allows any token (including `GITHUB_TOKEN`) to install them.
+
+  **Option 4: Use `secrets.GITHUB_TOKEN` with `packages: read` only for same-org, same-repo packages**
+
+  If the package is in the **same repository** as the consuming workflow, `GITHUB_TOKEN`
+  should work — ensure the `packages` permission is granted in the workflow file:
+  ```yaml
+  permissions:
+    packages: read
+  ```
+fix_code:
+  - language: yaml
+    label: 'Use a PAT with read:packages scope instead of GITHUB_TOKEN for cross-repo GitHub Packages access'
+    code: |
+      name: Build and test
+      on: [push, pull_request]
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Setup Node.js
+              uses: actions/setup-node@v4
+              with:
+                node-version: '20'
+                registry-url: 'https://npm.pkg.github.com'
+                # ↑ This configures .npmrc to use npm.pkg.github.com
+
+            - name: Install dependencies
+              run: npm ci
+              env:
+                # Use a PAT with read:packages scope, NOT GITHUB_TOKEN
+                # GITHUB_TOKEN only works for packages in the same repo
+                NODE_AUTH_TOKEN: ${{ secrets.NPM_READ_PACKAGES_TOKEN }}
+
+  - language: yaml
+    label: 'Use GitHub App token for org-wide package access (recommended for teams)'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Generate org-scoped GitHub App token
+              id: app-token
+              uses: actions/create-github-app-token@v1
+              with:
+                app-id: ${{ vars.PACKAGES_APP_ID }}
+                private-key: ${{ secrets.PACKAGES_APP_PRIVATE_KEY }}
+                owner: ${{ github.repository_owner }}
+                # This token has read:packages across the org
+
+            - name: Setup Node.js with GitHub Packages registry
+              uses: actions/setup-node@v4
+              with:
+                node-version: '20'
+                registry-url: 'https://npm.pkg.github.com'
+
+            - name: Install dependencies (using App token for cross-repo packages)
+              run: npm ci
+              env:
+                NODE_AUTH_TOKEN: ${{ steps.app-token.outputs.token }}
+prevention:
+  - 'Never use `GITHUB_TOKEN` to install GitHub Packages from repositories other than the one running the workflow. Create a dedicated PAT with `read:packages` or use a GitHub App token.'
+  - 'Document in your repository README which packages require a special token, and provide setup instructions for developers and CI.'
+  - 'Store the `read:packages` PAT as an organization secret (not repository secret) so all repos that consume your packages can access it without per-repo configuration.'
+  - 'When publishing packages, document whether they are public or private and what token is needed to install them in dependent projects.'
+docs:
+  - url: 'https://github.com/actions/setup-node/issues/49'
+    label: 'actions/setup-node#49 — GITHUB_TOKEN does not have access to other private packages (119 reactions)'
+  - url: 'https://docs.github.com/en/packages/managing-github-packages-using-github-actions-workflows/publishing-and-installing-a-package-with-github-actions#installing-a-package-using-an-action'
+    label: 'GitHub Docs — Installing a package using an action (token requirements)'
+  - url: 'https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#creating-a-fine-grained-personal-access-token'
+    label: 'GitHub Docs — Creating a PAT with read:packages scope'
+  - url: 'https://docs.github.com/en/actions/security-guides/automatic-token-authentication#permissions-for-the-github_token'
+    label: 'GitHub Docs — Permissions for GITHUB_TOKEN (scoped to workflow repository)'
