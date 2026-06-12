@@ -1,0 +1,82 @@
+id: caching-artifacts-140
+title: 'upload-artifact v4+ Fails with "Unexpected token ''<'', ''<!DOCTYPE''..." — GitHub Artifact API Returns HTML Error Page'
+category: caching-artifacts
+severity: error
+tags:
+  - upload-artifact
+  - v4
+  - intermittent
+  - json-parse-error
+  - html-response
+  - service-degradation
+  - create-artifact
+  - finalize-artifact
+patterns:
+  - regex: 'Failed to (CreateArtifact|FinalizeArtifact): Unexpected token .?<.?, .?<!DOCTYPE'
+    flags: 'i'
+  - regex: 'Unexpected token .?<.?.*<!DOCTYPE.*is not valid JSON'
+    flags: 'i'
+error_messages:
+  - 'Error: Failed to FinalizeArtifact: Unexpected token ''<'', "<!DOCTYPE "... is not valid JSON'
+  - 'Error: Failed to CreateArtifact: Unexpected token ''<'', "<!DOCTYPE "... is not valid JSON'
+root_cause: |
+  The `actions/upload-artifact` action v4+ communicates with the GitHub Actions artifact
+  results API via HTTP/Twirp (JSON) to create and finalize artifact records. When the
+  artifact service or an intermediate layer (CDN, load balancer, API gateway) is
+  experiencing degradation or a transient error, it sometimes returns an HTML error page
+  (starting with `<!DOCTYPE html>`) instead of the expected JSON response body.
+
+  The action's JSON parser receives `<!DOCTYPE html><html>...` and throws a parse
+  exception with the message `Unexpected token '<', "<!DOCTYPE "... is not valid JSON`
+  (Node.js JSON.parse behavior). This manifests as a hard failure on either the
+  CreateArtifact RPC (before upload starts) or FinalizeArtifact RPC (after the blob
+  has been uploaded to Azure Blob Storage).
+
+  This error is not caused by the workflow configuration — it is a transient GitHub
+  infrastructure issue where the service-to-service routing layer returns HTML instead
+  of JSON. It occurs intermittently (typically at low rates) and correlates with
+  GitHub Actions service degradation events. Tracked in actions/upload-artifact#543
+  (17+ reactions, open since 2024).
+fix: |
+  This is a transient infrastructure error with no permanent workflow-side fix.
+
+  1. Re-run the failed workflow — the error is intermittent and will typically succeed
+     on retry.
+  2. Check https://githubstatus.com for active GitHub Actions service incidents.
+  3. Add a retry wrapper if your workflow uploads artifacts frequently and this error
+     appears regularly.
+  4. If using GitHub Enterprise Server (GHES), check whether the appliance's artifact
+     backend is configured correctly and the internal routing is healthy.
+fix_code:
+  - language: yaml
+    label: 'Add retry wrapper around upload-artifact to handle transient HTML responses'
+    code: |
+      steps:
+        - name: Build
+          run: make build
+
+        - name: Upload artifact (with continue-on-error + retry on transient failure)
+          id: upload
+          uses: actions/upload-artifact@v4
+          continue-on-error: true
+          with:
+            name: build-output
+            path: dist/
+
+        - name: Retry upload on transient failure
+          if: steps.upload.outcome == 'failure'
+          uses: actions/upload-artifact@v4
+          with:
+            name: build-output
+            path: dist/
+prevention:
+  - 'For critical workflows, wrap upload-artifact with a retry mechanism to recover from transient artifact service HTML responses.'
+  - 'Monitor https://githubstatus.com when upload-artifact failures spike across multiple unrelated repositories — this indicates a GitHub-side service incident.'
+  - 'Avoid using fail-fast: true on matrix jobs that upload artifacts; a transient HTML response in one matrix job will cancel all sibling jobs.'
+docs:
+  - url: 'https://github.com/actions/upload-artifact/issues/543'
+    label: 'actions/upload-artifact#543 — v4.3.1: Unexpected token ''<'', "<!DOCTYPE"... is not valid JSON'
+  - url: 'https://githubstatus.com'
+    label: 'GitHub Status — check for active GitHub Actions infrastructure incidents'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-workflow-data-as-artifacts'
+    label: 'GitHub Docs — Storing workflow data as artifacts'

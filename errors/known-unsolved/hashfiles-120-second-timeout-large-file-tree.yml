@@ -1,0 +1,111 @@
+id: known-unsolved-133
+title: 'hashFiles() Expression Function Has a Hardcoded 120-Second Timeout — Fails on Large File Trees'
+category: known-unsolved
+severity: limitation
+tags:
+  - hashFiles
+  - expression
+  - timeout
+  - large-repo
+  - cache
+  - self-hosted
+  - known-limitation
+  - performance
+patterns:
+  - regex: 'hashFiles\(.*\) couldn.t finish within 120 seconds'
+    flags: 'i'
+  - regex: 'The template is not valid.*hashFiles.*couldn.t finish within'
+    flags: 'i'
+  - regex: 'hashFiles.*couldn.t finish within \d+ seconds'
+    flags: 'i'
+error_messages:
+  - "Error: The template is not valid. .github/workflows/main.yml (Line: X, Col: Y): hashFiles('path/**') couldn't finish within 120 seconds."
+  - "hashFiles('Assets\\**') couldn't finish within 120 seconds."
+  - "hashFiles('Assets\\**, Packages\\**, ProjectSettings\\**') couldn't finish within 120 seconds."
+root_cause: |
+  The GitHub Actions `hashFiles()` expression function is evaluated by the runner
+  worker process during YAML template evaluation, before a job step executes. The
+  runner hard-codes a 120-second (2-minute) execution timeout for the `hashFiles()`
+  subprocess in the runner source
+  (GitHub.Runner.Worker/Expressions/HashFilesFunction.cs). If the function cannot
+  hash all matching files within this window, the runner sends CTRL+C to the subprocess
+  and throws a template validation error:
+
+    Error: The template is not valid. ... hashFiles('...') couldn't finish within 120 seconds.
+
+  This timeout is triggered when:
+  1. The glob pattern matches an extremely large number of files (tens of thousands+),
+     such as `node_modules/**`, `Assets/**` in Unity projects, or `**` on large repos.
+  2. The runner is on slow I/O storage (spinning disk, slow NFS mount, network-attached
+     storage on self-hosted runners), causing each file read to take longer than expected.
+  3. The runner host is under CPU pressure, slowing the Node.js hashing subprocess.
+
+  There is no workflow-level configuration option to increase the 120-second timeout.
+  The value is hardcoded in the runner binary and requires a GitHub-side runner release
+  to change. This is a known limitation tracked in actions/runner#1840 (open since 2022).
+fix: |
+  There is no way to increase the hashFiles() timeout from the workflow. Workarounds:
+
+  1. Narrow the glob pattern — Use the most specific paths possible to reduce the file
+     count. Instead of hashFiles('**'), use hashFiles('**/package-lock.json') or
+     hashFiles('**/yarn.lock'). Always target lockfiles, not dependency directories.
+
+  2. Replace hashFiles() with a custom hash step — Compute the hash via a shell command
+     and store it in GITHUB_OUTPUT or an env var for use in subsequent cache key
+     expressions. Shell-based hashing can process files sequentially without opening
+     all file handles at once, avoiding both EMFILE and the 120s timeout.
+
+  3. Improve runner I/O performance — For self-hosted runners on slow storage, migrate
+     the workspace to an SSD or faster mount point to speed up the hashing subprocess.
+
+  4. Exclude large directories from the workspace — If your repo contains vendor,
+     node_modules, or generated files, ensure they are gitignored and not present in
+     the checked-out workspace when hashFiles() runs.
+fix_code:
+  - language: yaml
+    label: 'Replace hashFiles() with a custom hash script for large file trees'
+    code: |
+      steps:
+        - uses: actions/checkout@v4
+
+        - name: Compute cache key hash (avoids hashFiles() 120s timeout)
+          id: hash
+          shell: bash
+          run: |
+            # Hash all .cs and .mat files sequentially — avoids opening too many
+            # file handles simultaneously and respects the runner I/O limits.
+            find Assets -type f \( -name "*.cs" -o -name "*.mat" \) | \
+              sort | \
+              xargs sha256sum 2>/dev/null | sha256sum | \
+              awk '{print $1}' | xargs -I{} echo "hash={}" >> "$GITHUB_OUTPUT"
+
+        - uses: actions/cache@v4
+          with:
+            path: Library
+            # Use the custom hash output — not hashFiles() which times out
+            key: Library-${{ steps.hash.outputs.hash }}
+  - language: yaml
+    label: 'Narrow glob to lockfiles only — never hash node_modules or vendor'
+    code: |
+      steps:
+        - uses: actions/cache@v4
+          with:
+            path: ~/.npm
+            # CORRECT: hash only the lockfile (fast, few files)
+            key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+            # WRONG: hashing node_modules or ** will time out on large repos:
+            # key: ${{ runner.os }}-npm-${{ hashFiles('node_modules/**') }}
+            # key: ${{ runner.os }}-npm-${{ hashFiles('**') }}
+prevention:
+  - 'Never use hashFiles(''**'') or patterns matching node_modules, vendor, or generated output directories — these match tens of thousands of files and will time out.'
+  - 'Target lockfiles with hashFiles() (package-lock.json, yarn.lock, Pipfile.lock, poetry.lock) — they are small and hash quickly.'
+  - 'For Unity projects with large Assets folders, compute cache keys using custom hash scripts rather than hashFiles() glob patterns.'
+  - 'On self-hosted runners, ensure workspace storage is SSD-backed to reduce per-file I/O time for hashFiles().'
+  - 'Test glob patterns locally before using in CI: find . -path ''./path/**'' | wc -l — if over 10000 files, use a custom hash instead.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/1840'
+    label: 'actions/runner#1840 — hashFiles() couldn''t finish within 120 seconds (open since 2022)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#hashfiles'
+    label: 'GitHub Docs — hashFiles() expression function reference'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/caching-dependencies-to-speed-up-workflows'
+    label: 'GitHub Docs — Caching dependencies to speed up workflows'

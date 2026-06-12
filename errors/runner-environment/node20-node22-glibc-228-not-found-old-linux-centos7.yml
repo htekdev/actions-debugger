@@ -1,0 +1,109 @@
+id: runner-environment-484
+title: 'Node 20/22 JavaScript Actions Fail with "GLIBC_2.28 not found" on Old Linux Distros (CentOS 7, Ubuntu 16/18, RHEL 7)'
+category: runner-environment
+severity: error
+tags:
+  - node20
+  - node22
+  - glibc
+  - self-hosted
+  - centos7
+  - ubuntu-16
+  - ubuntu-18
+  - old-linux
+  - composite-actions
+  - javascript-actions
+  - glibc-incompatibility
+patterns:
+  - regex: '/__e/node(20|22)/bin/node:.*GLIBC_2\.(2[5-9]|[3-9]\d).*not found'
+    flags: 'i'
+  - regex: '/node(20|22)/bin/node:.*version .GLIBC_2\.(2[5-9]|[3-9]\d). not found'
+    flags: 'i'
+  - regex: 'GLIBC_2\.2[5-9].*not found \(required by.*node'
+    flags: 'i'
+error_messages:
+  - '/__e/node20/bin/node: /lib/x86_64-linux-gnu/libm.so.6: version ''GLIBC_2.27'' not found (required by /__e/node20/bin/node)'
+  - '/__e/node20/bin/node: /lib/x86_64-linux-gnu/libc.so.6: version ''GLIBC_2.28'' not found (required by /__e/node20/bin/node)'
+  - '/__e/node20/bin/node: /lib/x86_64-linux-gnu/libc.so.6: version ''GLIBC_2.25'' not found (required by /__e/node20/bin/node)'
+root_cause: |
+  GitHub Actions migrated from Node 16 to Node 20 as the runtime for JavaScript actions
+  starting in late 2023. Node.js 20 (and Node.js 22) requires GLIBC 2.28 or later on
+  Linux. However, several Linux distributions that GitHub lists as supported for
+  self-hosted runners ship with older GLIBC versions:
+
+  - CentOS 7: GLIBC 2.17 (EOL June 2024, widely used in enterprise environments)
+  - RHEL 7 and derivatives (OEL 7, SL 7): GLIBC 2.17
+  - Ubuntu 16.04: GLIBC 2.23 (EOL April 2021)
+  - Ubuntu 18.04: GLIBC 2.27 (EOL April 2023)
+
+  When any JavaScript action that uses `runs: using: 'node20'` (or `node22`) executes
+  on these self-hosted runner hosts or container images, the runner extracts its embedded
+  Node.js binary (`/__e/node20/bin/node`) and attempts to execute it. The dynamic linker
+  immediately fails because the Node binary was compiled against GLIBC 2.28 symbols that
+  are not present in the old system libc, producing:
+
+    /__e/node20/bin/node: /lib/x86_64-linux-gnu/libc.so.6: version 'GLIBC_2.28' not found
+
+  This affects ALL JavaScript actions (including first-party actions: actions/checkout,
+  actions/cache, actions/setup-node, actions/upload-artifact) when running on these
+  old Linux environments. Tracked in actions/runner#2906 (59+ reactions, open since
+  2023).
+fix: |
+  The only permanent fix is to upgrade the runner host OS or container to a distribution
+  that ships GLIBC 2.28 or later.
+
+  1. Upgrade the runner OS — Migrate from CentOS 7 / RHEL 7 to CentOS Stream 8/9,
+     AlmaLinux 8/9, Rocky Linux 8/9, or Ubuntu 20.04+. These ship GLIBC 2.28+.
+
+  2. Use a newer container image — If running workflows inside a container on a self-hosted
+     runner, change the container: image to a newer base that has GLIBC 2.28+:
+     ubuntu:20.04 (2.31), ubuntu:22.04 (2.35), almalinux:8 (2.28), rockylinux:9 (2.34).
+
+  3. Pin actions to Node 16 versions (temporary workaround only) — Use specific action
+     versions that still bundle node16. For example, actions/checkout@v3 (node16) instead
+     of v4 (node20). Note: Node 16 is EOL and this is a short-term measure only.
+
+  4. Set ACTIONS_RUNNER_FORCED_INTERNAL_NODE_PATH — If a GLIBC-compatible Node 20+
+     binary is available on the runner (e.g., statically linked), set this env var to
+     override the runner's bundled Node binary path.
+fix_code:
+  - language: yaml
+    label: 'Use modern base container image with GLIBC 2.28+ (Node 20 actions work inside)'
+    code: |
+      jobs:
+        build:
+          runs-on: self-hosted     # host can be old Linux (CentOS 7, RHEL 7)
+          container:
+            image: ubuntu:22.04   # GLIBC 2.35 — Node 20 and Node 22 work inside
+          steps:
+            - uses: actions/checkout@v4    # Node 20 action — works in ubuntu:22.04
+            - name: Build
+              run: make build
+            - uses: actions/upload-artifact@v4
+              with:
+                name: build-output
+                path: dist/
+  - language: yaml
+    label: 'Temporary workaround — pin first-party actions to Node 16 versions'
+    code: |
+      jobs:
+        build:
+          runs-on: self-hosted-centos7
+          steps:
+            # Pin to versions that still ship node16 runtime (temporary only)
+            - uses: actions/checkout@v3           # v3 = node16, v4 = node20
+            - uses: actions/cache@v3              # v3 = node16, v4 = node20
+            - uses: actions/upload-artifact@v3   # v3 = node16, v4 = node20
+            # WARNING: Node 16 is deprecated. Upgrade OS for permanent fix.
+prevention:
+  - 'Before deploying self-hosted runners on custom Linux images, verify GLIBC version: ldd --version. Require GLIBC >= 2.28 for Node 20 actions.'
+  - 'When using container: in workflow jobs, always use base images with GLIBC 2.28+ (Ubuntu 20.04+, Debian Bullseye+, AlmaLinux 8+, Rocky Linux 8+).'
+  - 'Audit all self-hosted runner OS versions at each GitHub Actions Node runtime upgrade; plan migrations before EOL Linux distros become hard blockers.'
+  - 'CentOS 7 reached EOL June 2024. Migrate to AlmaLinux 8/9 or Rocky Linux 8/9 as drop-in replacements with GLIBC 2.28+.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/2906'
+    label: 'actions/runner#2906 — Composite Actions using Node 20 don''t work with CentOS 7 (59+ reactions, open)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners#linux'
+    label: 'GitHub Docs — Supported operating systems for self-hosted runners'
+  - url: 'https://nodejs.org/en/blog/release/v20.0.0'
+    label: 'Node.js v20 release notes — requires GLIBC 2.28 on Linux'
