@@ -1,0 +1,91 @@
+id: re-469
+title: 'Self-Hosted Runner on Immutable Filesystem Reports False Disk Space Warning Every Job'
+category: runner-environment
+severity: warning
+tags:
+  - self-hosted
+  - disk-space
+  - immutable-filesystem
+  - composefs
+  - bootc
+  - ostree
+  - fedora-coreos
+  - false-positive
+patterns:
+  - regex: 'Warning: You are running out of disk space\. The runner will stop working when the amount of free disk space is less than'
+    flags: 'i'
+  - regex: 'Runner is running on a low storage device'
+    flags: 'i'
+error_messages:
+  - "Warning: You are running out of disk space. The runner will stop working when the amount of free disk space is less than 100 megabytes."
+  - "Warning: You are running out of disk space. The runner will stop working when the amount of free disk space is less than 1 gigabyte."
+root_cause: |
+  The runner's disk-space check in `JobExtension.cs` calls `Directory.GetDirectoryRoot(path)` to
+  determine the filesystem root for each path it monitors. On Linux, this always returns `/`
+  regardless of the actual mount point.
+
+  On immutable/composefs root filesystems (Fedora CoreOS, bootc-based images, ostree-managed
+  systems, any system using a read-only root mount with overlays), the runner resolves EVERY path —
+  including workspace, tools, and _temp directories — to the root `/` filesystem. The root
+  filesystem on these systems is intentionally small and read-only, so the free-space check against
+  it always reports "almost full" even when the writable overlay volumes have gigabytes of space.
+
+  The underlying bug: `CheckDiskSpaceAsync` does not follow mount points or use `statvfs` per-path
+  — it calls `Directory.GetDirectoryRoot()` which returns `/` universally on Linux, then checks
+  free space on that root mount. On immutable systems where `/` is a compressed squashfs or
+  composefs image mounted read-only, the "free space" is 0 or near 0, so the warning fires on
+  every job regardless of actual available storage.
+
+  Source: actions/runner#4380 (opened Apr 25, 2026, confirmed by v-SergeRadich).
+fix: |
+  **Workaround 1 — Override work/tools directories to a writable volume:**
+  Configure `RUNNER_WORK_FOLDER` and tool cache to point to a writable mount that the runner
+  can actually write to (e.g., a tmpfs or persistent data volume). The runner disk check will
+  then measure free space on that writable mount.
+
+  **Workaround 2 — Suppress the warning via runner environment:**
+  Set the environment variable `RUNNER_TOOL_CACHE` and workspace to a writable path under a
+  mounted data volume (e.g., `/var/lib/runner/work`). The runner resolves the root of that path
+  which should map to a normal writable filesystem with real free space.
+
+  **Long-term fix:** This is a runner bug (actions/runner#4380). GitHub is investigating a
+  `statvfs`-per-path approach. There is no complete fix from the user side until the runner
+  implements proper per-mount free-space checks.
+fix_code:
+  - language: yaml
+    label: 'Workaround — point runner work folder to a writable data volume'
+    code: |
+      # In your runner registration or systemd unit, set:
+      # RUNNER_WORK_FOLDER=/var/lib/runner/work
+      # This ensures disk space is measured on the writable volume,
+      # not the immutable root filesystem.
+
+      # Example systemd override for a bootc/Fedora CoreOS runner:
+      # /etc/systemd/system/actions.runner.service.d/override.conf
+      # [Service]
+      # Environment=RUNNER_WORK_FOLDER=/var/lib/runner/work
+      # Environment=RUNNER_TOOL_CACHE=/var/lib/runner/tools
+
+      # In your workflow (hosted on this runner), no changes needed.
+      # The false warning will stop once the runner resolves work paths
+      # to a mount point with actual free space.
+      - name: Build
+        run: make build
+  - language: yaml
+    label: 'Verify actual disk space (diagnostic step to confirm false positive)'
+    code: |
+      - name: Check actual disk space
+        run: df -h
+        # Expected: shows GB of free space on /var, /home, or data volumes
+        # even when the runner reports "low disk space" warning.
+        # If df -h shows real free space, this is the false-positive bug.
+prevention:
+  - 'On immutable Linux systems, always configure the runner work folder to a writable mount (e.g., /var/lib/runner) rather than default locations.'
+  - 'Use `df -h` in a diagnostic step to confirm whether the disk space warning is a false positive from the root filesystem check.'
+  - 'Track actions/runner#4380 for an official fix that uses per-path statvfs rather than Directory.GetDirectoryRoot.'
+  - 'Consider using Fedora CoreOS writable overlays or a dedicated data partition mounted at /var for runner workloads.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4380'
+    label: 'actions/runner#4380 — False disk space warning on immutable/composefs root filesystems'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners'
+    label: 'GitHub Docs — About self-hosted runners'
