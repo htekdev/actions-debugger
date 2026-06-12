@@ -1,0 +1,113 @@
+id: caching-artifacts-143
+title: 'cache save Fails with Misleading "another job may be creating this cache" — Real Cause Is 409 Conflict (Key Already Exists)'
+category: caching-artifacts
+severity: error
+tags:
+  - actions/cache
+  - cache-save
+  - immutable-cache
+  - 409-conflict
+  - matrix
+  - misleading-error
+  - race-condition
+patterns:
+  - regex: 'Unable to reserve cache with key.{0,200}another job may be creating this cache'
+    flags: "i"
+  - regex: 'Failed to save.*Unable to reserve cache'
+    flags: "i"
+  - regex: 'Failed to CreateCacheEntry.*409.*Conflict.*already exists'
+    flags: "i"
+error_messages:
+  - "Failed to save: Unable to reserve cache with key <cache-key>, another job may be creating this cache."
+  - "Warning: Cache save failed."
+  - "Failed to CreateCacheEntry: Received non-retryable error: Failed request: (409) Conflict: cache entry with the same key, version, and scope already exists"
+root_cause: |
+  GitHub Actions caches are **immutable** — once a cache entry is created with
+  a specific `key`, that key cannot be overwritten or updated. Attempting to
+  save a cache using a key that already exists results in a `409 Conflict`
+  HTTP response from the cache service.
+
+  The user-visible error message "another job may be creating this cache" is
+  misleading. Enabling `ACTIONS_STEP_DEBUG=true` reveals the actual debug log:
+    `(409) Conflict: cache entry with the same key, version, and scope already exists`
+
+  This error occurs in two distinct scenarios:
+
+  **Scenario A — Immutable cache from a previous run:**
+  A workflow ran successfully before and saved a cache with a static or
+  slowly-changing key (e.g., just `runner.os` or a branch name). On the next
+  run, the key evaluates to the same value, but the cache already exists —
+  the save fails. The workflow silently uses stale cached content.
+
+  **Scenario B — Matrix race condition:**
+  Multiple parallel matrix jobs compute the same cache key (because the key
+  does not include matrix-dimension values). All jobs attempt to save the cache
+  simultaneously; one job reserves the key first and the others receive a 409
+  with the misleading error.
+
+  Sources: actions/cache#1665, actions/cache#1707
+fix: |
+  Include a **content-changing value** (typically a lockfile hash) in the
+  cache key so the key naturally rotates when dependencies change:
+
+    key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+
+  For matrix workflows, include all matrix dimension values in the key to
+  prevent parallel jobs from competing for the same entry.
+
+  To force-refresh a specific cache entry (e.g., after a dependency override),
+  delete it using the GitHub CLI before the next workflow run:
+
+    gh cache delete --key <exact-key> --repo owner/repo
+fix_code:
+  - language: yaml
+    label: 'Content-hashed key — rotates when dependencies change, prevents 409 on re-runs'
+    code: |
+      - name: Cache npm dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            node_modules
+          # Hash of lockfile: key changes only when dependencies change
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+  - language: yaml
+    label: 'Matrix workflow — include all matrix dimensions to prevent parallel-job key collisions'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest, macos-latest]
+              node: [18, 20, 22]
+          runs-on: ${{ matrix.os }}
+          steps:
+            - name: Cache node modules
+              uses: actions/cache@v4
+              with:
+                path: node_modules
+                # All matrix dimensions in the key prevent race-condition 409s
+                key: node-${{ matrix.os }}-${{ matrix.node }}-${{ hashFiles('**/package-lock.json') }}
+  - language: yaml
+    label: 'Force-delete a stale exact-key cache via GitHub CLI'
+    code: |
+      # Run locally or in a pre-workflow step to clear a stuck immutable cache
+      gh cache delete \
+        --key "ubuntu-latest-node-20-abc123def456" \
+        --repo owner/repo
+prevention:
+  - 'Always include a lockfile hash in cache keys — `hashFiles()` ensures the key rotates when dependencies change'
+  - 'In matrix workflows, embed every matrix dimension in the cache key to prevent parallel jobs from colliding on the same immutable entry'
+  - 'Enable `ACTIONS_STEP_DEBUG=true` to see the real `409 Conflict` message when "another job may be creating this cache" appears with no concurrent jobs'
+  - 'Treat caches as write-once per key — design key schemes to generate unique keys for each meaningful content change rather than trying to overwrite existing ones'
+docs:
+  - url: 'https://github.com/actions/cache/issues/1665'
+    label: 'actions/cache#1665 — Misleading error message when attempting to overwrite the existing cache'
+  - url: 'https://github.com/actions/cache/issues/1707'
+    label: 'actions/cache#1707 — Unable to reserve cache (actions/cache/save@v5)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows#restrictions-for-accessing-a-cache'
+    label: 'GitHub Docs — Cache restrictions (caches are immutable)'
+  - url: 'https://cli.github.com/manual/gh_cache_delete'
+    label: 'GitHub CLI — gh cache delete'

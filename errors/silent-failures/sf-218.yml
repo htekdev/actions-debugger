@@ -1,0 +1,107 @@
+id: sf-218
+title: 'shell: bash in Composite Action on windows-11-arm Intermittently Exits 0 With Zero Output (WoW64 x86_64 Race)'
+category: silent-failures
+severity: silent-failure
+tags:
+  - windows-11-arm
+  - composite-action
+  - shell-bash
+  - wow64
+  - arm64
+  - intermittent
+  - zero-output
+patterns:
+  - regex: 'windows-11-arm.*shell.*bash|windows.*arm64.*composite.*bash'
+    flags: "i"
+error_messages:
+  - "# No explicit error — step exits 0 with no output. Downstream steps fail because tools the bash script should have installed are missing."
+root_cause: |
+  On `windows-11-arm` runners, the GitHub Actions runner binary is a **native
+  ARM64 process**. When a composite action step uses `shell: bash`, the runner
+  resolves `bash` to `C:\Program Files\Git\bin\bash.EXE`, which is an
+  **x86_64 binary running under Windows WoW64 ARM64 emulation**.
+
+  This cross-architecture parent-child process spawn — native ARM64 runner
+  launching an x86_64 emulated bash child — is unique to `windows-11-arm`.
+  A transient race condition in the WoW64 process-creation path causes the
+  bash subprocess to launch with exit code 0 but produce **zero output** and
+  execute no commands. The runner sees exit code 0 and reports the step as
+  "passed," even though nothing was installed, built, or deployed.
+
+  The failure is intermittent (~1-2% per invocation) and affects any composite
+  action using `shell: bash` on this runner type. Two consecutive bash steps
+  in the same job can produce different outcomes: one silently fails, the
+  other succeeds normally.
+
+  Confirmed across multiple repositories:
+  - microsoft/Windows-rust-driver-samples (≥9 occurrences out of ~500 runs)
+  - microsoft/windows-drivers-rs
+
+  Reported: https://github.com/actions/runner-images/issues/14052
+fix: |
+  Replace `shell: bash` with `shell: pwsh` (PowerShell Core) in composite
+  action steps when targeting `windows-11-arm`. PowerShell is a native ARM64
+  binary on these runners and does not exhibit the WoW64 race condition.
+
+  If the bash script logic is complex or must remain portable, gate the shell
+  choice on the runner OS at the workflow level using a `matrix` or `if:` to
+  select `bash` on Linux/macOS and `pwsh` on Windows ARM64.
+
+  Always add a post-install verification step that confirms the expected
+  tool/artifact exists before proceeding — this converts a silent failure into
+  an explicit error that surfaces early.
+fix_code:
+  - language: yaml
+    label: 'Replace shell: bash with shell: pwsh for steps in composite actions on windows-11-arm'
+    code: |
+      # In action.yml of your composite action:
+      runs:
+        using: composite
+        steps:
+          - name: Install tool
+            # BEFORE (broken on windows-11-arm): shell: bash
+            # shell: bash
+            # run: bash "${GITHUB_ACTION_PATH}/install.sh"
+
+            # AFTER: use pwsh — native ARM64 on windows-11-arm
+            shell: pwsh
+            run: |
+              # PowerShell equivalent of install.sh
+              $toolUri = "https://example.com/tool.zip"
+              Invoke-WebRequest -Uri $toolUri -OutFile tool.zip
+              Expand-Archive tool.zip -DestinationPath $env:RUNNER_TOOL_CACHE\tool
+
+          - name: Verify tool installed (catches silent bash zero-output failures)
+            shell: pwsh
+            run: |
+              if (-not (Get-Command mytool -ErrorAction SilentlyContinue)) {
+                throw "mytool not found — composite action step may have silently exited 0 without running"
+              }
+  - language: yaml
+    label: 'Workflow-level detection: fail-fast if composite action produces no evidence of execution'
+    code: |
+      steps:
+        - uses: my-org/install-rust-tools@v2  # composite action with shell: bash
+
+        # Explicit guard — convert silent failure to explicit error
+        - name: Verify cargo-make installed
+          shell: pwsh
+          run: |
+            $cmd = Get-Command cargo-make -ErrorAction SilentlyContinue
+            if (-not $cmd) {
+              Write-Error "cargo-make missing after install step — possible windows-11-arm WoW64 bash race"
+              exit 1
+            }
+            Write-Host "cargo-make OK: $($cmd.Source)"
+prevention:
+  - 'Avoid `shell: bash` in composite actions targeting `windows-11-arm` — use `shell: pwsh` or a runner-OS-conditional shell selection'
+  - 'Add post-install verification steps that assert the expected artifact (binary, file, directory) exists before the composite action returns'
+  - 'When a step on `windows-11-arm` has exit code 0 but no log output, suspect the WoW64 bash race — add explicit assertions'
+  - 'Track https://github.com/actions/runner-images/issues/14052 for an official fix or upstream Git-for-Windows bash update'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14052'
+    label: 'actions/runner-images#14052 — Composite action bash steps intermittently produce zero output on windows-11-arm'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#defaultsrunshell'
+    label: 'GitHub Docs — Workflow syntax: shell defaults'
+  - url: 'https://docs.github.com/en/actions/creating-actions/metadata-syntax-for-github-actions#runsstepsshell'
+    label: 'GitHub Docs — Composite action step shell attribute'
