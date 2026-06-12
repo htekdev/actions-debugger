@@ -1,0 +1,94 @@
+id: sf-224
+title: '`github.action_repository` and `github.action_ref` Are Empty in Composite Action `run:` Steps'
+category: silent-failures
+severity: silent-failure
+tags:
+  - composite-action
+  - github-context
+  - action_repository
+  - action_ref
+  - context-availability
+  - run-step
+patterns:
+  - regex: 'github\.action_repository'
+    flags: 'i'
+  - regex: 'github\.action_ref'
+    flags: 'i'
+error_messages:
+  - "# no error — github.action_repository and github.action_ref silently evaluate to empty string in run: steps"
+  - "REPOSITORY="
+  - "ACTION_REF="
+root_cause: |
+  In composite actions, `github.action_repository` and `github.action_ref` are context
+  values that identify which action is currently executing (e.g.
+  `owner/my-action` and `v2`). They are populated for `env:` block evaluation at the job
+  level, but when referenced inside `run:` step scripts via `${{ github.action_repository }}`
+  or `${{ github.action_ref }}`, the runner evaluates them at a different phase and returns
+  empty strings.
+
+  This means composite actions that attempt to construct dynamic paths or API calls based on
+  their own repository/ref — a common pattern for self-referential logic — silently receive
+  empty strings. The step runs without error, the variables are just blank, and downstream
+  logic silently fails or produces incorrect results.
+
+  The same values ARE correctly populated when accessed via `env:` at the job level and when
+  used by Node.js or Docker action types. The inconsistency is specific to the `run:` step
+  evaluation path inside composite actions.
+
+  GitHub support has indicated this is unlikely to be fixed in the near term.
+fix: |
+  Capture the values in an `env:` block on the step, then reference the environment
+  variables in the shell script rather than using the `${{ }}` expression inline in `run:`.
+
+  Replace:
+    run: echo "${{ github.action_repository }}"
+
+  With:
+    env:
+      ACTION_REPO: ${{ github.action_repository }}
+      ACTION_REF: ${{ github.action_ref }}
+    run: echo "$ACTION_REPO@$ACTION_REF"
+
+  The `env:` block is evaluated at a different phase where the context IS populated
+  correctly, so the shell variables receive the expected values.
+fix_code:
+  - language: yaml
+    label: 'BROKEN — github.action_repository empty in run: step expression'
+    code: |
+      # action.yml (composite action)
+      runs:
+        using: composite
+        steps:
+          - name: Show which action is running
+            shell: bash
+            run: |
+              # BROKEN: both evaluate to empty string
+              echo "Repo: ${{ github.action_repository }}"
+              echo "Ref:  ${{ github.action_ref }}"
+  - language: yaml
+    label: 'FIXED — capture via env: block, then use shell variable'
+    code: |
+      # action.yml (composite action)
+      runs:
+        using: composite
+        steps:
+          - name: Show which action is running
+            shell: bash
+            env:
+              ACTION_REPO: ${{ github.action_repository }}
+              ACTION_REF: ${{ github.action_ref }}
+            run: |
+              # FIXED: env: block populated correctly
+              echo "Repo: $ACTION_REPO"
+              echo "Ref:  $ACTION_REF"
+prevention:
+  - "Never use `${{ github.action_repository }}` or `${{ github.action_ref }}` directly inside `run:` scripts in composite actions — always capture via an `env:` block first."
+  - "Use `github.action_path` (which IS available correctly) to derive the action location when you need a file path rather than the repo/ref identifier."
+  - "Add a smoke-test step to composite actions that prints `$ACTION_REPO` via `env:` to verify the value is populated correctly."
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/contexts#github-context'
+    label: 'GitHub Docs: github context — action_repository and action_ref'
+  - url: 'https://github.com/actions/runner/issues/2473'
+    label: 'actions/runner#2473: github.action_repository and github.action_ref are empty in run for composite actions (13 reactions)'
+  - url: 'https://orgs/community/discussions/49245'
+    label: 'GitHub Community Discussion: Cross-filed composite action context issue'
