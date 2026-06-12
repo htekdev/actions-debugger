@@ -1,0 +1,96 @@
+id: ku-138
+title: '`ACTIONS_RUNTIME_TOKEN` Not Exposed in Composite Actions'
+category: known-unsolved
+severity: error
+tags:
+  - composite-action
+  - ACTIONS_RUNTIME_TOKEN
+  - oidc
+  - cache-api
+  - toolkit
+  - environment-variables
+patterns:
+  - regex: 'ACTIONS_RUNTIME_TOKEN'
+    flags: 'i'
+  - regex: 'Unable to get ACTIONS_RUNTIME_TOKEN'
+    flags: 'i'
+  - regex: "Error: Input required and not supplied: token"
+    flags: 'i'
+error_messages:
+  - "Error: Unable to get ACTIONS_RUNTIME_TOKEN env variable"
+  - "Error: ACTIONS_RUNTIME_TOKEN: not set"
+  - "Error: Input required and not supplied: token"
+  - "ACTIONS_RUNTIME_TOKEN is not available"
+root_cause: |
+  GitHub Actions exposes `ACTIONS_RUNTIME_TOKEN` automatically to Node.js and Docker
+  action types — the runner injects it into their environment during handler setup.
+  However, composite actions (type `using: composite`) run as a series of `run:` shell
+  steps and do NOT receive `ACTIONS_RUNTIME_TOKEN` in their environment from the runner.
+
+  This means composite actions that try to call the Actions Runtime API directly —
+  e.g. for OIDC token requests, cache service operations, artifact uploads via the
+  low-level toolkit, or custom toolcache interactions — fail with missing token errors
+  when they attempt to read `process.env.ACTIONS_RUNTIME_TOKEN` or
+  `$ACTIONS_RUNTIME_TOKEN` in a shell script.
+
+  The token IS available in the parent job environment via
+  `${{ env.ACTIONS_RUNTIME_TOKEN }}` (it is injected at the job level), but composite
+  action `run:` steps do not inherit it automatically the way Docker and Node.js action
+  handlers do.
+
+  This is a known design gap that has been open since composite actions were introduced.
+  The runner's Node.js handler (NodeScriptActionHandler.cs) and Docker handler
+  (ContainerActionHandler.cs) both inject the token explicitly; the composite handler
+  does not.
+fix: |
+  There is no first-party fix. Workarounds:
+
+  1. **Use `crazy-max/ghaction-github-runtime@v3`** (community action): adds
+     `ACTIONS_RUNTIME_TOKEN` and `ACTIONS_RUNTIME_URL` to `$GITHUB_ENV`, making them
+     available to all subsequent steps including composite action `run:` steps.
+
+  2. **Wrap in a Node.js action**: if the composite action needs OIDC or cache API access,
+     extract that logic into a small Node.js action (type: `using: node20`) which DOES
+     receive `ACTIONS_RUNTIME_TOKEN` automatically.
+
+  3. **Pass via `env:` explicitly**: if the parent workflow or a preceding step writes
+     `ACTIONS_RUNTIME_TOKEN` to `$GITHUB_ENV`, subsequent composite `run:` steps can
+     read it as a normal environment variable.
+fix_code:
+  - language: yaml
+    label: 'WORKAROUND — inject ACTIONS_RUNTIME_TOKEN via ghaction-github-runtime'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Expose GitHub Actions runtime token
+              uses: crazy-max/ghaction-github-runtime@v3
+              # Adds ACTIONS_RUNTIME_TOKEN + ACTIONS_RUNTIME_URL to $GITHUB_ENV
+
+            - name: Use your composite action that needs the token
+              uses: ./.github/actions/my-composite-action
+              # Now $ACTIONS_RUNTIME_TOKEN is available in composite run: steps
+  - language: yaml
+    label: 'WORKAROUND — pass token explicitly via env: in the composite action step'
+    code: |
+      # In the calling workflow
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: ./.github/actions/my-composite-action
+              env:
+                ACTIONS_RUNTIME_TOKEN: ${{ env.ACTIONS_RUNTIME_TOKEN }}
+                ACTIONS_RUNTIME_URL: ${{ env.ACTIONS_RUNTIME_URL }}
+prevention:
+  - "If your composite action needs to call the Actions Runtime API, plan for the missing token from the start — do not assume it will be available."
+  - "Consider converting token-dependent logic into a small Node.js action wrapper that calls the composite action, preserving the `ACTIONS_RUNTIME_TOKEN` injection."
+  - "Use `crazy-max/ghaction-github-runtime` as an early step in any job that runs composite actions requiring cache or OIDC API access."
+docs:
+  - url: 'https://github.com/actions/runner/issues/3046'
+    label: 'actions/runner#3046: Composite actions should be provisioned with ACTIONS_RUNTIME_TOKEN (20 reactions)'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication'
+    label: 'GitHub Docs: Automatic token authentication'
+  - url: 'https://github.com/crazy-max/ghaction-github-runtime'
+    label: 'Workaround: crazy-max/ghaction-github-runtime — expose runtime token to composite actions'
