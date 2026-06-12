@@ -1,0 +1,117 @@
+id: runner-environment-488
+title: '`actions/checkout@v5+` Sets Duplicate `Authorization` git Header on Self-Hosted Runners — HTTP 400 Fatal Push/Fetch Failure'
+category: runner-environment
+severity: error
+tags:
+  - checkout
+  - self-hosted
+  - git-config
+  - http-extra-header
+  - authorization
+  - duplicate-header
+  - credential-persistence
+  - v5
+patterns:
+  - regex: 'remote: Duplicate header: "Authorization"'
+    flags: 'i'
+  - regex: 'fatal: unable to access.*The requested URL returned error: 400'
+    flags: 'i'
+  - regex: 'Duplicate header.*Authorization.*400'
+    flags: 'i'
+error_messages:
+  - 'remote: Duplicate header: "Authorization"'
+  - "fatal: unable to access 'https://github.com/org/repo/': The requested URL returned error: 400"
+  - "Error: The process '/usr/bin/git' failed with exit code 128"
+root_cause: |
+  `actions/checkout@v5` and later versions changed how git credentials are
+  persisted after checkout. Starting with PR #2286, the action sets
+  `git config http.extraHeader "Authorization: Bearer <token>"` to configure
+  HTTP authentication for subsequent git operations.
+
+  On **self-hosted runners** where the git global or system config persists
+  between jobs, a previous checkout run may have already written an
+  `http.extraHeader Authorization` entry. When the next checkout runs, it
+  ALSO writes its own `http.extraHeader` entry. Git (v2.22+) allows multiple
+  `http.extraHeader` values in config and sends ALL of them with every HTTP
+  request.
+
+  The result: git sends **two** `Authorization: Bearer ...` headers in the
+  HTTP request to GitHub. GitHub''s server rejects any request with duplicate
+  authentication headers, returning HTTP 400 with the message
+  `remote: Duplicate header: "Authorization"`.
+
+  This can also occur on GitHub-hosted runners within the same job when
+  checkout is called multiple times for different repositories, if the first
+  checkout''s credential configuration is not properly scoped to the specific
+  repo URL and bleeds into the second checkout.
+
+  The underlying issue is that `http.extraHeader` entries **accumulate** in
+  git config across checkout invocations unless explicitly unset. Each new
+  `git config --add http.extraHeader` call appends rather than replaces.
+fix: |
+  **Option 1 (recommended for self-hosted runners)**: Unset existing
+  `http.extraHeader` entries before running checkout to prevent accumulation:
+
+  ```
+  git config --global --unset-all http.extraHeader
+  ```
+
+  **Option 2**: Set `persist-credentials: false` on the checkout step if you
+  do not need git credentials in subsequent steps. This prevents checkout from
+  writing `http.extraHeader` to the config at all.
+
+  **Option 3**: Use an SSH remote instead of HTTPS for push/fetch operations
+  that follow the checkout. SSH authentication is separate from HTTP
+  credentials and is not affected by this issue.
+
+  **Option 4**: Pin to `actions/checkout@v4` which uses a different credential
+  persistence mechanism (`Authorization` header via credential helper, not
+  `http.extraHeader`) if upgrading to v5+ is not feasible.
+fix_code:
+  - language: yaml
+    label: 'Unset stale http.extraHeader before checkout on self-hosted runners'
+    code: |
+      jobs:
+        build:
+          runs-on: self-hosted
+          steps:
+            - name: Clean stale git credential headers (self-hosted runner safety)
+              run: git config --global --unset-all http.extraHeader || true
+
+            - uses: actions/checkout@v5
+              with:
+                fetch-depth: 0
+
+            - name: Push to remote
+              run: |
+                git push origin HEAD:${{ github.ref_name }}
+
+  - language: yaml
+    label: 'Use persist-credentials: false when downstream git auth is not needed'
+    code: |
+      jobs:
+        build:
+          runs-on: self-hosted
+          steps:
+            - uses: actions/checkout@v5
+              with:
+                persist-credentials: false  # ✅ Does not write http.extraHeader
+
+            # No git push/fetch needed after checkout — persist-credentials: false is safe
+            - name: Build only
+              run: make build
+
+prevention:
+  - 'On self-hosted runners, add `git config --global --unset-all http.extraHeader || true` as the first step in every job to clear any leftover credential headers from previous runs.'
+  - 'Use `persist-credentials: false` on checkout steps where downstream git operations are not required. This eliminates the http.extraHeader write entirely.'
+  - 'If you call `actions/checkout` multiple times in one job for different repositories, ensure each checkout uses a distinct `path:` and `persist-credentials: false` unless you need credentials for that specific repo afterward.'
+  - 'Periodically audit the global git config on self-hosted runners: run `git config --global --list | grep extraHeader` to detect accumulated credential headers.'
+docs:
+  - url: 'https://github.com/actions/checkout/issues/2299'
+    label: 'actions/checkout#2299 — Duplicate header: "Authorization" (10 reactions, 22 comments)'
+  - url: 'https://github.com/actions/checkout/pull/2286'
+    label: 'actions/checkout#2286 — PR that changed authorization header mechanism in v5'
+  - url: 'https://git-scm.com/docs/git-config#Documentation/git-config.txt-httpextraHeader'
+    label: 'git-config http.extraHeader — multiple values accumulate per-call'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication'
+    label: 'GitHub Docs — Automatic token authentication'

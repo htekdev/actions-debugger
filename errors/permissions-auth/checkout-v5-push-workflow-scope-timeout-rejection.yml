@@ -1,0 +1,162 @@
+id: permissions-auth-121
+title: '`actions/checkout@v5` Intermittently Causes Push Rejection — "Unable to determine if workflow can be created or updated due to timeout"'
+category: permissions-auth
+severity: error
+tags:
+  - checkout
+  - push
+  - workflow-scope
+  - github-token
+  - timeout
+  - intermittent
+  - v5
+  - credentials
+patterns:
+  - regex: 'Unable to determine if workflow can be created or updated due to timeout'
+    flags: 'i'
+  - regex: 'remote: error: Unable to determine.*workflows.*scope.*may be required'
+    flags: 'i'
+  - regex: 'remote rejected.*Unable to determine.*workflow.*timeout'
+    flags: 'i'
+error_messages:
+  - "remote: error: Unable to determine if workflow can be created or updated due to timeout; `workflows` scope may be required."
+  - "! [remote rejected] HEAD -> deploy/component/env (Unable to determine if workflow can be created or updated due to timeout; `workflows` scope may be required.)"
+  - "error: failed to push some refs to 'https://github.com/org/repo'"
+root_cause: |
+  When pushing a branch via HTTPS with the default `GITHUB_TOKEN`, GitHub''s
+  server performs a server-side validation to determine whether the push would
+  create or update files under `.github/workflows/`. This validation checks
+  whether the token used for the push has the `workflows` permission.
+
+  `actions/checkout@v5` changed the credential persistence mechanism compared
+  to v4. Under certain conditions — particularly when pushing to branches that
+  have ever contained workflow files, or when the branch name pattern triggers
+  GitHub''s heuristic workflow-file check — GitHub''s backend validation can
+  **time out** instead of completing cleanly.
+
+  When this timeout occurs, GitHub returns the error:
+  `"Unable to determine if workflow can be created or updated due to timeout;
+  workflows scope may be required."`
+
+  This error is **intermittent**: the same push succeeds on retry (sometimes
+  immediately), suggesting it is a race condition or load-dependent behavior
+  on GitHub''s internal pipeline service rather than a deterministic
+  permissions failure.
+
+  Key observations from affected users:
+  - The same workflow succeeds reliably with `actions/checkout@v4` + same token
+  - Using a PAT with `workflow` scope makes the error disappear (the validation
+    is bypassed for tokens with explicit `workflow` scope)
+  - After one successful run with a PAT, subsequent GITHUB_TOKEN runs may
+    temporarily succeed (suggests a per-repo cache of validation results)
+  - Affects deploy/* branches, release branches, and any branch that has
+    touched `.github/workflows/` at any point in its history
+fix: |
+  **Option 1 (most reliable)**: Create a GitHub App with repository
+  permissions that includes `workflows: write`. Use the app token for pushes
+  instead of the default `GITHUB_TOKEN`.
+
+  **Option 2**: Use a Personal Access Token (PAT) with the `workflow` scope
+  for push operations. Store the PAT as a repository secret.
+
+  **Option 3**: Switch to SSH for push operations. SSH authentication bypasses
+  the HTTPS workflow-file validation path entirely.
+
+  **Option 4 (temporary workaround)**: Add retry logic around the push step.
+  Since the error is intermittent, a retry will often succeed.
+
+  **Option 5**: If pushing to a branch that will NEVER contain workflow files,
+  first push to a non-workflow branch, then fast-forward the actual branch.
+fix_code:
+  - language: yaml
+    label: 'Use a GitHub App token with workflows write permission for push'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          permissions:
+            contents: write
+          steps:
+            - name: Generate GitHub App token
+              uses: actions/create-github-app-token@v2
+              id: app-token
+              with:
+                app-id: ${{ vars.DEPLOY_APP_ID }}
+                private-key: ${{ secrets.DEPLOY_APP_PRIVATE_KEY }}
+
+            - uses: actions/checkout@v5
+              with:
+                token: ${{ steps.app-token.outputs.token }}
+                fetch-depth: 0
+
+            - name: Push to deploy branch
+              run: |
+                git push origin HEAD:deploy/production
+              env:
+                GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+
+  - language: yaml
+    label: 'Use SSH remote to bypass HTTPS workflow validation'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v5
+              with:
+                persist-credentials: false  # We will use SSH instead
+
+            - name: Configure SSH for push
+              run: |
+                mkdir -p ~/.ssh
+                echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+                chmod 600 ~/.ssh/deploy_key
+                echo "Host github.com" >> ~/.ssh/config
+                echo "  IdentityFile ~/.ssh/deploy_key" >> ~/.ssh/config
+                echo "  StrictHostKeyChecking no" >> ~/.ssh/config
+
+            - name: Push via SSH (bypasses HTTPS workflow scope validation)
+              run: |
+                git remote set-url origin git@github.com:${{ github.repository }}.git
+                git push origin HEAD:deploy/production
+
+  - language: yaml
+    label: 'Add retry logic for intermittent workflow scope timeout'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          permissions:
+            contents: write
+          steps:
+            - uses: actions/checkout@v5
+
+            - name: Push with retry (for intermittent workflow scope timeout)
+              run: |
+                for attempt in 1 2 3; do
+                  echo "Push attempt $attempt of 3"
+                  if git push origin HEAD:deploy/production; then
+                    echo "Push succeeded on attempt $attempt"
+                    break
+                  fi
+                  if [ $attempt -lt 3 ]; then
+                    echo "Push failed, waiting 15s before retry..."
+                    sleep 15
+                  else
+                    echo "All push attempts failed"
+                    exit 1
+                  fi
+                done
+
+prevention:
+  - 'For any workflow that pushes to branches that have historically contained `.github/workflows/` files, provision a GitHub App with `workflows: write` permission rather than relying on `GITHUB_TOKEN`.'
+  - 'Use SSH remotes for push operations in deploy workflows. SSH bypasses GitHub''s HTTPS workflow-file validation entirely and is immune to this class of timeout errors.'
+  - 'Pin checkout to `actions/checkout@v4` in workflows that cannot tolerate intermittent push failures, until the underlying GitHub backend validation behavior stabilizes.'
+  - 'Add `git remote -v` and `git push --dry-run` logging to capture push details when diagnosing intermittent rejections.'
+docs:
+  - url: 'https://github.com/actions/checkout/issues/2287'
+    label: 'actions/checkout#2287 — checkout@v5 intermittently requires workflow-scope token to push (11 reactions)'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#permissions-for-the-github_token'
+    label: 'GitHub Docs — GITHUB_TOKEN permissions (workflows scope required to modify workflow files)'
+  - url: 'https://docs.github.com/en/apps/creating-github-apps/about-creating-github-apps/about-creating-github-apps'
+    label: 'GitHub Docs — GitHub Apps (grant fine-grained workflow write permission)'
