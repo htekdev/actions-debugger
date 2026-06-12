@@ -1,0 +1,120 @@
+id: ku-132
+title: 'Using `environment:` on a Job Always Creates a Deployment Record — Cannot Use for Secrets Only'
+category: known-unsolved
+severity: limitation
+tags:
+  - environment
+  - deployment
+  - environment-secrets
+  - github-deployments
+  - known-limitation
+  - no-workaround
+  - api
+patterns:
+  - regex: 'environment.*deployment.*created|deployment.*environment.*unintended'
+    flags: 'i'
+error_messages:
+  - "# No error message — this is a silent behavior: a deployment is always created in the GitHub Deployments UI and API when environment: is used on a job."
+root_cause: |
+  GitHub Actions ties the `environment:` job key to the GitHub Deployments API.
+  Whenever a job with `environment:` runs (regardless of purpose), GitHub
+  automatically creates a deployment record for that environment. There is no
+  way to use `environment:` solely to access environment-scoped secrets or
+  protection rules without also creating a deployment record.
+
+  This affects users who want to:
+  - Gate a non-deployment job behind environment protection reviewers
+  - Access environment-scoped secrets in a build/test job (not a deploy job)
+  - Use wait-timer protection rules on steps that are not actually deployments
+
+  The consequence is that the Deployments tab fills with entries for every CI
+  run, breaking deployment tracking for teams that use the Deployments view to
+  track actual production releases. GitHub has confirmed this is by design, and
+  no opt-out exists as of mid-2026.
+
+  412 reactions on the tracking issue (actions/runner#2120) make this one of the
+  most-requested missing features in GitHub Actions.
+fix: |
+  There is NO fix or workaround that fully avoids creating a deployment record
+  when `environment:` is used.
+
+  Partial mitigations:
+  1. Use repository-level secrets instead of environment-scoped secrets for
+     non-deployment jobs to avoid using `environment:` altogether.
+  2. Use a separate "deployment sentinel" job that calls `environment:` while
+     your build/test jobs use repository secrets — keep actual deployment logic
+     isolated to dedicated jobs.
+  3. Delete deployment records programmatically after the run via the GitHub API
+     (requires a token with `deployments` write scope), though this adds
+     complexity and still briefly creates the record.
+  4. Accept the limitation and filter the Deployments view using the environment
+     name to separate real deployments from gated jobs.
+fix_code:
+  - language: yaml
+    label: 'Use repository secrets for non-deploy jobs to avoid environment: key'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          # No `environment:` here — use repository secrets instead
+          env:
+            API_KEY: ${{ secrets.API_KEY }}   # repository-level secret
+          steps:
+            - run: ./build.sh
+
+        deploy:
+          runs-on: ubuntu-latest
+          needs: build
+          environment: production   # only this job uses environment:
+          steps:
+            - run: ./deploy.sh
+              env:
+                PROD_KEY: ${{ secrets.PROD_KEY }}
+  - language: yaml
+    label: 'Delete deployment record after job via GitHub API (partial mitigation)'
+    code: |
+      jobs:
+        gated-job:
+          runs-on: ubuntu-latest
+          environment: my-gate   # creates unwanted deployment record
+          steps:
+            - run: echo "doing work"
+
+        cleanup-deployment:
+          runs-on: ubuntu-latest
+          needs: gated-job
+          if: always()
+          steps:
+            - name: Delete deployment record
+              uses: actions/github-script@v7
+              with:
+                github-token: ${{ secrets.PAT_WITH_DEPLOYMENTS_WRITE }}
+                script: |
+                  const deployments = await github.rest.repos.listDeployments({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    environment: 'my-gate',
+                    per_page: 1
+                  });
+                  if (deployments.data.length > 0) {
+                    const id = deployments.data[0].id;
+                    await github.rest.repos.createDeploymentStatus({
+                      owner: context.repo.owner, repo: context.repo.repo,
+                      deployment_id: id, state: 'inactive'
+                    });
+                    await github.rest.repos.deleteDeployment({
+                      owner: context.repo.owner, repo: context.repo.repo,
+                      deployment_id: id
+                    });
+                  }
+prevention:
+  - 'Design workflows so that only actual deployment jobs use `environment:` — use repository secrets for CI/CD gating.'
+  - 'If you need environment protection rules without deployment tracking, consider GitHub Actions Environments only for jobs that represent real deployments.'
+  - 'Track the upstream issue (actions/runner#2120) for any opt-out feature addition.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/2120'
+    label: 'actions/runner#2120 — Using Environments without creating deployment automatically (412 reactions)'
+  - url: 'https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment'
+    label: 'GitHub Docs — Managing environments for deployment'
+  - url: 'https://docs.github.com/en/rest/deployments/deployments'
+    label: 'GitHub REST API — Deployments'
