@@ -1,0 +1,134 @@
+id: pa-119
+title: '`actions/checkout@v6` `persist-credentials` Uses `includeIf` That Breaks Git Auth in Worktrees'
+category: permissions-auth
+severity: error
+tags:
+  - checkout-v6
+  - persist-credentials
+  - git-worktree
+  - includeIf
+  - authentication
+  - git-auth
+  - credential-helper
+patterns:
+  - regex: 'fatal: could not read Username for.*terminal prompts disabled'
+    flags: 'i'
+  - regex: 'remote: Repository not found\.|fatal: repository.*not found.*git.*worktree'
+    flags: 'i'
+  - regex: 'fatal: Authentication failed for.*https://github\.com.*worktree'
+    flags: 'i'
+  - regex: 'git fetch.*fatal.*could not read Username.*terminal prompts disabled'
+    flags: 'i'
+error_messages:
+  - "fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+  - "remote: Repository not found."
+  - "fatal: Authentication failed for 'https://github.com/owner/repo.git/'"
+  - "Error: fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+root_cause: |
+  Starting with `actions/checkout@v6.0.0`, the action changed how it stores Git
+  credentials. Instead of writing the token directly to `.git/config`, it now writes
+  credentials to a separate file and loads it via a Git `includeIf` directive:
+
+  ```ini
+  [includeIf "gitdir:/home/runner/work/owner/repo/.git"]
+      path = /path/to/credential-file
+  ```
+
+  The `gitdir:` predicate matches by the exact path of the `.git` directory. For the
+  **main repository**, `gitdir` resolves to `/home/runner/work/owner/repo/.git` — which
+  matches perfectly.
+
+  For a **Git worktree**, however, the `gitdir` resolves to a sub-path of `.git`:
+
+  ```
+  /home/runner/work/owner/repo/.git/worktrees/my-worktree
+  ```
+
+  Because the `includeIf` directive only matches the exact `.git` path (not
+  `.git/worktrees/*`), the credential file is **not loaded** inside the worktree.
+  Any `git fetch`, `git push`, or `git clone` executed from within the worktree fails
+  with `terminal prompts disabled` because Git cannot find credentials to authenticate.
+
+  This affects workflows that:
+  - Use `git worktree add` after `actions/checkout` (common in monorepo or parallel
+    build setups)
+  - Call composite actions or scripts that create worktrees internally
+  - Pin to `actions/checkout@v6` or later with the default `persist-credentials: true`
+
+  Worktrees created before the checkout step also fail — the credential file path is
+  specific to the checked-out repo's `.git` location.
+fix: |
+  **Option 1 (pin to v5):** Use `actions/checkout@v5` for workflows that rely on git
+  worktrees, until the v6 maintainers add wildcard `includeIf` worktree support.
+
+  **Option 2 (re-configure credentials inside the worktree):** After creating the
+  worktree, explicitly configure a credential helper or set the Git URL insteadOf
+  to provide credentials. The simplest approach is to pass the token via the remote URL.
+
+  **Option 3 (disable persist-credentials and handle auth manually):** Set
+  `persist-credentials: false` and configure `git credential` or a token in the
+  remote URL explicitly for the worktree.
+
+  Note: A wildcard `includeIf` fix (`gitdir:/home/runner/work/owner/repo/.git/worktrees/*`)
+  has been proposed in actions/checkout#2318 but is not yet released.
+fix_code:
+  - language: yaml
+    label: 'BROKEN — checkout v6 with worktrees causes auth failure'
+    code: |
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: true  # default — credentials only work in main checkout
+
+      - name: Create a worktree for parallel build
+        run: git worktree add ../my-worktree main
+
+      - name: Fetch inside worktree (FAILS — credentials not loaded)
+        working-directory: ../my-worktree
+        run: git fetch origin  # fatal: could not read Username
+
+  - language: yaml
+    label: 'WORKAROUND 1 — pin to v5 which uses global credential config'
+    code: |
+      - uses: actions/checkout@v5  # v5 uses global .git/config, works with worktrees
+        with:
+          persist-credentials: true
+
+      - name: Create and use a worktree
+        run: git worktree add ../my-worktree main
+
+      - name: Fetch inside worktree (works on v5)
+        working-directory: ../my-worktree
+        run: git fetch origin
+
+  - language: yaml
+    label: 'WORKAROUND 2 — inject token into remote URL inside the worktree'
+    code: |
+      - uses: actions/checkout@v6
+
+      - name: Create worktree
+        run: git worktree add ../my-worktree main
+
+      - name: Configure credentials in worktree
+        working-directory: ../my-worktree
+        run: |
+          git remote set-url origin \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+
+      - name: Fetch inside worktree (works with explicit URL token)
+        working-directory: ../my-worktree
+        run: git fetch origin
+
+prevention:
+  - 'Any workflow that creates git worktrees after `actions/checkout@v6+` must configure credentials separately inside each worktree.'
+  - 'Prefer `actions/checkout@v5` until actions/checkout#2318 is resolved and a v6 patch is released.'
+  - 'Set `persist-credentials: false` if your workflow does not need to push, to avoid confusion about which checkout writes credentials where.'
+  - 'Test credential availability inside worktrees by running `git fetch --dry-run` as a smoke-check step.'
+docs:
+  - url: 'https://github.com/actions/checkout/issues/2318'
+    label: 'actions/checkout#2318: persist-credentials in separate file breaks GitHub auth for Git worktrees (8 reactions)'
+  - url: 'https://github.com/actions/checkout/pull/2286'
+    label: 'actions/checkout#2286: PR that introduced the includeIf credential file change in v6.0.0'
+  - url: 'https://git-scm.com/docs/git-config#_conditional_includes'
+    label: 'Git Docs: Conditional includes — gitdir: predicate matching rules'
+  - url: 'https://git-scm.com/docs/git-worktree'
+    label: 'Git Docs: git-worktree — Manage multiple working trees'
