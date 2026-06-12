@@ -1,0 +1,130 @@
+id: runner-environment-477
+title: 'Self-hosted Kubernetes/ARC runner: "Access to the path /proc/[pid]/oom_score_adj is denied" cancels job'
+category: runner-environment
+severity: error
+tags:
+  - self-hosted
+  - kubernetes
+  - arc
+  - eks
+  - oom-score-adj
+  - unprivileged-container
+  - docker-in-docker
+  - dind
+patterns:
+  - regex: 'Failed to update oom_score_adj for PID'
+    flags: 'i'
+  - regex: 'System\.UnauthorizedAccessException: Access to the path ''/proc/\d+/oom_score_adj'' is denied'
+    flags: 'i'
+  - regex: 'Access to the path.*oom_score_adj.*is denied'
+    flags: 'i'
+error_messages:
+  - "Failed to update oom_score_adj for PID: 554."
+  - "System.UnauthorizedAccessException: Access to the path '/proc/554/oom_score_adj' is denied."
+  - "System.IO.IOException: Permission denied"
+  - "at GitHub.Runner.Sdk.ProcessInvoker.WriteProcessOomScoreAdj(Int32 processId, Int32 oomScoreAdj)"
+root_cause: |
+  The GitHub Actions runner writes an OOM (Out-Of-Memory) score adjustment to
+  `/proc/<pid>/oom_score_adj` for every subprocess it spawns. This helps the Linux
+  kernel's OOM killer preserve the runner process if the system runs low on memory.
+
+  On **unprivileged containerized runners** — including:
+  - Actions Runner Controller (ARC) on Kubernetes
+  - Self-hosted runners on EKS with Docker-in-Docker (DinD)
+  - Custom Kubernetes deployments where the runner container runs without elevated privileges
+
+  …the `/proc/<pid>/oom_score_adj` file is not writable by the runner process.
+  When the runner tries to set the OOM score for each spawned process, it receives
+  `System.UnauthorizedAccessException: Permission denied`, which causes the runner
+  to cancel the job mid-execution.
+
+  This error repeats on every subprocess launch (once per step, per shell invocation),
+  flooding the runner diagnostic logs (`Worker_*.log`) and causing the job to be cancelled
+  or marked as failed depending on the runner version.
+
+  **Fix introduced in runner v2.335.x:** A new environment variable
+  `ACTIONS_RUNNER_DISABLE_OOM_SCORE_ADJ=true` (or `=1`) was added. When set, the runner
+  skips all `oom_score_adj` writes and emits a Verbose trace instead of throwing an exception.
+  Self-hosted runner operators on Kubernetes/ARC should set this variable to suppress the error.
+fix: |
+  **Runner v2.335.x and later — set the env var (recommended):**
+  Set `ACTIONS_RUNNER_DISABLE_OOM_SCORE_ADJ=true` in the runner container's environment.
+  This suppresses all `/proc/[pid]/oom_score_adj` writes without affecting job execution.
+
+  For ARC (Actions Runner Controller) using a `RunnerDeployment` or `HorizontalRunnerAutoscaler`,
+  add the env var to the runner container spec:
+
+    template:
+      spec:
+        containers:
+          - name: runner
+            env:
+              - name: ACTIONS_RUNNER_DISABLE_OOM_SCORE_ADJ
+                value: "true"
+
+  **Runner < v2.335.x — grant SYS_PTRACE or proc access:**
+  If upgrading the runner is not immediately possible, grant the container sufficient
+  privilege to write to `/proc/<pid>/oom_score_adj`. Options include:
+  - Adding `SYS_ADMIN` or `SYS_PTRACE` capability
+  - Running the container as root (not recommended for security)
+  - Using a Pod Security Policy / Pod Security Admission that allows procfs writes
+
+  **Alternative — use `securityContext.allowPrivilegeEscalation: false` + upgrade runner:**
+  The `ACTIONS_RUNNER_DISABLE_OOM_SCORE_ADJ` flag is the cleanest long-term fix.
+fix_code:
+  - language: yaml
+    label: 'ARC RunnerDeployment — set ACTIONS_RUNNER_DISABLE_OOM_SCORE_ADJ (runner v2.335.x+)'
+    code: |
+      apiVersion: actions.summerwind.dev/v1alpha1
+      kind: RunnerDeployment
+      metadata:
+        name: my-runner
+      spec:
+        template:
+          spec:
+            containers:
+              - name: runner
+                image: ghcr.io/actions/actions-runner:latest
+                env:
+                  - name: ACTIONS_RUNNER_DISABLE_OOM_SCORE_ADJ
+                    value: "true"
+
+  - language: yaml
+    label: 'Docker Compose DinD runner — set env var'
+    code: |
+      services:
+        runner:
+          image: ghcr.io/actions/actions-runner:latest
+          environment:
+            - ACTIONS_RUNNER_DISABLE_OOM_SCORE_ADJ=true
+          volumes:
+            - /var/run/docker.sock:/var/run/docker.sock
+
+  - language: yaml
+    label: 'Kubernetes pod spec — securityContext + env var'
+    code: |
+      spec:
+        containers:
+          - name: runner
+            image: ghcr.io/actions/actions-runner:latest
+            env:
+              - name: ACTIONS_RUNNER_DISABLE_OOM_SCORE_ADJ
+                value: "true"
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: false
+              runAsNonRoot: true
+prevention:
+  - "Always set ACTIONS_RUNNER_DISABLE_OOM_SCORE_ADJ=true in the runner container environment when deploying on Kubernetes or any unprivileged container environment."
+  - "Keep self-hosted runners updated to v2.335.x or later to benefit from the ACTIONS_RUNNER_DISABLE_OOM_SCORE_ADJ env var support."
+  - "Monitor runner diagnostic logs in _diag/Worker_*.log for repeated oom_score_adj exceptions if jobs are unexpectedly cancelled."
+  - "When running on EKS, ARC, or custom K8s deployments, test a workflow that spawns multiple steps to verify no oom_score_adj errors appear before deploying to production."
+docs:
+  - url: 'https://github.com/actions/runner/issues/3380'
+    label: 'actions/runner#3380: Self-hosted K8s runner fails with oom_score_adj permission denied'
+  - url: 'https://github.com/actions/runner/pull/4478'
+    label: 'actions/runner PR#4478: Allow skipping oom_score_adj write via ACTIONS_RUNNER_DISABLE_OOM_SCORE_ADJ env var (v2.335.x)'
+  - url: 'https://github.com/actions/actions-runner-controller/issues/3132'
+    label: 'actions-runner-controller#3132: Related ARC oom_score_adj issue'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners'
+    label: 'GitHub Docs: About self-hosted runners'
