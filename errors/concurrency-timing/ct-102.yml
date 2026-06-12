@@ -1,0 +1,144 @@
+id: concurrency-timing-102
+title: 'Transitive skip cascade — downstream jobs skipped even when direct needs ran successfully via always()'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - needs
+  - skipped
+  - always
+  - cascade
+  - transitive
+  - job-dependency
+  - skip-propagation
+  - dag
+patterns:
+  - regex: 'This job was skipped'
+    flags: 'i'
+  - regex: 'needs\.[a-z_-]+\.result.*always\(\)'
+    flags: 'i'
+  - regex: 'Skipping this job because a previous job in the chain was skipped'
+    flags: 'i'
+error_messages:
+  - "This job was skipped."
+  - "Skipping this job because a previous job in the chain was skipped."
+root_cause: |
+  GitHub Actions propagates skip status **transitively** through the entire job
+  dependency graph (DAG). When job A is skipped and job B depends on A with
+  `if: always() && ...` (causing B to run), downstream job C that only `needs: [B]`
+  is STILL skipped — even though B ran and reported `result: success`.
+
+  The cascade mechanics:
+    1. Job A is skipped (e.g., `if: false`).
+    2. Job B uses `needs: [A]` with `if: always() && needs.A.result != 'failed'`
+       and runs successfully.
+    3. Job C uses `needs: [B]` with **no `if:` condition**.
+    4. Job C is skipped because GitHub sees that A (a transitive dependency of C
+       through B) was skipped, and C does not have an explicit `always()` override.
+
+  The key misconception: adding `always()` to B "fixes" B, but does NOT reset the
+  skip signal for jobs further down the chain. Each job in the dependency chain that
+  depends on any ancestor that was skipped must independently opt out of the cascade
+  using `if: always()` or an explicit `needs.<id>.result` check.
+
+  This is distinct from the simple skip cascade (where a direct dependency is skipped)
+  — here the direct dependency (B) actually ran and succeeded, yet C is still skipped
+  because of the transitive state from A.
+
+  Source: actions/runner#2205 — "Jobs skipped when NEEDS job ran successfully"
+  (92 reactions, open since 2022).
+fix: |
+  Every job in the chain that must run regardless of upstream skips must explicitly
+  opt in with `if: always()` (or an explicit result check). Adding `always()` to an
+  intermediate job does NOT protect downstream jobs from the transitive skip cascade.
+
+  Option 1 — Add `if: always()` to ALL jobs that must tolerate a skipped ancestor:
+    jobs:
+      a:
+        if: false                              # skipped
+        ...
+      b:
+        needs: [a]
+        if: always() && needs.a.result != 'failed'
+        ...
+      c:
+        needs: [b]
+        if: always() && needs.b.result == 'success'   # ← must also have always()
+        ...
+
+  Option 2 — Use explicit result checks on every downstream job:
+    c:
+      needs: [b]
+      if: needs.b.result == 'success' || needs.b.result == 'skipped'
+      ...
+
+  Option 3 — Restructure the DAG so that jobs with `always()` semantics are not
+  in the dependency path of jobs that should only run on success. Separate the
+  "fan-out" logic from the "conditional continuation" logic.
+fix_code:
+  - language: yaml
+    label: 'WRONG — C is skipped even though B ran (transitive skip from A cascades through B)'
+    code: |
+      jobs:
+        a:
+          runs-on: ubuntu-latest
+          if: false               # A is skipped
+          steps:
+            - run: echo "A"
+
+        b:
+          runs-on: ubuntu-latest
+          needs: [a]
+          if: always() && needs.a.result != 'failed'  # B runs correctly
+          steps:
+            - run: echo "B ran — result will be success"
+
+        c:
+          runs-on: ubuntu-latest
+          needs: [b]
+          # No if: condition — developer expects this to run when B succeeds
+          # BUG: C is STILL SKIPPED because A was skipped and C has no always() override
+          steps:
+            - run: echo "C — this never runs"
+  - language: yaml
+    label: 'FIXED — add always() (or explicit result check) to every job in the chain'
+    code: |
+      jobs:
+        a:
+          runs-on: ubuntu-latest
+          if: false               # A is skipped
+          steps:
+            - run: echo "A"
+
+        b:
+          runs-on: ubuntu-latest
+          needs: [a]
+          if: always() && needs.a.result != 'failed'  # B runs correctly
+          steps:
+            - run: echo "B ran"
+
+        c:
+          runs-on: ubuntu-latest
+          needs: [b]
+          # FIX: explicitly allow c to run when b succeeded, regardless of upstream skips
+          if: always() && needs.b.result == 'success'
+          steps:
+            - run: echo "C runs correctly now"
+prevention:
+  - 'Every job that must run regardless of upstream skipped ancestors needs its own
+    `if: always() && needs.<id>.result == ''success''` — adding `always()` to an
+    intermediate job does NOT protect jobs further down the dependency chain.'
+  - 'When designing multi-stage pipelines with optional first stages, add `always()`
+    to ALL downstream jobs that should execute on successful intermediate runs, not
+    just the first job that handles the optionality.'
+  - 'Use `needs.<id>.result != ''failure''` for stages that should run after either
+    success or skip, and `needs.<id>.result == ''success''` for stages that must only
+    run after success.'
+  - 'Consider flattening DAGs where transitive skip semantics are complex — if every
+    stage needs `always()` anyway, a linear chain with explicit checks is clearer.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/2205'
+    label: 'actions/runner#2205 — Jobs skipped when NEEDS job ran successfully (92 reactions, open)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-jobs-in-a-workflow#defining-prerequisite-jobs'
+    label: 'GitHub Docs: Using jobs in a workflow — defining prerequisite jobs'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/using-conditions-to-control-job-execution'
+    label: 'GitHub Docs: Using conditions to control job execution'

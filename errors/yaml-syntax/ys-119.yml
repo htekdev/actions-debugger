@@ -1,0 +1,152 @@
+id: yaml-syntax-119
+title: 'github.event.action is empty for push, schedule, and workflow_dispatch — if: conditions silently evaluate false'
+category: yaml-syntax
+severity: silent-failure
+tags:
+  - github.event.action
+  - event-action
+  - push
+  - schedule
+  - workflow_dispatch
+  - if-condition
+  - silent-failure
+  - expression
+  - empty-string
+patterns:
+  - regex: 'github\.event\.action\s*==\s*[''"][a-z_]+[''"]'
+    flags: 'i'
+  - regex: 'if:.*github\.event\.action'
+    flags: 'i'
+  - regex: 'event\.action.*opened|event\.action.*closed|event\.action.*created'
+    flags: 'i'
+error_messages:
+  - "if: github.event.action == 'opened'"
+  - "Step was skipped (event.action evaluates to empty string for push events)"
+root_cause: |
+  `github.event.action` is only populated for events that have action subtypes:
+  `pull_request`, `issues`, `issue_comment`, `pull_request_review`, `check_run`,
+  `deployment_status`, `create`, `delete`, and similar webhook events.
+
+  For events that do NOT have action subtypes — specifically `push`, `schedule`,
+  `workflow_dispatch`, `workflow_run`, `repository_dispatch` — `github.event.action`
+  is an **empty string** (`''`).
+
+  This produces a silent failure pattern: an `if:` condition that checks
+  `github.event.action == 'opened'` evaluates to `'' == 'opened'` = `false`,
+  so the step or job is silently skipped without any error or warning message.
+
+  Common scenario: A workflow handles multiple trigger events (`on: [push, pull_request]`).
+  The developer adds a step with `if: github.event.action == 'opened'` intending it to
+  only run on PR creation. The step runs correctly on `pull_request` triggered runs (where
+  `event.action` is `'opened'`) but is silently skipped on `push` triggered runs — which
+  may appear correct at first glance but creates unexpected omissions if the developer
+  intended the step to run on push events regardless.
+
+  The real danger is the inverse: a step without an `if:` check that relies on
+  `github.event.action` within its logic (e.g., inside a script) will receive an empty
+  string on push/schedule/workflow_dispatch, causing subtle behavioral differences.
+fix: |
+  Always combine `github.event.action` checks with `github.event_name` guards to make
+  the condition unambiguous:
+
+  Option 1 — Guard with event_name first:
+    if: github.event_name == 'pull_request' && github.event.action == 'opened'
+
+  Option 2 — Use event_name only (if the action subtype isn't needed):
+    if: github.event_name == 'pull_request'  # fires for ALL PR actions
+
+  Option 3 — Check all relevant actions explicitly:
+    if: |
+      (github.event_name == 'pull_request' && github.event.action == 'opened') ||
+      github.event_name == 'push'
+
+  For scripts that read `github.event.action` directly, add a guard:
+    - run: |
+        ACTION="${{ github.event.action }}"
+        if [[ -z "$ACTION" ]]; then
+          echo "No action subtype — event was ${{ github.event_name }}"
+          ACTION="none"
+        fi
+        echo "Processing action: $ACTION"
+fix_code:
+  - language: yaml
+    label: 'WRONG — event.action silently empty on push, step skipped unexpectedly'
+    code: |
+      on:
+        push:
+          branches: [main]
+        pull_request:
+          branches: [main]
+
+      jobs:
+        notify:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Notify on PR open
+              # BUG: this step is silently skipped on push events because
+              # github.event.action is '' (empty) for push, not 'opened'
+              if: github.event.action == 'opened'
+              run: echo "PR #${{ github.event.pull_request.number }} was opened"
+
+            - name: Always runs build
+              run: make build
+  - language: yaml
+    label: 'FIXED — guard event.action check with event_name'
+    code: |
+      on:
+        push:
+          branches: [main]
+        pull_request:
+          branches: [main]
+
+      jobs:
+        notify:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Notify on PR open (correct guard)
+              # FIX: check event_name first so we only compare action when it's valid
+              if: github.event_name == 'pull_request' && github.event.action == 'opened'
+              run: echo "PR #${{ github.event.pull_request.number }} was opened"
+
+            - name: Run on push only
+              if: github.event_name == 'push'
+              run: echo "Push to ${{ github.ref_name }} by ${{ github.actor }}"
+
+            - name: Always runs build
+              run: make build
+  - language: yaml
+    label: 'Defensive script — handle empty event.action gracefully'
+    code: |
+      - name: Process event
+        run: |
+          EVENT_NAME="${{ github.event_name }}"
+          EVENT_ACTION="${{ github.event.action }}"
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            echo "PR event: action=$EVENT_ACTION"
+            if [[ "$EVENT_ACTION" == "opened" ]]; then
+              echo "New PR — running onboarding checks"
+            fi
+          elif [[ "$EVENT_NAME" == "push" ]]; then
+            echo "Push event — event.action is empty (normal)"
+            echo "Ref: ${{ github.ref }}"
+          elif [[ "$EVENT_NAME" == "schedule" ]]; then
+            echo "Scheduled run — event.action is empty (normal)"
+          fi
+prevention:
+  - 'Never use `if: github.event.action == ''something''` as a standalone condition —
+    always pair it with `github.event_name == ''event_type'' &&` to prevent silent
+    false evaluations on events that lack action subtypes.'
+  - 'Events that do NOT set `github.event.action`: push, schedule, workflow_dispatch,
+    workflow_run, repository_dispatch, workflow_call, pull_request_target (uses action
+    but only on action-subtype-capable events), create, delete.'
+  - 'When a workflow has multiple triggers (on: [push, pull_request]), audit every
+    `if:` condition that references `github.event.action` — ensure each is guarded by
+    an `event_name` check or the behavior on other trigger types is intentional.'
+  - 'Prefer `github.event_name` over `github.event.action` as the primary filter when
+    event type is what matters; use `event.action` only as a secondary subtype filter.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows'
+    label: 'GitHub Docs: Events that trigger workflows — full list with supported activity types'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context'
+    label: 'GitHub Docs: github context — github.event.action field description'

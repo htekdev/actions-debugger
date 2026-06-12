@@ -1,0 +1,144 @@
+id: triggers-117
+title: 'pull_request auto_merge_enabled / auto_merge_disabled activity types not in defaults — workflow never fires when auto-merge is toggled'
+category: triggers
+severity: silent-failure
+tags:
+  - pull_request
+  - auto-merge
+  - auto_merge_enabled
+  - auto_merge_disabled
+  - activity-types
+  - defaults
+  - not-triggered
+  - workflow-dispatch
+patterns:
+  - regex: 'on:\s*\n\s+pull_request:\s*$'
+    flags: 'im'
+  - regex: 'auto.merge.enabled|auto.merge.disabled'
+    flags: 'i'
+  - regex: 'types:.*auto_merge'
+    flags: 'i'
+error_messages:
+  - "Workflow not triggered on auto-merge enabled for pull request"
+  - "Expected pull_request trigger for auto_merge_enabled — no workflow run created"
+root_cause: |
+  The `pull_request` event supports the `auto_merge_enabled` and `auto_merge_disabled`
+  activity types, which fire when a user enables or disables the auto-merge feature on
+  a pull request. However, these types are **NOT included in the default set** of
+  activity types.
+
+  The default activity types for `on.pull_request` (when no `types:` list is specified)
+  are only:
+    - opened
+    - synchronize
+    - reopened
+
+  Because `auto_merge_enabled` and `auto_merge_disabled` are not defaults, a workflow
+  that only declares `on: pull_request:` (without a `types:` list) will **never trigger**
+  when auto-merge is toggled. The workflow is simply not queued — no error message,
+  no warning, no indication that the event was received.
+
+  This is particularly confusing for teams that want to:
+    - Auto-deploy when a PR has auto-merge enabled as a signal of review approval
+    - Notify stakeholders when auto-merge is enabled on a PR
+    - Run additional checks specifically when auto-merge is set
+
+  Common incorrect assumption: "since pull_request: with no types catches all PR
+  events, enabling auto-merge will trigger my workflow." This is false — only the
+  three default types are matched.
+fix: |
+  Explicitly declare `types: [auto_merge_enabled]` or `types: [auto_merge_disabled]`
+  (or both) in the `on.pull_request:` block. Note that once you specify `types:`,
+  the defaults (opened, synchronize, reopened) are no longer included automatically
+  — you must list all required types explicitly.
+
+  Option 1 — Trigger only on auto_merge_enabled:
+    on:
+      pull_request:
+        types: [auto_merge_enabled]
+
+  Option 2 — Combine with default types:
+    on:
+      pull_request:
+        types: [opened, synchronize, reopened, auto_merge_enabled, auto_merge_disabled]
+
+  Option 3 — Separate workflow specifically for auto-merge events:
+    on:
+      pull_request:
+        types: [auto_merge_enabled, auto_merge_disabled]
+fix_code:
+  - language: yaml
+    label: 'WRONG — auto_merge events silently ignored (defaults do not include them)'
+    code: |
+      on:
+        pull_request:
+          # No types: — only fires on opened, synchronize, reopened
+          # auto_merge_enabled and auto_merge_disabled are NEVER matched
+          branches: [main]
+
+      jobs:
+        deploy-preview:
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "This never runs when auto-merge is enabled"
+  - language: yaml
+    label: 'FIXED — explicitly include auto_merge_enabled in types list'
+    code: |
+      on:
+        pull_request:
+          # Must list ALL needed types once you specify types:
+          types: [opened, synchronize, reopened, auto_merge_enabled, auto_merge_disabled]
+          branches: [main]
+
+      jobs:
+        ci:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Show what triggered this run
+              run: echo "Triggered by ${{ github.event.action }}"
+            - name: Handle auto-merge events specifically
+              if: github.event.action == 'auto_merge_enabled'
+              run: echo "Auto-merge was just enabled on PR #${{ github.event.pull_request.number }}"
+  - language: yaml
+    label: 'Dedicated auto-merge workflow (separate from CI)'
+    code: |
+      # .github/workflows/auto-merge-notification.yml
+      on:
+        pull_request:
+          types: [auto_merge_enabled, auto_merge_disabled]
+
+      jobs:
+        notify:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Comment on PR
+              uses: actions/github-script@v7
+              with:
+                script: |
+                  const action = context.payload.action;
+                  const pr = context.payload.pull_request.number;
+                  const msg = action === 'auto_merge_enabled'
+                    ? '🤖 Auto-merge enabled — this PR will merge automatically when all checks pass.'
+                    : '⚠️ Auto-merge disabled on this PR.';
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: pr,
+                    body: msg
+                  });
+prevention:
+  - 'When you want to react to non-default `pull_request` activity types
+    (auto_merge_enabled, auto_merge_disabled, edited, ready_for_review, labeled,
+    unlabeled, review_requested, review_request_removed), you MUST specify them
+    explicitly in `types:`.'
+  - 'Adding any `types:` list replaces the defaults — always re-add
+    `opened, synchronize, reopened` if those are still needed for CI runs.'
+  - 'Check the GitHub Actions documentation for the full list of supported activity
+    types for each event before assuming an event fires "for everything".'
+  - 'After adding a new trigger type, verify it fires by creating a test PR and
+    checking the Actions tab — missing triggers produce zero log output.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request'
+    label: 'GitHub Docs: pull_request event — full list of supported activity types'
+  - url: 'https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/incorporating-changes-from-a-pull-request/automatically-merging-a-pull-request'
+    label: 'GitHub Docs: Automatically merging a pull request (auto-merge feature)'
