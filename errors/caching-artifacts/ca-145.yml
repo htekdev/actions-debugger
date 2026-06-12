@@ -1,0 +1,95 @@
+id: caching-artifacts-145
+title: '`windows-11-arm` runner missing `zstd` breaks `enableCrossOsArchive` cache save/restore'
+category: caching-artifacts
+severity: error
+tags:
+  - windows-11-arm
+  - cross-os-caching
+  - zstd
+  - arm64
+  - cache
+  - actions-cache
+patterns:
+  - regex: 'Failed to restore cache entry.*fail-on-cache-miss'
+    flags: 'i'
+  - regex: 'Failed to save.*tar\.exe.*failed with exit code 1'
+    flags: 'i'
+  - regex: 'zstd.*executable not found|Cannot exec.*zstd|spawn.*zstd.*ENOENT'
+    flags: 'i'
+error_messages:
+  - "Error: Failed to restore cache entry. Exiting as fail-on-cache-miss is set. Input key: <key>"
+  - "Error: Failed to save: Error: The process 'C:\\Windows\\system32\\tar.exe' failed with exit code 1"
+  - "tar: Failed to exec zstd: executable not found in %PATH%"
+root_cause: |
+  The `windows-11-arm` GitHub-hosted runner image does not ship `zstd` (the Zstandard
+  compression tool) in its PATH. The `actions/cache@v3+` action requires `zstd` to create
+  and extract cross-OS compatible archives when `enableCrossOsArchive: true` is set.
+
+  On standard `windows-latest` and `windows-2022`/`windows-2025` runner images, `zstd.exe`
+  is included in the image's tool cache. On `windows-11-arm`, this binary is absent,
+  causing `tar.exe` to fail when it attempts to compress the cache archive with zstd.
+
+  The SAVE step on `windows-11-arm` silently fails or reports a tar exit code 1 error.
+  Subsequent RESTORE steps on other runners (e.g., `ubuntu-latest`) find no cached entry
+  and fail with `fail-on-cache-miss: true`, or silently treat it as a cache miss without
+  that option.
+fix: |
+  Install `zstd` via Chocolatey before the `actions/cache` step on `windows-11-arm` runners.
+  Use a conditional step so it only runs on ARM runners to avoid slowing down other
+  runner types in a matrix.
+fix_code:
+  - language: yaml
+    label: 'Install zstd before cache step on windows-11-arm'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-11-arm
+          steps:
+            - uses: actions/checkout@v4
+
+            # Install zstd — required for enableCrossOsArchive on windows-11-arm
+            - name: Install zstd (windows-11-arm only)
+              run: choco install zstandard -y
+              shell: pwsh
+
+            - uses: actions/cache@v4
+              with:
+                path: |
+                  ~/.gradle/caches
+                  ~/.gradle/wrapper
+                key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*') }}
+                enableCrossOsArchive: true
+  - language: yaml
+    label: 'Matrix conditional install for mixed-OS builds'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-11-arm]
+          runs-on: ${{ matrix.os }}
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Install zstd (windows-11-arm)
+              if: matrix.os == 'windows-11-arm'
+              run: choco install zstandard -y
+              shell: pwsh
+
+            - uses: actions/cache@v4
+              with:
+                path: build/
+                key: ${{ runner.os }}-build-${{ hashFiles('**/*.cs') }}
+                enableCrossOsArchive: true
+prevention:
+  - "Audit any `enableCrossOsArchive: true` cache steps that run on `windows-11-arm`"
+  - "Add `choco install zstandard -y` as a prerequisite step on `windows-11-arm` for cross-OS cache workflows"
+  - "Pin `fail-on-cache-miss: true` to surface save failures early rather than silently missing cache"
+  - "Monitor runner-images#14081 for when GitHub adds `zstd` natively to `windows-11-arm` images"
+docs:
+  - url: 'https://github.com/actions/cache?tab=readme-ov-file#cross-os-cache'
+    label: 'actions/cache — Cross-OS caching documentation'
+  - url: 'https://github.com/actions/runner-images/issues/14081'
+    label: 'runner-images#14081 — windows-11-arm missing zstd for cross-OS caching'
+  - url: 'https://github.com/actions/cache/blob/main/tips-and-workarounds.md#cross-os-cache'
+    label: 'actions/cache — Cross-OS caching tips and workarounds'
