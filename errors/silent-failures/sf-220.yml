@@ -1,0 +1,121 @@
+id: silent-failures-220
+title: '`windows-11-arm` runner: `PROCESSOR_ARCHITECTURE` and `platform.machine()` silently report `AMD64` instead of `ARM64`'
+category: silent-failures
+severity: silent-failure
+tags:
+  - windows-11-arm
+  - arm64
+  - architecture-detection
+  - processor-architecture
+  - python
+  - powershell
+  - binary-selection
+patterns:
+  - regex: 'PROCESSOR_ARCHITECTURE.*AMD64.*windows.11.arm|platform\.machine\(\).*AMD64.*arm'
+    flags: 'i'
+  - regex: 'architecture.*AMD64.*expected.*ARM64|downloaded.*x64.*arm64.*runner'
+    flags: 'i'
+error_messages:
+  - "PROCESSOR_ARCHITECTURE=AMD64 (on windows-11-arm runner)"
+  - "platform.machine(): AMD64  # on windows-11-arm — expected ARM64"
+  - "Downloading x64 binary on windows-11-arm runner"
+root_cause: |
+  On `windows-11-arm` runners, processes running under the x64 emulation layer (WoW64) inherit
+  the `PROCESSOR_ARCHITECTURE=AMD64` environment variable from the x64-emulated shell. This
+  is a Windows compatibility behavior: when a 64-bit x64 process (such as `pwsh.exe` or
+  `python.exe` compiled for x64) runs on ARM64 Windows under x64 emulation, Windows sets
+  `PROCESSOR_ARCHITECTURE=AMD64` to maintain compatibility with software that checks it.
+
+  The same behavior affects Python's `platform.machine()` and `platform.architecture()` —
+  both return `AMD64`/`x86_64` on `windows-11-arm` when the Python binary itself is x64.
+
+  This causes silent failures in workflows that use these values to decide which binary
+  architecture to download or build for:
+  - A script downloads an `amd64` binary, which then runs under x64 emulation (slower,
+    may have compatibility issues)
+  - A build system targets x64 instead of ARM64, producing incorrect outputs
+  - CI validation checks pass because x64 binaries run successfully under emulation, but
+    native ARM64 performance and compatibility are never tested
+
+  **Correct detection methods on `windows-11-arm`:**
+  - `$env:PROCESSOR_ARCHITEW6432` → returns `ARM64` (set only in WoW64 processes)
+  - `$env:PROCESSOR_IDENTIFIER` → returns `ARMv8 (64-bit) Family 8 Model D49 ...`
+  - Python `platform.processor()` → returns `ARMv8 (64-bit) ...`
+  - PowerShell `[System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture` → returns `Arm64`
+fix: |
+  Replace architecture detection logic that relies on `PROCESSOR_ARCHITECTURE` or
+  `platform.machine()` with detection methods that are reliable on ARM64 Windows.
+
+  The most portable approach is to check `PROCESSOR_ARCHITEW6432` (set by WoW64 to the
+  *native* architecture) before falling back to `PROCESSOR_ARCHITECTURE`:
+fix_code:
+  - language: yaml
+    label: 'Reliable arch detection in PowerShell'
+    code: |
+      - name: Detect true architecture
+        shell: pwsh
+        run: |
+          # PROCESSOR_ARCHITEW6432 is set by WoW64 to the native CPU arch
+          # Falls back to PROCESSOR_ARCHITECTURE on native (non-emulated) processes
+          $arch = if ($env:PROCESSOR_ARCHITEW6432) {
+            $env:PROCESSOR_ARCHITEW6432
+          } else {
+            $env:PROCESSOR_ARCHITECTURE
+          }
+          # Or use .NET RuntimeInformation (most reliable):
+          $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+          Write-Host "True architecture: $arch"
+          # $arch will be "Arm64" on windows-11-arm regardless of emulation
+  - language: yaml
+    label: 'Reliable arch detection in Python'
+    code: |
+      - name: Detect architecture in Python
+        shell: pwsh
+        run: |
+          python -c "
+          import platform, ctypes
+          # platform.machine() returns 'AMD64' on x64-emulated Python on ARM64 Windows
+          # Use ctypes to query native arch instead:
+          is_wow64 = ctypes.c_bool(False)
+          ctypes.windll.kernel32.IsWow64Process(-1, ctypes.byref(is_wow64))
+          if is_wow64.value:
+              # Running as x64 under WoW64 on ARM64; native arch is ARM64
+              print('Native arch: ARM64')
+          else:
+              print('Native arch:', platform.machine())
+          "
+  - language: yaml
+    label: 'Matrix-based binary selection (explicit)'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              include:
+                - os: windows-latest
+                  arch: x64
+                  binary_suffix: amd64
+                - os: windows-11-arm
+                  arch: arm64
+                  binary_suffix: arm64
+          runs-on: ${{ matrix.os }}
+          steps:
+            - name: Download correct binary
+              run: |
+                Invoke-WebRequest -Uri "https://example.com/tool-${{ matrix.binary_suffix }}.exe" -OutFile tool.exe
+              shell: pwsh
+prevention:
+  - "Never use `$env:PROCESSOR_ARCHITECTURE` alone for architecture detection on `windows-11-arm` — it returns `AMD64` when running under x64 emulation"
+  - "Use `$env:PROCESSOR_ARCHITEW6432` or `[RuntimeInformation]::OSArchitecture` for reliable ARM64 detection"
+  - "Prefer explicit `matrix.arch` or `runner.arch` context variable over runtime detection where possible"
+  - "The `runner.arch` GitHub Actions context returns `ARM64` correctly on `windows-11-arm` — prefer it over environment variables"
+  - "Test architecture detection logic specifically on `windows-11-arm` in your matrix"
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14071'
+    label: 'runner-images#14071 — windows-11-arm reports incorrect PROCESSOR_ARCHITECTURE'
+  - url: 'https://learn.microsoft.com/en-us/windows/win32/winprog64/wow64-implementation-details#environment-variables'
+    label: 'Microsoft Docs — WoW64 environment variables (PROCESSOR_ARCHITEW6432)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#runner-context'
+    label: 'GitHub Docs — runner context (runner.arch)'
+  - url: 'https://learn.microsoft.com/en-us/dotnet/api/system.runtime.interopservices.runtimeinformation.osarchitecture'
+    label: 'Microsoft Docs — RuntimeInformation.OSArchitecture'
