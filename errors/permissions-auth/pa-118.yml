@@ -1,0 +1,136 @@
+id: pa-118
+title: '`GITHUB_TOKEN` Cannot Push `.github/workflows/` Files Without `permissions: workflows: write`'
+category: permissions-auth
+severity: error
+tags:
+  - GITHUB_TOKEN
+  - workflows-permission
+  - git-push
+  - permissions-block
+  - workflow-file
+  - github-actions-bot
+patterns:
+  - regex: 'refusing to allow a GitHub App to create or update workflow .+\.github/workflows/.+ without `workflows` permission'
+    flags: 'i'
+  - regex: 'remote rejected.*refusing to allow a GitHub App.*workflows.*permission'
+    flags: 'i'
+  - regex: 'refusing to allow a GitHub App to create or update workflow.*without `workflows` permission'
+    flags: ''
+error_messages:
+  - "! [remote rejected]  ->  (refusing to allow a GitHub App to create or update workflow `.github/workflows/ci.yml` without `workflows` permission)"
+  - "refusing to allow a GitHub App to create or update workflow `.github/workflows/deploy.yml` without `workflows` permission"
+  - "error: failed to push some refs to 'https://github.com/owner/repo.git'"
+root_cause: |
+  The `GITHUB_TOKEN` is a temporary installation token scoped to the `github-actions[bot]`
+  GitHub App. GitHub enforces that any push containing changes to `.github/workflows/` files
+  requires the `workflows` write permission on the installation token — separate from the
+  standard `contents: write` permission.
+
+  A workflow that pushes workflow file changes with only `permissions: contents: write` will
+  fail at the `git push` step:
+
+  ```
+  ! [remote rejected] main -> main (refusing to allow a GitHub App to create or update
+  workflow `.github/workflows/ci.yml` without `workflows` permission)
+  ```
+
+  This is different from:
+  - **Classic PAT** (needs the `workflow` OAuth scope — see `classic-pat-workflow-scope-missing.yml`)
+  - **GitHub App tokens** via `create-github-app-token` (needs `permission-workflows: write` input)
+
+  For `GITHUB_TOKEN` specifically, you must add `workflows: write` to the `permissions:` block
+  at either the workflow level or the job level. GitHub Actions does NOT include `workflows`
+  in the default `GITHUB_TOKEN` permissions — it must be explicitly requested.
+
+  Note: `workflows: write` implicitly requires `contents: write` as a prerequisite. You must
+  grant both for workflow file commits to succeed.
+fix: |
+  Add `workflows: write` to the `permissions:` block in your workflow or the specific job
+  that performs the `git push`. Also ensure `contents: write` is present since workflows
+  permission alone is not sufficient for general file writes.
+
+  If using repository settings to restrict default GITHUB_TOKEN permissions to read-only,
+  you must explicitly grant both `contents: write` and `workflows: write` at the workflow
+  or job level.
+fix_code:
+  - language: yaml
+    label: 'BROKEN — only contents: write granted; workflow file push fails'
+    code: |
+      name: Auto-update workflow
+      on:
+        push:
+          branches: [main]
+
+      permissions:
+        contents: write  # ✗ Insufficient — workflows: write also required
+
+      jobs:
+        update:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Modify a workflow file
+              run: echo "# updated" >> .github/workflows/ci.yml
+            - name: Push changes
+              run: |
+                git config user.name "github-actions[bot]"
+                git config user.email "github-actions[bot]@users.noreply.github.com"
+                git add .github/workflows/ci.yml
+                git commit -m "chore: update workflow"
+                git push
+              # Fails: "refusing to allow a GitHub App to create or update workflow
+              #         `.github/workflows/ci.yml` without `workflows` permission"
+
+  - language: yaml
+    label: 'FIXED — add workflows: write alongside contents: write'
+    code: |
+      name: Auto-update workflow
+      on:
+        push:
+          branches: [main]
+
+      permissions:
+        contents: write   # ✓ required for git push
+        workflows: write  # ✓ required for .github/workflows/ file changes
+
+      jobs:
+        update:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Modify a workflow file
+              run: echo "# updated" >> .github/workflows/ci.yml
+            - name: Push changes
+              run: |
+                git config user.name "github-actions[bot]"
+                git config user.email "github-actions[bot]@users.noreply.github.com"
+                git add .github/workflows/ci.yml
+                git commit -m "chore: update workflow"
+                git push
+
+  - language: yaml
+    label: 'ALTERNATIVE — job-level permissions override (minimal scope per job)'
+    code: |
+      jobs:
+        update:
+          runs-on: ubuntu-latest
+          permissions:
+            contents: write   # ✓ job-level grant — overrides workflow-level
+            workflows: write  # ✓ required for workflow file changes
+          steps:
+            - uses: actions/checkout@v4
+            - name: Push workflow file changes
+              run: git push
+
+prevention:
+  - 'Any workflow that commits changes to `.github/workflows/` files must have `permissions: workflows: write` in addition to `contents: write`.'
+  - 'If your workflow only conditionally pushes workflow files, still grant `workflows: write` — GitHub checks the permission at push time, not workflow-parse time.'
+  - 'Prefer job-level `permissions:` over workflow-level to minimize the blast radius of the broad `workflows: write` scope.'
+  - 'Consider using a GitHub App with `workflows` permission for automated workflow management workflows — it provides more granular control than GITHUB_TOKEN.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#permissions'
+    label: 'GitHub Docs: Workflow syntax — permissions (workflows scope)'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#permissions-for-the-github_token'
+    label: 'GitHub Docs: Permissions for the GITHUB_TOKEN'
+  - url: 'https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps?apiVersion=2022-11-28#repository-permissions-for-workflows'
+    label: 'GitHub Docs: Repository permissions for workflows (GitHub Apps and GITHUB_TOKEN)'
