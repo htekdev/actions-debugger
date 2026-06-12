@@ -1,0 +1,114 @@
+id: runner-environment-478
+title: 'ubuntu-24.04-arm: Wine programs hang or time out — broken Ubuntu 24.04 ARM Wine packaging'
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-24.04-arm
+  - arm64
+  - wine
+  - cross-compile
+  - windows-arm
+  - packaging-bug
+patterns:
+  - regex: 'wine.*timeout|wine.*hung|wine.*hang'
+    flags: 'i'
+  - regex: 'virtual_setup_exception stack overflow.*wine|022c:err:virtual'
+    flags: 'i'
+  - regex: 'wine.*killed|timeout.*wine.*process'
+    flags: 'i'
+error_messages:
+  - "Process killed after timeout running wine program"
+  - "022c:err:virtual:virtual_setup_exception stack overflow 880 bytes addr 0x6fffffd95894"
+  - "wine: could not exec the wine loader"
+root_cause: |
+  The `wine` package shipped in **Ubuntu 24.04 (Noble Numbat)** for ARM64 was compiled without
+  a required build fix (tracked as Ubuntu bug #2102681 / Debian bug #1100695). The resulting
+  binary is incorrectly built and cannot reliably execute Windows ARM programs — programs
+  either hang on startup and are eventually killed by the job timeout, or throw
+  stack-overflow / exception-handling errors.
+
+  This affects the `ubuntu-24.04-arm` GitHub Actions runner image, which uses the system
+  Ubuntu 24.04 ARM64 Wine package. The same issue does not affect:
+  - `ubuntu-22.04-arm` (older, working Wine build)
+  - `ubuntu-26.04` and `ubuntu-26.04-arm` (Wine packaging bug was fixed in 26.04)
+
+  Workflows cross-compiling Windows ARM binaries with Meson, Cargo (via cross-compilation),
+  or other toolchains and then running them under Wine for testing will intermittently fail
+  because Wine hangs indefinitely waiting to handle the program's startup exception.
+
+  On `ubuntu-26.04`, Wine programs that throw C++ exceptions may additionally fail with:
+    `022c:err:virtual:virtual_setup_exception stack overflow`
+  This is a separate but related ARM Wine issue in the Ubuntu 26.04 package (as of June 2026).
+fix: |
+  **Option 1 — Use ubuntu-22.04-arm (recommended short-term):**
+  Downgrade the runner to `ubuntu-22.04-arm`. The Wine package in Ubuntu 22.04 ARM64
+  is correctly built and executes Windows ARM programs reliably.
+
+  **Option 2 — Use a Docker container with a correctly compiled Wine:**
+  Use a container image with Wine compiled from source (without the packaging bug):
+    container: ghcr.io/mstorsjo/wine
+
+  This image contains Wine correctly compiled for ARM64 and avoids the Ubuntu packaging issue.
+
+  **Option 3 — Build Wine from source in the workflow:**
+  Install build dependencies and compile Wine from upstream source on the runner. This is
+  time-consuming but produces a correctly built binary. Only practical if compile time is
+  acceptable.
+
+  **Option 4 — Wait for ubuntu-24.04-arm update or use ubuntu-26.04-arm:**
+  The fix is already in Ubuntu 26.04. Once Ubuntu 24.04 ARM receives a backported Wine fix
+  (unlikely given Ubuntu's backport policy for this type of packaging regression), or
+  ubuntu-26.04-arm becomes stable, migrating to that image will resolve the issue.
+fix_code:
+  - language: yaml
+    label: 'Failing — ubuntu-24.04-arm with Wine programs hanging'
+    code: |
+      jobs:
+        test-wine:
+          runs-on: ubuntu-24.04-arm    # Wine packaging bug causes hangs
+          steps:
+            - uses: actions/checkout@v4
+            - name: Install Wine
+              run: sudo apt-get install -y wine
+            - name: Run Windows binary under Wine
+              run: wine ./my-windows-arm64.exe  # hangs indefinitely
+
+  - language: yaml
+    label: 'Fixed — use ubuntu-22.04-arm with working Wine'
+    code: |
+      jobs:
+        test-wine:
+          runs-on: ubuntu-22.04-arm    # Wine package correctly built in 22.04
+          steps:
+            - uses: actions/checkout@v4
+            - name: Install Wine
+              run: sudo apt-get install -y wine
+            - name: Run Windows binary under Wine
+              run: wine ./my-windows-arm64.exe
+
+  - language: yaml
+    label: 'Alternative — use Docker container with correctly compiled Wine'
+    code: |
+      jobs:
+        test-wine:
+          runs-on: ubuntu-24.04-arm
+          container: ghcr.io/mstorsjo/wine    # correctly compiled Wine for ARM64
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run Windows binary under Wine
+              run: wine ./my-windows-arm64.exe
+
+prevention:
+  - "Test Wine-dependent workflows on ubuntu-22.04-arm before relying on ubuntu-24.04-arm for ARM Wine execution."
+  - "Add a `wine --version` step early in the workflow and verify the Wine binary launches a trivial test program before running production binaries under Wine."
+  - "If using Wine on ubuntu-26.04-arm, validate that C++ exception handling works correctly before relying on it in CI."
+  - "Pin Wine-dependent jobs to known-good runner images or use a Docker container image where Wine is compiled from upstream source."
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14094'
+    label: 'runner-images#14094: [ubuntu-24.04-arm] Wine programs seem to hang'
+  - url: 'https://bugs.launchpad.net/ubuntu/+source/wine/+bug/2102681'
+    label: 'Ubuntu bug #2102681: wine incorrectly compiled in Ubuntu 24.04 ARM'
+  - url: 'https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1100695'
+    label: 'Debian bug #1100695: wine ARM packaging regression (fixed in Debian, backported to Ubuntu 26.04)'
+  - url: 'https://github.com/mstorsjo/wine'
+    label: 'mstorsjo/wine: Docker image with correctly compiled Wine for ARM64'
