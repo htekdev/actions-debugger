@@ -1,0 +1,86 @@
+id: sf-222
+title: 'Reusable Workflow Empty-String Caller Input Silently Ignores Callee Default'
+category: silent-failures
+severity: silent-failure
+tags:
+  - reusable-workflow
+  - workflow-call
+  - inputs
+  - default-value
+  - empty-string
+  - silent-failure
+patterns:
+  - regex: 'uses:.*\.github/workflows/.*\.ya?ml'
+    flags: 'i'
+  - regex: 'with:\s*\n.*:\s*\$\{\{\s*inputs\.'
+    flags: 'im'
+error_messages:
+  - "# no visible error — callee input silently receives empty string instead of its declared default"
+root_cause: |
+  When a reusable workflow declares an input with a `default:` value, that default is only
+  applied when the caller provides NO value for the input. If the caller passes
+  `${{ inputs.message }}` and the outer workflow_dispatch was triggered WITHOUT providing
+  a value for `message`, the expression evaluates to the outer input's type-default — an
+  empty string `""` for string inputs when no default is set.
+
+  The runner receives the explicit empty string `""` as the passed value and treats it as
+  a valid non-null value, so it does NOT fall back to the callee's declared default.
+  The callee silently sees `inputs.message == ""` instead of `"default message"`.
+
+  This is counterintuitive: developers expect "if the caller has nothing to pass, the callee
+  should use its own default." Instead, the empty string propagates silently and the callee
+  default is bypassed entirely. The behaviour is consistent with how YAML/JSON treat empty
+  strings as valid values, but surprises nearly every developer who uses reusable workflow
+  defaults as a fallback mechanism.
+fix: |
+  Move default-handling to the caller workflow. Use the `||` operator in the calling
+  workflow's `with:` block to substitute a fallback when the outer input is absent:
+
+    message: ${{ inputs.message || 'default message' }}
+
+  Alternatively, declare `required: true` in the callee and ensure the caller always
+  provides a meaningful value. Do NOT rely solely on the callee's `default:` when the
+  value is passed via a caller input that may evaluate to empty string.
+fix_code:
+  - language: yaml
+    label: 'BROKEN — caller passes empty string; callee default is never used'
+    code: |
+      # caller.yml
+      on:
+        workflow_dispatch:
+          inputs:
+            message:
+              type: string
+              required: false   # evaluates to "" when not provided by user
+      jobs:
+        call-reusable:
+          uses: ./.github/workflows/reusable.yml@main
+          with:
+            message: ${{ inputs.message }}   # passes "" — callee default ignored
+
+      # reusable.yml
+      on:
+        workflow_call:
+          inputs:
+            message:
+              type: string
+              default: 'default message'   # NEVER applied — "" was explicitly passed
+  - language: yaml
+    label: 'FIXED — use || in caller to guard against empty string'
+    code: |
+      # caller.yml
+      jobs:
+        call-reusable:
+          uses: ./.github/workflows/reusable.yml@main
+          with:
+            message: ${{ inputs.message || 'default message' }}   # caller handles default
+prevention:
+  - "Never rely on a callee reusable workflow's `default:` to handle empty strings propagated from a caller — always guard in the caller with `|| 'fallback'`."
+  - "Use `${{ inputs.X || 'fallback' }}` in the calling workflow's `with:` block when the outer workflow_dispatch input may be absent."
+  - "Declare `required: true` in the callee if empty string would cause issues, to surface the problem explicitly."
+  - "Add a test that triggers the outer workflow with no inputs supplied to verify the callee receives the intended default."
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#onworkflow_callinputsinput_iddefault'
+    label: 'GitHub Docs: workflow_call inputs default'
+  - url: 'https://github.com/actions/runner/issues/2907'
+    label: 'actions/runner#2907: Reusable workflow input default not used when caller passes empty string (17 reactions)'
