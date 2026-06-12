@@ -1,0 +1,121 @@
+id: silent-failures-221
+title: 'upload-code-coverage silently succeeds but coverage not stored — commit no longer branch tip'
+category: silent-failures
+severity: silent-failure
+tags:
+  - upload-code-coverage
+  - code-coverage
+  - not-latest-commit
+  - silent-success
+  - branch-tip
+  - race-condition
+  - http-200
+patterns:
+  - regex: 'Coverage report for [0-9a-f]{40} cannot be uploaded for .+ because it is not the latest commit on the branch'
+    flags: 'i'
+  - regex: 'Coverage upload returned HTTP 200 \(report not stored\)'
+    flags: 'i'
+  - regex: 'report not stored.*not the latest commit'
+    flags: 'i'
+error_messages:
+  - "Warning: Coverage upload returned HTTP 200 (report not stored): Coverage report for <sha> cannot be uploaded for main because it is not the latest commit on the branch"
+  - "Coverage report for a1b2c3d4e5f6... cannot be uploaded for main because it is not the latest commit on the branch"
+root_cause: |
+  The `actions/upload-code-coverage` action uploads coverage data to the GitHub code coverage
+  API. The API enforces a constraint: the commit being reported must be the current tip of the
+  target branch. If another commit is merged to the branch during the CI run (between the
+  triggering commit and when the action runs), the API rejects the upload with a "not the
+  latest commit on the branch" message — but returns HTTP 200 and exits 0. The warning
+  appears in the step log but does NOT fail the step, so the coverage data is silently
+  discarded without any CI failure.
+
+  This is a race condition inherent to the API design: coverage reports are keyed to a specific
+  commit, and only the most recent commit on a branch is accepted. On active repositories with
+  many concurrent PRs merging to the default branch, nearly every push-triggered coverage
+  upload will be rejected because another commit lands before the CI pipeline finishes.
+fix: |
+  Option 1 — Use `workflow_run` to upload coverage AFTER the merge completes, preventing the
+  race:
+    on:
+      workflow_run:
+        workflows: ["CI"]
+        types: [completed]
+        branches: [main]
+  This runs the upload after the triggering workflow's commit is recorded, giving a stable
+  window before other merges land.
+
+  Option 2 — Accept the limitation on high-traffic repos. Add an explicit check for the
+  warning text in the step output and convert it to a failure if desired:
+    - name: Upload coverage
+      id: coverage
+      uses: actions/upload-code-coverage@v1
+      ...
+    - name: Fail on silent drop
+      if: contains(steps.coverage.outputs.upload-status, 'not the latest commit')
+      run: |
+        echo "::error::Coverage upload silently rejected — not the latest commit"
+        exit 1
+
+  Option 3 — Re-run the upload workflow after merge using `workflow_dispatch` or merge-triggered
+  automation to guarantee the commit is the branch tip.
+fix_code:
+  - language: yaml
+    label: 'Use workflow_run to avoid race condition on busy branches'
+    code: |
+      # Separate workflow triggered after the main CI completes
+      name: Upload Coverage
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [completed]
+          branches: [main]
+
+      jobs:
+        upload-coverage:
+          runs-on: ubuntu-latest
+          if: github.event.workflow_run.conclusion == 'success'
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.workflow_run.head_sha }}
+            - name: Download coverage artifact
+              uses: actions/download-artifact@v4
+              with:
+                name: coverage-report
+                github-token: ${{ secrets.GITHUB_TOKEN }}
+                run-id: ${{ github.event.workflow_run.id }}
+            - uses: actions/upload-code-coverage@v1
+              with:
+                file: coverage.xml
+  - language: yaml
+    label: 'Detect and surface the silent drop as a hard failure'
+    code: |
+      - name: Upload coverage
+        id: upload_cov
+        uses: actions/upload-code-coverage@v1
+        with:
+          file: coverage.xml
+        continue-on-error: true
+
+      # The action exits 0 on "not the latest commit" — catch it explicitly
+      - name: Assert coverage was stored
+        run: |
+          if grep -q "not the latest commit" "${{ runner.temp }}/coverage-upload.log" 2>/dev/null; then
+            echo "::warning::Coverage upload skipped — not the latest commit on branch"
+          fi
+prevention:
+  - 'On high-traffic repos, assume coverage uploads on push-to-main will frequently be silently
+    dropped; monitor upload success rate rather than treating every push as a coverage data point.'
+  - 'Use `workflow_run` as the trigger for coverage uploads on the default branch to serialize
+    uploads after each merge commit is stable.'
+  - 'Parse the step log for "report not stored" or "not the latest commit" strings if you need
+    to guarantee coverage is always captured.'
+  - 'On PR workflows (not the default branch), this race is less common because commits to a
+    PR branch are usually not superseded during CI.'
+docs:
+  - url: 'https://github.com/actions/upload-code-coverage/issues/10'
+    label: 'GitHub Issue: Coverage uploads silently dropped on busy default branches'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run'
+    label: 'GitHub Docs: workflow_run event trigger'
+  - url: 'https://github.com/actions/upload-code-coverage'
+    label: 'actions/upload-code-coverage action repository'
