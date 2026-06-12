@@ -1,0 +1,132 @@
+id: known-unsolved-137
+title: 'Repository ruleset required status checks — wildcard patterns never match GitHub Actions job contexts'
+category: known-unsolved
+severity: limitation
+tags:
+  - rulesets
+  - required-status-checks
+  - wildcard
+  - pattern-matching
+  - branch-protection
+  - job-context
+  - pr-blocked
+  - status-check
+patterns:
+  - regex: 'Expected.*Waiting for status to be reported'
+    flags: 'i'
+  - regex: 'ruleset.*required.*status.*check.*waiting'
+    flags: 'i'
+  - regex: '\bpreview\*\b|\bcheck\*\b|\bdeploy-\*\b'
+    flags: 'i'
+error_messages:
+  - "Expected — Waiting for status to be reported"
+  - "Status context 'preview*' never matched any running checks"
+  - "PR blocked — required status check 'deploy-*' waiting indefinitely"
+root_cause: |
+  GitHub repository rulesets accept strings in the "Required status checks" field, but they
+  use **exact string matching**, not glob/wildcard matching. Despite the UI accepting patterns
+  like `preview*`, `deploy-*`, or `test-*`, these are treated as literal strings to match
+  against the check context name — not as wildcard patterns.
+
+  GitHub Actions reports job status checks using a specific context format:
+    `{job_id} / {Job Name}`
+  For example:
+    - `preview_admin / Infra Preview admin`
+    - `preview_dev / Infra Preview dev`
+    - `preview_staging / Infra Preview staging`
+
+  The ruleset string `preview*` is compared literally against `preview_admin / Infra Preview
+  admin` — which never matches. The PR stays blocked indefinitely with "Expected — Waiting
+  for status to be reported" because no check ever exactly equals the literal string `preview*`.
+
+  This affects any attempt to use a single wildcard-style rule to cover multiple dynamically-
+  named jobs (e.g., generated from a matrix, per-environment deploys, per-service tests).
+fix: |
+  There is no supported wildcard/glob matching in ruleset required status checks (as of 2026).
+  Use one of these workarounds:
+
+  Option 1 — List each required check explicitly by its exact context name:
+    Required status checks:
+      - preview_admin / Infra Preview admin
+      - preview_dev / Infra Preview dev
+      - preview_staging / Infra Preview staging
+      - preview_prod / Infra Preview prod
+
+  Option 2 — Create a single aggregate/fan-in job that depends on all relevant jobs, and
+  require only that aggregate job in the ruleset:
+    all-previews-passed:
+      needs: [preview_admin, preview_dev, preview_staging, preview_prod]
+      if: always()
+      runs-on: ubuntu-latest
+      steps:
+        - run: |
+            if [[ "${{ needs.preview_admin.result }}" != "success" ]] || \
+               [[ "${{ needs.preview_dev.result }}" != "success" ]] || \
+               [[ "${{ needs.preview_staging.result }}" != "success" ]] || \
+               [[ "${{ needs.preview_prod.result }}" != "success" ]]; then
+              echo "One or more preview jobs failed"
+              exit 1
+            fi
+  Then require only `all-previews-passed / all-previews-passed` in the ruleset.
+fix_code:
+  - language: yaml
+    label: 'Aggregate fan-in job to replace wildcard status check requirement'
+    code: |
+      jobs:
+        preview_admin:
+          name: Infra Preview admin
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "deploying admin preview"
+
+        preview_dev:
+          name: Infra Preview dev
+          runs-on: ubuntu-latest
+          steps:
+            - run: echo "deploying dev preview"
+
+        # Fan-in job — require THIS in your ruleset instead of 'preview*'
+        all-previews-passed:
+          name: All previews passed
+          needs: [preview_admin, preview_dev]
+          if: always()
+          runs-on: ubuntu-latest
+          steps:
+            - name: Assert all previews succeeded
+              run: |
+                results=("${{ needs.preview_admin.result }}" "${{ needs.preview_dev.result }}")
+                for result in "${results[@]}"; do
+                  if [[ "$result" != "success" ]]; then
+                    echo "::error::A preview job failed or was cancelled"
+                    exit 1
+                  fi
+                done
+  - language: yaml
+    label: 'Explicit required status checks (alternative: list each check individually)'
+    code: |
+      # In your repository ruleset, list each exact check context name:
+      # Required status checks:
+      #   - preview_admin / Infra Preview admin
+      #   - preview_dev / Infra Preview dev
+      #   - preview_staging / Infra Preview staging
+      #   - preview_prod / Infra Preview prod
+      #
+      # The context is always: "{job_id} / {Job Name}" from your workflow file
+      # e.g., if job id is 'preview_admin' and name is 'Infra Preview admin':
+      #   Required check context = "preview_admin / Infra Preview admin"
+prevention:
+  - 'When configuring ruleset required status checks, always use the exact check context string
+    (format: `{job_id} / {Job Name}`) rather than wildcard patterns.'
+  - 'Use an aggregate fan-in job as the single required check when protecting multiple related
+    jobs — this scales better than listing each job individually and survives matrix changes.'
+  - 'Verify required check context names by examining the PR checks panel after a workflow run;
+    the exact string shown is what the ruleset must match.'
+  - 'If your matrix changes (adding/removing environments), remember to update the fan-in job
+    and the ruleset required check list accordingly.'
+docs:
+  - url: 'https://github.com/orgs/community/discussions/197566'
+    label: 'GitHub Community Discussion: Wildcard patterns in rulesets not matching status checks'
+  - url: 'https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets'
+    label: 'GitHub Docs: About rulesets'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-jobs-in-a-workflow#defining-prerequisite-jobs'
+    label: 'GitHub Docs: Using jobs in a workflow — defining prerequisite jobs'
