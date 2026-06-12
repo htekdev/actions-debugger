@@ -1,0 +1,80 @@
+id: re-481
+title: 'ubuntu-slim runner ships git 2.43.0 instead of documented 2.52+ due to missing PPA pin'
+category: runner-environment
+severity: warning
+tags:
+  - ubuntu-slim
+  - git
+  - version-mismatch
+  - apt
+  - ppa
+  - container-runner
+  - regression
+patterns:
+  - regex: 'git version 2\.43\.'
+    flags: 'i'
+  - regex: 'fatal: unknown option|error: unknown switch|unrecognized argument'
+    flags: 'i'
+error_messages:
+  - 'git version 2.43.0'
+  - 'fatal: unknown option'
+  - 'error: unknown switch'
+root_cause: |
+  The `ubuntu-slim` runner image is built from a minimal `ubuntu:24.04` Docker base.
+  Unlike the standard `ubuntu-24.04` GitHub-hosted runner, ubuntu-slim's git install
+  script does not consistently pin to the `git-core` Launchpad PPA. When the apt
+  resolver falls back to the Ubuntu 24.04 LTS base repository, it installs git 2.43.0
+  — the LTS-pinned version in the Ubuntu focal/noble archive — rather than the 2.52+
+  version distributed via the PPA and documented in the ubuntu-slim README.
+
+  The ubuntu-slim README states git 2.52.0 is installed, but the actual installed
+  version since image 20260504.56.2 is 2.43.0. This regression was introduced between:
+  - 20260413.54.1 — git 2.53.0 (from PPA, matches README)
+  - 20260504.56.2 — git 2.43.0 (from Ubuntu base apt, README out of date)
+
+  Workflows that use git features introduced between 2.44 and 2.52 fail with opaque
+  "unknown option" or "unknown switch" errors on ubuntu-slim, while the same workflow
+  succeeds on ubuntu-24.04 standard runners. As of June 2026, the issue is unresolved
+  and the ubuntu-slim image README is inaccurate.
+fix: |
+  Install git explicitly from the git-core PPA as an early workflow step on ubuntu-slim.
+  This overrides the downgraded system git (2.43.0) with the current PPA version (2.52+).
+fix_code:
+  - language: yaml
+    label: 'Upgrade git from PPA on ubuntu-slim to get 2.52+'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-slim
+          steps:
+            - name: Upgrade git from PPA (ubuntu-slim ships 2.43.0, not 2.52+)
+              run: |
+                sudo add-apt-repository ppa:git-core/ppa -y
+                sudo apt-get update -q
+                sudo apt-get install -y --no-install-recommends git
+                git --version  # verify: expect 2.52+ or later
+
+            - uses: actions/checkout@v4
+            # ... rest of workflow
+  - language: yaml
+    label: 'Diagnostic — detect git version mismatch at start of workflow'
+    code: |
+      - name: Check git version
+        run: |
+          GIT_VER=$(git --version | awk '{print $3}')
+          echo "Git version: $GIT_VER"
+          # ubuntu-slim may report 2.43.0 instead of expected 2.52+
+          # If you need git >= 2.44, install from PPA before using git features
+prevention:
+  - 'Always run git --version early in ubuntu-slim workflows to detect the downgraded version'
+  - 'Do not assume ubuntu-slim has the same git version as ubuntu-24.04 standard runners'
+  - 'Pin git from git-core/ppa if your workflow uses any feature added in git 2.44 or later'
+  - 'Monitor actions/runner-images#14014 for the official fix to the ubuntu-slim git version'
+  - 'Cross-reference the ubuntu-slim README version claims against actual installed versions'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14014'
+    label: 'runner-images#14014 — ubuntu-slim git downgraded to 2.43.0'
+  - url: 'https://github.com/actions/runner-images/blob/main/images/ubuntu-slim/ubuntu-slim-Readme.md'
+    label: 'ubuntu-slim software manifest (check actual vs documented versions)'
+  - url: 'https://launchpad.net/~git-core/+archive/ubuntu/ppa'
+    label: 'git-core PPA — provides git 2.52+ for Ubuntu'
