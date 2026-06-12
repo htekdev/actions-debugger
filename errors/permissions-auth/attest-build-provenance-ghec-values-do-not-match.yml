@@ -1,0 +1,93 @@
+id: permissions-auth-117
+title: 'attest-build-provenance Fails: "Invalid Argument — values do not match" on GHEC'
+category: permissions-auth
+severity: error
+tags:
+  - attestation
+  - attest-build-provenance
+  - ghec
+  - sigstore
+  - oidc
+  - enterprise
+  - github-enterprise-cloud
+  - provenance
+patterns:
+  - regex: 'Failed to persist attestation: Invalid Argument - values do not match'
+    flags: 'i'
+  - regex: 'values do not match: https://github\.com/.+ != https://.+\.ghe\.com'
+    flags: 'i'
+  - regex: 'Error: Failed to persist attestation: Invalid Argument'
+    flags: 'i'
+error_messages:
+  - "Error: Failed to persist attestation: Invalid Argument - values do not match: https://github.com/my-org/my-repo != https://my-org.ghe.com/my-org/my-repo"
+  - "Error: Error: Failed to persist attestation: Invalid Argument - values do not match"
+root_cause: |
+  actions/attest-build-provenance persists a Sigstore attestation by calling the
+  GitHub Attestations REST API. The API validates that the repository URL in the
+  OIDC token (`iss` / `repository` claims) matches the repository context of the
+  request.
+
+  For GitHub Enterprise Cloud (GHEC) organizations, the OIDC token issuer uses the
+  enterprise subdomain: `https://token.actions.githubusercontent.com` for github.com
+  repos, but `https://<enterprise>.ghe.com/.well-known/openid-configuration` for
+  GHEC-hosted repos. When an enterprise managed user (EMU) runs a workflow on a
+  repo hosted at `github.com`, but the organization's GHEC tenant URL is
+  `https://org.ghe.com`, the attestation service may derive the expected repository
+  URL from the enterprise subdomain, causing a mismatch with the actual
+  `https://github.com/org/repo` URL embedded in the OIDC token.
+
+  This manifests after GHEC configuration changes, org migrations, or when internal
+  repositories are made public — the OIDC token issuer URL diverges from the
+  repository URL the attestation API expects to see.
+fix: |
+  Option 1: Set the GITHUB_SIGSTORE_INSTANCE environment variable to force the
+  action to use the public GitHub Sigstore instance instead of the enterprise one:
+
+    env:
+      GITHUB_SIGSTORE_INSTANCE: github
+
+  Option 2: If the repo was recently migrated between github.com and a GHEC
+  instance, wait for the OIDC issuer to stabilize or contact GitHub Support to
+  resolve the URL mismatch on the enterprise tenant configuration.
+
+  Option 3: Use actions/attest@v2+ which provides more configuration options for
+  enterprise Sigstore endpoints via the `sigstore` input parameter.
+fix_code:
+  - language: yaml
+    label: 'Force public GitHub Sigstore instance via env variable'
+    code: |
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        env:
+          GITHUB_SIGSTORE_INSTANCE: github   # force public Sigstore
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+  - language: yaml
+    label: 'Ensure id-token permission is granted and repo is on correct instance'
+    code: |
+      jobs:
+        attest:
+          runs-on: ubuntu-latest
+          permissions:
+            id-token: write       # required for OIDC
+            attestations: write   # required for persisting attestation
+            contents: read
+          steps:
+            - uses: actions/attest-build-provenance@v2
+              env:
+                GITHUB_SIGSTORE_INSTANCE: github
+              with:
+                subject-path: dist/my-binary
+prevention:
+  - 'Add GITHUB_SIGSTORE_INSTANCE: github as a default env on attestation jobs in GHEC organizations.'
+  - 'Verify the OIDC issuer URL matches your repository host before running attestation workflows.'
+  - 'After migrating a repo between github.com and GHEC, test attestation on a non-critical workflow first.'
+  - 'Check the actions/attest-build-provenance release notes after GitHub Enterprise updates.'
+docs:
+  - url: 'https://github.com/actions/attest-build-provenance/issues/216'
+    label: 'attest-build-provenance#216 — Invalid Argument values do not match on GHEC'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds'
+    label: 'GitHub Docs — Using artifact attestations to establish provenance'
+  - url: 'https://docs.github.com/en/enterprise-cloud@latest/actions/security-for-github-actions/using-artifact-attestations'
+    label: 'GitHub Enterprise Cloud — artifact attestations'
