@@ -1,0 +1,86 @@
+id: runner-environment-479
+title: 'setup-python Fails to Find Python Version in Ubuntu 26.04 Container on Self-Hosted Runner'
+category: runner-environment
+severity: error
+tags:
+  - setup-python
+  - ubuntu-26
+  - container
+  - self-hosted-runner
+  - versions-manifest
+  - python-version-not-found
+patterns:
+  - regex: 'The version .+ with architecture .x64. was not found for this operating system'
+    flags: 'i'
+  - regex: 'setup-python.*version.*not found.*container.*ubuntu'
+    flags: 'i'
+error_messages:
+  - "Error: The version '3.13' with architecture 'x64' was not found for this operating system."
+root_cause: |
+  When actions/setup-python runs inside a job container (e.g. `container: ubuntu:latest`
+  or `container: ubuntu:26.04`) on a SELF-HOSTED runner, it queries the versions manifest
+  to find pre-built Python binaries. On Ubuntu 26.04 (Noble+) containers, the action
+  cannot resolve a matching manifest entry and returns "version not found."
+
+  The root cause is that the versions-manifest.json for actions/setup-python maps Python
+  distributions to specific Linux identifiers. Ubuntu 26.04 (or `ubuntu:latest` when it
+  resolves to 26.04) presents a different OS identifier than Ubuntu 24.04 or 22.04. The
+  manifest does not yet include a matching pre-compiled binary distribution for the new
+  Ubuntu 26.04 glibc/OS combination, so no download URL is found and the action errors out.
+
+  This only affects SELF-HOSTED runners. GitHub-hosted `ubuntu-latest` runners work because
+  they bypass the manifest lookup for containers differently — the host runner provides
+  toolcache entries that containers can access, while self-hosted runners lack those entries.
+
+  The runner's host OS (e.g. Amazon Linux) is irrelevant — it is the container OS that
+  matters for the Python binary lookup.
+
+  Reported in setup-python#1309 (June 2026, 8 reactions). Downgrading to
+  `container: ubuntu:24.04` is the confirmed workaround.
+fix: |
+  1. Pin the container image to Ubuntu 24.04 (or 22.04) instead of `ubuntu:latest` or
+     `ubuntu:26.04` until the setup-python manifest includes Ubuntu 26.04 distributions.
+  2. Use `python-version-file:` pointing to a .python-version or pyproject.toml to allow
+     setup-python to install from the system package manager as a fallback.
+  3. Pre-install Python in the container image itself and set `update-environment: false`
+     to skip the manifest lookup entirely.
+fix_code:
+  - language: yaml
+    label: 'Pin container to ubuntu:24.04 until setup-python manifest supports 26.04'
+    code: |
+      jobs:
+        build:
+          runs-on: [self-hosted]
+          container: ubuntu:24.04    # Pin to 24.04 — ubuntu:latest may resolve to 26.04
+          steps:
+            - uses: actions/setup-python@v6
+              with:
+                python-version: '3.13'
+  - language: yaml
+    label: 'Pre-install Python in a custom container image to bypass manifest lookup'
+    code: |
+      # Dockerfile
+      FROM ubuntu:26.04
+      RUN apt-get update && apt-get install -y python3.13 python3.13-venv python3-pip
+
+      # Workflow — set update-environment: false to use pre-installed Python
+      jobs:
+        build:
+          runs-on: [self-hosted]
+          container: myorg/ubuntu-26-python:latest    # custom image with Python pre-installed
+          steps:
+            - uses: actions/setup-python@v6
+              with:
+                python-version: '3.13'
+                update-environment: false   # don't download — use system Python
+prevention:
+  - 'Do not use `container: ubuntu:latest` on self-hosted runners when relying on setup-python — `ubuntu:latest` may resolve to a new major version (e.g. 26.04) for which pre-built Python binaries are not yet available in the versions manifest.'
+  - 'Pin container image tags to a specific version (ubuntu:24.04) rather than floating tags in production self-hosted workflows.'
+  - 'Watch setup-python releases and versions-manifest.json for Ubuntu 26.04 support to land before migrating self-hosted container workflows.'
+docs:
+  - url: 'https://github.com/actions/setup-python/issues/1309'
+    label: 'setup-python #1309 — Failing to fetch version from manifest when using Ubuntu 26.04 container on self-hosted runner'
+  - url: 'https://github.com/actions/setup-python/blob/main/docs/advanced-usage.md'
+    label: 'setup-python Advanced Usage — containers and self-hosted runners'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-where-your-workflow-runs/running-jobs-in-a-container'
+    label: 'GitHub Docs — Running jobs in a container'

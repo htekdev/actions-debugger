@@ -1,0 +1,84 @@
+id: caching-artifacts-139
+title: 'actions/cache Fails With ENOTFOUND on IPv6 Self-Hosted Cache Server — IPv6 Address Literal Parsed as Hostname'
+category: caching-artifacts
+severity: warning
+tags:
+  - actions-cache
+  - ipv6
+  - self-hosted-runner
+  - ENOTFOUND
+  - ACTIONS_CACHE_URL
+  - getaddrinfo
+  - cache-server
+patterns:
+  - regex: 'getCacheEntry failed: getaddrinfo ENOTFOUND \[[\da-f:]+\]'
+    flags: 'i'
+  - regex: 'reserveCache failed: getaddrinfo ENOTFOUND \[[\da-f:]+\]'
+    flags: 'i'
+  - regex: 'Failed to (restore|save): (getCacheEntry|reserveCache) failed: getaddrinfo ENOTFOUND \['
+    flags: 'i'
+error_messages:
+  - "::warning::Failed to restore: getCacheEntry failed: getaddrinfo ENOTFOUND [2001:bc8:1d90:1fc1:dc00:ff:fe2b:3f97]"
+  - "::warning::Failed to save: reserveCache failed: getaddrinfo ENOTFOUND [2001:bc8:1d90:1fc1:dc00:ff:fe2b:3f97]"
+root_cause: |
+  When a self-hosted runner is configured with an IPv6 cache server URL via the
+  ACTIONS_CACHE_URL environment variable (e.g. http://[2001:bc8:...]:8080/), the
+  Node.js HTTP client inside the @actions/cache toolkit package incorrectly strips
+  the surrounding square brackets from the IPv6 address literal when constructing
+  the hostname for DNS resolution.
+
+  The resulting bare IPv6 address string (e.g. 2001:bc8:1d90:1fc1:dc00:ff:fe2b:3f97,
+  without brackets) is passed to getaddrinfo as if it were a DNS hostname. Since it
+  is not a valid hostname and not an IPv4 address, getaddrinfo returns ENOTFOUND,
+  causing every cache restore and save to fail.
+
+  The failures surface as warnings (not errors) so the workflow continues to run —
+  but the cache is never used and never saved, silently eliminating any performance
+  benefit and causing repeated cold build times on self-hosted setups with IPv6 cache
+  infrastructure.
+
+  Root fix merged in actions/toolkit PR #2298 (HTTP client IPv6 bracket handling).
+  The fix may not be deployed to all currently pinned versions of actions/cache.
+  Reported in actions/cache#1718.
+fix: |
+  Configure the self-hosted cache server to listen on an IPv4 address or register a
+  DNS hostname that resolves to the cache server, and use that in ACTIONS_CACHE_URL
+  instead of a bare IPv6 literal.
+
+  If the fix from actions/toolkit PR #2298 has been shipped in a new actions/cache
+  release, upgrading to that release will also resolve the issue.
+fix_code:
+  - language: yaml
+    label: 'Use IPv4 or DNS hostname for ACTIONS_CACHE_URL instead of IPv6 literal'
+    code: |
+      # Set in runner environment, Docker Compose, or workflow env: block.
+      # WRONG — IPv6 literal causes getaddrinfo ENOTFOUND:
+      # ACTIONS_CACHE_URL: http://[2001:bc8:1d90:1fc1:dc00:ff:fe2b:3f97]:8080/
+
+      # CORRECT — Use IPv4 address:
+      env:
+        ACTIONS_CACHE_URL: http://192.168.1.10:8080/
+
+      # OR use a DNS hostname that resolves to the cache server:
+      # ACTIONS_CACHE_URL: http://cache.internal.example.com:8080/
+  - language: yaml
+    label: 'Test ACTIONS_CACHE_URL connectivity from the runner before deploying'
+    code: |
+      # Add a diagnostic step to verify cache server is reachable:
+      steps:
+        - name: Test cache server connectivity
+          run: |
+            echo "ACTIONS_CACHE_URL: $ACTIONS_CACHE_URL"
+            curl -s -o /dev/null -w "%{http_code}" "$ACTIONS_CACHE_URL" || echo "Cache server unreachable"
+prevention:
+  - 'Configure self-hosted cache servers (e.g. actions-cache-server, Minio, Gitea cache) to listen on an IPv4 interface or a DNS hostname rather than a bare IPv6 literal.'
+  - 'Test ACTIONS_CACHE_URL reachability with curl from the runner before relying on cache steps in CI workflows.'
+  - 'Treat ::warning:: lines from actions/cache in workflow logs as actionable — cache failures silently degrade performance without failing the job.'
+  - 'Watch actions/cache and actions/toolkit releases for the IPv6 address bracket fix (actions/toolkit PR #2298) to ship in a stable release.'
+docs:
+  - url: 'https://github.com/actions/cache/issues/1718'
+    label: 'actions/cache #1718 — Caching fails on IPv6 cache server'
+  - url: 'https://github.com/actions/toolkit/pull/2298'
+    label: 'actions/toolkit PR #2298 — Fix IPv6 address parsing in HTTP client'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners#communication-requirements'
+    label: 'GitHub Docs — Self-hosted runner communication requirements'

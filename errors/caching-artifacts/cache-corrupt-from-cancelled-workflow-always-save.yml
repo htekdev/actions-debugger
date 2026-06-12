@@ -1,0 +1,105 @@
+id: caching-artifacts-138
+title: 'Workflow Cancellation During cache/restore Leaves Corrupt Cache — always() Save Poisons Future Runs'
+category: caching-artifacts
+severity: error
+tags:
+  - actions-cache
+  - cache
+  - corrupt-cache
+  - workflow-cancel
+  - windows
+  - always
+  - cache-restore
+  - cache-save
+patterns:
+  - regex: 'Error: The operation was canceled\.'
+    flags: 'i'
+  - regex: 'cache\.tzst.*force-local.*\nError: The operation was canceled'
+    flags: 'im'
+error_messages:
+  - "Error: The operation was canceled."
+  - "\"C:\\Program Files\\Git\\usr\\bin\\tar.exe\" -xf D:/a/_temp/.../cache.tzst ... --use-compress-program \"zstd -d\"\nError: The operation was canceled."
+root_cause: |
+  When a workflow is cancelled mid-run while actions/cache/restore is actively
+  extracting the cache archive, the extraction is interrupted at an arbitrary point.
+  The target directory on disk is left in a partially-extracted (corrupt) state —
+  some files are present, some are missing, and some may be truncated.
+
+  If the workflow uses actions/cache/save with `if: always()` (a popular pattern to
+  ensure the cache is populated even when a job fails), the save step runs after the
+  cancellation because `always()` evaluates to true regardless of job status including
+  cancellation. The save step re-archives the now-partial directory and uploads it
+  under the original cache key, atomically overwriting the last known-good cache.
+
+  Subsequent workflow runs perform a cache hit on this key, restore the corrupted
+  archive, and experience seemingly unrelated build failures: missing source files,
+  truncated binaries, incomplete package store manifests, etc. The restore step reports
+  SUCCESS because the download/extract of the corrupt archive itself succeeds — the
+  corruption only manifests when the extracted files are actually used.
+
+  This issue is most commonly observed on Windows runners where cache extraction via
+  tar/zstd is slower and workflow cancellations are more likely to land during active
+  extraction. Reported in actions/cache#1729 with a reproducible example from the
+  Agda project on Cabal/Haskell builds.
+fix: |
+  Guard the cache/save step with a condition that prevents saving when the preceding
+  restore was interrupted or the job was cancelled. Use one of:
+
+  1. Prefer the composite `actions/cache@v5` action over split save/restore — the
+     composite action's save is a post action, which is NOT executed when a job is
+     cancelled (post actions only run on success/failure, not cancellation).
+
+  2. If using split save/restore, add an explicit `if:` condition on the save step
+     that checks both step outcome and job cancellation status.
+
+  3. If the cache key is already corrupted, delete it manually via GitHub UI
+     (Actions > Caches) or API before the next run.
+fix_code:
+  - language: yaml
+    label: 'Preferred fix: Use composite actions/cache — post action skips on cancellation'
+    code: |
+      steps:
+        - name: Cache cabal store
+          uses: actions/cache@v5    # composite action — save post-step NOT run on cancel
+          with:
+            path: ~/.cabal
+            key: cabal-${{ runner.os }}-${{ hashFiles('cabal.project') }}
+            restore-keys: |
+              cabal-${{ runner.os }}-
+
+        - name: Build
+          run: cabal build all
+  - language: yaml
+    label: 'Split save/restore: Guard cache/save against cancelled restore'
+    code: |
+      steps:
+        - name: Restore cache
+          id: cache-restore
+          uses: actions/cache/restore@v5
+          with:
+            path: ~/.cabal
+            key: cabal-${{ runner.os }}-${{ hashFiles('cabal.project') }}
+
+        - name: Build
+          run: cabal build all
+
+        - name: Save cache
+          uses: actions/cache/save@v5
+          # Only save when restore completed AND build succeeded
+          # Do NOT use if: always() — this runs even on cancellation and saves corrupt state
+          if: steps.cache-restore.outcome == 'success' && job.status == 'success'
+          with:
+            path: ~/.cabal
+            key: ${{ steps.cache-restore.outputs.cache-primary-key }}
+prevention:
+  - 'Do not use `if: always()` on actions/cache/save steps — always() evaluates true even on job cancellation, allowing a corrupt partial-restore state to be saved.'
+  - 'Prefer the composite `actions/cache@v5` over separate save/restore when you do not need fine-grained control — its post action is cancelled-safe.'
+  - 'If a job is cancelled during restore and you suspect cache corruption, manually delete the affected cache key via GitHub UI (repo → Actions → Caches) before the next run.'
+  - 'Guard save with `job.status == success` or inspect `steps.<restore-id>.outcome` to ensure a complete restore before re-saving.'
+docs:
+  - url: 'https://github.com/actions/cache/issues/1729'
+    label: 'actions/cache #1729 — Workflow cancellation during restore writes corrupt cache'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows'
+    label: 'GitHub Docs — Caching dependencies to speed up workflows'
+  - url: 'https://docs.github.com/en/actions/reference/context-reference#job-context'
+    label: 'GitHub Docs — job context (job.status)'
