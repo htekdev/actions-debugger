@@ -1,0 +1,111 @@
+id: re-484
+title: 'fastlane `multi_json` Gem Missing in GitHub-Hosted Runner — `Could not find multi_json` at Build Time'
+category: runner-environment
+severity: error
+tags:
+  - fastlane
+  - ruby
+  - gems
+  - multi_json
+  - representable
+  - google-apis-core
+  - runner-image
+  - ubuntu
+patterns:
+  - regex: 'Could not find .multi_json. \(>= [0-9.]+ among [0-9]+ total gem'
+    flags: 'i'
+  - regex: 'Gem::MissingSpecError.*multi_json'
+    flags: 'i'
+  - regex: 'Could not find .multi_json. \(>= 1\.14\.1\)'
+    flags: ''
+error_messages:
+  - "Could not find 'multi_json' (>= 1.14.1) among 178 total gem(s) (Gem::MissingSpecError)"
+  - "Checked in 'GEM_PATH=/root/.local/share/gem/ruby/3.2.0:/var/lib/gems/3.2.0:...', execute `gem env` for more information"
+  - "from /var/lib/gems/3.2.0/gems/representable-3.2.0/lib/representable/json.rb:1:in `<top (required)>'"
+root_cause: |
+  The `multi_json` gem is a runtime dependency of `representable` >= 3.x, which is in turn
+  required by `google-apis-core`, which is a dependency of many `google-apis-*` client gems
+  (e.g. `google-apis-playcustomapp_v1`) used by **fastlane** for Google Play Store
+  deployments.
+
+  GitHub-hosted Ubuntu runners pre-install a set of system Ruby gems, but `multi_json`
+  is not among them. The gem is expected to be installed transitively through Bundler when
+  running `bundle install` from a `Gemfile.lock` that pins it.
+
+  The error occurs when:
+  1. A workflow installs gems using system Ruby **without Bundler** (e.g. `gem install fastlane`)
+  2. The `Gemfile.lock` does not pin `multi_json` explicitly
+  3. A newer `representable` version declares `multi_json` as optional but the runtime
+     load path still attempts to require it for JSON representation
+
+  Common trigger: workflows that run `gem install fastlane` directly (bypassing Bundler)
+  and then invoke `fastlane supply` or any lane that uploads to Google Play.
+
+  The error backtrace shows:
+  ```
+  representable/json.rb → google/apis/core/json_representation.rb →
+  google-apis-playcustomapp_v1 → fastlane action
+  ```
+
+  The fix requires ensuring `multi_json` is available in the gem load path.
+fix: |
+  Add `multi_json` as an explicit dependency in your `Gemfile` (or install it before
+  invoking fastlane) to guarantee it is present regardless of transitive resolution.
+
+  If you are installing fastlane via `gem install` without Bundler, prefix the command
+  with a `multi_json` installation.
+
+  Using a `Gemfile` with Bundler is the recommended long-term solution — it locks all
+  transitive dependencies including `multi_json`.
+fix_code:
+  - language: yaml
+    label: 'BROKEN — gem install fastlane without multi_json present'
+    code: |
+      - name: Install fastlane
+        run: gem install fastlane  # ✗ multi_json not pulled in transitively
+
+      - name: Deploy to Play Store
+        run: bundle exec fastlane supply  # Gem::MissingSpecError: Could not find multi_json
+
+  - language: yaml
+    label: 'FIXED — install multi_json explicitly before fastlane'
+    code: |
+      - name: Install Ruby dependencies
+        run: |
+          gem install multi_json  # ✓ explicit install
+          gem install fastlane
+
+      - name: Deploy to Play Store
+        run: fastlane supply
+
+  - language: yaml
+    label: 'RECOMMENDED — use Bundler with a Gemfile that pins multi_json'
+    code: |
+      # Gemfile
+      # source 'https://rubygems.org'
+      # gem 'fastlane'
+      # gem 'multi_json', '>= 1.14.1'  # pin explicitly
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+          bundler-cache: true  # runs bundle install automatically
+
+      - name: Deploy to Play Store
+        run: bundle exec fastlane supply
+
+prevention:
+  - 'Always use Bundler (`bundle exec fastlane`) rather than bare `fastlane` — Bundler resolves and installs all transitive gems including `multi_json`.'
+  - 'Pin `multi_json` explicitly in your `Gemfile` to prevent silent breakage when `representable` changes its dependency declarations.'
+  - 'Use the `ruby/setup-ruby` action with `bundler-cache: true` for reliable gem installation in CI.'
+  - 'Add `gem install multi_json` as a preflight step if using bare `gem install fastlane` without a Gemfile.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14186'
+    label: 'actions/runner-images#14186: Could not find multi_json — fastlane build failure (18 comments)'
+  - url: 'https://github.com/fastlane/fastlane'
+    label: 'fastlane: Official repository and documentation'
+  - url: 'https://github.com/ruby/setup-ruby'
+    label: 'ruby/setup-ruby: Recommended action for Ruby + Bundler in GitHub Actions'
+  - url: 'https://bundler.io/guides/gemfile.html'
+    label: 'Bundler Docs: Gemfile reference — pinning transitive dependencies'
