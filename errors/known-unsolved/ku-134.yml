@@ -1,0 +1,108 @@
+id: ku-134
+title: 'actions/checkout ssh-key Not Accessible Inside Docker Container Actions — RUNNER_TEMP Not Mounted'
+category: known-unsolved
+severity: error
+tags:
+  - actions/checkout
+  - ssh-key
+  - docker
+  - container-action
+  - runner-temp
+  - git-push
+  - known-limitation
+patterns:
+  - regex: 'Identity file.{0,80}not accessible.*No such file or directory'
+    flags: "i"
+  - regex: 'Warning: Identity file.{0,120}_temp.{0,80}not accessible'
+    flags: "i"
+  - regex: 'Host key verification failed'
+    flags: "i"
+error_messages:
+  - "Warning: Identity file /home/runner/work/_temp/abc123-key not accessible: No such file or directory."
+  - "No RSA host key is known for github.com and you have requested strict checking."
+  - "Host key verification failed."
+  - "fatal: Could not read from remote repository."
+  - "Please make sure you have the correct access rights and the repository exists."
+root_cause: |
+  When `actions/checkout` is configured with an `ssh-key` input, it writes the
+  private key to a temporary file under `RUNNER_TEMP` on the host runner and
+  sets git's `core.sshCommand` (via `GIT_SSH_COMMAND`) to reference that path.
+
+  When a subsequent step is a **Docker container action** (an action that
+  specifies `image:` in its action.yml), the runner launches a fresh Docker
+  container. Only a fixed set of volumes are mounted into the container:
+    - `/home/runner/work/_temp/_github_home` → `/github/home`
+    - `/home/runner/work/_temp/_github_workflow` → `/github/workflow`
+    - The workspace directory → `/github/workspace`
+
+  `RUNNER_TEMP` itself (`/home/runner/work/_temp/`) is **NOT** mounted into
+  container actions. The SSH key file path written by `actions/checkout` exists
+  on the host but is inaccessible from inside the container. Any `git push`,
+  `git fetch`, or `git clone` that the container action attempts will inherit
+  the `GIT_SSH_COMMAND` environment variable that points to the missing key
+  file, producing a fatal SSH error.
+
+  This is a long-standing limitation reported in 2020 and unresolved as of 2026:
+  https://github.com/actions/checkout/issues/297
+fix: |
+  There is no direct fix from GitHub — RUNNER_TEMP will not be mounted into
+  container actions without a GitHub-side change. Use one of these workarounds:
+
+  **Option 1 — Switch to HTTPS + token authentication:**
+  Replace the `ssh-key` input with a `token:` input and use HTTPS remotes.
+  GitHub App tokens or fine-grained PATs are preferred over classic PATs.
+
+  **Option 2 — Avoid container actions for git-operating steps:**
+  Replace the Docker container action that performs git operations with a
+  `run:` step (executed directly on the runner host). The SSH key files are
+  accessible on the host. Docker can still be used, but call it via `docker
+  run` in a `run:` step rather than using a container action that the runner
+  spawns automatically.
+
+  **Option 3 — Pass the SSH key via environment variable into the container:**
+  If you control the container action image, read the SSH key from an
+  environment variable and write it inside the container at runtime, bypassing
+  the RUNNER_TEMP path entirely.
+fix_code:
+  - language: yaml
+    label: 'Workaround: use HTTPS token auth instead of ssh-key for container-action-adjacent workflows'
+    code: |
+      - uses: actions/checkout@v4
+        with:
+          repository: org/my-repo
+          # Use token instead of ssh-key when subsequent steps use Docker container actions
+          token: ${{ secrets.MY_GITHUB_APP_TOKEN }}
+
+      # Container action can now use HTTPS for git operations
+      - uses: some/container-action@v1
+        with:
+          git_token: ${{ secrets.MY_GITHUB_APP_TOKEN }}
+  - language: yaml
+    label: 'Workaround: replace container action git step with a run: step on the host'
+    code: |
+      - uses: actions/checkout@v4
+        with:
+          ssh-key: ${{ secrets.DEPLOY_KEY }}
+
+      # This run: step executes on the HOST, so RUNNER_TEMP SSH key is accessible
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -am "automated update"
+          git push
+
+      # AVOID: using a Docker container action here — SSH key is inaccessible inside it
+      # - uses: some/container-action@v1   # ← THIS WILL FAIL with ssh-key auth
+prevention:
+  - 'Do not combine `ssh-key` in `actions/checkout` with Docker container actions that perform git operations in the same job'
+  - 'Test SSH-authenticated git operations from container actions in a minimal repro before building production workflows on them'
+  - 'Prefer HTTPS + GitHub App tokens for git authentication when Docker container actions are involved — tokens work inside containers, SSH keys do not'
+  - 'Track https://github.com/actions/checkout/issues/297 for an official resolution'
+docs:
+  - url: 'https://github.com/actions/checkout/issues/297'
+    label: 'actions/checkout#297 — SSH key not available in container actions (open since 2020)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-where-your-workflow-runs/running-jobs-in-a-container'
+    label: 'GitHub Docs — Running jobs in a container'
+  - url: 'https://docs.github.com/en/actions/creating-actions/creating-a-docker-container-action'
+    label: 'GitHub Docs — Creating a Docker container action'
