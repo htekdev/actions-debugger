@@ -1,0 +1,100 @@
+id: ku-138
+title: 'GitHub Actions Runners Have No Pseudo-Terminal — bash -i Fails with "no job control"'
+category: known-unsolved
+severity: limitation
+tags:
+  - tty
+  - pseudo-terminal
+  - pty
+  - bash-interactive
+  - no-job-control
+  - isatty
+  - shell
+  - known-limitation
+patterns:
+  - regex: 'bash: cannot set terminal process group \(\d+\): Inappropriate ioctl for device'
+    flags: 'i'
+  - regex: 'bash: no job control in this shell'
+    flags: 'i'
+  - regex: 'the input device is not a TTY'
+    flags: 'i'
+  - regex: 'not a tty'
+    flags: 'i'
+error_messages:
+  - 'bash: cannot set terminal process group (1291): Inappropriate ioctl for device'
+  - 'bash: no job control in this shell'
+  - 'the input device is not a TTY'
+  - 'not a tty'
+root_cause: |
+  GitHub Actions executes each `run:` step by spawning a shell process with
+  stdin/stdout/stderr connected to pipes — NOT a pseudo-terminal (PTY/TTY). The
+  shell cannot set the terminal process group ID because there is no controlling
+  terminal. This is a fundamental architectural property of the runner, not a bug.
+
+  Consequences:
+  - `tty` command outputs "not a tty" (exit 1)
+  - `bash -i` (interactive) emits "cannot set terminal process group (N): Inappropriate
+    ioctl for device" and "no job control in this shell" on every step
+  - Tools that call isatty() / sys.stdin.isatty() / process.stdout.isTTY receive false
+    and fall back to non-interactive/non-colored output modes
+  - Interactive prompts (package managers, installers) hang waiting for terminal input
+  - `pty.spawn()` in Python causes the job to run indefinitely with no output
+  - GNU parallel, expect, and similar tools that require a controlling terminal fail
+
+  The warnings from `bash -i -l` are harmless but cannot be suppressed because they
+  come from bash's own startup — not from the workflow or action code.
+fix: |
+  Do not rely on TTY presence in CI. Use environment variables and flags to force
+  non-interactive/non-colored modes:
+
+  - Set `DEBIAN_FRONTEND=noninteractive` for apt/dpkg commands
+  - Set `CI=true` (already set by GitHub Actions) — most modern tools check this
+  - Set `TERM=xterm-256color` if tools need color codes despite no real terminal
+  - Use `--no-tty`, `--non-interactive`, `--batch`, or `--no-progress` flags
+  - Pipe long output through `| cat` to prevent pager detection (e.g., `git -P log | cat`)
+  - Use `python -u` for unbuffered Python output without needing a TTY
+  - Never use `shell: bash -i -l {0}` in run steps
+
+  There is no workaround that gives a real PTY to run steps — GitHub Actions
+  simply does not allocate one. Use `docker run -t` only if running a container
+  action, not for run steps.
+fix_code:
+  - language: yaml
+    label: 'Force non-interactive modes via env vars (correct approach)'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          env:
+            DEBIAN_FRONTEND: noninteractive   # prevents apt prompts
+            TERM: xterm-256color             # enables color escape codes
+            # CI=true is already set by GitHub Actions
+          steps:
+            - name: Install packages (non-interactive)
+              run: |
+                sudo apt-get install -y -q package-name
+            - name: Run Python script (unbuffered)
+              run: python -u myscript.py
+  - language: yaml
+    label: 'Incorrect: bash -i -l causes "no job control" warnings on every step'
+    code: |
+      # WRONG — do not do this:
+      steps:
+        - name: Login
+          shell: bash -i -l {0}   # causes "no job control" + "Inappropriate ioctl" warnings
+          run: |
+            nvm use 20
+            npm install
+prevention:
+  - 'Never use shell: bash -i -l {0} in run steps — interactive shells require a TTY that does not exist in CI'
+  - 'Configure tools to detect CI via the CI=true environment variable (set automatically by GitHub Actions)'
+  - 'Use --no-tty, --non-interactive, --batch, or --quiet flags for tools that check for terminal presence'
+  - 'Set DEBIAN_FRONTEND=noninteractive when running apt/dpkg commands in workflows'
+  - 'Use python -u or set PYTHONUNBUFFERED=1 for unbuffered Python output without a TTY'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions'
+    label: 'GitHub Docs: Workflow commands for GitHub Actions'
+  - url: 'https://github.com/actions/runner/issues/241'
+    label: 'actions/runner#241: Not a tty (107 reactions)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/running-variations-of-jobs-in-a-workflow'
+    label: 'GitHub Docs: Running variations of jobs in a workflow'

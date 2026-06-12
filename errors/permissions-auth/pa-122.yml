@@ -1,0 +1,127 @@
+id: pa-122
+title: '`GITHUB_TOKEN` Cannot Access Organization Membership or Team APIs — `read:org` Not a Grantable Scope'
+category: permissions-auth
+severity: error
+tags:
+  - github-token
+  - read-org
+  - organization
+  - org-membership
+  - team-membership
+  - resource-not-accessible
+  - permissions
+  - limitation
+patterns:
+  - regex: 'Resource not accessible by integration'
+    flags: 'i'
+  - regex: 'orgs/[^/]+/(members|teams)'
+    flags: 'i'
+  - regex: 'HttpError: Resource not accessible by integration.*orgs'
+    flags: 'i'
+error_messages:
+  - 'Resource not accessible by integration - https://docs.github.com/rest'
+  - 'HttpError: Resource not accessible by integration'
+  - 'RequestError [HttpError]: Resource not accessible by integration'
+root_cause: |
+  `GITHUB_TOKEN` is repository-scoped. GitHub's `permissions:` block in workflow
+  YAML only supports a fixed list of repository-level permission scopes
+  (contents, issues, pull-requests, packages, security-events, etc.).
+
+  The OAuth `read:org` scope — required to read organization membership, team
+  membership, and organization-level user data — is NOT in this list and cannot be
+  granted to `GITHUB_TOKEN` via any workflow YAML configuration.
+
+  Attempting to call these API endpoints with `GITHUB_TOKEN` always returns
+  403 "Resource not accessible by integration", regardless of the `permissions:`
+  block:
+
+    - GET /orgs/{org}/members
+    - GET /orgs/{org}/members/{username}
+    - GET /orgs/{org}/teams
+    - GET /orgs/{org}/teams/{team_slug}/members
+    - GET /user/memberships/orgs/{org}
+    - GET /orgs/{org}/outside_collaborators
+
+  This is an intentional security boundary: GitHub does not allow workflows to
+  query organization-wide user data using the automatically-generated token.
+  Granting org membership reads to arbitrary pull requests or push workflows
+  would expose sensitive access data.
+
+  The error is indistinguishable from other "Resource not accessible by integration"
+  errors caused by missing scopes, making it hard to diagnose without checking the
+  GitHub Docs permissions table.
+fix: |
+  Use one of the following token types instead of GITHUB_TOKEN:
+
+  Option 1 (recommended): Create a GitHub App with "Members: Read" organization
+  permission and use `actions/create-github-app-token` to generate a token.
+
+  Option 2: Store a PAT (Fine-Grained or Classic with `read:org`) as a repository
+  or organization secret, then use that secret in the step that calls org APIs.
+
+  Note: Fine-Grained PATs support organization-level read permissions;
+  Classic PATs with `read:org` scope work for both public and private membership.
+fix_code:
+  - language: yaml
+    label: 'Option 1 (recommended): GitHub App token with org Members: Read permission'
+    code: |
+      jobs:
+        check-org-membership:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Generate GitHub App token
+              id: app-token
+              uses: actions/create-github-app-token@v1
+              with:
+                app-id: ${{ vars.ORG_APP_ID }}
+                private-key: ${{ secrets.ORG_APP_PRIVATE_KEY }}
+                owner: ${{ github.repository_owner }}
+
+            - name: Check org team membership (works with App token)
+              env:
+                GH_TOKEN: ${{ steps.app-token.outputs.token }}
+              run: |
+                gh api /orgs/${{ github.repository_owner }}/teams/my-team/members
+  - language: yaml
+    label: 'Option 2: PAT with read:org scope stored as secret'
+    code: |
+      jobs:
+        check-org-membership:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Check org membership (PAT with read:org required)
+              env:
+                GH_TOKEN: ${{ secrets.ORG_READ_PAT }}   # PAT with read:org scope
+              run: |
+                gh api /orgs/${{ github.repository_owner }}/members \
+                  --jq '.[].login'
+  - language: yaml
+    label: 'Wrong: GITHUB_TOKEN cannot access org member/team APIs — always 403'
+    code: |
+      jobs:
+        check-membership:
+          runs-on: ubuntu-latest
+          permissions:
+            contents: read
+            # NOTE: there is NO permissions key that grants read:org to GITHUB_TOKEN
+          steps:
+            - name: This will fail with "Resource not accessible by integration"
+              env:
+                GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                gh api /orgs/${{ github.repository_owner }}/members
+prevention:
+  - 'Before using GITHUB_TOKEN for a GitHub API call, verify the endpoint does not require read:org scope'
+  - 'Org membership, team membership, and org-level user queries always require read:org — use a PAT or GitHub App token'
+  - 'Create a dedicated GitHub App with minimal "Members: Read" org permission for CI workflows that need to query team membership'
+  - 'Do not store Classic PATs with broad admin:org scope; use Fine-Grained PATs with only the required org permissions'
+  - 'Design access-control workflows to check GitHub teams (which require a PAT/App) rather than trying to use GITHUB_TOKEN'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/assigning-permissions-to-jobs'
+    label: 'GitHub Docs: Assigning permissions to jobs — supported GITHUB_TOKEN scopes'
+  - url: 'https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens'
+    label: 'GitHub Docs: Managing personal access tokens (PAT with read:org)'
+  - url: 'https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app'
+    label: 'GitHub Docs: GitHub App tokens with org-level permissions'
+  - url: 'https://docs.github.com/en/rest/orgs/members'
+    label: 'GitHub Docs: REST API — Organization members (requires read:org)'

@@ -1,0 +1,129 @@
+id: sf-222
+title: '`gh run download` Uses REST API — Cannot Access Artifacts from an In-Progress Run'
+category: silent-failures
+severity: silent-failure
+tags:
+  - gh-cli
+  - gh-run-download
+  - artifacts
+  - rest-api
+  - pipeline-api
+  - in-progress
+  - same-run
+  - download-artifact
+  - silent-failure
+patterns:
+  - regex: 'gh run download.*--run-id|gh.*run.*download.*github\.run_id'
+    flags: 'i'
+  - regex: 'no artifacts found for run'
+    flags: 'i'
+  - regex: 'no artifacts match the filter criteria'
+    flags: 'i'
+error_messages:
+  - 'no artifacts found for run 12345678'
+  - 'no artifacts match the filter criteria'
+root_cause: |
+  `gh run download` calls the GitHub REST API endpoint:
+  GET /repos/{owner}/{repo}/actions/runs/{run_id}/artifacts
+
+  This REST endpoint only returns artifacts from COMPLETED workflow runs. Artifacts
+  uploaded by a previous job in the SAME ONGOING RUN are invisible to this endpoint
+  even if the upload step succeeded.
+
+  In contrast, `actions/download-artifact@v4` uses the internal pipeline API:
+  $ACTIONS_RUNTIME_URL/_apis/pipelines/workflows/{run_id}/artifacts
+
+  The pipeline API provides real-time visibility into artifacts from any job in the
+  current run, regardless of whether the run has completed. This is why
+  `actions/download-artifact` can download artifacts from sibling jobs in the same
+  run while `gh run download` cannot.
+
+  A common failure pattern:
+  1. Job A runs `actions/upload-artifact@v4` — artifact uploaded successfully
+  2. Job B runs `gh run download --run-id ${{ github.run_id }} --name my-artifact`
+  3. `gh run download` exits 0 but downloads nothing — the REST API sees an empty
+     artifacts list because the run is still in progress
+
+  This silent failure leaves the subsequent build steps with missing files, often
+  causing confusing "file not found" errors downstream rather than a clear artifact
+  error.
+fix: |
+  Replace `gh run download` with `actions/download-artifact@v4` when downloading
+  artifacts from a previous job in the same workflow run:
+
+  If you specifically need `gh run download`, trigger the download from a separate
+  `workflow_run` workflow that fires after the upstream run completes:
+fix_code:
+  - language: yaml
+    label: 'Correct: use actions/download-artifact@v4 to access artifacts within the same run'
+    code: |
+      jobs:
+        upload:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Build and upload artifact
+              run: echo "build output" > result.txt
+            - uses: actions/upload-artifact@v4
+              with:
+                name: my-artifact
+                path: result.txt
+
+        download:
+          needs: upload
+          runs-on: ubuntu-latest
+          steps:
+            # CORRECT: uses the internal pipeline API, works during the same run
+            - uses: actions/download-artifact@v4
+              with:
+                name: my-artifact
+                run-id: ${{ github.run_id }}  # explicit run-id optional; defaults to current run
+                github-token: ${{ secrets.GITHUB_TOKEN }}
+            - run: cat result.txt
+  - language: yaml
+    label: 'Incorrect: gh run download cannot see artifacts while the run is still in progress'
+    code: |
+      jobs:
+        download:
+          needs: upload
+          runs-on: ubuntu-latest
+          steps:
+            # WRONG: uses REST API — no artifacts returned while run is in-progress
+            - name: Download artifact (will be empty / silent failure)
+              env:
+                GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                gh run download --repo ${{ github.repository }} \
+                  --run-id ${{ github.run_id }} \
+                  --name my-artifact
+  - language: yaml
+    label: 'If gh run download is required: use workflow_run completed trigger instead'
+    code: |
+      on:
+        workflow_run:
+          workflows: ['Build']
+          types: [completed]
+      jobs:
+        post-process:
+          runs-on: ubuntu-latest
+          steps:
+            # This fires AFTER the upstream run completes — REST API now returns artifacts
+            - env:
+                GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                gh run download --repo ${{ github.repository }} \
+                  --run-id ${{ github.event.workflow_run.id }} \
+                  --name my-artifact
+prevention:
+  - 'Never use `gh run download` to access artifacts within the same workflow run — use `actions/download-artifact@v4` instead'
+  - 'Reserve `gh run download` for cases where you are downloading artifacts from a COMPLETED run triggered by a `workflow_run` event'
+  - 'The absence of an error from `gh run download` does not mean the download succeeded — always verify that expected files exist after the download step'
+  - 'Check the `actions/download-artifact` action docs for the `run-id` and `github-token` inputs required for cross-run downloads'
+docs:
+  - url: 'https://cli.github.com/manual/gh_run_download'
+    label: 'GitHub CLI docs: gh run download'
+  - url: 'https://github.com/actions/download-artifact'
+    label: 'actions/download-artifact — uses the internal pipeline API'
+  - url: 'https://github.com/cli/cli/issues/5625'
+    label: 'cli/cli#5625: gh run download can''t download artifacts from current run (16 reactions)'
+  - url: 'https://docs.github.com/en/rest/actions/artifacts'
+    label: 'GitHub Docs: REST API — List workflow run artifacts'
