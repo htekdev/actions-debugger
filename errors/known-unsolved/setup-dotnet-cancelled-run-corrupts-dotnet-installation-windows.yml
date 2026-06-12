@@ -1,0 +1,146 @@
+id: known-unsolved-129
+title: 'Cancelled Workflow Leaves Corrupted .NET SDK Installation on Windows Self-Hosted Runners'
+category: known-unsolved
+severity: error
+tags:
+  - setup-dotnet
+  - self-hosted
+  - windows
+  - cancel
+  - corrupt-state
+  - concurrency
+  - dotnet-install
+patterns:
+  - regex: 'Either downloaded or local package size can not be measured.*corrupted'
+    flags: 'i'
+  - regex: 'The operation was canceled'
+    flags: 'i'
+  - regex: 'dotnet-install.*size can not be measured|package size.*corrupted.*dotnet'
+    flags: 'i'
+error_messages:
+  - "dotnet-install: Either downloaded or local package size can not be measured. One of them may be corrupted."
+  - "Error: The operation was canceled."
+  - "dotnet-install: Extracting the archive."
+root_cause: |
+  When a GitHub Actions workflow is cancelled (manually or via `concurrency.cancel-in-progress`)
+  while `actions/setup-dotnet` is actively extracting a .NET SDK archive, the extraction
+  process is terminated mid-operation. This leaves a partially extracted directory under
+  `C:\Program Files\dotnet\packs\` (or the equivalent location on the runner).
+
+  On the next workflow run targeting the same self-hosted runner, the `install-dotnet.ps1`
+  script detects the incomplete archive and logs:
+  ```
+  dotnet-install: Either downloaded or local package size can not be measured.
+  One of them may be corrupted.
+  ```
+
+  The script then attempts to re-download and re-extract, but the partially extracted
+  directory may cause conflicts, resulting in installation failures or silent incomplete
+  .NET installations.
+
+  Root causes:
+  1. The `dotnet-install.ps1`/`install-dotnet.ps1` scripts do not implement atomic extraction
+     (extract to temp, then move) — partial extracts are written directly to the target dir.
+  2. Cancellation via GitHub Actions does not trigger a cleanup handler in the script.
+  3. There is no post-action cleanup of partial .NET installations in `actions/setup-dotnet`.
+
+  This affects self-hosted Windows runners only (GitHub-hosted runners are ephemeral and
+  discarded after each run, so partial state doesn't persist across runs).
+
+  Reported in actions/setup-dotnet#501. No fix has been shipped; this is a known limitation
+  of the dotnet-install scripts and the `actions/setup-dotnet` action.
+fix: |
+  There is no automatic fix. Manual recovery is required when a .NET installation becomes
+  corrupted by a cancelled run.
+
+  **Recovery steps:**
+
+  1. Identify the corrupted directory — it's usually the last partially installed SDK version
+     under `C:\Program Files\dotnet\packs\` or `C:\Program Files\dotnet\sdk\`:
+
+  ```powershell
+  Get-ChildItem "C:\Program Files\dotnet\packs\" | Where-Object { $_.LastWriteTime -gt (Get-Date).AddDays(-1) }
+  Get-ChildItem "C:\Program Files\dotnet\sdk\" | Where-Object { $_.LastWriteTime -gt (Get-Date).AddDays(-1) }
+  ```
+
+  2. Delete the corrupted (partially extracted) directory:
+
+  ```powershell
+  Remove-Item "C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\6.0.26" -Recurse -Force
+  ```
+
+  3. Re-run the workflow — `setup-dotnet` will re-download and re-install cleanly.
+
+  **Mitigation: Pre-run cleanup step on self-hosted Windows runners**
+
+  Add a cleanup step before `setup-dotnet` to remove any suspicious partial installations
+  from the previous run:
+
+  ```yaml
+  - name: Clean up partial dotnet installations (self-hosted Windows)
+    if: runner.os == 'Windows'
+    shell: pwsh
+    run: |
+      $sdkRoot = "C:\Program Files\dotnet"
+      # Remove any packs directories modified in the last hour (potentially partial)
+      Get-ChildItem "$sdkRoot\packs" -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -gt (Get-Date).AddHours(-1) } |
+        ForEach-Object {
+          Write-Host "Removing potentially corrupted: $($_.FullName)"
+          Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        }
+  ```
+
+  **Alternative: Use ephemeral runners**
+
+  Register Windows self-hosted runners with `--ephemeral` so each run gets a fresh
+  environment and partial state cannot persist across jobs.
+fix_code:
+  - language: yaml
+    label: 'Pre-checkout cleanup for partial .NET installations on Windows self-hosted'
+    code: |
+      jobs:
+        build:
+          runs-on: [self-hosted, Windows]
+          steps:
+            - name: Clean partial dotnet installations
+              if: runner.os == 'Windows'
+              shell: pwsh
+              run: |
+                $packs = "C:\Program Files\dotnet\packs"
+                if (Test-Path $packs) {
+                  Get-ChildItem $packs -Directory |
+                    Where-Object { $_.LastWriteTime -gt (Get-Date).AddHours(-2) } |
+                    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+                }
+
+            - uses: actions/setup-dotnet@v4
+              with:
+                dotnet-version: '8.0.x'
+  - language: yaml
+    label: 'Use ephemeral self-hosted runners to prevent state persistence'
+    code: |
+      # Register runner as ephemeral (CLI example):
+      # ./config.sh --url https://github.com/ORG/REPO --token TOKEN --ephemeral
+      #
+      # Or in workflow — ephemeral runners are automatically removed after each job:
+      jobs:
+        build:
+          runs-on: [self-hosted, Windows, ephemeral]
+          steps:
+            - uses: actions/setup-dotnet@v4
+              with:
+                dotnet-version: '8.0.x'
+prevention:
+  - 'Use ephemeral self-hosted Windows runners when possible to prevent partial installation state from persisting'
+  - 'Add a pre-run cleanup step on persistent self-hosted runners to remove recently modified .NET pack directories'
+  - 'Avoid cancelling workflows that are mid-installation on self-hosted runners'
+  - 'Monitor the dotnet/install-scripts repo for progress on atomic extraction support'
+  - 'If concurrency groups with cancel-in-progress are used, consider using job-level concurrency rather than run-level to avoid cancelling mid-install'
+docs:
+  - url: 'https://github.com/actions/setup-dotnet/issues/501'
+    label: 'actions/setup-dotnet#501 — Cancelled run may leave broken .NET installation'
+  - url: 'https://learn.microsoft.com/en-us/dotnet/core/tools/dotnet-install-script'
+    label: 'Microsoft docs — dotnet-install script reference'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/adding-self-hosted-runners#ephemeral-self-hosted-runners'
+    label: 'GitHub docs — Ephemeral self-hosted runners'
