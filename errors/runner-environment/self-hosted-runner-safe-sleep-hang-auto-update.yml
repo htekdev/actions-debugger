@@ -1,0 +1,93 @@
+id: runner-environment-475
+title: 'safe_sleep.sh hangs at 96% CPU indefinitely during runner auto-update'
+category: runner-environment
+severity: error
+tags:
+  - self-hosted
+  - auto-update
+  - safe_sleep
+  - runner-update
+  - hung-process
+  - linux
+patterns:
+  - regex: 'safe_sleep\.sh\s+\d+'
+    flags: 'i'
+  - regex: '/bin/bash.*safe_sleep\.sh'
+    flags: 'i'
+  - regex: 'runner.*update.*hang|Runner.*auto.*update.*stuck'
+    flags: 'i'
+error_messages:
+  - '/bin/bash /home/actions-runner/safe_sleep.sh 1'
+  - 'Exiting runner...'
+root_cause: |
+  During the GitHub Actions runner auto-update process, the runner extracts the new
+  version, stops its listener, and calls `safe_sleep.sh` to wait for the old process
+  to finish before starting the new version. On Linux systems under heavy load (high
+  CPU/IO, cloud instances with CPU steal, or overcommitted VMs), `safe_sleep.sh` can
+  enter a CPU-busy loop that never terminates.
+
+  The symptom is a process visible in `ps aux` consuming ~96-100% CPU:
+    `actions+  72298 96.3  0.0  4372  3328 ?  R  Apr02 1988:54 /bin/bash /home/actions-runner/safe_sleep.sh 1`
+
+  The elapsed time grows to days or weeks, the runner never comes back online, and
+  all queued jobs wait indefinitely. The runner appears offline or stuck in the
+  GitHub repository settings.
+
+  This was a confirmed bug in runner versions prior to v2.322 (fixed December 2025),
+  reported in actions/runner#3792 with 77 reactions. The fix changed the update wait
+  mechanism to use a proper process-completed check rather than a polling sleep loop.
+fix: |
+  Immediate fix — kill the stuck process and restart the runner service:
+    1. Find the PID: `ps aux | grep safe_sleep.sh`
+    2. Kill it: `sudo kill -9 <PID>`
+    3. Restart the runner service:
+         sudo systemctl restart actions.runner.<name>.service
+       or: cd /path/to/actions-runner && ./run.sh
+
+  Permanent fix — upgrade the runner to v2.322 or later:
+    The bug was fixed in runner v2.322 (released December 2025). The runner's
+    auto-update mechanism was rewritten to avoid the safe_sleep.sh polling loop.
+    Upgrade procedure:
+    1. Stop the runner service
+    2. Download the latest runner from https://github.com/actions/runner/releases
+    3. Extract and reconfigure, or use the --update flag
+    4. Start the runner service
+
+  Prevention — disable auto-update and manage runner upgrades manually:
+    Set RUNNER_MANUAL_UPDATE_MESSAGE=1 or configure your runner with
+    `--disableupdate` to prevent auto-updates until you control the timing.
+fix_code:
+  - language: bash
+    label: 'Kill stuck safe_sleep.sh process and restart runner'
+    code: |
+      # Find and kill the stuck process
+      STUCK_PID=$(ps aux | grep safe_sleep.sh | grep -v grep | awk '{print $2}')
+      if [ -n "$STUCK_PID" ]; then
+        sudo kill -9 $STUCK_PID
+        echo "Killed stuck safe_sleep.sh PID: $STUCK_PID"
+      fi
+      # Restart the runner service
+      sudo systemctl restart actions.runner.$(hostname).service
+  - language: bash
+    label: 'Upgrade runner to latest version to apply the permanent fix'
+    code: |
+      cd /path/to/actions-runner
+      # Stop service
+      sudo ./svc.sh stop
+      # Download and extract latest runner
+      RUNNER_VERSION=$(curl -s https://api.github.com/repos/actions/runner/releases/latest | jq -r .tag_name | sed 's/v//')
+      curl -L "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz" | tar xz
+      # Restart service (no reconfigure needed for in-place upgrade)
+      sudo ./svc.sh start
+prevention:
+  - "Upgrade self-hosted runners to v2.322 or later — the safe_sleep.sh hang is fixed in this version."
+  - "Monitor runner health with a watchdog that alerts if the runner process has been consuming >90% CPU for more than 5 minutes."
+  - "On cloud instances prone to CPU steal, use `--disableupdate` to control runner upgrade timing and avoid auto-updates during peak load."
+  - "Check `_diag/Runner_*.log` for 'Update' messages — a stuck update will show repeated 'Waiting for runner to complete' log entries."
+docs:
+  - url: 'https://github.com/actions/runner/issues/3792'
+    label: 'runner#3792 — safe_sleep.sh rarely hangs indefinitely (77 reactions, fixed v2.322)'
+  - url: 'https://github.com/actions/runner/releases'
+    label: 'GitHub Actions Runner releases'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/autoscaling-with-self-hosted-runners'
+    label: 'GitHub Docs — Managing self-hosted runners'
