@@ -1,0 +1,107 @@
+id: ys-121
+title: '`uses:` Field Does Not Evaluate `${{ }}` Expressions — Dynamic Action or Reusable Workflow Versions Are Not Possible'
+category: yaml-syntax
+severity: error
+tags:
+  - uses
+  - expressions
+  - dynamic-version
+  - action-version
+  - reusable-workflow
+  - vars-context
+  - limitation
+  - parse-error
+patterns:
+  - regex: 'uses:\s+[a-zA-Z0-9_./-]+@\$\{\{'
+    flags: 'i'
+  - regex: 'uses:\s+\$\{\{.*\}\}'
+    flags: 'i'
+  - regex: 'uses:\s+[a-zA-Z0-9_./-]*\$\{\{'
+    flags: 'i'
+error_messages:
+  - 'The uses clause must not contain a string template'
+  - 'Expected format''{owner}/{repo}@{ref}'''
+  - 'Unrecognized named-value'
+  - 'Invalid format for ''uses'''
+root_cause: |
+  The `uses:` field in both step definitions (`jobs.<id>.steps[*].uses`) and
+  reusable workflow job calls (`jobs.<id>.uses`) is evaluated at workflow
+  **parse time**, before the expression engine runs. GitHub Actions does not
+  substitute `${{ }}` expressions in `uses:` values — the literal string
+  (including the dollar-brace syntax) is passed to the action/workflow resolver,
+  which fails to find a valid reference.
+
+  This is a deliberate security constraint: allowing expressions in `uses:` would
+  enable repository variables, secrets, or environment-dependent values to redirect
+  execution to an attacker-controlled action or workflow version, creating a
+  supply-chain attack vector. The parser enforces this by rejecting any `uses:`
+  value containing `${{`.
+
+  Common patterns that fail:
+    uses: actions/checkout@${{ vars.CHECKOUT_VERSION }}
+    uses: ${{ vars.MY_ORG }}/custom-action@v2
+    uses: ./.github/actions/${{ matrix.action_name }}
+
+  All of these produce a parse error or a resolution failure before the workflow run starts.
+fix: |
+  Pin `uses:` values to literal strings. Manage version consistency using tooling
+  rather than runtime expressions:
+
+  - Use **Dependabot** (`dependabot.yml`) to automatically create PRs that bump
+    action versions across all workflow files when a new release is published.
+  - Use **Renovate Bot** for finer-grained version control policies.
+  - For local composite actions, reference them with a literal relative path:
+    `uses: ./.github/actions/my-action`
+  - For SHA pinning (strongest supply-chain guarantee), pin to the full commit SHA:
+    `uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683`
+
+  If you need to conditionally run different actions, use an `if:` condition on
+  separate steps rather than a dynamic `uses:` reference.
+fix_code:
+  - language: yaml
+    label: 'Use literal action version strings — no expressions in uses:'
+    code: |
+      steps:
+        # BAD: expressions are not evaluated in uses: — parse error
+        # - uses: actions/checkout@${{ vars.CHECKOUT_VERSION }}
+        # - uses: ${{ vars.CUSTOM_ORG }}/deploy-action@v3
+        # - uses: ./.github/actions/${{ matrix.action }}
+
+        # GOOD: literal version pins
+        - uses: actions/checkout@v4.2.2
+        - uses: actions/setup-node@v4.1.0
+
+        # GOOD: conditional execution via if: instead of dynamic uses:
+        - uses: my-org/deploy-staging@v2
+          if: ${{ vars.ENVIRONMENT == 'staging' }}
+        - uses: my-org/deploy-production@v2
+          if: ${{ vars.ENVIRONMENT == 'production' }}
+  - language: yaml
+    label: 'Dependabot config to auto-update action versions'
+    code: |
+      # .github/dependabot.yml
+      version: 2
+      updates:
+        - package-ecosystem: "github-actions"
+          directory: "/"
+          schedule:
+            interval: "weekly"
+          groups:
+            github-actions:
+              patterns:
+                - "actions/*"
+                - "github/*"
+prevention:
+  - 'Run `actionlint` in CI — it detects `${{ }}` expressions in `uses:` fields and fails the pipeline before the workflow reaches production'
+  - 'Configure Dependabot or Renovate to automate action version bumps so you never need to parameterize versions at runtime'
+  - 'Use SHA-pinning for critical workflows to freeze the exact action version regardless of tag mutations'
+  - 'For local reusable actions, use relative paths (`uses: ./.github/actions/name`) which are always resolved from the repository root without expressions'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idstepsuses'
+    label: 'GitHub Actions — jobs.<job_id>.steps[*].uses syntax'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_iduses'
+    label: 'GitHub Actions — jobs.<job_id>.uses (reusable workflow)'
+  - url: 'https://docs.github.com/en/code-security/dependabot/working-with-dependabot/keeping-your-actions-up-to-date-with-dependabot'
+    label: 'Keeping your actions up to date with Dependabot'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions#using-third-party-actions'
+    label: 'Security hardening for GitHub Actions — using third-party actions'
