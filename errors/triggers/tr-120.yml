@@ -1,0 +1,120 @@
+id: triggers-120
+title: 'workflow_run Downstream Trigger Continues Firing After Upstream Workflow File Is Deleted'
+category: triggers
+severity: limitation
+tags:
+  - workflow-run
+  - trigger
+  - deleted-workflow
+  - caching
+  - known-limitation
+  - phantom-trigger
+patterns:
+  - regex: 'workflow_run.*trigger.*deleted|downstream.*workflow.*deleted.*upstream'
+    flags: 'i'
+  - regex: 'workflow.*no longer exists.*workflow_run'
+    flags: 'i'
+error_messages:
+  - 'The workflow_run trigger fires even after the upstream workflow YAML file has been deleted'
+root_cause: |
+  When a workflow file is deleted from the repository, GitHub does not immediately stop
+  resolving `workflow_run` triggers that reference it as the upstream workflow name. The
+  platform caches the workflow name→ID mapping and processes queued `completed` events for
+  runs that were already in flight at the time of deletion. Depending on queue depth and
+  processing lag, the downstream workflow can continue to fire for several minutes to a
+  few hours after the upstream file is removed.
+
+  Additionally, if the upstream workflow name was renamed (the `name:` key changed without
+  renaming the file), `workflow_run` triggers that reference the old name string silently
+  stop matching — but may continue matching for in-flight runs.
+
+  Observed patterns:
+  1. **Post-delete phantom fires** — upstream YAML deleted, downstream fires 1–5+ more
+     times as previously-queued `completed` events drain.
+  2. **Wrong commit SHA** — a `workflow_run` downstream workflow checks out the SHA from
+     `github.event.workflow_run.head_sha`, but that SHA may refer to a commit from another
+     branch that was merged earlier, not the latest commit on the triggering branch.
+  3. **Infinite loop after rename** — upstream workflow is renamed; old `workflow_run`
+     triggers no longer match; developer creates a new downstream workflow referencing the
+     new name, but the old downstream workflow is never removed and fires on unrelated runs.
+
+  There is no explicit GitHub API or UI mechanism to "flush" the pending `workflow_run`
+  event queue for a deleted workflow.
+fix: |
+  Because this is a platform-level caching behavior with no user-controlled flush, the
+  mitigations focus on making the downstream workflow resilient:
+
+  1. **Guard with `if:` condition on workflow name** — check `github.event.workflow_run.name`
+     matches the exact expected upstream workflow name. This prevents phantom fires from
+     stale events after a rename.
+
+  2. **Guard with `if:` on conclusion** — most phantom fires complete the upstream run with
+     conclusion `success` or `failure`; filtering on conclusion prevents unwanted action.
+
+  3. **Add an `if:` condition on head_branch** — validate that
+     `github.event.workflow_run.head_branch` is the expected branch before proceeding.
+
+  4. **Wait out the cache** — after deleting or renaming the upstream workflow, wait
+     10–30 minutes before relying on the downstream workflow being fully quiesced.
+
+  5. **Migrate to composite or reusable workflows** — avoids `workflow_run` trigger
+     entirely by making the downstream logic a reusable workflow called directly.
+fix_code:
+  - language: yaml
+    label: 'Guard downstream workflow against phantom fires after upstream deletion/rename'
+    code: |
+      on:
+        workflow_run:
+          workflows: ["Frontend CI"]   # exact name from upstream name: key
+          types: [completed]
+          branches: [main]
+
+      jobs:
+        deploy:
+          # Explicit guards against phantom fires from stale cached events
+          if: |
+            github.event.workflow_run.conclusion == 'success' &&
+            github.event.workflow_run.name == 'Frontend CI' &&
+            github.event.workflow_run.head_branch == 'main'
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ref: ${{ github.event.workflow_run.head_sha }}
+  - language: yaml
+    label: 'Migration — use reusable workflow instead of workflow_run to avoid trigger cache issues'
+    code: |
+      # In .github/workflows/frontend-ci.yml (upstream):
+      jobs:
+        test:
+          uses: ./.github/workflows/_deploy.yml
+          # OR: call the deploy job directly as a needs: dependency
+          # This removes the workflow_run trigger layer entirely.
+
+      # Downstream logic becomes a reusable workflow called by the upstream:
+      # .github/workflows/_deploy.yml (reusable):
+      on:
+        workflow_call:
+          inputs:
+            environment:
+              required: true
+              type: string
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          environment: ${{ inputs.environment }}
+          steps:
+            - run: echo "Deploying"
+prevention:
+  - 'After deleting an upstream workflow file, wait 15–30 minutes before expecting the downstream `workflow_run` trigger to stop firing'
+  - 'Always include an `if:` guard on `github.event.workflow_run.name` in the downstream workflow to prevent misfire after renames'
+  - 'Pin `github.event.workflow_run.head_sha` explicitly in the `actions/checkout` `ref:` parameter to ensure the correct commit is checked out'
+  - 'Prefer reusable workflows (`workflow_call`) over `workflow_run` for tightly-coupled CI→deploy chains — it avoids the trigger cache entirely'
+  - 'When renaming an upstream workflow, update all `workflow_run` trigger references atomically in the same PR'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run'
+    label: 'GitHub Docs — workflow_run event'
+  - url: 'https://docs.github.com/en/actions/sharing-automations/reusing-workflows'
+    label: 'GitHub Docs — Reusing workflows (workflow_call alternative)'
+  - url: 'https://stackoverflow.com/q/79941021'
+    label: 'Stack Overflow — workflow_run trigger keeps firing with old commit SHA after workflow file deleted'
