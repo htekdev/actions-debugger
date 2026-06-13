@@ -1,0 +1,119 @@
+id: ca-154
+title: 'CodeQL TRAP caching fills GitHub Actions cache quota — other workflow caches evicted'
+category: caching-artifacts
+severity: warning
+tags:
+  - codeql
+  - trap-caching
+  - cache-limit
+  - cache-eviction
+  - code-scanning
+  - monorepo
+  - performance
+patterns:
+  - regex: 'Caching TRAP files for|TRAP cache.*saved|Restoring TRAP cache'
+    flags: 'i'
+  - regex: 'cache.*storage.*quota|Cache capacity reached.*Evicting'
+    flags: 'i'
+  - regex: 'Unable to restore.*TRAP.*cache|TRAP.*cache.*miss'
+    flags: 'i'
+error_messages:
+  - 'Caching TRAP files for org/repo (Language: javascript-typescript)'
+  - 'Restoring TRAP cache from org/repo...'
+  - 'Cache capacity reached. Evicting old cache entries.'
+root_cause: |
+  The `github/codeql-action` (init and analyze steps) uses `actions/cache`
+  internally to persist TRAP (Text Representation of Analyzed Programs) files
+  between runs. TRAP files are the compiled intermediate representation of source
+  code that CodeQL analyzes.
+
+  In high-frequency repositories (active monorepos with dozens of merges per
+  day), each CI run generates a new TRAP cache entry keyed to the exact code
+  state. Because the key changes on every commit, cache restoration is rare
+  and a new entry is written each time. GitHub Actions enforces a 10 GB
+  per-repository cache limit. When hundreds of TRAP cache entries accumulate,
+  they exhaust this quota within one to a few days.
+
+  Once the 10 GB limit is reached, GitHub begins evicting the
+  least-recently-used entries. This evicts OTHER workflow caches — npm
+  dependencies, Go modules, Docker layer caches, pip wheels — that were
+  actively providing value, causing build times to increase across all
+  workflows in the repository.
+
+  The TRAP caching feature was designed to accelerate incremental CodeQL
+  re-analysis. For repos where most source lines change between runs, the
+  cache hit rate is near zero, making TRAP caching net-negative: it consumes
+  cache space without improving CodeQL speed.
+
+  Source: github/codeql-action#2030 (May 2025, confirmed by GitHub staff).
+fix: |
+  Disable TRAP caching in the CodeQL init action by setting `trap-caching: false`.
+  This prevents TRAP files from being written to the GitHub Actions cache and
+  frees the full 10 GB budget for other workflow caches.
+
+  Use `trap-caching: false` when any of the following apply:
+    - Repository has high commit velocity (10+ merges per day)
+    - The Actions Cache tab shows many entries with "TRAP" in the key name
+    - Non-CodeQL workflows are experiencing more frequent cache misses
+    - Total repository cache usage is near the 10 GB limit
+
+  Alternatively, reduce CodeQL scan frequency (e.g., scan only on push to the
+  default branch rather than every PR) to reduce the number of unique TRAP
+  cache entries created per day.
+fix_code:
+  - language: yaml
+    label: 'Disable TRAP caching — prevents cache churn in high-frequency repos'
+    code: |
+      jobs:
+        analyze:
+          name: Analyze code
+          runs-on: ubuntu-latest
+          permissions:
+            actions: read
+            contents: read
+            security-events: write
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Initialize CodeQL
+              uses: github/codeql-action/init@v3
+              with:
+                languages: javascript-typescript
+                trap-caching: false   # prevents TRAP files from filling 10 GB cache quota
+
+            - name: Perform CodeQL Analysis
+              uses: github/codeql-action/analyze@v3
+  - language: yaml
+    label: 'Limit CodeQL scans to default branch to reduce TRAP cache entry growth'
+    code: |
+      on:
+        push:
+          branches: [main]     # analyze on merge to main only — not every PR
+        schedule:
+          - cron: '0 6 * * 1'  # weekly full-codebase scan
+
+      jobs:
+        analyze:
+          runs-on: ubuntu-latest
+          permissions:
+            actions: read
+            contents: read
+            security-events: write
+          steps:
+            - uses: actions/checkout@v4
+            - uses: github/codeql-action/init@v3
+              with:
+                languages: javascript-typescript
+            - uses: github/codeql-action/analyze@v3
+prevention:
+  - 'Set `trap-caching: false` in the CodeQL init step for repos with more than ~10 merges per day.'
+  - 'Inspect the Actions Cache tab regularly — many entries with "TRAP" in the key name signal cache churn.'
+  - 'Limit CodeQL analysis to pushes on protected branches rather than every PR to reduce cache entry growth.'
+  - 'Review total cache usage periodically; if near 10 GB, CodeQL TRAP caches are a common culprit.'
+docs:
+  - url: 'https://github.com/github/codeql-action/issues/2030'
+    label: 'codeql-action#2030 — TRAP caching causes GitHub Actions Cache to churn (May 2025)'
+  - url: 'https://docs.github.com/en/code-security/code-scanning/creating-an-advanced-setup-for-code-scanning/codeql-code-scanning-for-compiled-languages#caching-trap-files'
+    label: 'GitHub Docs — CodeQL TRAP caching (advanced setup)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows#usage-limits-and-eviction-policy'
+    label: 'GitHub Docs — Cache usage limits and eviction policy (10 GB per repository)'

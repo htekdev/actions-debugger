@@ -1,0 +1,103 @@
+id: re-503
+title: 'Ubuntu 26.04 public preview runner: DNS resolution failures for third-party package repositories'
+category: runner-environment
+severity: error
+tags:
+  - ubuntu-26.04
+  - runner-image
+  - dns
+  - network
+  - preview
+  - curl-error-6
+  - hostname-resolution
+  - third-party-repos
+patterns:
+  - regex: 'Curl error \(6\).*Could not resolve host|curl.*6.*resolve.*hostname'
+    flags: 'i'
+  - regex: 'Could not resolve host.*ubuntu-26|ubuntu-26.*Could not resolve host'
+    flags: 'i'
+  - regex: 'getaddrinfo.*Name or service not known.*26\.04|EAI_NONAME.*ubuntu-26'
+    flags: 'i'
+error_messages:
+  - 'Curl error (6): Could not resolve hostname for https://fedoraproject-updates-archive.fedoraproject.org'
+  - 'Could not resolve host: dl.fedoraproject.org'
+  - 'curl: (6) Could not resolve host: packages.example-repo.org'
+  - 'getaddrinfo: Name or service not known'
+root_cause: |
+  The Ubuntu 26.04 GitHub Actions runner (available as a public preview from
+  June 11, 2026, as `ubuntu-26.04` and `ubuntu-26.04-arm`) has intermittent
+  DNS resolution failures for some third-party package repository hostnames.
+
+  The Ubuntu 26.04 image switches from the traditional `resolv.conf` / `systemd-
+  resolved` DNS configuration used in Ubuntu 24.04 to a newer resolver stack.
+  Some third-party repository mirrors that rely on external DNS servers not
+  in the runner's configured resolver list may fail to resolve, producing
+  `Curl error (6): Could not resolve hostname`.
+
+  This issue is specific to the preview image. Ubuntu 24.04 runners using the
+  same workflows on the same network resolve the same hostnames successfully.
+  The failure is non-deterministic — the same hostname may resolve on some runs
+  but not others due to timing or caching differences in the new DNS stack.
+
+  Known affected scenarios include:
+    - Installing packages from Fedora/EPEL mirrors via `dnf`/`yum` within
+      container build steps
+    - `curl` or `wget` to third-party APT/YUM/pip repository hosts
+    - Custom Docker image builds that `apt-get` from third-party PPAs during
+      the build phase
+
+  Source: actions/runner-images#14230 (filed June 13, 2026, Ubuntu 26.04
+  public preview — network related issues).
+fix: |
+  **Short-term workaround while the preview image issue is investigated:**
+
+  1. **Pin to ubuntu-24.04** — Use an explicit runner version that does not
+     have the DNS issue. Ubuntu 24.04 runners are stable and resolve the
+     same hostnames correctly.
+
+  2. **Use `ubuntu-latest`** — `ubuntu-latest` currently aliases ubuntu-24.04
+     and is unaffected.
+
+  3. **Retry logic** — For intermittent failures, add a retry mechanism around
+     the failing step using `--retry` flags in `curl` or a retry composite action.
+
+  4. **Check runner-images for updates** — The Ubuntu 26.04 preview image is
+     actively updated. Monitor runner-images#14230 for a fix or workaround from
+     GitHub's runner team.
+fix_code:
+  - language: yaml
+    label: 'Pin to ubuntu-24.04 until ubuntu-26.04 DNS issues are resolved'
+    code: |
+      jobs:
+        build:
+          # ubuntu-26.04 has intermittent DNS resolution failures (June 2026 preview)
+          # Use ubuntu-24.04 or ubuntu-latest (currently aliases ubuntu-24.04) as workaround
+          runs-on: ubuntu-24.04   # stable DNS, no hostname resolution issues
+          steps:
+            - uses: actions/checkout@v4
+            - name: Install packages from third-party repository
+              run: |
+                curl -fsSL https://packages.example-repo.org/install.sh | sh
+  - language: yaml
+    label: 'Add retry logic for curl calls on ubuntu-26.04 preview'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-26.04
+          steps:
+            - uses: actions/checkout@v4
+            - name: Download with retry (workaround for ubuntu-26.04 DNS issues)
+              run: |
+                # curl --retry retries on transient failures including DNS (Curl error 6)
+                curl --retry 3 --retry-delay 5 --retry-all-errors \
+                  -fsSL https://packages.example-repo.org/install.sh | sh
+prevention:
+  - 'Do not migrate CI workflows to ubuntu-26.04 during the public preview phase without testing for DNS resolution issues.'
+  - 'If using ubuntu-26.04 is required, add `--retry 3 --retry-all-errors` flags to curl/wget calls as a safety net.'
+  - 'Monitor actions/runner-images for a patch to the ubuntu-26.04 DNS configuration before adopting it in production workflows.'
+  - 'Use explicit runner version labels (ubuntu-24.04, ubuntu-26.04) rather than ubuntu-latest to control when new image versions take effect.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14230'
+    label: 'runner-images#14230 — [Ubuntu 26.04] network related issues (June 13, 2026)'
+  - url: 'https://github.com/actions/runner-images/issues/14226'
+    label: 'runner-images#14226 — Ubuntu 26.04 and Ubuntu 26.04 Arm public preview announcement (June 11, 2026)'
