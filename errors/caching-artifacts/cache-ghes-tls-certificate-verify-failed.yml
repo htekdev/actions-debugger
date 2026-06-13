@@ -1,0 +1,116 @@
+id: caching-artifacts-149
+title: 'actions/cache fails on GHES with TLS certificate verification error — unable to verify the first certificate'
+category: caching-artifacts
+severity: error
+tags:
+  - ghes
+  - tls
+  - ssl
+  - certificate
+  - self-signed
+  - enterprise
+  - node-tls
+  - cache-restore
+patterns:
+  - regex: 'unable to verify the first certificate'
+    flags: 'i'
+  - regex: 'downloadCache failed.*unable to verify'
+    flags: 'i'
+  - regex: 'Failed to restore.*certificate.*verify|Failed to save.*certificate.*verify'
+    flags: 'i'
+  - regex: 'Error: UNABLE_TO_VERIFY_LEAF_SIGNATURE'
+    flags: 'i'
+  - regex: 'RequestError.*certificate.*has expired|RequestError.*self.signed certificate'
+    flags: 'i'
+error_messages:
+  - 'Warning: Failed to restore: downloadCache failed: unable to verify the first certificate'
+  - 'Error: UNABLE_TO_VERIFY_LEAF_SIGNATURE'
+  - 'RequestError: unable to verify the first certificate'
+  - 'Error: self signed certificate in certificate chain'
+root_cause: |
+  `actions/cache` uses Node.js HTTP clients to communicate with the GitHub Actions cache
+  service endpoint. On GitHub Enterprise Server (GHES) deployments that use self-signed
+  TLS certificates or certificates issued by a private Certificate Authority (CA), Node.js
+  cannot verify the TLS certificate chain by default.
+
+  Node.js does not use the system's native OS certificate store on Linux/macOS — it ships
+  with its own bundled CA bundle. If the GHES instance's TLS certificate is not signed by
+  a CA in Node.js's bundle (e.g., it's self-signed, or signed by an internal CA not in
+  the Mozilla bundle), all HTTP requests from the runner's Node.js process will fail with
+  "unable to verify the first certificate" or "UNABLE_TO_VERIFY_LEAF_SIGNATURE".
+
+  This affects:
+  - `actions/cache@v3`, `actions/cache@v4`, `actions/cache@v5` on GHES
+  - Any JavaScript action that makes HTTPS requests to the GHES instance
+  - Occurs on GHES versions that use self-signed certificates or internal CAs
+fix: |
+  Set the `NODE_EXTRA_CA_CERTS` environment variable to point to the CA bundle that includes
+  the private CA certificate chain. Node.js reads this env var to extend its trusted CA list.
+
+  1. Export the GHES TLS certificate chain (PEM format) from your GHES admin console or
+     via `openssl s_client -showcerts -connect your-ghes-host:443 < /dev/null`
+
+  2. Copy the PEM file to the self-hosted runner's filesystem (e.g., `/etc/ssl/ghes-ca.pem`)
+
+  3. Set NODE_EXTRA_CA_CERTS in the runner's environment before the cache step runs.
+
+  Alternatively, use the `self-signed-certificate` runner configuration option in
+  actions-runner or set NODE_TLS_REJECT_UNAUTHORIZED=0 (NOT recommended for production
+  as it disables all TLS verification).
+fix_code:
+  - language: yaml
+    label: 'Set NODE_EXTRA_CA_CERTS workflow-level to trust GHES self-signed certificate'
+    code: |
+      # Configure the custom CA cert at workflow level
+      env:
+        # Path to the PEM file containing your GHES private CA certificate
+        # The file must exist on the self-hosted runner filesystem
+        NODE_EXTRA_CA_CERTS: /etc/ssl/certs/ghes-ca.pem
+
+      jobs:
+        build:
+          runs-on: self-hosted
+          steps:
+            - uses: actions/checkout@v4
+
+            - uses: actions/cache@v4
+              with:
+                path: ~/.npm
+                key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+
+            - name: Install dependencies
+              run: npm ci
+  - language: yaml
+    label: 'Set NODE_EXTRA_CA_CERTS at the runner level via .env file'
+    code: |
+      # In the runner's .env file (on the self-hosted runner host):
+      # NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ghes-ca.pem
+      #
+      # Or set it in the runner service environment. On Linux with systemd:
+      # sudo systemctl edit actions.runner.<org>.<name>.service
+      # [Service]
+      # Environment="NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ghes-ca.pem"
+      #
+      # This avoids needing to set it in every workflow file.
+
+      jobs:
+        build:
+          runs-on: self-hosted
+          steps:
+            # NODE_EXTRA_CA_CERTS is set at the runner level — no workflow change needed
+            - uses: actions/cache@v4
+              with:
+                path: ~/.npm
+                key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+prevention:
+  - 'Set NODE_EXTRA_CA_CERTS globally in the runner service environment so all JavaScript actions (not just cache) trust the GHES private CA'
+  - 'Use a publicly trusted TLS certificate (e.g., from Let''s Encrypt) on your GHES instance to avoid Node.js TLS verification issues entirely'
+  - 'Test connectivity from the runner by running `node -e "const https = require(''https''); https.get(''https://your-ghes-host/'', r => console.log(r.statusCode)).on(''error'', e => console.error(e.message))"` to confirm the cert issue before debugging the workflow'
+  - 'Document the required NODE_EXTRA_CA_CERTS path in your team''s runner setup guide so new runner deployments are pre-configured'
+docs:
+  - url: 'https://github.com/actions/cache/issues/1286'
+    label: 'actions/cache#1286 — downloadCache failed: unable to verify the first certificate (GHES)'
+  - url: 'https://nodejs.org/api/cli.html#node_extra_ca_certsfile'
+    label: 'Node.js CLI: NODE_EXTRA_CA_CERTS documentation'
+  - url: 'https://docs.github.com/en/enterprise-server@latest/admin/overview/about-github-enterprise-server'
+    label: 'GitHub Enterprise Server documentation'
