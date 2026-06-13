@@ -1,0 +1,100 @@
+id: ct-103
+title: '`github.head_ref` Is Empty String on Push Events — Concurrency Key Collapses All Push Runs Into One Group'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - head_ref
+  - push
+  - pull_request
+  - empty-string
+  - cancel-in-progress
+  - branch-name
+patterns:
+  - regex: 'group:\s*\$\{\{\s*github\.head_ref\s*\}\}'
+    flags: 'i'
+  - regex: 'group:\s*[''"][^''"]*\$\{\{\s*github\.head_ref\s*\}\}[^''"]*[''"]'
+    flags: 'i'
+  - regex: 'This run was cancelled'
+    flags: 'i'
+error_messages:
+  - "This run was cancelled."
+  - "Run was cancelled."
+root_cause: |
+  `github.head_ref` is populated only for `pull_request` and `pull_request_target`
+  events — it contains the source branch name of the PR (e.g., `feature/my-change`).
+
+  For `push` events, `github.head_ref` is an **empty string** because push events
+  are not associated with a pull request and have no "head" vs "base" distinction.
+
+  When developers write a concurrency group key using only `github.head_ref`:
+
+  ```yaml
+  concurrency:
+    group: ${{ github.head_ref }}
+    cancel-in-progress: true
+  ```
+
+  All `push` event workflow runs evaluate the concurrency group key to `""` (empty
+  string). Every push run to any branch — `main`, `develop`, `feature/x` — shares
+  the same empty concurrency key. With `cancel-in-progress: true`, each new push
+  cancels ALL other in-progress push runs across every branch simultaneously.
+
+  This is a silent failure because:
+  - Push runs from unrelated branches unexpectedly cancel each other.
+  - PR runs still work correctly (they get a proper `head_ref` key).
+  - The concurrency group `""` is valid YAML, so no error is shown.
+fix: |
+  Use the `||` fallback operator to substitute `github.ref_name` (available for
+  push events) when `github.head_ref` is empty:
+
+  ```yaml
+  concurrency:
+    group: ${{ github.head_ref || github.ref_name }}
+    cancel-in-progress: true
+  ```
+
+  `github.ref_name` returns the short branch name for push events (e.g., `main`).
+  For PR events, `github.head_ref` takes precedence and provides the source branch.
+
+  Alternatively, include the workflow name to avoid cross-workflow concurrency collisions:
+
+  ```yaml
+  concurrency:
+    group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+    cancel-in-progress: true
+  ```
+fix_code:
+  - language: yaml
+    label: 'WRONG — head_ref is empty on push, all pushes share empty concurrency group'
+    code: |
+      on: [push, pull_request]
+      concurrency:
+        group: ${{ github.head_ref }}   # empty string for all push events!
+        cancel-in-progress: true
+  - language: yaml
+    label: 'CORRECT — fallback to ref_name when head_ref is empty'
+    code: |
+      on: [push, pull_request]
+      concurrency:
+        # head_ref is populated for PRs; ref_name is the branch name for push events
+        group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+        cancel-in-progress: true
+  - language: yaml
+    label: 'CORRECT — using github.ref for a stable, always-populated key'
+    code: |
+      on: [push, pull_request]
+      concurrency:
+        # github.ref is always set: refs/heads/main (push) or refs/pull/42/merge (PR)
+        group: ${{ github.workflow }}-${{ github.ref }}
+        cancel-in-progress: true
+prevention:
+  - 'Never use `github.head_ref` alone as a concurrency key if the workflow runs on both `push` and `pull_request` events.'
+  - 'Use `github.head_ref || github.ref_name` or `github.ref` to ensure a non-empty concurrency group key for all event types.'
+  - 'Test concurrency configuration by triggering push events from multiple branches simultaneously and verifying only intra-branch cancellations occur.'
+  - 'Always prefix the concurrency group with `${{ github.workflow }}` to prevent cross-workflow concurrency collisions.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency'
+    label: 'GitHub Docs — Using concurrency'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context'
+    label: 'GitHub Docs — github context (head_ref, ref_name, ref)'
