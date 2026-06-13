@@ -1,0 +1,100 @@
+id: ca-151
+title: '`actions/stale` State Cache Missed Due to Pagination — Processing Restarts From First Issue'
+category: caching-artifacts
+severity: warning
+tags:
+  - actions-stale
+  - cache
+  - pagination
+  - state
+  - operations-per-run
+  - first-page
+  - checkpoint
+patterns:
+  - regex: 'The saved state was not found.*process starts from the first issue'
+    flags: 'i'
+  - regex: 'Unable to reserve cache with key _state.*another job may be creating this cache'
+    flags: 'i'
+  - regex: 'Failed to save.*cache entry with the same key.*scope already exists'
+    flags: 'i'
+  - regex: 'Cache already exists.*Scope.*Key: _state'
+    flags: 'i'
+error_messages:
+  - "The saved state was not found, the process starts from the first issue."
+  - "Failed to save: Unable to reserve cache with key _state, another job may be creating this cache. More details: Cache already exists. Scope: refs/heads/master, Key: _state, Version: ..."
+  - "Received non-retryable error: Failed request: (409) Conflict: cache entry with the same key, version, and scope already exists"
+root_cause: |
+  `actions/stale` uses the GitHub Actions cache API to persist its processing
+  checkpoint between runs (stored under the key `_state`). To check whether
+  this cache entry already exists before a run, the action calls
+  `checkIfCacheExists`, which lists the repository's caches using the default
+  page size of 30 entries — **without filtering by key or ref**.
+
+  If a repository accumulates more than 30 cache entries (common on active
+  repos with many matrix jobs, dependency caches, or build caches), the
+  `_state` entry may be pushed to page 2 or later of the API results. The
+  action only inspects the first page, so `_state` is treated as absent.
+
+  As a result, on each run:
+  1. The state is reported missing → stale processing restarts from issue #1
+     instead of continuing from the saved checkpoint.
+  2. At the end of the run, when the action tries to save the new state,
+     a 409 Conflict is returned because the `_state` cache key already exists
+     from the previous run (it was not found, so it was never deleted first).
+
+  This bug was reported in actions/stale#1136. The underlying fix requires
+  passing `key` and `ref` query parameters to the list-caches API call so
+  only the relevant cache entry is checked, regardless of pagination.
+fix: |
+  **Short-term workaround** — manually delete the `_state` cache entry from
+  the repository's Actions cache list before the next run:
+  1. Go to `Settings → Actions → Caches` and delete any `_state` cache entry.
+  2. The next `actions/stale` run will start fresh without the 409 conflict.
+
+  **Medium-term** — pin to the community fork that has the pagination fix:
+  `itchyny/actions-stale` includes a correct `checkIfCacheExists` implementation.
+
+  **Long-term** — upgrade `actions/stale` when a release incorporating the
+  PR #1152 pagination fix is published.
+fix_code:
+  - language: yaml
+    label: 'Workaround: delete _state cache via GitHub CLI before stale runs'
+    code: |
+      # Add this as a step before actions/stale in your workflow
+      - name: Clear stale action state cache
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/${{ github.repository }}/actions/caches \
+            --jq '.actions_caches[] | select(.key == "_state") | .id' \
+            | xargs -I{} gh api --method DELETE \
+                repos/${{ github.repository }}/actions/caches/{}
+  - language: yaml
+    label: 'Workaround: pin to community fork with pagination fix'
+    code: |
+      - uses: itchyny/actions-stale@0980a21d84c23bd4d8c62b0958f47f25822286f2
+        with:
+          repo-token: ${{ github.token }}
+          days-before-stale: 60
+          days-before-close: 7
+          operations-per-run: 30
+  - language: yaml
+    label: 'Long-term: watch for actions/stale release with PR #1152 fix'
+    code: |
+      # When actions/stale releases a version including PR #1152, upgrade:
+      - uses: actions/stale@v10  # bump to the version that includes PR #1152
+        with:
+          repo-token: ${{ github.token }}
+          days-before-stale: 60
+          days-before-close: 7
+prevention:
+  - 'If a repository has many cache entries (matrix jobs, large mono-repos), periodically clean up unused caches to keep the total count under 30 to avoid stale state pagination issues'
+  - 'Monitor `actions/stale` runs for the "saved state was not found" message — it indicates the checkpoint is being ignored and processing is restarting unnecessarily'
+  - 'Set `operations-per-run` high enough that stale can complete in a single run, eliminating the need for cross-run state persistence'
+docs:
+  - url: 'https://github.com/actions/stale/issues/1136'
+    label: 'actions/stale#1136 — State restoration fails if a repo has many caches'
+  - url: 'https://github.com/actions/stale/pull/1152'
+    label: 'actions/stale#1152 — Fix checkIfCacheExists to use key and ref filters'
+  - url: 'https://docs.github.com/en/rest/actions/cache#list-github-actions-caches-for-a-repository'
+    label: 'GitHub REST API — list caches for a repository'

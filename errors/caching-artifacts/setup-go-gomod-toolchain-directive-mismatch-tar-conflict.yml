@@ -1,0 +1,132 @@
+id: ca-152
+title: '`actions/setup-go` Cache Restore Fails With "Cannot open: File exists" When `go.mod` Has Mismatched `go` and `toolchain` Directives'
+category: caching-artifacts
+severity: warning
+tags:
+  - setup-go
+  - cache
+  - tar
+  - go-mod
+  - toolchain-directive
+  - go-1-21
+  - file-exists
+  - go-toolchain
+patterns:
+  - regex: 'golang\.org/toolchain@.*Cannot open: File exists'
+    flags: 'i'
+  - regex: 'Cannot open: File exists.*toolchain@v0\.0\.1-go'
+    flags: 'i'
+  - regex: 'Warning: Failed to restore.*tar.*exit code 2'
+    flags: 'i'
+  - regex: 'go/pkg/mod/golang\.org/toolchain@.*Cannot open'
+    flags: 'i'
+error_messages:
+  - "/usr/bin/tar: ../../../go/pkg/mod/golang.org/toolchain@v0.0.1-go1.21.1.linux-amd64/...: Cannot open: File exists"
+  - "/usr/bin/tar: Exiting with failure status due to previous errors"
+  - "Warning: Failed to restore: \"/usr/bin/tar\" failed with error: The process '/usr/bin/tar' failed with exit code 2"
+root_cause: |
+  When a `go.mod` file specifies both a `go` version and a **different**
+  `toolchain` version (a Go 1.21+ feature), the Go toolchain automatically
+  downloads and installs the requested toolchain during the first `go`
+  invocation in the workflow:
+
+  ```
+  go 1.21.0
+  toolchain go1.21.1
+  ```
+
+  On the **first** `actions/setup-go` cache-enabled run:
+  1. `setup-go` installs Go 1.21.0 (the `go` directive version).
+  2. Go detects the `toolchain go1.21.1` directive and auto-downloads toolchain
+     1.21.1 from the module proxy, writing files to:
+     `$GOPATH/pkg/mod/golang.org/toolchain@v0.0.1-go1.21.1.linux-amd64/`
+  3. `setup-go`'s post-step saves the module cache (which now includes the
+     downloaded toolchain files) to the Actions cache.
+
+  On **subsequent** runs:
+  1. `setup-go` again installs Go 1.21.0 — Go immediately auto-downloads
+     toolchain 1.21.1 again **before** the cache restore completes, writing
+     the toolchain files to disk.
+  2. `setup-go`'s cache restore step then tries to extract the saved cache
+     archive, which also contains the toolchain files. `tar` finds them
+     already on disk and fails with "Cannot open: File exists" (exit code 2).
+  3. A warning is emitted; the job continues but the cache restore is partial.
+
+  This is distinct from the Go 1.23 telemetry issue (`golang.org/x/telemetry`)
+  and the double-invocation issue — the trigger here is the `toolchain`
+  directive in `go.mod` causing automatic toolchain downloads that race with
+  cache restore.
+fix: |
+  **Option 1 (recommended)**: Upgrade to `actions/setup-go@v5` or later, which
+  handles this scenario better. Version 5 introduced awareness of the `toolchain`
+  directive and avoids the race.
+
+  **Option 2**: Align the `go` and `toolchain` directives in `go.mod` so they
+  reference the same version, preventing the auto-download entirely.
+
+  **Option 3**: Disable Go's toolchain auto-download by setting
+  `GOTOOLCHAIN=local` in the workflow environment. This prevents Go from
+  downloading a different toolchain version and avoids the file-exists conflict.
+
+  **Option 4**: Pre-delete the conflicting toolchain directory before
+  `setup-go` restores the cache.
+fix_code:
+  - language: yaml
+    label: 'Recommended: set GOTOOLCHAIN=local to prevent auto-download'
+    code: |
+      env:
+        GOTOOLCHAIN: local  # Prevents Go from auto-downloading toolchain per go.mod directive
+
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - uses: actions/setup-go@v5
+              with:
+                go-version-file: go.mod
+                cache: true
+
+            - run: go build ./...
+  - language: yaml
+    label: 'Alternative: align go and toolchain versions in go.mod'
+    code: |
+      # In go.mod — use the same version for both directives to avoid auto-download
+      # BEFORE (causes toolchain auto-download):
+      #   go 1.21.0
+      #   toolchain go1.21.1
+      #
+      # AFTER (no auto-download needed, no tar conflict):
+      #   go 1.21.1
+      #   toolchain go1.21.1
+
+      # Run locally to update:
+      # go get go@1.21.1
+  - language: yaml
+    label: 'Workaround: clean toolchain cache dir before setup-go'
+    code: |
+      - name: Remove pre-existing toolchain cache to prevent tar conflict
+        run: |
+          rm -rf "$(go env GOPATH)/pkg/mod/golang.org/toolchain@"* 2>/dev/null || true
+        # Go may not be in PATH yet; use a raw path if needed:
+        # rm -rf ~/go/pkg/mod/golang.org/toolchain@* 2>/dev/null || true
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+prevention:
+  - 'Set `GOTOOLCHAIN=local` in workflow-level `env` when using `go.mod` with a `toolchain` directive; this prevents auto-download races with cache restore'
+  - 'Prefer `actions/setup-go@v5` or later which has improved handling of the `toolchain` directive'
+  - 'If you intentionally use different `go` and `toolchain` versions in `go.mod`, expect cache restore warnings on second run and add `GOTOOLCHAIN=local` to silence them'
+  - 'Run `go env GOTOOLCHAIN` locally to verify toolchain behavior before committing a `go.mod` with mismatched directives'
+docs:
+  - url: 'https://github.com/actions/setup-go/issues/424'
+    label: 'actions/setup-go#424 — Tar errors on cache restore after toolchain installation (13 reactions)'
+  - url: 'https://go.dev/doc/toolchain'
+    label: 'Go Toolchain documentation — go and toolchain directives in go.mod'
+  - url: 'https://pkg.go.dev/cmd/go#hdr-Go_toolchain_selection'
+    label: 'Go toolchain selection — GOTOOLCHAIN env var behavior'
+  - url: 'https://github.com/actions/setup-go'
+    label: 'actions/setup-go README'
