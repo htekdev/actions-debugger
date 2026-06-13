@@ -1,0 +1,127 @@
+id: silent-failures-232
+title: '`actions/checkout` v6.0.0–v6.0.1 Silently Converts Annotated Tags to Lightweight Tags'
+category: silent-failures
+severity: silent-failure
+tags:
+  - checkout
+  - annotated-tags
+  - lightweight-tags
+  - git-tag
+  - tagger-metadata
+  - v6
+  - tag-annotation
+  - version-pinned
+patterns:
+  - regex: 'taggeremail|taggername|taggerdate'
+    flags: 'i'
+  - regex: 'git tag.*--format.*tagger|tag.*points-at.*tagger'
+    flags: 'i'
+error_messages:
+  - 'git tag --list --points-at HEAD --format ''%(taggeremail)'' returns empty'
+  - 'git cat-file tag v1.2.3 — not a tag object'
+  - 'error: v1.2.3 is not a tag object'
+root_cause: |
+  `actions/checkout` v6.0.0 and v6.0.1 fetch a tag by its commit hash rather than
+  by the tag reference itself. The fetch refspec used was:
+
+    git fetch origin +{COMMIT_SHA}:refs/tags/{TAG_NAME}
+
+  This creates a local tag that is a direct reference to the commit object, stripping
+  any tag object that wrapped it. Annotated tags created with `git tag -a` contain a
+  tag object with tagger metadata (name, email, date, message), which is separate from
+  the commit object. By fetching the commit SHA directly instead of the tag refspec,
+  the tag object is never downloaded — only the commit is fetched.
+
+  The result: the local tag exists and `git checkout refs/tags/v1.2.3` works, but:
+  - `git tag -l --points-at HEAD --format '%(taggeremail)'` returns empty
+  - `git cat-file -t v1.2.3` returns "commit" instead of "tag"
+  - `git log --no-walk --tags --pretty=format:%D` omits the annotation
+  - Tools that read tagger information (release scripts, changelogs, signing verifiers)
+    silently get wrong or empty metadata
+
+  This is a silent failure because: the checkout step succeeds with exit 0, the tag
+  name is present, git commands that only need the commit (e.g. `git log`) work fine.
+  Only operations that specifically need the tag object annotation fail.
+
+  Fixed in `actions/checkout` v6.0.2 (PR #2356, released January 9, 2026). The fix
+  uses `+refs/tags/*:refs/tags/*` as the refspec, fetching the actual tag objects.
+fix: |
+  Upgrade `actions/checkout` to v6.0.2 or later. The fix is already included in the
+  floating `v6` tag, so workflows using `uses: actions/checkout@v6` are already
+  unaffected.
+
+  Workflows pinned to a specific SHA or to `v6.0.0` / `v6.0.1` must be updated.
+
+  To verify you are on a fixed version: check the "Set up job" log which shows the
+  resolved action SHA, or add a diagnostic step to verify tag annotation is preserved.
+fix_code:
+  - language: yaml
+    label: 'Upgrade checkout to v6.0.2+ to preserve annotated tag metadata'
+    code: |
+      steps:
+        # ❌ Broken — annotated tag annotation is stripped:
+        - uses: actions/checkout@v6.0.0  # or v6.0.1
+          with:
+            ref: ${{ github.ref }}        # e.g. refs/tags/v1.2.3
+
+        # ✅ Fixed — upgrade to v6.0.2 or floating v6 tag:
+        - uses: actions/checkout@v6.0.2
+          with:
+            ref: ${{ github.ref }}
+
+        # ✅ Or use floating v6 (always gets the latest patch):
+        - uses: actions/checkout@v6
+          with:
+            ref: ${{ github.ref }}
+  - language: yaml
+    label: 'Diagnostic step to verify annotated tag annotation is preserved'
+    code: |
+      steps:
+        - uses: actions/checkout@v6.0.2
+          with:
+            ref: ${{ github.ref }}
+
+        - name: Verify annotated tag annotation is present
+          if: startsWith(github.ref, 'refs/tags/')
+          run: |
+            TAG="${{ github.ref_name }}"
+            TYPE=$(git cat-file -t "$TAG" 2>/dev/null || echo "not-found")
+            if [ "$TYPE" = "tag" ]; then
+              echo "✅ Annotated tag object preserved"
+              git tag -l --points-at HEAD --format '%(taggername) %(taggeremail) %(taggerdate)'
+            elif [ "$TYPE" = "commit" ]; then
+              echo "❌ Tag is a lightweight reference to commit — annotation was stripped"
+              echo "Upgrade to actions/checkout@v6.0.2 or later"
+              exit 1
+            else
+              echo "⚠️  Tag $TAG not found locally"
+            fi
+  - language: yaml
+    label: 'Workaround for pinned old versions: re-fetch tag by refspec after checkout'
+    code: |
+      steps:
+        # If upgrading checkout is not immediately possible, re-fetch the tag object:
+        - uses: actions/checkout@v6.0.0  # or v6.0.1
+          with:
+            ref: ${{ github.ref }}
+
+        - name: Re-fetch tag to restore annotation (workaround for v6.0.0/v6.0.1)
+          if: startsWith(github.ref, 'refs/tags/')
+          run: |
+            # Fetch the actual tag object (not just the commit SHA)
+            git fetch -f origin "${{ github.ref }}:${{ github.ref }}"
+            echo "Tag type is now: $(git cat-file -t '${{ github.ref_name }}')"
+prevention:
+  - 'Pin to `actions/checkout@v6` (floating) or `v6.0.2+` to avoid this regression in v6.0.0/v6.0.1.'
+  - 'In tag-triggered release workflows, add a diagnostic step verifying `git cat-file -t ${{ github.ref_name }}` returns "tag" not "commit".'
+  - 'Avoid pinning checkout to specific pre-patch SHAs — the floating major/minor tag (v6) always includes the latest bug fixes.'
+  - 'Tools that read tagger metadata (GPG signing verifiers, changelog generators, `git describe` with annotation) should include a pre-flight check for tag type.'
+docs:
+  - url: 'https://github.com/actions/checkout/pull/2356'
+    label: 'actions/checkout PR #2356 — Fix tag handling: preserve annotations and explicit fetch-tags (fixed in v6.0.2)'
+  - url: 'https://github.com/actions/checkout/issues/290'
+    label: 'actions/checkout#290 — Preserve tag annotations (original report, 2020)'
+  - url: 'https://github.com/actions/checkout/releases/tag/v6.0.2'
+    label: 'actions/checkout v6.0.2 release notes (January 9, 2026)'
+  - url: 'https://git-scm.com/book/en/v2/Git-Basics-Tagging'
+    label: 'Git documentation — Annotated Tags vs Lightweight Tags'

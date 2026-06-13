@@ -1,0 +1,126 @@
+id: known-unsolved-143
+title: 'JIT Token Expires During Sequential max-parallel:1 Matrix Workflows'
+category: known-unsolved
+severity: error
+tags:
+  - jit-runner
+  - self-hosted
+  - sequential
+  - max-parallel
+  - matrix
+  - token-expiry
+  - ephemeral
+patterns:
+  - regex: 'The operation was canceled\.'
+    flags: 'i'
+  - regex: 'jit.*token.*expir|token.*expir.*jit'
+    flags: 'i'
+  - regex: 'Failed to connect to the GitHub Actions service'
+    flags: 'i'
+error_messages:
+  - 'The operation was canceled.'
+  - 'Error: The operation was canceled.'
+  - 'Jobs 11+ fail with "The operation was canceled"'
+root_cause: |
+  JIT (Just-In-Time) runner tokens are scoped to a single job and expire after
+  approximately 60 minutes. When a matrix workflow uses `max-parallel: 1` to
+  enforce sequential execution, later jobs queue behind earlier ones. If the total
+  cumulative runtime of all preceding jobs exceeds ~60 minutes, the JIT token for
+  the waiting runner expires before GitHub dispatches the job to it.
+
+  The failure mode:
+  1. A serverless runner (Modal, AWS Lambda, Fargate, etc.) fetches a JIT config
+     on webhook receipt for job N.
+  2. Jobs 1–(N-1) run sequentially (max-parallel: 1), each taking several minutes.
+  3. By the time jobs 10+ become eligible to run, the 60-minute JIT token for those
+     runners has expired.
+  4. The runner attempts to connect to the GitHub Actions service, but the token
+     is no longer valid — the connection is cancelled.
+  5. The job fails with "The operation was canceled." even though the runner process
+     started and the worker code is intact.
+
+  This is a fundamental GitHub Actions JIT architecture limitation: JIT tokens are
+  not renewable and have no configurable TTL. There is no server-side mechanism to
+  refresh a JIT token while it is waiting in the queue.
+
+  This differs from the false-positive "lost communication" error (known-unsolved-058),
+  which affects already-running ephemeral jobs that complete successfully but appear
+  to disconnect. The JIT sequential expiry causes actual job failure before the job
+  begins executing user steps.
+fix: |
+  There is no direct fix — the 60-minute JIT token TTL is enforced by GitHub and is
+  not configurable. The following architectural workarounds are available:
+
+  1. Reduce total sequential runtime below 60 minutes:
+     - Combine short jobs into fewer, longer jobs to reduce the number of sequential
+       steps that must queue.
+     - Profile which matrix slices are slow and optimize or parallelize them.
+
+  2. Increase max-parallel (remove the strict sequential constraint):
+     - If ordering is required only between specific jobs, use `needs:` chains instead
+       of `max-parallel: 1` on a single matrix.
+     - This allows later jobs to obtain fresh JIT tokens earlier without waiting.
+
+  3. Use persistent (non-ephemeral) self-hosted runners:
+     - Persistent runners hold a long-lived registration token, not a JIT token.
+     - They do not expire while waiting in the queue.
+     - Trade-off: persistent runners have higher operational overhead.
+
+  4. Delay JIT token fetch until job dispatch (not webhook receipt):
+     - If the runner platform supports it, fetch the JIT config lazily at dispatch
+       time rather than pre-fetching on webhook receipt.
+     - This avoids holding a token that expires before the job starts.
+fix_code:
+  - language: yaml
+    label: 'Replace max-parallel:1 matrix with needs: chain to avoid JIT expiry'
+    code: |
+      # ❌ Problematic: max-parallel:1 matrix — job 11+ JIT token expires after 60 min
+      jobs:
+        sequential-work:
+          runs-on: [self-hosted, ephemeral]
+          strategy:
+            max-parallel: 1
+            matrix:
+              job_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+
+      # ✅ Workaround A: Remove max-parallel constraint so JIT tokens are fetched
+      # when jobs actually start, not when the workflow is dispatched
+      jobs:
+        parallel-work:
+          runs-on: [self-hosted, ephemeral]
+          strategy:
+            matrix:
+              job_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+
+      # ✅ Workaround B: Use needs: chains for true ordering without JIT expiry
+      jobs:
+        job-1:
+          runs-on: [self-hosted, ephemeral]
+          steps: [...]
+        job-2:
+          needs: job-1
+          runs-on: [self-hosted, ephemeral]
+          steps: [...]
+  - language: yaml
+    label: 'Use persistent runners when sequential execution with long total runtime is required'
+    code: |
+      # Persistent runners are not affected by the 60-min JIT token TTL
+      jobs:
+        sequential-build:
+          runs-on: [self-hosted, linux, persistent]  # NOT ephemeral
+          strategy:
+            max-parallel: 1
+            matrix:
+              job_id: [1, 2, 3, ..., 37]  # 37 x 6 min = 222 min total — safe on persistent
+prevention:
+  - 'Estimate total sequential runtime before using max-parallel:1 with JIT runners: N_jobs × avg_job_minutes must stay under 60 minutes.'
+  - 'Prefer needs: dependency chains over max-parallel:1 for ordered execution with ephemeral JIT runners.'
+  - 'Use persistent self-hosted runners for long-running sequential workflows that cannot be parallelized.'
+  - 'Monitor for "The operation was canceled." errors on jobs with high matrix indices — they are the signature of JIT token expiry, not infra failures.'
+docs:
+  - url: 'https://github.com/actions/runner/issues/4248'
+    label: 'actions/runner#4248 — JIT Token Expiration with Long-Running Sequential Workflows (2 comments, June 2026)'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/autoscaling-with-self-hosted-runners#using-just-in-time-runners'
+    label: 'GitHub Docs — Just-in-time (JIT) runners'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idstrategymax-parallel'
+    label: 'Workflow syntax — jobs.<job_id>.strategy.max-parallel'

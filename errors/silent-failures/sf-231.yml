@@ -1,0 +1,107 @@
+id: silent-failures-231
+title: '`job.workflow_ref` and `job.workflow_*` Context Properties Return Empty String on Runner < v2.334.0'
+category: silent-failures
+severity: silent-failure
+tags:
+  - job-context
+  - workflow-ref
+  - workflow-sha
+  - self-hosted
+  - runner-version
+  - context-empty
+  - reusable-workflow
+patterns:
+  - regex: 'job\.workflow_ref|job\.workflow_sha|job\.workflow_repository|job\.workflow_file_path'
+    flags: 'i'
+error_messages:
+  - '${{ job.workflow_ref }} expands to empty string'
+  - 'job.workflow_ref is empty'
+  - 'workflow_ref context not available'
+root_cause: |
+  GitHub Actions runner v2.334.0 (released April 21, 2026) added four new typed
+  accessors to the `job` expression context (PR #4335):
+
+    - `job.workflow_ref`       — full ref (owner/repo/.github/workflows/file.yml@refs/heads/branch)
+    - `job.workflow_sha`       — commit SHA of the resolved workflow file
+    - `job.workflow_repository` — owner/repo of the workflow file
+    - `job.workflow_file_path` — .github/workflows/file.yml path only
+
+  These properties are particularly useful in reusable workflows that need to identify
+  their own source identity at runtime.
+
+  On any self-hosted runner older than v2.334.0, these properties are not populated
+  by the runner's JobContext hydration. Because GitHub Actions silently treats unknown
+  context properties as empty strings (rather than erroring), workflows that reference
+  `${{ job.workflow_ref }}` will appear to succeed but the expression expands to an
+  empty string. Downstream steps that depend on a non-empty value — such as conditional
+  checks, logging, or attestation steps — will silently produce wrong results.
+
+  GitHub-hosted runners (ubuntu-latest, windows-latest, macos-latest) are always on a
+  recent runner version and are not affected. Only self-hosted runners that have not been
+  updated since before April 21, 2026 are impacted.
+fix: |
+  Update self-hosted runners to v2.334.0 or later. The runner auto-updates when a new
+  version is available if `ACTIONS_RUNNER_UPDATE_VERSION` is set, or update manually via
+  the runner configuration script.
+
+  To verify a runner's version: check the "Set up job" step in any workflow run — it logs
+  "Runner name: ..., Runner version: 2.XXX.X". Alternatively, check the runner's
+  _diag/Worker_*.log file for the version string.
+
+  As a short-term workaround before updating, use the `github` context instead:
+  - `github.workflow_ref` — available in all runner versions as a top-level context
+  - `github.workflow_sha` — similarly available top-level
+
+  Note: `github.workflow_ref` has been available since runner v2.304.0 and is safe
+  to use as a drop-in substitute for `job.workflow_ref` in most scenarios.
+fix_code:
+  - language: yaml
+    label: 'Use github.workflow_ref instead of job.workflow_ref for compatibility'
+    code: |
+      jobs:
+        identify:
+          runs-on: self-hosted
+          steps:
+            # ❌ Empty on runner < v2.334.0:
+            - run: echo "Workflow ref: ${{ job.workflow_ref }}"
+
+            # ✅ Available on all modern runners (since v2.304.0):
+            - run: echo "Workflow ref: ${{ github.workflow_ref }}"
+
+            # ✅ job.workflow_* safe to use once runners are updated to v2.334.0+:
+            - run: |
+                echo "ref:        ${{ job.workflow_ref }}"
+                echo "sha:        ${{ job.workflow_sha }}"
+                echo "repo:       ${{ job.workflow_repository }}"
+                echo "file path:  ${{ job.workflow_file_path }}"
+  - language: yaml
+    label: 'Check runner version in a prior step before relying on job.workflow_ref'
+    code: |
+      jobs:
+        debug:
+          runs-on: self-hosted
+          steps:
+            - name: Check runner version (must be >= 2.334.0 for job.workflow_*)
+              run: echo "Runner version is shown in the Set up job log header"
+
+            - name: Safe usage — falls back to github.workflow_ref if needed
+              run: |
+                # job.workflow_ref is safe on v2.334.0+; use github.workflow_ref as fallback
+                JOB_REF="${{ job.workflow_ref }}"
+                GITHUB_REF="${{ github.workflow_ref }}"
+                EFFECTIVE_REF="${JOB_REF:-$GITHUB_REF}"
+                echo "Effective workflow ref: $EFFECTIVE_REF"
+prevention:
+  - 'Keep self-hosted runners updated to the latest version to receive new context properties as they are added.'
+  - 'In reusable workflows, prefer `github.workflow_ref` over `job.workflow_ref` for maximum runner version compatibility.'
+  - 'When upgrading workflows to use new context properties, add a version note comment indicating the minimum required runner version.'
+  - 'Test workflows against self-hosted runners with the actual installed runner version before relying on recently added context properties.'
+docs:
+  - url: 'https://github.com/actions/runner/pull/4335'
+    label: 'actions/runner PR #4335 — feat: add job.workflow_* typed accessors to JobContext (shipped in v2.334.0)'
+  - url: 'https://github.com/actions/runner/releases/tag/v2.334.0'
+    label: 'GitHub Actions Runner v2.334.0 release notes (April 21, 2026)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/contexts#job-context'
+    label: 'GitHub Docs — job context properties'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/contexts#github-context'
+    label: 'GitHub Docs — github context (github.workflow_ref available as fallback)'
