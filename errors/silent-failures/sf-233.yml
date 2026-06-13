@@ -1,0 +1,115 @@
+id: sf-233
+title: "Windows Server 2025: default Java silently changed from 8 to 17, breaking Maven/Gradle builds"
+category: silent-failures
+severity: silent-failure
+tags:
+  - windows-2025
+  - windows-latest
+  - java
+  - maven
+  - gradle
+  - java-version
+  - runner-image-update
+patterns:
+  - regex: 'Source option \d+ is no longer supported\. Use \d+ or later'
+    flags: i
+  - regex: 'error:\s+source release \d+ requires target release \d+'
+    flags: i
+  - regex: 'InaccessibleObjectException.*Unable to make.*accessible.*module java\.base'
+    flags: i
+  - regex: 'Unsupported class file major version \d+'
+    flags: i
+  - regex: 'JAVA_HOME\s*=\s*C:\\Program Files\\(?:Eclipse Adoptium|Microsoft)\\jdk-17'
+    flags: i
+error_messages:
+  - "error: Source option 8 is no longer supported. Use 11 or later."
+  - "error: source release 8 requires target release 8"
+  - "java.lang.reflect.InaccessibleObjectException: Unable to make field ... accessible: module java.base does not 'opens java.lang' to unnamed module"
+  - "Unsupported class file major version 61"
+  - "[WARNING] Using platform encoding (UTF-8 actually) to copy filtered resources, i.e. build is platform dependent!"
+root_cause: |
+  When `windows-latest` migrated from Windows Server 2022 to Windows Server 2025 (September 2025,
+  actions/runner-images#12677), the default pre-installed Java version changed from **Java 8 (JDK 8)**
+  to **Java 17 (JDK 17)**. On windows-2022, `java -version` returned a 1.8.x JDK. On windows-2025,
+  `java -version` returns a 17.x JDK.
+
+  This is a silent failure because:
+  1. Workflows that do NOT use `actions/setup-java` and rely on the system Java receive a different runtime
+     version without any explicit error or warning in the workflow log about the version change.
+  2. Maven or Gradle builds configured with `<source>1.8</source>/<target>1.8</target>` in pom.xml may
+     continue to compile (Java 17 supports `--release 8`) but hit runtime failures when code uses
+     reflection patterns that Java 17's strong encapsulation (JEP 396, JEP 403) now restricts.
+  3. Projects using Lombok, certain Spring Boot versions, JPA/Hibernate older versions, or AspectJ may
+     fail or produce different behavior under Java 17 strong encapsulation.
+  4. Hardcoded `JAVA_HOME` paths pointing to a JDK 8 install directory will break silently when the
+     path no longer exists on windows-2025.
+
+  This does NOT affect workflows that explicitly use `actions/setup-java` with a `java-version:` input,
+  as that action installs and pins the requested version regardless of runner image defaults.
+fix: |
+  Always use `actions/setup-java` with an explicit `java-version:` to avoid dependence on the runner image
+  default Java version. This is the recommended practice regardless of runner OS or image version.
+
+  If you need to stay on Java 8:
+  ```yaml
+  - uses: actions/setup-java@v4
+    with:
+      distribution: temurin
+      java-version: '8'
+  ```
+
+  If migrating to Java 17 (recommended), audit your build for:
+  - Reflective access warnings/errors (add `--add-opens` JVM flags if needed)
+  - Outdated Lombok version (upgrade to 1.18.22+)
+  - Spring Boot 2.x reflection issues (upgrade to 2.6+ or 3.x for Java 17 support)
+fix_code:
+  - language: yaml
+    label: "Pin Java version explicitly with actions/setup-java (prevents silent version drift)"
+    code: |
+      jobs:
+        build:
+          runs-on: windows-latest   # windows-2025: default Java is now 17, not 8
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Set up Java 17
+              uses: actions/setup-java@v4
+              with:
+                distribution: temurin
+                java-version: '17'
+                cache: maven  # or 'gradle'
+
+            - name: Build with Maven
+              run: mvn -B package --file pom.xml
+  - language: yaml
+    label: "Pin to Java 8 explicitly if legacy compatibility required"
+    code: |
+      jobs:
+        build:
+          runs-on: windows-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Set up Java 8
+              uses: actions/setup-java@v4
+              with:
+                distribution: temurin
+                java-version: '8'
+                cache: gradle
+
+            - name: Build with Gradle
+              run: ./gradlew build
+prevention:
+  - "Always specify `java-version:` in `actions/setup-java` — never rely on the runner's system Java."
+  - "Add `actions/setup-java` as a required step in all Java workflow templates to prevent version drift."
+  - "Set `fail-fast: true` in your matrix to surface Java version incompatibilities immediately."
+  - "Use `.mvn/jvm.config` or `gradle.properties` to enforce the expected Java version at the build tool level."
+docs:
+  - url: "https://github.com/actions/runner-images/issues/12677"
+    label: "actions/runner-images#12677 — Windows Server 2025 becomes windows-latest (Java default 8→17)"
+  - url: "https://github.com/actions/setup-java"
+    label: "actions/setup-java — Install and configure a specific Java version"
+  - url: "https://openjdk.org/jeps/403"
+    label: "JEP 403: Strongly Encapsulate JDK Internals (Java 17)"
+  - url: "https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners#supported-software"
+    label: "GitHub Docs: Supported software on GitHub-hosted runners"
