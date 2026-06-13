@@ -1,0 +1,87 @@
+id: permissions-auth-123
+title: 'Reusable workflow nested job requests higher permission than caller grants — workflow validation fails'
+category: permissions-auth
+severity: error
+tags:
+  - reusable-workflow
+  - permissions
+  - nested-job
+  - workflow-validation
+  - permissions-escalation
+patterns:
+  - regex: 'The nested job .+ is requesting .+, but is only allowed'
+    flags: 'i'
+  - regex: 'Error calling workflow .+ The nested job'
+    flags: 'i'
+error_messages:
+  - "Error calling workflow 'org/repo/.github/workflows/deploy.yml@branch'. The nested job 'build' is requesting 'packages: write', but is only allowed 'packages: read'."
+  - "The nested job 'deploy' is requesting 'contents: write', but is only allowed 'contents: read'."
+root_cause: |
+  GitHub validates permissions at workflow parse time, not at runtime. If the caller workflow
+  explicitly restricts a permission (e.g., `packages: read` at the job or workflow level) and
+  the called reusable workflow's job block requests a higher permission (e.g., `packages: write`),
+  GitHub emits a validation error and prevents the workflow from running at all.
+
+  This validation happens unconditionally — even if the nested job has an `if: false` condition,
+  a `needs:` dependency that would prevent it from executing, or a concurrency group that would
+  cancel it. There is no way to guard against this with runtime conditions; the check is purely
+  structural.
+
+  The error arises most commonly when:
+  1. A caller workflow grants only the minimum permissions it needs (e.g., `packages: read` for
+     reading images), and calls a reusable workflow that also requires `packages: write` in a
+     different job for a different purpose.
+  2. A monorepo shares a reusable workflow across caller workflows with different permission
+     budgets, and one caller has a more restrictive permission set than the reusable workflow
+     declares.
+fix: |
+  Choose one of these options:
+
+  Option 1 — Elevate the caller permission to match the called workflow's requirement:
+    Add `packages: write` (or the required permission) to the caller workflow's job-level
+    or workflow-level `permissions:` block so the nested job can request it.
+
+  Option 2 — Remove the explicit restrictive permission from the caller:
+    If the caller does not explicitly set `packages:` in its `permissions:` block at all,
+    GitHub defaults to granting whatever the called reusable workflow requests. Removing the
+    overly restrictive key avoids the parse-time conflict.
+
+  Option 3 — Split into separate reusable workflows:
+    Refactor so that read-only callers call a reusable workflow that only declares read
+    permissions, and write-capable callers call a separate workflow that declares write.
+fix_code:
+  - language: yaml
+    label: 'Option 1 — Elevate caller permission to satisfy nested job requirement'
+    code: |
+      # Caller workflow — grant the permission the reusable job requires
+      jobs:
+        call-deploy:
+          permissions:
+            contents: read
+            packages: write      # Required by the nested job in the reusable workflow
+          uses: ./.github/workflows/deploy.yml
+  - language: yaml
+    label: 'Option 2 — Omit the restrictive permission from the caller'
+    code: |
+      # Caller workflow — omit "packages:" entirely to let the called
+      # workflow declare its own permissions without a ceiling conflict.
+      jobs:
+        call-deploy:
+          permissions:
+            contents: read
+            # packages: read  <-- Remove this line; let the called workflow control it
+          uses: ./.github/workflows/deploy.yml
+prevention:
+  - 'Audit caller permissions before restricting them: check every reusable workflow you call
+    for its job-level permission declarations, then ensure none exceed your caller grants.'
+  - 'Use the minimum-permissions principle at the workflow level, not the job level, when
+    calling reusable workflows — this prevents unintended ceiling conflicts.'
+  - 'Add a CI step or linting rule (e.g., actionlint) that validates caller/callee permission
+    compatibility across your workflow files before merging.'
+docs:
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#permissions-for-the-github_token'
+    label: 'GitHub Docs: Permissions for the GITHUB_TOKEN'
+  - url: 'https://docs.github.com/en/actions/sharing-automations/reusing-workflows#supported-keywords-for-jobs-that-call-a-reusable-workflow'
+    label: 'GitHub Docs: Supported keywords for jobs that call a reusable workflow'
+  - url: 'https://github.com/actions/runner/issues/4151'
+    label: 'actions/runner#4151: needs/if should prevent errors about nested jobs violating permissions'

@@ -1,0 +1,100 @@
+id: runner-environment-494
+title: '`dotnet dev-certs https --trust` fails with EventSource ID mismatch on Ubuntu — exit code 4'
+category: runner-environment
+severity: error
+tags:
+  - dotnet
+  - ubuntu
+  - dev-certs
+  - aspnetcore
+  - eventsource
+  - https
+  - certificate
+patterns:
+  - regex: 'Exception in Command Processing for EventSource Dotnet-dev-certs'
+    flags: 'i'
+  - regex: 'Event WslWindowsTrustSucceeded was assigned event ID'
+    flags: 'i'
+  - regex: 'There was an error trusting the HTTPS developer certificate'
+    flags: 'i'
+error_messages:
+  - "[0] ERROR: Exception in Command Processing for EventSource Dotnet-dev-certs: Event WslWindowsTrustSucceeded was assigned event ID 115 but 113 was passed to WriteEvent."
+  - "There was an error trusting the HTTPS developer certificate. It will be trusted by some clients but not by others."
+  - "Error: Process completed with exit code 4."
+root_cause: |
+  The `dotnet dev-certs https --trust` command fails on Ubuntu 24.04 runner image versions
+  starting around 20260217.30.1 with an EventSource schema mismatch. The error message
+  "Event WslWindowsTrustSucceeded was assigned event ID 115 but 113 was passed to WriteEvent"
+  indicates that the .NET EventSource schema used to compile `dotnet dev-certs` no longer
+  matches the runtime EventSource registration in the running .NET host.
+
+  This regression was introduced when the Ubuntu 24.04 runner image updated its bundled
+  .NET SDK to a version where the `Dotnet-dev-certs` EventSource had incompatible event ID
+  assignments between the tool binary and the runtime. The command exits with code 4
+  (certificate trust failed), causing any workflow step running
+  `dotnet dev-certs https --trust` to fail.
+
+  On Linux, the `--trust` flag is less meaningful than on Windows or macOS because Linux
+  does not have a centralized system certificate trust store that .NET can update
+  non-interactively in a headless CI environment. In most Linux CI configurations,
+  the certificate is not actually trusted system-wide by this command.
+fix: |
+  Option 1 (recommended for Linux CI) — Skip `dotnet dev-certs https --trust` on Linux:
+    The `--trust` step does not reliably work in Linux CI environments. Guard the step
+    with `if: runner.os != 'Linux'`, or remove it entirely from Linux workflows.
+
+  Option 2 — Add `continue-on-error: true` if the trust step is not strictly required:
+    If certificate trust is only needed on Windows or macOS, tolerate the failure:
+    `continue-on-error: true` on the dev-certs step for Linux runners.
+
+  Option 3 — Use ASPNETCORE environment variables to configure HTTPS without needing a
+    trusted dev certificate in CI.
+fix_code:
+  - language: yaml
+    label: 'Skip --trust on Linux using OS guard'
+    code: |
+      jobs:
+        integration-test:
+          runs-on: ubuntu-24.04
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Setup dev certificates (skip --trust on Linux)
+              run: |
+                dotnet dev-certs https --clean
+                # --trust is unreliable in headless Linux CI — skip to avoid exit code 4
+                if [[ "$RUNNER_OS" != "Linux" ]]; then
+                  dotnet dev-certs https --trust
+                fi
+  - language: yaml
+    label: 'Cross-platform — guard --trust with if condition'
+    code: |
+      jobs:
+        integration-test:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest, macos-latest]
+          runs-on: ${{ matrix.os }}
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Clean dev certs
+              run: dotnet dev-certs https --clean
+
+            - name: Trust dev certs (Windows and macOS only)
+              if: runner.os != 'Linux'
+              run: dotnet dev-certs https --trust
+prevention:
+  - 'Avoid relying on `dotnet dev-certs https --trust` in Linux CI — it does not integrate
+    with the system trust store and frequently breaks across .NET version upgrades.'
+  - 'Use OS-conditional steps (if: runner.os != ''Linux'') for certificate trust operations
+    that are only meaningful on Windows or macOS.'
+  - 'For ASP.NET Core integration tests on Linux, configure the test server to use HTTP or
+    provide a pre-trusted certificate via environment variables instead of dev-certs.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/13705'
+    label: 'actions/runner-images#13705: New Ubuntu runner image failing on DOTNET HTTPS dev cert --trust'
+  - url: 'https://github.com/dotnet/aspnetcore/issues/65391'
+    label: 'dotnet/aspnetcore#65391: Related upstream EventSource ID regression'
+  - url: 'https://aka.ms/dev-certs-trust'
+    label: 'Microsoft Docs: Trust the ASP.NET Core HTTPS development certificate'
