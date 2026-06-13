@@ -1,0 +1,115 @@
+id: sf-226
+title: '`github.event.commits` Is Absent in `pull_request` Events — Expressions Accessing Commit Data Silently Return Empty'
+category: silent-failures
+severity: silent-failure
+tags:
+  - github-context
+  - event-payload
+  - commits
+  - pull-request
+  - push
+  - null-context
+  - commit-message
+  - silent-skip
+patterns:
+  - regex: 'github\.event\.commits\[?\d*\]?\.'
+    flags: 'i'
+  - regex: 'github\.event\.commits.*pull_request'
+    flags: 'i'
+  - regex: 'contains\(toJSON\(github\.event\.commits\)'
+    flags: 'i'
+error_messages:
+  - "Error: Unhandled error: TypeError: Cannot read properties of undefined (reading '0')"
+  - "Expression evaluation result is empty for github.event.commits[0].message"
+  - "Step was skipped because the condition was false: contains(toJSON(github.event.commits), '[deploy]')"
+root_cause: |
+  The `github.event.commits` array is only present in the event payload for `push`
+  events (and related events like `create`). It is **absent** — not null but completely
+  missing — from the `pull_request`, `pull_request_target`, `workflow_dispatch`,
+  `schedule`, and most other event payloads.
+
+  Developers commonly write expressions like:
+  - `contains(toJSON(github.event.commits), '[deploy]')` — to check commit messages
+  - `github.event.commits[0].message` — to read the latest commit's message
+  - `github.event.commits.*.author.name` — to iterate commit authors
+
+  These expressions silently return empty string or evaluate to `false` (not an error)
+  when the workflow runs on a `pull_request` event, because the `commits` key is
+  undefined in the JSON payload. This causes:
+  - Conditional steps to be silently skipped.
+  - Commit message parsing logic to silently do nothing on PRs.
+  - Downstream job logic that depends on commit message flags to never fire on PRs.
+
+  The closely related `github.event.head_commit` is null (not absent) on PRs — see
+  sf-037 for that pattern. `github.event.commits` follows the same spirit but uses
+  array absence rather than null.
+fix: |
+  Guard all `github.event.commits` accesses behind an `event_name` check, or use
+  alternative sources for commit information that work across event types.
+
+  For commit message inspection: use `git log` inside a `run:` step and set an output
+  variable, which works for both push and PR events after checkout.
+
+  For PR events specifically: `github.event.pull_request.head.sha` gives the HEAD
+  commit SHA, but NOT the commit message — you need to use the API or `git log`.
+fix_code:
+  - language: yaml
+    label: 'WRONG — commits array absent on pull_request events; step silently skipped'
+    code: |
+      jobs:
+        check-commit:
+          runs-on: ubuntu-latest
+          steps:
+            - if: contains(toJSON(github.event.commits), '[deploy]')
+              # This condition is always FALSE on pull_request events because
+              # github.event.commits is absent (undefined), not an empty array
+              run: echo "Deploy flag found in commits"
+  - language: yaml
+    label: 'CORRECT — guard with event_name or use git log for cross-event commit access'
+    code: |
+      jobs:
+        check-commit:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            # Option 1: guard with event_name
+            - if: github.event_name == 'push' && contains(toJSON(github.event.commits), '[deploy]')
+              run: echo "Deploy flag found in push commits"
+
+            # Option 2: use git log for both push and PR events (requires checkout)
+            - id: check-flag
+              run: |
+                if git log -1 --format='%s' | grep -q '\[deploy\]'; then
+                  echo "deploy=true" >> "$GITHUB_OUTPUT"
+                fi
+            - if: steps.check-flag.outputs.deploy == 'true'
+              run: echo "Deploy flag found"
+  - language: yaml
+    label: 'CORRECT — per-event payload for commit SHA on PR vs push'
+    code: |
+      jobs:
+        get-sha:
+          runs-on: ubuntu-latest
+          steps:
+            - run: |
+                if [ "${{ github.event_name }}" = "pull_request" ]; then
+                  # Use PR head SHA for pull_request events
+                  SHA="${{ github.event.pull_request.head.sha }}"
+                else
+                  # Use github.sha for push and other events
+                  SHA="${{ github.sha }}"
+                fi
+                echo "Commit SHA: $SHA"
+prevention:
+  - 'Never access `github.event.commits` without first checking `github.event_name == ''push''`.'
+  - 'Use `git log` after `actions/checkout` for commit message inspection that works on both push and PR events.'
+  - 'Review the GitHub Actions event payload reference to understand which fields are present for each event type.'
+  - 'Add explicit `event_name` guards when a workflow is triggered by multiple events with different payload shapes.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#push'
+    label: 'GitHub Docs — push event payload (commits array present here)'
+  - url: 'https://docs.github.com/en/webhooks/webhook-events-and-payloads#pull_request'
+    label: 'GitHub Docs — pull_request event payload (no commits array)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#github-context'
+    label: 'GitHub Docs — github context reference'
