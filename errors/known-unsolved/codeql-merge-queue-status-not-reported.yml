@@ -1,0 +1,96 @@
+id: known-unsolved-142
+title: 'CodeQL Scans Triggered by merge_group Event Do Not Report "Code Scanning Results / CodeQL" Status Check to PR'
+category: known-unsolved
+severity: limitation
+tags:
+  - codeql
+  - merge-queue
+  - merge_group
+  - required-status-check
+  - code-scanning
+  - branch-protection
+  - pull-request
+patterns:
+  - regex: 'merge_group.*codeql|codeql.*merge_group'
+    flags: 'i'
+  - regex: 'Code scanning results.*CodeQL.*[Ww]aiting|CodeQL.*Expected.*[Ww]aiting.*status'
+    flags: 'i'
+error_messages:
+  - "Code scanning results / CodeQL — Expected — Waiting for status to be reported"
+  - "Required status check 'Code scanning results / CodeQL' is not present on this commit"
+root_cause: |
+  When GitHub Actions workflows run `github/codeql-action/analyze` on a `merge_group`
+  trigger (pull request merge queue), CodeQL successfully performs the analysis and
+  uploads the SARIF results — but the Code Scanning status check is NOT posted back to
+  the pull request.
+
+  GitHub's merge queue creates ephemeral merge commits (refs like
+  `gh-readonly-queue/main/...`) that exist only for the duration of the queue check.
+  The CodeQL status posted to this merge commit SHA is not propagated back to the
+  PR head commit SHA that branch protection rules evaluate.
+
+  As a result:
+  - The merge queue job completes successfully with CodeQL analysis done
+  - The SARIF results are uploaded to the code scanning results
+  - But the "Code scanning results / CodeQL" required status check on the PR shows
+    "Expected — Waiting for status to be reported"
+  - The PR cannot merge while CodeQL is a required branch protection status check
+
+  This is a GitHub platform architectural limitation: the merge queue and code scanning
+  status reporting pipelines are not integrated. There is no runner-side fix available;
+  it requires a platform change from GitHub.
+
+  Note: CodeQL on `pull_request` events DOES correctly report status, because
+  pull request events target the PR head SHA directly.
+fix: |
+  There is no complete fix as of mid-2026. Workarounds:
+
+  1. Run CodeQL on `pull_request` (not `merge_group`) so status reports to the PR head
+     commit. Do not require the merge_group CodeQL check in branch protection.
+
+  2. Remove "Code scanning results / CodeQL" from required merge queue status checks.
+     Keep it as a required check for pull_request events only.
+
+  3. Track https://github.com/github/codeql-action/issues/1537 for official resolution.
+fix_code:
+  - language: yaml
+    label: 'Run CodeQL on pull_request so PR status is correctly reported'
+    code: |
+      name: CodeQL Analysis
+
+      on:
+        push:
+          branches: [main]
+        pull_request:          # Use pull_request for required status checks
+          branches: [main]
+        # merge_group:         # Omit or do NOT require this in branch protection until fixed
+        #   branches: [main]
+        schedule:
+          - cron: '0 12 * * 1'
+
+      jobs:
+        analyze:
+          name: Analyze
+          runs-on: ubuntu-latest
+          permissions:
+            actions: read
+            contents: read
+            security-events: write
+          steps:
+            - uses: actions/checkout@v4
+            - uses: github/codeql-action/init@v3
+              with:
+                languages: javascript
+            - uses: github/codeql-action/autobuild@v3
+            - uses: github/codeql-action/analyze@v3
+prevention:
+  - 'Do not set "Code scanning results / CodeQL" as a required status check for merge queue until GitHub resolves this gap'
+  - 'Use pull_request trigger for CodeQL scans that feed into required branch protection status checks'
+  - 'Track github/codeql-action#1537 for updates on merge_group CodeQL status reporting'
+docs:
+  - url: https://github.com/github/codeql-action/issues/1537
+    label: "GitHub Issue #1537 — GitHub merge queue builds don't report CodeQL status"
+  - url: https://docs.github.com/en/code-security/code-scanning/managing-your-code-scanning-configuration/about-the-tool-status-page
+    label: 'About the code scanning tool status page — GitHub Docs'
+  - url: https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue
+    label: 'Managing a merge queue — GitHub Docs'
