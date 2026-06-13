@@ -1,0 +1,104 @@
+id: sf-227
+title: '`if: failure()` on a Step After a `continue-on-error: true` Step Never Triggers — Failure Is Absorbed'
+category: silent-failures
+severity: silent-failure
+tags:
+  - continue-on-error
+  - failure
+  - if-condition
+  - step-context
+  - status-check-function
+  - cleanup
+  - silent-skip
+patterns:
+  - regex: 'continue-on-error:\s*true'
+    flags: 'i'
+  - regex: 'if:\s*failure\(\)'
+    flags: 'i'
+  - regex: 'if:\s*\$\{\{\s*failure\(\)\s*\}\}'
+    flags: 'i'
+error_messages:
+  - "Step was skipped because the condition was false: failure()"
+  - "Cleanup step never runs despite previous step failing"
+root_cause: |
+  `continue-on-error: true` on a step instructs the runner to continue executing the
+  job even if that step exits with a non-zero code. Crucially, it also marks the step's
+  `conclusion` as `success` in the `steps` context — the failure is absorbed at the
+  job level.
+
+  The `failure()` status check function evaluates whether the **current job is in a
+  failed state** at the point where the `if:` condition is evaluated. Because
+  `continue-on-error: true` prevents the previous step's failure from changing the
+  job's status to "failed," `failure()` evaluates to `false` on all subsequent steps.
+
+  As a result, any step guarded by `if: failure()` that comes AFTER a
+  `continue-on-error: true` step that actually failed will be **silently skipped**.
+  This is the most common cause of cleanup or error-handling steps never running
+  despite a step failure.
+
+  Note: The raw failure IS still accessible via `steps.<id>.outcome == 'failure'`
+  (the `outcome` property reflects the exit code before `continue-on-error` is
+  applied). See sf-068 for the `conclusion` vs `outcome` distinction.
+fix: |
+  Replace `if: failure()` with a direct check on `steps.<id>.outcome == 'failure'`
+  to detect the raw failure of a specific step, regardless of `continue-on-error`.
+
+  If you need cleanup that runs after ANY failure in the job (not just one specific
+  step), restructure so that the failing step does NOT use `continue-on-error`.
+  Instead, capture its exit code into an output and make the cleanup conditional on
+  that output.
+fix_code:
+  - language: yaml
+    label: 'WRONG — failure() never triggers after continue-on-error: true step'
+    code: |
+      steps:
+        - id: risky-step
+          run: ./might-fail.sh
+          continue-on-error: true   # absorbs the failure at job level
+
+        - name: cleanup
+          # WRONG: failure() evaluates to false because the job is not in failed state
+          if: failure()
+          run: echo "This never runs even when risky-step fails!"
+  - language: yaml
+    label: 'CORRECT — use steps.<id>.outcome to detect absorbed failures'
+    code: |
+      steps:
+        - id: risky-step
+          run: ./might-fail.sh
+          continue-on-error: true   # absorbs the failure at job level
+
+        - name: cleanup-on-failure
+          # CORRECT: outcome reflects the raw exit code before continue-on-error
+          if: steps.risky-step.outcome == 'failure'
+          run: echo "Runs only when risky-step actually failed"
+
+        - name: always-cleanup
+          # CORRECT: always() or no condition to always run
+          if: always()
+          run: echo "Runs regardless of risky-step outcome"
+  - language: yaml
+    label: 'CORRECT — avoid continue-on-error when downstream failure() checks are needed'
+    code: |
+      steps:
+        - id: risky-step
+          run: |
+            ./might-fail.sh || echo "failed=true" >> "$GITHUB_OUTPUT"
+
+        - name: cleanup
+          # CORRECT: now failure() on a previous step propagates normally
+          # because we removed continue-on-error from risky-step
+          if: steps.risky-step.outputs.failed == 'true'
+          run: echo "Runs when risky-step reports failure via output"
+prevention:
+  - 'Never use `if: failure()` on a step that comes after a step with `continue-on-error: true` — use `steps.<id>.outcome == ''failure''` instead.'
+  - 'Remember: `steps.<id>.outcome` = raw exit code result; `steps.<id>.conclusion` = result after applying `continue-on-error`.'
+  - 'For unconditional cleanup steps, use `if: always()` — not `if: failure()` — when `continue-on-error` is in play anywhere in the job.'
+  - 'Prefer `|| echo "failed=true" >> "$GITHUB_OUTPUT"` patterns over `continue-on-error: true` when downstream steps need to react to failures via expressions.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#status-check-functions'
+    label: 'GitHub Docs — Status check functions (failure, success, always, cancelled)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idstepscontinue-on-error'
+    label: 'GitHub Docs — continue-on-error'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#steps-context'
+    label: 'GitHub Docs — steps context (outcome vs conclusion)'
