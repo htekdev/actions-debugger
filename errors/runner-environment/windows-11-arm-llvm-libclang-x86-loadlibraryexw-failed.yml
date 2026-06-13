@@ -1,0 +1,98 @@
+id: 'runner-environment-491'
+title: 'windows-11-arm Pre-installed LLVM is x86_64 — `libclang.dll` Fails to Load in Native ARM64 Process (LoadLibraryExW failed)'
+category: runner-environment
+severity: error
+tags:
+  - windows-11-arm
+  - llvm
+  - clang
+  - rust
+  - bindgen
+  - arm64
+  - runner-image
+patterns:
+  - regex: 'Unable to find libclang.*libclang\.dll could not be opened: LoadLibraryExW failed'
+    flags: 'i'
+  - regex: 'the `libclang` shared library at C:\\\\Program Files\\\\LLVM\\\\bin\\\\libclang\.dll could not be opened'
+    flags: 'i'
+  - regex: 'LoadLibraryExW failed.*libclang'
+    flags: 'i'
+  - regex: 'clang-sys.*unable to find libclang.*windows-11-arm'
+    flags: 'i'
+error_messages:
+  - 'Unable to find libclang: "the `libclang` shared library at C:\Program Files\LLVM\bin\libclang.dll could not be opened: LoadLibraryExW failed"'
+  - 'thread ''main'' panicked at ''Unable to find libclang: "could not open libclang.dll: LoadLibraryExW failed"'''
+root_cause: |
+  The `windows-11-arm` runner image pre-installs LLVM as an **x86_64 binary** under WoW64
+  emulation. When a native ARM64 process (such as a Rust build that uses `bindgen` or
+  `clang-sys`) attempts to load `C:\Program Files\LLVM\bin\libclang.dll`, the Windows
+  loader rejects it because the DLL is built for x86_64 and cannot be loaded into a
+  native ARM64 process.
+
+  The failure manifests as `LoadLibraryExW failed` — Windows silently returns an error
+  from the DLL loader rather than a meaningful architecture mismatch message. Build tools
+  that link against libclang (Rust's `clang-sys` crate, `bindgen`, LLDB Python bindings,
+  etc.) surface this as "Unable to find libclang".
+
+  Confirmed in actions/runner-images#14085 (June 2026, open). Upstream LLVM began
+  shipping prebuilt ARM64 Windows binaries in v20.1.0 (April 2025), but the runner image
+  was not updated to install the native ARM64 build.
+fix: |
+  Install a native ARM64 LLVM/Clang build before any step that requires libclang.
+  Use `KyleMayes/install-llvm-action@v2` (or later), which detects the runner architecture
+  and downloads the correct prebuilt LLVM binary from the LLVM GitHub releases.
+
+  Set `LIBCLANG_PATH` after installation so that `clang-sys`/`bindgen` find the correct
+  native library instead of falling back to the broken x86_64 system LLVM.
+fix_code:
+  - language: yaml
+    label: 'Install native ARM64 LLVM via KyleMayes/install-llvm-action'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-11-arm
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Install native ARM64 LLVM
+              uses: KyleMayes/install-llvm-action@v2
+              with:
+                version: '20'     # First LLVM version with ARM64 Windows prebuilts
+
+            - name: Export LIBCLANG_PATH for clang-sys / bindgen
+              run: |
+                $llvmBin = (Get-Command clang).Source | Split-Path
+                echo "LIBCLANG_PATH=$llvmBin" >> $env:GITHUB_ENV
+              shell: pwsh
+
+            - name: Build (Rust with bindgen)
+              run: cargo build --release
+  - language: yaml
+    label: 'Set LIBCLANG_PATH manually if you install LLVM yourself'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-11-arm
+          steps:
+            - name: Download LLVM ARM64 and set LIBCLANG_PATH
+              run: |
+                $ver = "20.1.7"
+                $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$ver/LLVM-$ver-woa64.exe"
+                Invoke-WebRequest $url -OutFile llvm-arm64.exe
+                Start-Process -Wait -FilePath llvm-arm64.exe -ArgumentList '/S', "/D=C:\LLVM-arm64"
+                echo "LIBCLANG_PATH=C:\LLVM-arm64\bin" >> $env:GITHUB_ENV
+              shell: pwsh
+prevention:
+  - 'Always verify that pre-installed tools on `windows-11-arm` are native ARM64 binaries and not x86_64 shims before relying on them in native ARM64 builds'
+  - 'Set `LIBCLANG_PATH` explicitly in workflows using `clang-sys` or `bindgen` on any Windows ARM64 runner'
+  - 'Check `llvm-project` releases for ARM64 Windows binaries before using the runner''s system LLVM — native builds have been available since v20.1.0'
+  - 'Use `file C:\Program Files\LLVM\bin\libclang.dll` (via Git Bash) or PowerShell `Get-Item` + `dumpbin /headers` to confirm whether the installed DLL is ARM64 or x86_64'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14085'
+    label: 'actions/runner-images#14085: [windows-11-arm] libclang broken (June 2026)'
+  - url: 'https://github.com/KyleMayes/install-llvm-action'
+    label: 'KyleMayes/install-llvm-action: Cross-platform LLVM installer for GitHub Actions'
+  - url: 'https://github.com/llvm/llvm-project/releases'
+    label: 'LLVM Project Releases: Native ARM64 Windows binaries available from v20.1.0'
+  - url: 'https://github.com/rust-lang/rust-bindgen'
+    label: 'rust-lang/rust-bindgen: Uses libclang and respects LIBCLANG_PATH'
