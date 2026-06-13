@@ -1,0 +1,130 @@
+id: re-489
+title: '`actions/checkout` Fails with "couldn''t find remote ref refs/pull/N/merge" for PRs with Merge Conflicts'
+category: runner-environment
+severity: error
+tags:
+  - checkout
+  - pull-request
+  - merge-ref
+  - merge-conflict
+  - refs-pull-merge
+  - git
+  - draft-pr
+patterns:
+  - regex: "fatal: couldn't find remote ref refs/pull/\\d+/merge"
+    flags: 'i'
+  - regex: 'refs/pull/\d+/merge.*not found|couldn.t find.*refs/pull/\d+/merge'
+    flags: 'i'
+  - regex: "Error: fatal: couldn't find remote ref refs/pull"
+    flags: 'i'
+error_messages:
+  - "fatal: couldn't find remote ref refs/pull/123/merge"
+  - "Error: fatal: couldn't find remote ref refs/pull/123/merge"
+  - "fatal: repository 'https://github.com/...' not found"
+root_cause: |
+  GitHub creates a virtual `refs/pull/{N}/merge` reference for each open pull request
+  to represent the result of merging the PR's head commit into the base branch. This
+  ref is useful for CI workflows that want to test the merged code (not just the PR
+  head) — it is commonly referenced as:
+
+  ```yaml
+  uses: actions/checkout@v4
+  with:
+    ref: refs/pull/${{ github.event.pull_request.number }}/merge
+  ```
+
+  However, GitHub only generates this virtual ref when the PR can be **cleanly merged**
+  into the base branch with no conflicts. In the following cases the ref does NOT exist:
+
+  - The PR has **merge conflicts** with the base branch
+  - The PR is a **draft** and GitHub hasn't computed the merge result yet
+  - The PR was just opened and the merge ref hasn't been computed yet (brief race)
+  - The base branch was force-pushed after the merge ref was last computed
+
+  When `refs/pull/N/merge` doesn't exist, `actions/checkout` calls `git fetch` for
+  that ref and git returns `fatal: couldn't find remote ref refs/pull/123/merge`,
+  causing the step — and by default the entire workflow — to fail.
+
+  This is especially frustrating because the same workflow succeeds on clean PRs and
+  silently starts failing once a conflict is introduced, making the CI appear broken
+  for reasons unrelated to the code change.
+fix: |
+  Option 1 (recommended): Check out the PR's HEAD ref (`refs/pull/N/head`) instead
+  of the merge ref. This always exists but tests the PR's code without the merge
+  applied. For most CI purposes this is sufficient.
+
+  Option 2: Add a guard step that checks if the merge ref is reachable before
+  attempting to check it out, and fail with a clear message ("PR has merge conflicts,
+  please resolve before CI can test the merged result") instead of a cryptic git error.
+
+  Option 3: Use `actions/checkout` default behavior (checkout the triggering SHA)
+  and skip the manual `ref:` override. The default checkout in a pull_request workflow
+  uses the merge commit if available, or the head commit if the merge ref is absent.
+
+  Option 4 (for workflow_run or cross-event contexts): access the merge SHA via
+  `github.event.pull_request.merge_commit_sha` and check it is non-null before use.
+fix_code:
+  - language: yaml
+    label: 'BROKEN — refs/pull/N/merge fails when PR has conflicts or merge ref not yet computed'
+    code: |
+      # BROKEN: fails silently when PR has merge conflicts
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                # This ref does not exist for conflicting PRs
+                ref: refs/pull/${{ github.event.pull_request.number }}/merge
+  - language: yaml
+    label: 'OPTION 1 — use refs/pull/N/head (always exists, no merge applied)'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                # Always exists — checks out the PR's HEAD commit
+                ref: refs/pull/${{ github.event.pull_request.number }}/head
+  - language: yaml
+    label: 'OPTION 2 — guard: skip merge-ref checkout and fail with a clear message when mergeable is null/false'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Check if PR is mergeable
+              env:
+                MERGEABLE: ${{ github.event.pull_request.mergeable }}
+              run: |
+                if [ "$MERGEABLE" = "false" ] || [ -z "$MERGEABLE" ]; then
+                  echo "::error::PR has merge conflicts or mergeability not yet computed. Resolve conflicts before CI can test the merged result."
+                  exit 1
+                fi
+
+            - uses: actions/checkout@v4
+              with:
+                ref: refs/pull/${{ github.event.pull_request.number }}/merge
+  - language: yaml
+    label: 'OPTION 3 — rely on default checkout behavior (uses merge commit when available)'
+    code: |
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            # Default checkout in pull_request context uses merge commit if mergeable,
+            # otherwise falls back to the head commit — no manual ref needed
+            - uses: actions/checkout@v4
+prevention:
+  - 'Avoid hardcoding refs/pull/N/merge in workflows — use the default checkout or refs/pull/N/head instead'
+  - 'If you must test the merged result, guard with a mergeability check step first and emit a clear error for conflicting PRs'
+  - 'Add a required status check that validates PR mergeability so contributors resolve conflicts before CI runs the merge-dependent step'
+  - 'Note that github.event.pull_request.mergeable can be null (not yet computed) on very recently opened PRs — treat null as non-mergeable'
+docs:
+  - url: 'https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request'
+    label: 'GitHub REST API: Get a pull request — mergeable and merge_commit_sha fields'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/events-that-trigger-workflows#pull_request'
+    label: 'GitHub Docs: pull_request event — checkout behavior'
+  - url: 'https://github.com/actions/checkout'
+    label: 'actions/checkout — default ref behavior documentation'

@@ -1,0 +1,127 @@
+id: ca-146
+title: 'download-artifact v4/v5 Fails with "Request timeout" When Downloading Large Artifacts from Blob Storage'
+category: caching-artifacts
+severity: error
+tags:
+  - download-artifact
+  - artifact
+  - timeout
+  - blob-storage
+  - request-timeout
+  - transient
+  - large-artifact
+patterns:
+  - regex: 'Unable to download and extract artifact: Request timeout:'
+    flags: 'i'
+  - regex: 'Unable to download artifact\(s\): Unable to download and extract artifact: Request timeout'
+    flags: 'i'
+  - regex: 'download and extract artifact.*Request timeout'
+    flags: 'i'
+error_messages:
+  - 'Unable to download artifact(s): Unable to download and extract artifact: Request timeout: /actions-results/...'
+  - 'Error: Unable to download artifact(s): Unable to download and extract artifact: Request timeout'
+  - 'Request timeout: https://productionresultssa.blob.core.windows.net/...'
+root_cause: |
+  `actions/download-artifact@v4+` downloads artifact content from Azure Blob Storage
+  via a time-limited SAS URL. When the artifact download takes too long — due to
+  large artifact size, network congestion between the GitHub Actions runner and Azure
+  Blob Storage, or throttling on the blob storage endpoint — the SAS URL's embedded
+  time window expires while the download is still in progress.
+
+  The error manifests as a `Request timeout:` followed by the full blob storage URL
+  (including the expiring `se=` query parameter). This is distinct from:
+  - `Artifact download failed after N retries` — which covers retry exhaustion
+  - `Not a valid zip file` — which covers corrupt downloads
+
+  The issue is intermittent: retrying the workflow often succeeds because a fresh SAS
+  URL with a new time window is generated. Large artifacts (typically >1 GB uncompressed
+  or >500 MB compressed) are most susceptible. GitHub-hosted runners in certain regions
+  can also experience higher latency to the blob storage endpoint.
+
+  First reported widely in actions/download-artifact#249 (115 reactions). The root
+  cause is that the SAS URL timeout is calculated from the time the artifact download
+  request is initiated, not from the time the runner begins pulling bytes — so if the
+  runner is under load or the storage endpoint is slow to respond, the window can
+  close mid-download.
+fix: |
+  There is no user-side configuration to extend the SAS URL timeout. Options:
+
+  1. **Re-run the failed job**: A fresh workflow run generates a new SAS URL with a
+     new time window. This is the simplest fix for transient occurrences.
+
+  2. **Reduce artifact size**: Split large artifacts into smaller named artifacts using
+     multiple `upload-artifact` steps and download them in parallel or sequentially.
+     Smaller artifacts are less likely to time out.
+
+  3. **Use `actions/cache` instead of artifacts** for build outputs that are only
+     consumed within the same workflow. Cache restores use the same blob backend but
+     have more lenient timeout handling.
+
+  4. **Check for runner resource contention**: Artifacts download over the runner's
+     network. If the runner is simultaneously performing other I/O-heavy operations,
+     the effective download bandwidth may be reduced. Isolate the download step.
+
+  5. **Upgrade to latest action version**: `actions/download-artifact@v5` and later
+     include improved retry logic and timeout handling compared to v4.x releases.
+fix_code:
+  - language: yaml
+    label: 'Split large artifact into smaller named parts to reduce per-download size'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Build frontend
+              run: npm run build
+
+            # Upload as separate smaller artifacts instead of one large one
+            - name: Upload dist/js
+              uses: actions/upload-artifact@v4
+              with:
+                name: dist-js
+                path: dist/js/
+
+            - name: Upload dist/css
+              uses: actions/upload-artifact@v4
+              with:
+                name: dist-css
+                path: dist/css/
+
+        deploy:
+          needs: build
+          runs-on: ubuntu-latest
+          steps:
+            # Download smaller artifacts separately — each less likely to timeout
+            - uses: actions/download-artifact@v4
+              with:
+                name: dist-js
+                path: dist/js/
+
+            - uses: actions/download-artifact@v4
+              with:
+                name: dist-css
+                path: dist/css/
+  - language: yaml
+    label: 'Upgrade to latest download-artifact version with improved retry/timeout handling'
+    code: |
+      steps:
+        # Prefer latest version — v5+ has better timeout/retry logic than v4.x
+        - uses: actions/download-artifact@v5
+          with:
+            name: my-artifact
+            path: artifacts/
+prevention:
+  - 'Keep individual artifact sizes under 500 MB compressed where possible to reduce timeout exposure'
+  - 'Use actions/cache instead of artifacts for inter-job data that does not need to persist beyond the workflow'
+  - 'Split large build outputs into multiple named artifacts and download them separately'
+  - 'Pin to the latest major version of download-artifact to get improved timeout handling'
+  - 'Add retry logic at the workflow level using continue-on-error and a subsequent re-download step as a fallback'
+docs:
+  - url: 'https://github.com/actions/download-artifact/issues/249'
+    label: 'actions/download-artifact#249: Unable to download and extract artifact: Request timeout (115 reactions)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-workflow-data-as-artifacts'
+    label: 'GitHub Docs: Storing workflow data as artifacts'
+  - url: 'https://github.com/actions/download-artifact'
+    label: 'actions/download-artifact — changelog and migration guide'
