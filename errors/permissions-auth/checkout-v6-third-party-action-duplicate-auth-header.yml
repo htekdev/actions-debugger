@@ -1,0 +1,101 @@
+id: pa-125
+title: "actions/checkout v6 conflicts with third-party actions that manage git credentials, causing 'Duplicate header: Authorization'"
+category: permissions-auth
+severity: error
+tags:
+  - checkout-v6
+  - git-credentials
+  - duplicate-header
+  - authorization
+  - create-pull-request
+  - third-party-action
+patterns:
+  - regex: 'remote: Duplicate header: "Authorization"'
+    flags: "i"
+  - regex: "remote: Duplicate header.*Authorization"
+    flags: "i"
+  - regex: 'fatal: unable to access.*The requested URL returned error: 400'
+    flags: "i"
+  - regex: 'Duplicate header.*Authorization.*fatal.*unable to access'
+    flags: "im"
+error_messages:
+  - 'remote: Duplicate header: "Authorization"'
+  - "fatal: unable to access 'https://github.com/org/repo/': The requested URL returned error: 400"
+  - "Error: The process '/usr/bin/git' failed with exit code 128"
+root_cause: |
+  actions/checkout v6 changed how git credentials are stored during a workflow job. Previous
+  versions (v4, v5) stored the GITHUB_TOKEN as a global git config `http.extraheader` entry.
+  Version 6 switched to per-directory credential files using git's `includeIf.gitdir` mechanism
+  — individual config files are written to `$RUNNER_TEMP/git-credentials-*.config` and included
+  conditionally for the checked-out repo directory.
+
+  Third-party actions (most notably `peter-evans/create-pull-request` and similar actions that
+  operate on the git repository) often add their own Authorization header to the git config to
+  temporarily use different credentials. These actions were written expecting the v4/v5 style
+  global config and do not know how to remove the v6-style `includeIf` entries. The result is
+  two conflicting Authorization headers being sent to GitHub when git commands run, producing
+  a 400 error from the server.
+
+  Affected patterns:
+  - Any workflow that uses `actions/checkout@v6` followed by a third-party action that adds
+    git credentials (create-pull-request, release actions, push actions, etc.).
+  - Self-hosted runners where a stale git global/system config includes an Authorization header
+    from a previous run or pre-installed tooling.
+fix: |
+  Option 1 — Update the third-party action:
+  Update `peter-evans/create-pull-request` to v7.0.9+ which includes v6-style credential cleanup.
+  Check for updates to other affected third-party actions.
+
+  Option 2 — Disable credential persistence in checkout:
+  Set `persist-credentials: false` on the checkout step so v6 does not write its `includeIf`
+  config at all. Then explicitly set credentials only where needed.
+
+  Option 3 — Pin checkout to v5:
+  If the third-party action cannot be updated, pin `actions/checkout@v5` to use the old
+  credential storage mechanism. Monitor for a v5-compatible third-party action release.
+
+  Option 4 — Clean stale runner git config (self-hosted runners):
+  Run `git config --list --global` and `git config --list --system` to identify pre-existing
+  Authorization entries and remove them from the runner's git config.
+fix_code:
+  - language: yaml
+    label: "Fix: set persist-credentials: false and manage credentials manually"
+    code: |
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # Downstream steps that need to push use an explicit token
+      - uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  - language: yaml
+    label: "Workaround: pin checkout to v5 until third-party action adds v6 support"
+    code: |
+      # Pin to v5 while waiting for create-pull-request v7.0.9+ or equivalent
+      - uses: actions/checkout@v5
+
+      - uses: peter-evans/create-pull-request@v7
+
+  - language: yaml
+    label: "Diagnostic: check for stale git config on self-hosted runner"
+    code: |
+      - name: Check global git config for stale auth
+        run: |
+          git config --list --global || true
+          git config --list --system || true
+prevention:
+  - "When upgrading checkout from v5 to v6, audit all downstream actions that interact with git — any that manage their own credentials may need updates."
+  - "Prefer `persist-credentials: false` as a defence-in-depth pattern to reduce credential coupling between actions."
+  - "On self-hosted runners, ensure the base runner image has no pre-configured git Authorization headers in global or system config."
+  - "Keep third-party git actions (create-pull-request, release-please, etc.) up to date alongside checkout major version bumps."
+docs:
+  - url: "https://github.com/actions/checkout/issues/2299"
+    label: "GitHub issue: Duplicate header Authorization"
+  - url: "https://github.com/peter-evans/create-pull-request/releases/tag/v7.0.9"
+    label: "peter-evans/create-pull-request v7.0.9 changelog (v6 credential cleanup)"
+  - url: "https://github.com/actions/checkout/pull/2286"
+    label: "actions/checkout PR #2286: auth config change that introduced this issue"
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions#considering-cross-repository-access"
+    label: "Security hardening: credential management in GitHub Actions"

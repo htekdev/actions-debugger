@@ -1,0 +1,88 @@
+id: sf-234
+title: "actions/checkout v6.0.2 changes file timestamps causing rsync to silently miss modified files"
+category: silent-failures
+severity: silent-failure
+tags:
+  - checkout-v6
+  - rsync
+  - timestamps
+  - file-sync
+  - silent-failure
+  - regression
+patterns:
+  - regex: 'checkout.*6\.0\.2.*rsync'
+    flags: "i"
+  - regex: 'rsync.*fewer.*changes.*checkout'
+    flags: "i"
+error_messages:
+  - "rsync detecting fewer changes than expected after checkout@v6.0.2"
+root_cause: |
+  actions/checkout v6.0.2 (released approximately January 2026) changed how the action writes
+  files to the runner's working directory, altering the on-disk timestamps of checked-out files
+  compared to previous versions (v6.0.1 and earlier).
+
+  rsync, when run in its default timestamp-comparison mode (`--archive` / `-a`), determines
+  which files have changed by comparing modification timestamps and file sizes between source
+  and destination. If checkout sets timestamps that do not reflect the actual last-modified time
+  (e.g., all files receive the current checkout time rather than the commit date, or vice versa),
+  rsync may conclude that files it previously would have transferred are unchanged and silently
+  skip them.
+
+  This produces no error — rsync exits 0, the workflow succeeds — but fewer files are
+  transferred than expected. Workflows that use rsync to deploy, sync, or mirror checked-out
+  files to a remote host or second directory may deploy stale or incomplete content with no
+  indication that anything went wrong.
+
+  The issue was confirmed to be introduced in v6.0.2 and absent in v6.0.1. It was reported and
+  discussed in actions/checkout but closed by maintainers without a fix, citing that checkout's
+  behaviour is within spec for git checkouts. Users confirmed reverting to v6.0.1 resolves it.
+fix: |
+  Option 1 — Pin to checkout v6.0.1:
+  Pin the checkout action to the last known-good version for rsync timestamp compatibility.
+  Monitor actions/checkout for a fix or a documented timestamp policy change in v6.0.3+.
+
+  Option 2 — Force rsync to use checksums:
+  Add the `--checksum` (`-c`) flag to rsync so it compares file content hashes rather than
+  relying on timestamps. This is slower but correct regardless of checkout timestamp behaviour.
+
+  Option 3 — Use rsync --no-times:
+  Remove timestamp comparison entirely. This forces rsync to use size-only comparison
+  when `--checksum` is too slow for large repos.
+fix_code:
+  - language: yaml
+    label: "Fix option 1: pin to checkout v6.0.1"
+    code: |
+      # Pin to last known-good version for rsync compatibility
+      - uses: actions/checkout@v6.0.1
+
+  - language: yaml
+    label: "Fix option 2: use --checksum flag to bypass timestamp comparison"
+    code: |
+      - uses: actions/checkout@v6
+
+      - name: Sync files (checksum-based, not timestamp-based)
+        run: |
+          rsync --checksum --archive --verbose \
+            ./dist/ user@host:/var/www/site/
+
+  - language: yaml
+    label: "Fix option 3: disable timestamp comparison in rsync"
+    code: |
+      - uses: actions/checkout@v6
+
+      - name: Sync files (no timestamp comparison)
+        run: |
+          rsync --archive --no-times --verbose \
+            ./dist/ user@host:/var/www/site/
+prevention:
+  - "Do not rely on checkout-generated file timestamps as a canonical change signal — git does not preserve commit timestamps by default."
+  - "Use `rsync --checksum` in CI pipelines for content-accurate sync; timestamp-based sync is fragile across different checkout implementations."
+  - "When upgrading checkout across minor versions (e.g., 6.0.1 → 6.0.2), verify rsync-based deploy steps still transfer the expected number of files."
+  - "Add a post-deploy sanity check that counts or checksums transferred files to detect silent under-deployment."
+docs:
+  - url: "https://github.com/actions/checkout/issues/2368"
+    label: "GitHub issue: 6.0.2 breaks previously working rsync"
+  - url: "https://github.com/actions/checkout/issues/2365"
+    label: "GitHub issue: original rsync regression report (v6.0.2)"
+  - url: "https://linux.die.net/man/1/rsync"
+    label: "rsync man page: --checksum and timestamp flags"
