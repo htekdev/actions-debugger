@@ -1,0 +1,115 @@
+id: 'silent-failures-229'
+title: 'windows-11-arm `platform.machine()` and `PROCESSOR_ARCHITECTURE` Return AMD64 Instead of ARM64 — Wrong Architecture Binaries Downloaded Silently'
+category: silent-failures
+severity: silent-failure
+tags:
+  - windows-11-arm
+  - arm64
+  - python
+  - architecture-detection
+  - runner-image
+  - silent-failure
+patterns:
+  - regex: 'platform\.machine\(\).*AMD64.*windows-11-arm|windows-11-arm.*platform\.machine.*AMD64'
+    flags: 'i'
+  - regex: 'PROCESSOR_ARCHITECTURE.*AMD64.*windows-11-arm|windows-11-arm.*PROCESSOR_ARCHITECTURE.*AMD64'
+    flags: 'i'
+  - regex: 'R\.version.*x86_64-w64-mingw32.*windows-11-arm'
+    flags: 'i'
+  - regex: 'arch.*x86_64.*windows-11-arm.*expected.*aarch64'
+    flags: 'i'
+error_messages:
+  - 'platform       x86_64-w64-mingw32'
+  - 'arch           x86_64'
+  - 'Python platform.machine(): AMD64'
+  - 'PROCESSOR_ARCHITECTURE: AMD64'
+root_cause: |
+  On `windows-11-arm`, the pre-installed Python interpreter and R runtime are **x86_64
+  binaries** running under WoW64 ARM64 emulation. When these tools report architecture
+  information, they report their own binary architecture (x86_64 / AMD64) rather than
+  the host hardware architecture (ARM64 / aarch64).
+
+  This affects:
+  - `python -c "import platform; print(platform.machine())"` → returns `"AMD64"`
+  - `$env:PROCESSOR_ARCHITECTURE` → returns `"AMD64"` (set by WoW64 for x86_64 processes)
+  - `Rscript -e 'print(R.version)'` → platform returns `"x86_64-w64-mingw32"`
+
+  Correct detection methods that reflect the true hardware:
+  - `$env:PROCESSOR_IDENTIFIER` → returns `"ARMv8 (64-bit) Family 8 Model D49 Revision 0, MICROSOFT CORPORATION"`
+  - `python -c "import platform; print(platform.processor())"` → returns the ARMv8 identifier
+
+  The silent failure occurs when a workflow script uses `platform.machine()` or
+  `PROCESSOR_ARCHITECTURE` to decide which binary to download. The script silently
+  selects an x86_64 artifact instead of the ARM64 one. The downloaded binary may run
+  under WoW64 emulation (appearing to succeed) but at significantly reduced performance,
+  or it may fail at link/runtime with a hard-to-diagnose error.
+
+  Tracked in actions/runner-images#14071 and #14089 (June 2026, open).
+fix: |
+  Use `PROCESSOR_IDENTIFIER` or `PROCESSOR_ARCHITEW6432` to detect ARM64 on
+  `windows-11-arm`. These environment variables are set by Windows for the native
+  hardware and are NOT overridden by WoW64.
+
+  For Python scripts:
+    processor_id = os.environ.get('PROCESSOR_IDENTIFIER', '')
+    is_arm64 = 'ARMv8' in processor_id or 'ARM64' in processor_id
+
+  For PowerShell/shell scripts:
+    Use `$env:PROCESSOR_IDENTIFIER` or check `[System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture`
+    which returns `Arm64` correctly even from an x86_64 process.
+
+  For GitHub Actions expressions (setting matrix arch):
+    Use `runner.arch` context: `${{ runner.arch }}` returns `ARM64` on windows-11-arm.
+    This is the most reliable method for conditional workflow logic.
+fix_code:
+  - language: yaml
+    label: 'Use runner.arch context instead of platform.machine() for arch-conditional steps'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-11-arm
+          steps:
+            - name: Detect architecture via runner context (reliable)
+              run: echo "Runner arch is ${{ runner.arch }}"
+
+            - name: Download correct binary based on runner.arch
+              run: |
+                if ("${{ runner.arch }}" -eq "ARM64") {
+                  $arch = "arm64"
+                } else {
+                  $arch = "amd64"
+                }
+                Invoke-WebRequest "https://example.com/tool-windows-$arch.zip" -OutFile tool.zip
+              shell: pwsh
+  - language: yaml
+    label: 'Python arch detection that works correctly on windows-11-arm'
+    code: |
+      - name: Detect true host architecture in Python
+        run: |
+          python - <<'EOF'
+          import os, platform
+
+          # WRONG: returns AMD64 on windows-11-arm (reports x86_64 WoW64 process arch)
+          # print(platform.machine())
+
+          # CORRECT: check PROCESSOR_IDENTIFIER for true hardware arch
+          proc_id = os.environ.get('PROCESSOR_IDENTIFIER', '')
+          is_arm64 = 'ARMv8' in proc_id or 'ARM64' in proc_id
+          arch = 'arm64' if is_arm64 else 'amd64'
+          print(f"True arch: {arch}")
+          EOF
+        shell: bash
+prevention:
+  - 'Never use `platform.machine()`, `$env:PROCESSOR_ARCHITECTURE`, or `R.version$arch` for architecture detection on `windows-11-arm` — these return x86_64/AMD64 from WoW64 processes'
+  - 'Use `${{ runner.arch }}` in GitHub Actions workflow expressions for arch-conditional logic'
+  - 'Use `$env:PROCESSOR_IDENTIFIER` or `[System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture` in PowerShell for reliable native arch detection'
+  - 'Add an architecture verification step early in workflows to print `runner.arch` and catch misdetection before it causes silent failures downstream'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14071'
+    label: 'actions/runner-images#14071: windows-11-arm PROCESSOR_ARCHITECTURE returns AMD64 (June 2026)'
+  - url: 'https://github.com/actions/runner-images/issues/14089'
+    label: 'actions/runner-images#14089: windows-11-arm R reports wrong arch x86_64 (June 2026)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#runner-context'
+    label: 'GitHub Docs: runner.arch context property'
+  - url: 'https://learn.microsoft.com/en-us/windows/win32/winprog64/wow64-implementation-details'
+    label: 'Microsoft Docs: WoW64 and PROCESSOR_ARCHITECTURE environment variable behaviour'

@@ -1,0 +1,111 @@
+id: 'known-unsolved-140'
+title: 'macOS Runner: `xcrun simctl list devices available` Returns No iOS/tvOS/watchOS Simulators — Intermittent Image-Specific Regression'
+category: known-unsolved
+severity: error
+tags:
+  - macos
+  - macos-15
+  - xcode
+  - ios
+  - simulator
+  - simctl
+  - intermittent
+  - runner-image
+patterns:
+  - regex: 'xcrun simctl list devices available.*== Devices ==\s*-- iOS'
+    flags: 'is'
+    multiline: true
+  - regex: 'Unable to find a destination.*no devices are available'
+    flags: 'i'
+  - regex: 'xcodebuild.*error.*The requested device could not be found.*simctl list.*shows no iOS'
+    flags: 'i'
+  - regex: 'simctl list devices.*-- iOS [0-9]+\.[0-9]+ --\s*-- iOS [0-9]+\.[0-9]+ --'
+    flags: 'is'
+    multiline: true
+error_messages:
+  - 'xcodebuild: error: Unable to find a destination matching the provided destination specifier'
+  - '== Devices ==\n-- iOS 18.4 --\n-- iOS 18.5 --\n-- iOS 18.6 --'
+  - 'xcrun simctl list devices available shows only visionOS simulators, iOS sections are empty'
+root_cause: |
+  On certain macOS-15-arm64 image versions (confirmed: 20250830.2281), `xcrun simctl list
+  devices available` returns empty iOS, tvOS, and watchOS device sections. Platform
+  section headers appear in the output (e.g., `-- iOS 18.4 --`, `-- iOS 18.5 --`) but
+  contain no device entries. Only visionOS simulators are listed.
+
+  This is an intermittent image-level regression — re-running the exact same workflow on
+  the same image version may succeed if the scheduler assigns a different runner instance
+  (which may have a different warm state for simctl). The failure is not reproducible
+  deterministically and does not produce a specific error from simctl itself; downstream
+  `xcodebuild` steps fail with "no matching destination" when attempting to test.
+
+  Root cause is believed to be a simctl/CoreSimulator state corruption in the image bake
+  process for affected image builds. The issue resolves when the image is rebuilt cleanly.
+  Not specific to any particular Xcode version — observed with Xcode 16.4 on
+  macos-15-arm64 image 20250830.2281.
+
+  Tracked in actions/runner-images#12948 (filed 2024, intermittent).
+fix: |
+  There is no reliable in-workflow fix. The following workarounds reduce the impact:
+
+  1. **Re-run the job** — the scheduler may assign a runner instance where simctl state
+     is intact. This is the only confirmed remediation for in-flight failures.
+
+  2. **Add a simctl diagnostic step** early in the job to detect the empty state and fail
+     fast with a clear error message rather than a confusing xcodebuild destination error.
+
+  3. **Boot a simulator explicitly** with `xcrun simctl boot <UDID>` before xcodebuild
+     if your workflow uses specific UDID-based destinations.
+
+  4. **Watch for image version updates** — affected image builds are typically replaced
+     within 1-3 days once the regression is reported. Pin to a known-good image version
+     if continuous failures are unacceptable.
+fix_code:
+  - language: yaml
+    label: 'Add early simctl health check to detect empty simulator list and fail fast'
+    code: |
+      jobs:
+        build:
+          runs-on: macos-latest   # or macos-15-arm64
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Verify iOS simulators are available
+              run: |
+                SIM_COUNT=$(xcrun simctl list devices available | grep -c "iPhone\|iPad")
+                if [ "$SIM_COUNT" -eq 0 ]; then
+                  echo "::error::No iOS simulators available. This is a known intermittent image regression."
+                  echo "::error::Re-run the job to get a runner instance with intact simctl state."
+                  echo "Simctl output:"
+                  xcrun simctl list devices available
+                  exit 1
+                fi
+                echo "Found $SIM_COUNT iOS/iPadOS simulator devices."
+
+            - name: Build and test
+              run: |
+                xcodebuild test \
+                  -scheme MyScheme \
+                  -destination 'platform=iOS Simulator,name=iPhone 16,OS=latest'
+  - language: yaml
+    label: 'Reset CoreSimulator state before running tests (workaround for persistent corruption)'
+    code: |
+      - name: Reset CoreSimulator device registry (workaround)
+        run: |
+          # Shut down all running simulators
+          xcrun simctl shutdown all || true
+          # Erase all simulator content and settings
+          xcrun simctl erase all || true
+          # List available devices after reset
+          xcrun simctl list devices available
+prevention:
+  - 'Add a simulator availability check as a dedicated early step to detect the empty-simctl regression and fail fast with a descriptive message before reaching xcodebuild'
+  - 'Subscribe to actions/runner-images release notes and watch for image builds on macOS runners — affected builds are usually superseded within 1-3 days'
+  - 'Do not pin to specific affected image versions; instead pin to a known-good build or use the floating label and accept occasional re-runs'
+  - 'Consider caching simctl booted simulators across jobs using self-hosted runners if consistent simulator availability is critical'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/12948'
+    label: 'actions/runner-images#12948: [macOS] Xcode 16.4 sometimes missing simulators (2024–2025)'
+  - url: 'https://developer.apple.com/documentation/xcode/running-your-app-in-simulator-or-on-a-device'
+    label: 'Apple Developer Docs: Running your app in Simulator'
+  - url: 'https://developer.apple.com/forums/thread/651334'
+    label: 'Apple Developer Forums: xcrun simctl list — empty device list troubleshooting'
