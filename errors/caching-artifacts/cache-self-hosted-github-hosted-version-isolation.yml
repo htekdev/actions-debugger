@@ -1,0 +1,123 @@
+id: caching-artifacts-153
+title: 'actions/cache key found via REST API but "Cache not found" when crossing GitHub-hosted/self-hosted runner boundary'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - cache
+  - self-hosted
+  - github-hosted
+  - cache-version
+  - runner-type
+  - cache-miss
+patterns:
+  - regex: 'Cache not found for input keys'
+    flags: 'i'
+  - regex: 'cache.*self.?hosted.*not found|self.?hosted.*cache.*miss'
+    flags: 'i'
+error_messages:
+  - "Cache not found for input keys: Linux-3.12.3-b7dbd3ea392a6a23acbfac7fae36dded9622e49c3fa5824b0b168cfa64a66cc1"
+  - "Cache not found for input keys: <key>"
+root_cause: |
+  The `actions/cache` action computes a cache `version` by hashing both the
+  cache `path` input AND the `RUNNER_TOOL_CACHE` environment variable. This
+  version is used as a secondary lookup key alongside the user-supplied cache key.
+
+  GitHub-hosted runners set `RUNNER_TOOL_CACHE` to a fixed OS-specific path:
+  - Linux:   /opt/hostedtoolcache
+  - Windows: C:\hostedtoolcache
+  - macOS:   /Users/runner/hostedtoolcache
+
+  Self-hosted runners use whatever path the administrator configured, which is
+  almost never the same as the GitHub-hosted default. As a result, a cache
+  entry saved by a GitHub-hosted runner has a different `version` hash than the
+  one the self-hosted runner computes, causing a guaranteed 100% cache miss even
+  when the cache key matches exactly.
+
+  Critically, the cache entry IS visible via the REST API (it exists in the
+  cache store with the matching key) but the `actions/cache` action cannot find
+  it because the version mismatch causes the lookup to return no results.
+
+  This affects any workflow that mixes runner types — for example, a "seed
+  cache" job on a GitHub-hosted runner followed by consuming jobs on
+  self-hosted runners.
+
+  Tracked in: https://github.com/actions/cache/issues/1595
+fix: |
+  Option 1 — Standardize RUNNER_TOOL_CACHE on self-hosted runners.
+  Set RUNNER_TOOL_CACHE to the same path as GitHub-hosted runners so the
+  version hash matches:
+
+  On Linux self-hosted runners, set the env var before starting the runner:
+    export RUNNER_TOOL_CACHE=/opt/hostedtoolcache
+
+  Option 2 — Include runner type in the cache key.
+  Scope the cache key so each runner type writes and reads its own cache entry,
+  eliminating cross-type lookups entirely.
+
+  Option 3 — Use restore-keys for cross-runner sharing.
+  Add a broad restore-keys prefix that matches entries from any runner type.
+  This still misses due to the version difference, so this option does NOT work.
+  Use option 1 or 2 instead.
+fix_code:
+  - language: yaml
+    label: 'Option 1 — Pin RUNNER_TOOL_CACHE on self-hosted runner (at OS level, not workflow)'
+    code: |
+      # On Linux self-hosted runner host, before starting the runner service:
+      # export RUNNER_TOOL_CACHE=/opt/hostedtoolcache
+      # Or add to /etc/environment for persistence.
+
+      # Your workflow cache step remains unchanged:
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+  - language: yaml
+    label: 'Option 2 — Include runner type in cache key to scope per runner'
+    code: |
+      - name: Cache dependencies (runner-type scoped)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          # Add runner.environment or a custom env var to the key
+          key: ${{ runner.os }}-${{ env.RUNNER_TYPE }}-pip-${{ hashFiles('**/requirements.txt') }}
+        env:
+          RUNNER_TYPE: ${{ contains(runner.name, 'self') && 'self-hosted' || 'github-hosted' }}
+  - language: yaml
+    label: 'Option 3 — Separate seed job on same runner type as consuming jobs'
+    code: |
+      jobs:
+        seed-cache:
+          # Run seed job on the SAME runner type that will consume the cache
+          runs-on: self-hosted  # Changed from ubuntu-latest to self-hosted
+          steps:
+            - uses: actions/checkout@v4
+            - name: Seed cache
+              uses: actions/cache@v4
+              with:
+                path: ~/.cache/pip
+                key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+            - run: pip install -r requirements.txt
+
+        build:
+          needs: seed-cache
+          runs-on: self-hosted  # Same runner type as seed-cache
+          steps:
+            - uses: actions/checkout@v4
+            - name: Restore cache
+              uses: actions/cache@v4
+              with:
+                path: ~/.cache/pip
+                key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+prevention:
+  - "Never mix GitHub-hosted and self-hosted runners in workflows that share a cache entry unless RUNNER_TOOL_CACHE is standardized."
+  - "When using self-hosted runners, always set RUNNER_TOOL_CACHE to the same value as GitHub-hosted runners for the OS."
+  - "If you suspect a version mismatch, use the Cache REST API to verify the entry exists and check the version field."
+  - "Include runner.environment or a custom RUNNER_TYPE marker in cache keys when mixing runner types is unavoidable."
+docs:
+  - url: 'https://github.com/actions/cache/issues/1595'
+    label: 'actions/cache#1595: GitHub-hosted runner-generated cache entry not found from self-hosted runner'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-where-your-workflow-runs/about-self-hosted-runners'
+    label: 'GitHub Docs: About self-hosted runners'
+  - url: 'https://github.com/actions/cache/blob/main/tips-and-workarounds.md'
+    label: 'actions/cache: Tips and workarounds'
