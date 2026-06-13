@@ -1,0 +1,131 @@
+id: tr-118
+title: '`workflow_run` `requested` Activity Type Fires When Upstream Is Queued — Before Execution, Artifacts Unavailable'
+category: triggers
+severity: silent-failure
+tags:
+  - workflow_run
+  - requested
+  - activity-types
+  - artifacts
+  - default-branch
+  - timing
+  - pre-execution
+patterns:
+  - regex: 'types:\s*\[.*\brequested\b'
+    flags: 'si'
+  - regex: 'types:\s*\n(\s+- [^\n]+\n)*\s+- requested'
+    flags: 'si'
+error_messages:
+  - "Unable to find artifact"
+  - "Error: Artifact not found for associated workflow run"
+  - "No artifact found with name"
+root_cause: |
+  The `workflow_run` event supports three activity types: `completed`, `in_progress`,
+  and `requested`. The `requested` type fires when the upstream workflow run is
+  **queued** — before any steps have executed.
+
+  Developers who use `types: [requested]` expecting to access upstream workflow
+  results (artifacts, job outputs, step conclusions) will find nothing is available.
+  The upstream workflow has not run yet.
+
+  Key behaviors of the `requested` type:
+
+  1. **No artifacts** — The upstream workflow has not uploaded anything yet.
+  2. **Null conclusion** — `github.event.workflow_run.conclusion` is `null` at
+     request time; the run has not completed.
+  3. **Fires for subsequently cancelled runs** — If the upstream workflow is cancelled
+     before execution (e.g., superseded by a concurrency group), the downstream
+     `requested`-triggered workflow still runs to completion, wasting runner minutes
+     processing a run that never produced output.
+  4. **Default-branch requirement** — Like ALL `workflow_run` triggers, the listening
+     workflow must be on the repository's default branch. Even if the upstream runs
+     on a feature branch, the downstream always executes from the default branch.
+  5. **No upstream-blocking capability** — `workflow_run` is downstream-only. A
+     `requested` listener cannot pause or influence the upstream workflow.
+
+  The docs say `requested` fires "when a workflow run is requested", which developers
+  interpret as "just before my CI runs — time to prepare". In practice, it fires the
+  moment the run is queued, with zero upstream data available.
+fix: |
+  Use `completed` to access upstream artifacts, outputs, and conclusion:
+
+    on:
+      workflow_run:
+        workflows: ["CI"]
+        types: [completed]
+
+  Use `in_progress` to react as soon as the upstream workflow begins executing
+  (artifacts still unavailable but the run is confirmed started and not cancelled).
+
+  Use `requested` only for pure notification/audit workflows that need no upstream
+  results — for example, posting "CI run queued" to a webhook using only metadata
+  fields like `github.event.workflow_run.html_url` and `github.event.workflow_run.id`.
+
+  If you need to set up resources BEFORE an upstream workflow runs, `workflow_run`
+  is not the right tool — it cannot block the upstream. Use job-dependency ordering
+  within a single workflow, or a `repository_dispatch` from a setup job.
+fix_code:
+  - language: yaml
+    label: 'WRONG — requested type; artifacts unavailable; upstream may be queued but not run'
+    code: |
+      on:
+        workflow_run:
+          workflows: ["Build"]
+          types: [requested]   # fires when Build is QUEUED, not when it finishes
+
+      jobs:
+        process:
+          runs-on: ubuntu-latest
+          steps:
+            # FAILS: No artifact exists — Build has not executed yet
+            - uses: actions/download-artifact@v4
+              with:
+                run-id: ${{ github.event.workflow_run.id }}
+                name: build-output
+  - language: yaml
+    label: 'CORRECT — use completed type and guard on conclusion'
+    code: |
+      on:
+        workflow_run:
+          workflows: ["Build"]
+          types: [completed]   # fires AFTER Build finishes (artifacts available)
+
+      jobs:
+        process:
+          if: ${{ github.event.workflow_run.conclusion == 'success' }}
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/download-artifact@v4
+              with:
+                run-id: ${{ github.event.workflow_run.id }}
+                name: build-output
+            - run: echo "Processing build artifact..."
+  - language: yaml
+    label: 'VALID use of requested — notification only (no upstream artifacts needed)'
+    code: |
+      on:
+        workflow_run:
+          workflows: ["CI"]
+          types: [requested]   # appropriate: notification only, no artifacts needed
+
+      jobs:
+        notify:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Post CI started notification
+              run: |
+                curl -s -X POST "$WEBHOOK_URL" \
+                  -d "CI run queued: ${{ github.event.workflow_run.html_url }}"
+              env:
+                WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+prevention:
+  - 'Use `completed` type when your downstream workflow needs upstream artifacts, outputs, or conclusion.'
+  - 'Use `in_progress` to react as soon as the upstream workflow begins executing (no artifacts yet, but run is confirmed started).'
+  - '`requested` is only appropriate for workflows that need NO upstream results — pure notifications or audit logs.'
+  - 'Always guard `completed`-triggered jobs with `if: github.event.workflow_run.conclusion == ''success''` to skip failed upstream runs.'
+  - 'Remember: all `workflow_run` listeners execute from the default branch regardless of the upstream workflow''s branch.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#workflow_run'
+    label: 'GitHub Docs — workflow_run event and activity types'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#using-data-from-the-triggering-workflow'
+    label: 'GitHub Docs — Using data from the triggering workflow'

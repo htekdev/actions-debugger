@@ -1,0 +1,130 @@
+id: ct-104
+title: 'Branch-Scoped Concurrency Group Allows Simultaneous Deployments to the Same Environment from Different Branches'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - environment
+  - deployment
+  - branch
+  - github-ref
+  - cross-branch
+  - concurrent-deploy
+  - job-environment
+patterns:
+  - regex: 'group:\s*[''"]?[^''"\n]*\$\{\{\s*github\.ref[^}]*\}\}[^''"\n]*'
+    flags: 'i'
+  - regex: 'group:\s*[''"]?[^''"\n]*\$\{\{\s*github\.ref_name[^}]*\}\}[^''"\n]*'
+    flags: 'i'
+  - regex: 'group:\s*[''"]?[^''"\n]*\$\{\{\s*github\.head_ref[^}]*\}\}[^''"\n]*'
+    flags: 'i'
+error_messages:
+  - "# No error — two branches deploy to the same environment simultaneously; may cause partial state or deployment races"
+root_cause: |
+  Workflows that include `github.ref`, `github.ref_name`, or `github.head_ref` in
+  their concurrency group key create **separate concurrency groups per branch**. When
+  two branches push to a workflow that deploys to the same environment, they get
+  different concurrency groups and do NOT queue or cancel each other.
+
+  Example:
+  - Branch `feature/alpha` pushes → group: `deploy-staging-refs/heads/feature/alpha`
+  - Branch `main` pushes       → group: `deploy-staging-refs/heads/main`
+  - Groups are different → both jobs run simultaneously → both deploy to `staging`
+
+  This pattern is correct for CI workflows (each branch's tests should run
+  independently), but incorrect for shared deployment environments where only one
+  deployment should be active at a time.
+
+  The confusion is common because teams copy a per-branch concurrency pattern from
+  CI into deploy workflows without adjusting the key. Environment protection rules
+  (required reviewers, wait timers) gate each individual job but do NOT prevent
+  multiple simultaneous deployments from different concurrency groups.
+
+  GitHub Actions provides the `job.environment` context — the environment name string
+  for the current job — which creates a stable, per-environment concurrency key that
+  applies across all branches deploying to that environment.
+fix: |
+  Key the concurrency group on the environment name, not the branch ref, so all
+  branches deploying to the same environment share one concurrency slot:
+
+    concurrency:
+      group: deploy-${{ job.environment }}
+      cancel-in-progress: false   # queue; do not discard deploys
+
+  Important: `job.environment` is only populated inside a job that declares
+  `environment:`. Set the concurrency group at the **job level**, not at the
+  workflow level, when using `job.environment`.
+
+  Use `cancel-in-progress: false` for deployments to ensure every triggered deploy
+  runs in order rather than being silently dropped.
+fix_code:
+  - language: yaml
+    label: 'WRONG — branch-scoped group; feature/ and main can deploy to staging simultaneously'
+    code: |
+      on: [push]
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          environment: staging
+          concurrency:
+            # BAD: different branches get different concurrency slots
+            # feature/alpha and main can both deploy to staging at the same time
+            group: deploy-staging-${{ github.ref }}
+            cancel-in-progress: true
+          steps:
+            - run: ./deploy.sh staging
+  - language: yaml
+    label: 'CORRECT — environment-scoped group; only one deploy to staging at a time'
+    code: |
+      on: [push]
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          environment: staging
+          concurrency:
+            # GOOD: all branches deploying to staging share one concurrency slot
+            # job.environment is the environment name ("staging")
+            group: deploy-${{ job.environment }}
+            cancel-in-progress: false   # queue — do not skip any deploys
+          steps:
+            - run: ./deploy.sh staging
+  - language: yaml
+    label: 'MULTI-ENV — staging and production each get their own independent slot'
+    code: |
+      on:
+        push:
+          branches: [main]
+
+      jobs:
+        deploy-staging:
+          runs-on: ubuntu-latest
+          environment: staging
+          concurrency:
+            group: deploy-${{ job.environment }}   # "staging" slot
+            cancel-in-progress: false
+          steps:
+            - run: ./deploy.sh staging
+
+        deploy-production:
+          needs: deploy-staging
+          runs-on: ubuntu-latest
+          environment: production
+          concurrency:
+            group: deploy-${{ job.environment }}   # "production" slot (separate)
+            cancel-in-progress: false
+          steps:
+            - run: ./deploy.sh production
+prevention:
+  - 'For deployment workflows, key concurrency groups on the environment name (`job.environment`), not on the branch ref.'
+  - 'Use `cancel-in-progress: false` for deployment jobs — silently dropping a deploy means a commit never reaches the environment.'
+  - 'Apply per-branch concurrency groups to CI jobs only; apply per-environment concurrency groups to deploy jobs.'
+  - 'Set job-level `concurrency:` (not workflow-level) when using `job.environment`, since that context is only available within a job.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency'
+    label: 'GitHub Docs — Using concurrency'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/accessing-contextual-information-about-workflow-runs#job-context'
+    label: 'GitHub Docs — job context (job.environment)'
+  - url: 'https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment'
+    label: 'GitHub Docs — Managing environments for deployment'
