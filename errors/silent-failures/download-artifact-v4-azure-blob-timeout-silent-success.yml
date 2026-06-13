@@ -1,0 +1,121 @@
+id: sf-230
+title: '`actions/download-artifact` v4 Azure Blob Request Timeout — Step Exits 0 Despite Download Failure'
+category: silent-failures
+severity: silent-failure
+tags:
+  - download-artifact
+  - azure-blob-storage
+  - timeout
+  - silent-failure
+  - intermittent
+  - matrix
+  - v4
+patterns:
+  - regex: 'Unable to download and extract artifact: Request timeout'
+    flags: 'i'
+  - regex: 'Unable to download artifact\(s\):.*Request timeout'
+    flags: 'i'
+  - regex: 'Unexpected HTTP response from blob storage: 503'
+    flags: 'i'
+  - regex: 'Unable to download and extract artifact: Unexpected HTTP response from blob storage'
+    flags: 'i'
+error_messages:
+  - "Error: Unable to download artifact(s): Unable to download and extract artifact: Request timeout: /actions-results/..."
+  - "Error: Unable to download artifact(s): Unable to download and extract artifact: Unexpected HTTP response from blob storage: 503 The server is busy."
+root_cause: |
+  `actions/download-artifact@v4` changed its storage backend from Azure Blob
+  Storage legacy API to the new "actions-results" service. During the v4 early
+  rollout (late 2023–early 2024), the new backend exhibited intermittent
+  connection timeouts and 503 responses under load, particularly in matrix
+  jobs where multiple jobs simultaneously download the same artifact.
+
+  The silent-failure aspect: when the download times out, the step may report
+  **exit code 0** (success) instead of failing the job. At least one confirmed
+  case shows the step always succeeds regardless of whether the artifact was
+  actually downloaded, leaving downstream steps operating on a missing or
+  empty artifact directory without any workflow failure signal.
+
+  Additional HTTP errors observed from the same backend instability:
+  - `503 The server is busy` — Azure Blob Storage overloaded
+  - `409 Public access is not permitted on this storage account` — wrong
+    endpoint or storage account configuration for the new v4 backend
+
+  These are transient infrastructure errors on GitHub's side, not caused by
+  workflow misconfiguration. The issue was most prevalent in December 2023
+  when v4 was first released, but intermittent timeouts continue to occur
+  under high concurrency.
+fix: |
+  1. **Retry on failure**: The most reliable fix is to re-run the failed job.
+     The issue is transient and typically resolves on retry.
+
+  2. **Explicit failure check**: After downloading, verify the expected files
+     actually exist before proceeding. This surfaces the silent failure:
+
+  3. **Reduce concurrent downloads**: If many matrix jobs download the same
+     artifact simultaneously, stagger them with `max-parallel` to reduce
+     pressure on the storage backend.
+
+  4. **Version consistency**: Ensure upload and download actions use the
+     same major version (v4 with v4, v3 with v3) — mismatched versions can
+     also cause download failures that manifest as timeouts.
+fix_code:
+  - language: yaml
+    label: 'Add file existence verification after download to catch silent failures'
+    code: |
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: my-artifact
+          path: dist/
+
+      # Explicitly verify download succeeded — surfaces silent timeout failures
+      - name: Verify artifact download
+        run: |
+          if [ ! -f dist/expected-file.txt ]; then
+            echo "::error::Artifact download failed silently — expected file missing"
+            exit 1
+          fi
+  - language: yaml
+    label: 'Limit parallel matrix downloads to reduce backend pressure'
+    code: |
+      jobs:
+        test:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, windows-latest, macos-latest]
+            max-parallel: 2  # Stagger artifact downloads across matrix legs
+          steps:
+            - uses: actions/download-artifact@v4
+              with:
+                name: build-output
+                path: dist/
+  - language: yaml
+    label: 'Ensure version consistency between upload and download'
+    code: |
+      jobs:
+        build:
+          steps:
+            - uses: actions/upload-artifact@v4  # ✅ v4
+              with:
+                name: my-artifact
+                path: dist/
+
+        test:
+          needs: build
+          steps:
+            - uses: actions/download-artifact@v4  # ✅ must match upload version
+              with:
+                name: my-artifact
+                path: dist/
+prevention:
+  - 'Always verify artifact file existence after download in critical workflows — do not assume exit 0 means the file is present'
+  - 'Pin upload and download artifact action versions to the same major version to prevent backend API mismatches'
+  - 'Use `max-parallel` on matrix jobs that download artifacts to avoid thundering-herd pressure on blob storage'
+  - 'Add `continue-on-error: false` explicitly and a post-download verification step to detect silent timeouts early'
+docs:
+  - url: 'https://github.com/actions/download-artifact/issues/249'
+    label: 'actions/download-artifact#249 — Unable to download and extract artifact: Request timeout (115 reactions)'
+  - url: 'https://github.com/actions/download-artifact/blob/main/docs/MIGRATION.md'
+    label: 'actions/download-artifact migration guide — v3 to v4 breaking changes'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-workflow-data-as-artifacts'
+    label: 'GitHub Docs — Storing workflow data as artifacts'
