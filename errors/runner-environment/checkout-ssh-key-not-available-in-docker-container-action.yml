@@ -1,0 +1,120 @@
+id: runner-environment-490
+title: 'actions/checkout ssh-key not available in subsequent Docker container actions'
+category: runner-environment
+severity: error
+tags:
+  - ssh
+  - ssh-key
+  - container-action
+  - docker
+  - checkout
+  - git-push
+  - private-repo
+patterns:
+  - regex: 'Identity file.*?_temp.*?not accessible: No such file or directory'
+    flags: 'i'
+  - regex: 'No RSA host key is known for.*?and you have requested strict checking'
+    flags: 'i'
+  - regex: 'Host key verification failed'
+    flags: 'i'
+  - regex: 'Warning: Identity file.*?runner.*?work.*?_temp.*?not accessible'
+    flags: 'i'
+error_messages:
+  - 'Warning: Identity file /home/runner/work/_temp/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx not accessible: No such file or directory.'
+  - 'No RSA host key is known for github.com and you have requested strict checking.'
+  - 'Host key verification failed.'
+  - 'fatal: Could not read from remote repository.'
+root_cause: |
+  When `actions/checkout` is used with the `ssh-key:` input, the runner saves the SSH
+  private key to a temporary file inside `/home/runner/work/_temp/` and starts an
+  `ssh-agent` process with the key loaded. The path to the key file and the
+  `SSH_AUTH_SOCK` socket are set on the HOST runner environment.
+
+  Docker container actions (actions defined with `runs: using: docker`) run inside
+  isolated Docker containers. The runner does NOT mount `/home/runner/work/_temp/` or
+  the `ssh-agent` socket into the container. As a result:
+
+  - The SSH identity file path that was configured on the host is not accessible inside
+    the container.
+  - The `SSH_AUTH_SOCK` environment variable, even if forwarded, points to a socket
+    that doesn't exist inside the container.
+  - Any git operation that requires SSH authentication inside the container (git push,
+    git fetch to private repos, git submodule update) will fail with "Host key
+    verification failed" or "Identity file not accessible".
+
+  This is a structural limitation of how Docker container actions are sandboxed: they
+  have access to the workspace (`/github/workspace`) and specific environment variables,
+  but do NOT have access to the host runner's SSH agent or temp file directory.
+
+  Notably, this does NOT affect JavaScript actions (`runs: using: node20`) or
+  composite actions with `run:` steps — those run directly on the host and inherit
+  the SSH agent socket correctly.
+fix: |
+  The SSH key set up by `actions/checkout` is not available inside Docker container
+  actions. Use one of these approaches:
+
+  1. **Avoid Docker container actions that need SSH**: Prefer JavaScript actions or
+     composite actions with `run:` steps for tasks that need SSH, as these inherit
+     the host SSH agent.
+
+  2. **Explicitly pass the SSH key to the container via env**: Set the SSH private key
+     as an environment variable and reconfigure SSH inside the container step. Note:
+     this only works in composite `run:` steps, not inside Docker container actions.
+
+  3. **Use HTTPS with token instead of SSH**: Replace SSH-based git operations with
+     HTTPS using the GITHUB_TOKEN. This works in any environment.
+
+  4. **Run git operations in a `run:` step before/after the container action**: Perform
+     any SSH-requiring git operations in plain shell steps which run on the host.
+fix_code:
+  - language: yaml
+    label: 'Use HTTPS instead of SSH for git operations in Docker container actions'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              # Instead of ssh-key, configure git to use the GITHUB_TOKEN over HTTPS
+              with:
+                token: ${{ secrets.GITHUB_TOKEN }}
+                persist-credentials: true
+
+            # A Docker container action can use HTTPS-based git (no SSH needed)
+            - uses: some-org/some-docker-action@v1
+              with:
+                github-token: ${{ secrets.GITHUB_TOKEN }}
+  - language: yaml
+    label: 'Perform git operations in run: steps (not Docker actions) when SSH is needed'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                ssh-key: ${{ secrets.DEPLOY_KEY }}
+
+            # SSH agent IS available here (run: step on host)
+            - name: Git push via SSH
+              run: |
+                git config user.email "bot@example.com"
+                git config user.name "CI Bot"
+                git commit -am "update files"
+                git push  # SSH works in run: steps
+
+            # Docker container action AFTER the SSH operations are done
+            - uses: some-org/some-docker-action@v1
+              # This action doesn't need SSH — it just reads the workspace
+prevention:
+  - 'Use `token:` (HTTPS) with `actions/checkout` instead of `ssh-key:` when subsequent steps include Docker container actions that need to push/fetch'
+  - 'Perform all SSH-requiring git operations in `run:` shell steps, which execute on the host and inherit the SSH agent; place these before or after Docker container action steps'
+  - 'Check if the Docker container action you are using offers an alternative HTTPS/token-based mode for git operations'
+  - 'JavaScript actions and composite `run:` steps DO inherit the SSH agent correctly — prefer these over Docker container actions when SSH is needed'
+docs:
+  - url: 'https://github.com/actions/checkout/issues/297'
+    label: 'actions/checkout#297 — SSH key not available in container actions'
+  - url: 'https://docs.github.com/en/actions/sharing-automations/creating-actions/creating-a-docker-container-action'
+    label: 'GitHub Docs: Creating a Docker container action'
+  - url: 'https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions'
+    label: 'GitHub Docs: Workflow commands — environment files'

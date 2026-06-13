@@ -1,0 +1,98 @@
+id: caching-artifacts-148
+title: 'actions/cache fails in Alpine containers — BusyBox tar does not support -P flag'
+category: caching-artifacts
+severity: error
+tags:
+  - alpine
+  - busybox
+  - tar
+  - container
+  - cache
+  - linux
+patterns:
+  - regex: '/bin/tar: unrecognized option: P'
+    flags: 'i'
+  - regex: 'Tar failed with error: The process.*?/bin/tar.*?failed with exit code 1'
+    flags: 'i'
+  - regex: 'BusyBox.*?tar.*?Usage: tar'
+    flags: 'i'
+  - regex: '\[warning\]Tar failed with error.*?exit code 1'
+    flags: 'i'
+error_messages:
+  - '/bin/tar: unrecognized option: P'
+  - '[warning]Tar failed with error: The process ''/bin/tar'' failed with exit code 1'
+  - 'BusyBox v1.31.1 () multi-call binary.'
+root_cause: |
+  `actions/cache` uses GNU tar with the `-P` flag (preserve absolute pathnames) when
+  creating and extracting cache archives. Alpine Linux containers ship BusyBox instead
+  of GNU tar. BusyBox's `tar` implementation does not support the `-P` flag, causing
+  the cache save and restore steps to fail with exit code 1.
+
+  The container's `/bin/tar` is the BusyBox multi-call binary, which supports only a
+  limited subset of tar flags. The `-P` flag that `actions/cache` passes is not in that
+  subset, so BusyBox immediately prints its usage and exits non-zero.
+
+  This issue was first reported in 2022 (actions/cache#352, 20 reactions) and continues
+  to affect any workflow running `actions/cache` inside an Alpine-based job container.
+fix: |
+  The fix is to install GNU tar inside the Alpine container before the cache step runs.
+  Alpine provides GNU tar via the `tar` package in the community repository.
+
+  Option 1: Install GNU tar at the start of the job:
+    - run: apk add --no-cache tar
+
+  Option 2: Add a step before checkout/cache to install GNU tar, then proceed as normal.
+
+  Option 3: Use a non-Alpine base image for jobs that require caching (e.g., Debian slim,
+  Ubuntu). BusyBox-based images are generally incompatible with actions that rely on
+  GNU-specific flags.
+fix_code:
+  - language: yaml
+    label: 'Install GNU tar in Alpine container before cache steps'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          container:
+            image: alpine:3.19
+          steps:
+            # Install GNU tar so actions/cache can use -P and other GNU flags
+            - name: Install GNU tar
+              run: apk add --no-cache tar
+
+            - uses: actions/checkout@v4
+
+            - uses: actions/cache@v4
+              with:
+                path: ~/.npm
+                key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+
+            - name: Install dependencies
+              run: npm ci
+  - language: yaml
+    label: 'Switch to a Debian/Ubuntu slim image to avoid BusyBox tar entirely'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          container:
+            # Use debian-slim instead of alpine to get GNU tar by default
+            image: node:20-slim
+          steps:
+            - uses: actions/checkout@v4
+            - uses: actions/cache@v4
+              with:
+                path: ~/.npm
+                key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+prevention:
+  - 'Always install GNU tar (`apk add --no-cache tar`) as the first step in Alpine container jobs that use `actions/cache`'
+  - 'Consider switching from Alpine to a Debian or Ubuntu slim base image for CI containers — they include GNU tar by default'
+  - 'Test `tar --version` in your container before adding cache steps; output containing "BusyBox" means GNU tar is not available'
+  - 'Use `cache-from` / `cache-to` Docker layer caching instead of `actions/cache` if your workflow is Alpine-only'
+docs:
+  - url: 'https://github.com/actions/cache/issues/352'
+    label: 'actions/cache#352 — tar command uses an option not available in BusyBox (20 reactions)'
+  - url: 'https://github.com/actions/cache/issues/1765'
+    label: 'actions/cache#1765 — Post cache not working on alpine runners (reopened June 2026)'
+  - url: 'https://github.com/actions/cache'
+    label: 'actions/cache documentation'
