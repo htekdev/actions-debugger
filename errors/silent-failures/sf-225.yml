@@ -1,0 +1,114 @@
+id: sf-225
+title: '`if: always()` Combined With `needs.result` Conditions Still Causes Job Skip When All Dependencies Are Skipped'
+category: silent-failures
+severity: silent-failure
+tags:
+  - needs
+  - always
+  - skipped
+  - job-conditions
+  - status-check
+  - if-expression
+  - pipeline
+patterns:
+  - regex: 'always\(\)\s*&&\s*needs\.\w+\.result\s*!=\s*[''"](?:failure|failed)[''"]'
+    flags: 'i'
+  - regex: 'always\(\)\s*&&\s*needs\.\w+\.result\s*==\s*[''"](?:success|skipped)[''"]'
+    flags: 'i'
+  - regex: 'This job was skipped'
+    flags: 'i'
+error_messages:
+  - "This job was skipped."
+  - "Skipping this job because a previous job in the chain was skipped."
+root_cause: |
+  GitHub Actions evaluates `if:` expressions on jobs in two passes. First, it applies
+  an implicit default status check: if no status check function is present, only jobs
+  whose `needs` dependencies all succeeded will run.
+
+  `always()` overrides this implicit check and forces evaluation. However, when
+  `always()` is combined with additional boolean conditions that inspect `needs.X.result`
+  — such as `if: always() && needs.deploy.result != 'failure'` — the behavior can
+  still produce a skip in certain multi-dependency graphs.
+
+  The root cause (documented in actions/runner#2205, 83 reactions) is that
+  `always()` does NOT make all sub-expressions of the `&&` chain evaluate in a
+  "permissive" mode. If any `needs` dependency is in a `skipped` state and the
+  combined condition evaluates to a result that the runner interprets as "the
+  pre-condition for running this job was not met," the job is silently skipped.
+
+  Community-confirmed workaround: replace `if: always()` or
+  `if: always() && needs.X.result != 'failed'` with
+  `if: !failure() && !cancelled()`. This idiom explicitly allows the job to run
+  when all predecessors either succeeded or were skipped, without triggering
+  on genuine failures or cancellations.
+fix: |
+  Replace `if: always()` (or `if: always() && needs.X.result != 'failed'`) with
+  `if: !failure() && !cancelled()` on downstream jobs that should run whenever
+  upstream jobs either succeeded OR were skipped — but NOT when something actively
+  failed.
+
+  Use `if: always()` only for jobs that must run unconditionally, regardless of
+  any upstream failure (e.g., final cleanup or notification steps).
+fix_code:
+  - language: yaml
+    label: 'PROBLEMATIC — job may still be skipped when needs deps are skipped'
+    code: |
+      jobs:
+        optional-build:
+          runs-on: ubuntu-latest
+          if: github.ref == 'refs/heads/main'
+          steps:
+            - run: make build
+
+        notify:
+          needs: optional-build
+          runs-on: ubuntu-latest
+          # WRONG: always() + needs condition can still cause skip
+          if: always() && needs.optional-build.result != 'failure'
+          steps:
+            - run: echo "Notifying..."
+  - language: yaml
+    label: 'CORRECT — use !failure() && !cancelled() for reliable skip-tolerant jobs'
+    code: |
+      jobs:
+        optional-build:
+          runs-on: ubuntu-latest
+          if: github.ref == 'refs/heads/main'
+          steps:
+            - run: make build
+
+        notify:
+          needs: optional-build
+          runs-on: ubuntu-latest
+          # CORRECT: runs when build succeeded OR was skipped; does not run on failure/cancel
+          if: '!failure() && !cancelled()'
+          steps:
+            - run: echo "Notifying..."
+  - language: yaml
+    label: 'CORRECT — unconditional run (cleanup/final step always runs)'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./deploy.sh
+
+        report:
+          needs: [build, deploy]
+          runs-on: ubuntu-latest
+          # Use always() only when the job must run regardless of ANY outcome
+          if: always()
+          steps:
+            - run: echo "Pipeline result for ${{ needs.deploy.result }}"
+prevention:
+  - 'Use `if: !failure() && !cancelled()` for jobs that should run when predecessors succeeded or were skipped, but NOT on failure.'
+  - 'Use `if: always()` only for unconditional jobs (cleanup, summaries) that must run regardless of any failure.'
+  - 'Avoid `if: always() && needs.X.result != ''failure''` — this combined form can behave unexpectedly when all needs are in skipped state.'
+  - 'Test workflows with `workflow_dispatch` and manually skip a dependency to verify downstream jobs behave correctly.'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-conditions-to-control-job-execution'
+    label: 'GitHub Docs — Using conditions to control job execution'
+  - url: 'https://github.com/actions/runner/issues/2205'
+    label: 'actions/runner#2205 — Jobs skipped when NEEDS job ran successfully (83 reactions)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions#status-check-functions'
+    label: 'GitHub Docs — Status check functions (always, failure, cancelled, success)'
