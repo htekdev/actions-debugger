@@ -1,0 +1,130 @@
+id: permissions-auth-124
+title: 'OIDC sub Claim for pull_request.closed Does Not Match refs/heads/main IAM Trust Policy'
+category: permissions-auth
+severity: error
+tags:
+  - oidc
+  - aws
+  - iam
+  - pull-request
+  - sub-claim
+  - AssumeRoleWithWebIdentity
+  - pull-request-closed
+patterns:
+  - regex: 'Not authorized to perform sts:AssumeRoleWithWebIdentity'
+    flags: 'i'
+  - regex: 'error.*AssumeRoleWithWebIdentity.*not authorized'
+    flags: 'i'
+  - regex: 'Is not authorized to assume role.*pull.request'
+    flags: 'i'
+error_messages:
+  - 'Not authorized to perform sts:AssumeRoleWithWebIdentity'
+  - 'Error: Not authorized to perform sts:AssumeRoleWithWebIdentity'
+  - 'Error: Assuming role failed: Not authorized to perform sts:AssumeRoleWithWebIdentity'
+root_cause: |
+  When a workflow is triggered by a `pull_request` event (including `types: [closed]` used
+  for post-merge deployments), the OIDC `sub` (subject) claim in the GitHub-issued JWT is
+  **always** `repo:<org>/<repo>:pull_request` — regardless of whether the PR was merged into
+  `main` or another branch.
+
+  Developers commonly configure their AWS IAM trust policy with:
+  ```
+  "token.actions.githubusercontent.com:sub": "repo:<org>/<repo>:ref:refs/heads/main"
+  ```
+  This condition matches `push` events on `main` but **never** matches a
+  `pull_request.closed` event, because the sub claim format is different for PR events.
+
+  Result: the OIDC credential exchange fails with `Not authorized to perform
+  sts:AssumeRoleWithWebIdentity` even though the PR was successfully merged to main and the
+  intent is to deploy from main.
+
+  GitHub OIDC sub claim formats by event type:
+  - `push` to main → `repo:<org>/<repo>:ref:refs/heads/main`
+  - `pull_request` (any type) → `repo:<org>/<repo>:pull_request`
+  - `workflow_dispatch` → `repo:<org>/<repo>:ref:refs/heads/<branch>`
+  - `release` → `repo:<org>/<repo>:ref:refs/tags/<tag>`
+fix: |
+  Update the AWS IAM trust policy to also allow `pull_request` sub claims for the same
+  role, OR use a separate IAM role for PR-triggered deployments, OR switch the trigger to
+  `push` on main (which fires after merge and has the `refs/heads/main` sub claim).
+
+  **Option 1 — Allow both sub patterns in the same role (StringLike array):**
+  Add `repo:<org>/<repo>:pull_request` alongside the existing branch condition.
+
+  **Option 2 — Switch trigger to push on main:**
+  Replace the `pull_request: [closed]` trigger with `push: branches: [main]`. The push
+  event fires after a merge and its sub claim will be `refs/heads/main`.
+
+  **Option 3 — Custom sub claim (recommended for tight scoping):**
+  Enable custom OIDC sub claim configuration in GitHub repository/org settings to scope
+  the subject to `environment:<name>` or `job_workflow_ref` instead of the default event
+  sub, then update the IAM condition accordingly.
+fix_code:
+  - language: yaml
+    label: 'IAM trust policy — allow both push and pull_request sub claims'
+    code: |
+      # In AWS IAM Role trust policy JSON:
+      # "Condition": {
+      #   "StringEquals": {
+      #     "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+      #   },
+      #   "StringLike": {
+      #     "token.actions.githubusercontent.com:sub": [
+      #       "repo:my-org/my-repo:ref:refs/heads/main",
+      #       "repo:my-org/my-repo:pull_request"
+      #     ]
+      #   }
+      # }
+
+      # Workflow that uses pull_request.closed:
+      on:
+        pull_request:
+          branches: [main]
+          types: [closed]
+
+      jobs:
+        deploy:
+          if: github.event.pull_request.merged == true
+          runs-on: ubuntu-latest
+          permissions:
+            id-token: write
+            contents: read
+          steps:
+            - uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-to-assume: arn:aws:iam::123456789012:role/deploy-role
+                aws-region: us-east-1
+  - language: yaml
+    label: 'Preferred — switch to push trigger to get refs/heads/main sub claim'
+    code: |
+      # push to main fires AFTER merge; sub claim is refs/heads/main
+      on:
+        push:
+          branches: [main]
+
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          permissions:
+            id-token: write
+            contents: read
+          steps:
+            - uses: aws-actions/configure-aws-credentials@v4
+              with:
+                role-to-assume: arn:aws:iam::123456789012:role/deploy-role
+                aws-region: us-east-1
+prevention:
+  - 'Prefer `push` on `main` over `pull_request.closed` for post-merge deployments — the sub claim is cleaner and matches the branch ref'
+  - 'Document which sub claim format each IAM role trusts so future changes remain consistent'
+  - 'Use `github.event.pull_request.merged == true` guard when using `pull_request.closed` trigger to avoid deploying on unmerged close'
+  - 'Test OIDC trust policy by printing the sub claim: add a step `run: echo $ACTIONS_ID_TOKEN_REQUEST_URL` and decode the token to verify sub format'
+  - 'Consider GitHub custom OIDC sub claims (repository settings → Actions → General) to bind trust to a specific environment rather than the event type'
+docs:
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect#understanding-the-oidc-token'
+    label: 'GitHub Docs — Understanding the OIDC token — sub claim format per event type'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services'
+    label: 'GitHub Docs — Configuring OIDC in AWS'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect#customizing-the-subject-claims-for-an-organization-or-repository'
+    label: 'GitHub Docs — Customizing OIDC subject claims'
+  - url: 'https://stackoverflow.com/q/78746014'
+    label: 'Stack Overflow — Not authorized to perform sts:AssumeRoleWithWebIdentity during OIDC on PR merge'

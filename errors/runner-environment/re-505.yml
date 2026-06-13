@@ -1,0 +1,116 @@
+id: runner-environment-505
+title: 'GPG Signing Fails — "Inappropriate ioctl for device" (No TTY in Runner)'
+category: runner-environment
+severity: error
+tags:
+  - gpg
+  - signing
+  - maven
+  - gradle
+  - pinentry
+  - non-interactive
+  - ossrh
+patterns:
+  - regex: 'gpg: signing failed: Inappropriate ioctl for device'
+    flags: 'i'
+  - regex: 'gpg:\s+signing failed.*ioctl'
+    flags: 'i'
+  - regex: 'error:.*sign.*ioctl for device'
+    flags: 'i'
+error_messages:
+  - 'gpg: signing failed: Inappropriate ioctl for device'
+  - 'gpg: [stdin]: sign+encrypt failed: Inappropriate ioctl for device'
+  - 'Error: Process completed with exit code 2.'
+root_cause: |
+  GitHub Actions runners have no interactive terminal (TTY). The GPG agent's default
+  `pinentry` mode requires a real TTY to prompt the user for a passphrase — even when the
+  passphrase is provided via environment variable or Maven/Gradle settings. Without a TTY,
+  `pinentry` cannot open a terminal for input and raises `Inappropriate ioctl for device`
+  (IOCTL ENOTTY).
+
+  This affects any workflow that invokes GPG signing directly or through build tools
+  (Maven `maven-gpg-plugin`, Gradle signing plugin, `git commit --gpg-sign`, etc.). The
+  passphrase **is** available but GPG refuses to read it through the non-TTY path unless
+  explicitly told to use loopback mode.
+
+  Common trigger scenarios:
+  - Publishing Java artifacts to Maven Central / Sonatype OSSRH via `maven-gpg-plugin`
+  - Signing releases with the Gradle signing plugin
+  - Creating signed git tags or commits inside a workflow
+  - Any `gpg --batch --sign` invocation without `--pinentry-mode loopback`
+fix: |
+  Use `--pinentry-mode loopback` to tell GPG to read the passphrase from the calling
+  process rather than launching a pinentry dialog. This must be configured at both the
+  GPG-agent level and, for build tool plugins, in their plugin configuration.
+
+  **For Maven `maven-gpg-plugin`:** add `<gpgArguments>` with `--pinentry-mode loopback`.
+  **For direct `gpg` commands:** pass `--batch --pinentry-mode loopback`.
+  **For git commit signing:** set `GPG_TTY` and configure `gpg.program` wrapper.
+fix_code:
+  - language: yaml
+    label: 'Maven GPG plugin — add pinentry-mode loopback in pom.xml'
+    code: |
+      # In pom.xml inside the maven-gpg-plugin <configuration>:
+      # <gpgArguments>
+      #   <arg>--pinentry-mode</arg>
+      #   <arg>loopback</arg>
+      # </gpgArguments>
+
+      # Workflow step that triggers the signed deploy:
+      - name: Publish to Maven Central
+        run: mvn --no-transfer-progress --batch-mode clean deploy -P release -DskipTests
+        env:
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+  - language: yaml
+    label: 'Direct GPG signing — set pinentry-mode loopback via gpg.conf'
+    code: |
+      - name: Configure GPG for non-interactive signing
+        run: |
+          mkdir -p ~/.gnupg
+          chmod 700 ~/.gnupg
+          echo "use-agent" >> ~/.gnupg/gpg.conf
+          echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
+          echo "allow-loopback-pinentry" >> ~/.gnupg/gpg-agent.conf
+          echo "RELOADAGENT" | gpg-connect-agent
+        shell: bash
+
+      - name: Import GPG key
+        run: echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+        env:
+          GNUPGHOME: ~/.gnupg
+
+      - name: Sign file
+        run: gpg --batch --yes --passphrase "${{ secrets.GPG_PASSPHRASE }}" --pinentry-mode loopback --detach-sign file.tar.gz
+  - language: yaml
+    label: 'actions/setup-java with gpg-private-key — passphrase via env var'
+    code: |
+      - name: Set up Java with GPG
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE   # env var name, not the value
+
+      # In pom.xml maven-gpg-plugin add:
+      # <gpgArguments><arg>--pinentry-mode</arg><arg>loopback</arg></gpgArguments>
+
+      - name: Deploy
+        run: mvn --batch-mode deploy -P release
+        env:
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+prevention:
+  - 'Always add `--pinentry-mode loopback` when invoking GPG in a non-interactive environment'
+  - 'Add `pinentry-mode loopback` and `allow-loopback-pinentry` to `~/.gnupg/gpg.conf` and `gpg-agent.conf` respectively at the start of the job'
+  - 'For Maven: configure `<gpgArguments>` in the `maven-gpg-plugin` rather than passing flags on the command line'
+  - 'Import the GPG key in a dedicated step before any signing step; verify import with `gpg --list-secret-keys`'
+  - 'Test signing in CI with a throwaway key before production deployment'
+docs:
+  - url: 'https://www.gnupg.org/documentation/manuals/gnupg/Agent-Configuration.html'
+    label: 'GnuPG Agent Configuration — allow-loopback-pinentry'
+  - url: 'https://maven.apache.org/plugins/maven-gpg-plugin/sign-mojo.html'
+    label: 'maven-gpg-plugin sign goal — gpgArguments parameter'
+  - url: 'https://stackoverflow.com/q/77703115'
+    label: 'Stack Overflow — gpg: signing failed: Inappropriate ioctl for device on GitHub Actions'
+  - url: 'https://docs.github.com/en/actions/use-cases-and-examples/publishing-packages/publishing-java-packages-with-maven'
+    label: 'GitHub Docs — Publishing Java packages with Maven'
