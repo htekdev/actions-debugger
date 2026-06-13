@@ -1,0 +1,117 @@
+id: sf-228
+title: '`softprops/action-gh-release` v2.6 Converts Existing Release to Draft and Fails to Finalize New Release'
+category: silent-failures
+severity: error
+tags:
+  - action-gh-release
+  - softprops
+  - release
+  - github-release
+  - tag
+  - overwrite
+  - draft
+  - finalize
+patterns:
+  - regex: 'error finalizing release.*already_exists.*tag_name'
+    flags: 'i'
+  - regex: 'HttpError: Validation Failed.*Release.*already_exists.*tag_name'
+    flags: 'i'
+  - regex: 'Using release \d+ for tag .+ instead of duplicate draft \d+'
+    flags: 'i'
+error_messages:
+  - "error finalizing release: HttpError: Validation Failed: {\"resource\":\"Release\",\"code\":\"already_exists\",\"field\":\"tag_name\"}"
+  - "retrying... (2 retries remaining)"
+  - "retrying... (1 retries remaining)"
+root_cause: |
+  In `softprops/action-gh-release` v2.6.x, the release creation logic has a race condition
+  when creating a release for a tag that already has an existing published release and the
+  workflow deletes and re-creates the tag (common in nightly/rolling release patterns).
+
+  The sequence that causes the silent corruption:
+
+  1. Workflow deletes the existing tag and immediately re-creates it at the new commit.
+  2. The action finds TWO release objects associated with the nightly tag:
+     - The **old published release** (which GitHub keeps associated with the deleted tag)
+     - A newly-created **draft release** generated in a prior race window
+  3. The action logs: `Using release <id> for tag <tag> instead of duplicate draft <id>`
+     and selects the older published release to update.
+  4. While processing, the action **converts the old published release to draft** status
+     as part of an internal update step — without surfacing this to the user.
+  5. The action then attempts to create/finalize a new release and fails with:
+     ```
+     error finalizing release: HttpError: Validation Failed:
+       {"resource":"Release","code":"already_exists","field":"tag_name"}
+     ```
+     because the tag still points to the converted-to-draft old release.
+  6. After 3 retries the workflow fails — leaving the repository with a **draft release**
+     (the converted old one) and no published release for that tag.
+
+  This is a silent failure because subscriber emails fire when the old release is briefly
+  republished (step 4 side-effect), but then the release disappears when it reverts to
+  draft status — causing user confusion and empty release page state.
+fix: |
+  **Option 1 — Pin to `v2.5.x` (immediate fix):**
+
+  Downgrade to the last stable version before v2.6 regressions:
+
+  ```yaml
+  - uses: softprops/action-gh-release@v2.5.0
+    with:
+      tag_name: nightly
+      prerelease: true
+      files: dist/*
+  ```
+
+  **Option 2 — Pre-delete the release before re-creating the tag:**
+
+  Use the GitHub CLI to explicitly delete the existing release before the tag
+  delete/recreate sequence, eliminating the duplicate-draft race:
+
+  ```yaml
+  - name: Delete existing release
+    run: |
+      gh release delete nightly --yes --cleanup-tag || true
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+  - uses: softprops/action-gh-release@v2.6.1
+    with:
+      tag_name: nightly
+      prerelease: true
+      files: dist/*
+  ```
+fix_code:
+  - language: yaml
+    label: "Stable rolling nightly release using gh CLI pre-deletion"
+    code: |
+      - name: Delete previous nightly release and tag
+        run: |
+          gh release delete nightly --yes --cleanup-tag 2>/dev/null || true
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Create new nightly release
+        uses: softprops/action-gh-release@v2.5.0
+        with:
+          tag_name: nightly
+          name: "Nightly Build ${{ github.sha }}"
+          prerelease: true
+          generate_release_notes: false
+          files: |
+            dist/Windows-*.zip
+            dist/Linux-*.AppImage
+            dist/MacOS-*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+prevention:
+  - "For rolling releases (nightly, latest), always delete the existing release with `gh release delete <tag> --yes --cleanup-tag` before tag re-creation to avoid the duplicate-draft race."
+  - "Pin action versions in workflows — use `softprops/action-gh-release@v2.5.0` or a pinned SHA until the v2.6 race condition is fixed upstream."
+  - "Audit release workflows after Dependabot bumps `softprops/action-gh-release` — the v2.5 → v2.6 upgrade is silent and introduces this race condition."
+  - "Monitor the Releases page for releases unexpectedly converting to draft status after a workflow run — this is the first symptom of this bug."
+docs:
+  - url: "https://github.com/softprops/action-gh-release/issues/772"
+    label: "softprops/action-gh-release#772: Draft release gets created, and empty release gets published (v2.6.1)"
+  - url: "https://github.com/softprops/action-gh-release/releases"
+    label: "softprops/action-gh-release releases"
+  - url: "https://docs.github.com/en/rest/releases/releases#update-a-release"
+    label: "GitHub REST API: Update a release"

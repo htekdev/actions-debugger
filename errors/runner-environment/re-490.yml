@@ -1,0 +1,120 @@
+id: re-490
+title: '`actions/setup-node` Fails When `.yarnrc.yml` Contains Yarn v4.14 `approvedGitRepositories` Key'
+category: runner-environment
+severity: error
+tags:
+  - setup-node
+  - yarn
+  - yarnrc
+  - cache
+  - approvedGitRepositories
+  - yarn-berry
+  - node
+  - caching
+patterns:
+  - regex: 'Unrecognized or legacy configuration settings found: approvedGitRepositories'
+    flags: 'i'
+  - regex: 'The .yarn config get cacheFolder. command failed with exit code: 1'
+    flags: 'i'
+  - regex: 'approvedGitRepositories.*run.*yarn config -v'
+    flags: 'i'
+error_messages:
+  - "Usage Error: Unrecognized or legacy configuration settings found: approvedGitRepositories - run \"yarn config -v\" to see the list of settings supported in Yarn"
+  - "Error: The 'yarn config get cacheFolder' command failed with exit code: 1"
+root_cause: |
+  `actions/setup-node` detects the active package manager at setup time. When `cache: 'yarn'`
+  is enabled (or auto-detected), it probes the Yarn cache folder by running:
+
+  ```
+  yarn config get cacheFolder
+  ```
+
+  Yarn v4.14 introduced `approvedGitRepositories` as a new top-level configuration key in
+  `.yarnrc.yml` to control which Git repositories can be used as package sources. If the
+  project's `.yarnrc.yml` declares `approvedGitRepositories`, but the `yarn` binary that
+  `setup-node` invokes is an older version that does not recognize this key, Yarn aborts
+  config command execution with:
+
+  ```
+  Usage Error: Unrecognized or legacy configuration settings found: approvedGitRepositories
+  ```
+
+  and exits with code 1. `setup-node` then fails with:
+
+  ```
+  Error: The 'yarn config get cacheFolder' command failed with exit code: 1
+  ```
+
+  The failure can manifest as an infinite retry loop (setup-node calls `yarn config get`
+  multiple times) before ultimately erroring out, wasting several minutes of job time.
+fix: |
+  Choose the fix that best fits your situation:
+
+  **Option 1 — Pin a matching yarn version in `setup-node` (recommended):**
+  Add `yarn-version: '4.14.1'` (or latest) so setup-node installs a Yarn binary that
+  understands `approvedGitRepositories` before it probes the cache folder.
+
+  ```yaml
+  - uses: actions/setup-node@v6
+    with:
+      node-version: '20'
+      cache: 'yarn'
+      # yarn-version is not a native setup-node input; use corepack instead:
+  - run: corepack enable && corepack prepare yarn@4.14.1 --activate
+  ```
+
+  **Option 2 — Enable corepack to auto-install the correct Yarn version first:**
+
+  ```yaml
+  - run: corepack enable
+  - uses: actions/setup-node@v6
+    with:
+      node-version: '20'
+      cache: 'yarn'
+  ```
+
+  With corepack enabled, the `yarn` invocation during setup resolves from the
+  `packageManager` field in `package.json`, which should be `yarn@4.14.x`.
+
+  **Option 3 — Disable yarn cache detection in setup-node and manage cache manually:**
+
+  ```yaml
+  - uses: actions/setup-node@v6
+    with:
+      node-version: '20'
+      # no cache: 'yarn' — skip the cacheFolder probe
+  - name: Get Yarn cache directory
+    id: yarn-cache-dir
+    run: echo "dir=$(yarn config get cacheFolder)" >> $GITHUB_OUTPUT
+  - uses: actions/cache@v4
+    with:
+      path: ${{ steps.yarn-cache-dir.outputs.dir }}
+      key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+  ```
+fix_code:
+  - language: yaml
+    label: "Use corepack to activate the correct Yarn version before setup-node"
+    code: |
+      steps:
+        - uses: actions/checkout@v6
+
+        - name: Enable Corepack (installs yarn from package.json#packageManager)
+          run: corepack enable
+
+        - uses: actions/setup-node@v6
+          with:
+            node-version: '20'
+            cache: 'yarn'
+
+        - run: yarn install --immutable
+prevention:
+  - "Always pin your Yarn version in `package.json` via the `packageManager` field (e.g., `\"packageManager\": \"yarn@4.14.1\"`) and enable corepack so all tooling uses the same binary."
+  - "When adding new `.yarnrc.yml` keys introduced in a specific Yarn version, ensure your CI pipeline installs that Yarn version before any step that invokes `yarn config` (including setup-node's auto-detection)."
+  - "Run `yarn --version` as a debug step when setup-node fails during yarn cache detection to confirm which yarn binary was being invoked."
+docs:
+  - url: "https://github.com/actions/setup-node/issues/1534"
+    label: "actions/setup-node#1534: Problem with yarn v4.14 config approvedGitRepositories"
+  - url: "https://yarnpkg.com/configuration/yarnrc#approvedGitRepositories"
+    label: "Yarn Berry docs: approvedGitRepositories configuration"
+  - url: "https://github.com/actions/setup-node#caching-packages-dependencies"
+    label: "actions/setup-node: Caching package dependencies"

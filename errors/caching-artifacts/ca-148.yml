@@ -1,0 +1,100 @@
+id: ca-148
+title: '`actions/cache` Fails in Alpine Linux Container — BusyBox `tar` Rejects `-P` Flag'
+category: caching-artifacts
+severity: error
+tags:
+  - actions-cache
+  - alpine
+  - busybox
+  - tar
+  - container
+  - linux
+  - self-hosted
+patterns:
+  - regex: '/bin/tar: unrecognized option: P'
+    flags: 'i'
+  - regex: 'BusyBox.*tar.*unrecognized|unrecognized.*option.*P.*BusyBox'
+    flags: 'i'
+  - regex: 'Tar failed with error.*bin/tar.*exit code 1'
+    flags: 'i'
+error_messages:
+  - "/bin/tar: unrecognized option: P"
+  - "BusyBox v1.31.1 () multi-call binary."
+  - "[warning]Tar failed with error: The process '/bin/tar' failed with exit code 1"
+root_cause: |
+  `actions/cache` (v3+) invokes `tar` with the `-P` / `--absolute-names` flag when
+  creating or extracting cache archives that contain absolute paths. This is a GNU tar
+  extension that instructs tar to preserve leading slashes.
+
+  Alpine Linux ships **BusyBox tar** as `/bin/tar`, which is a minimal tar implementation
+  that does not support the GNU `-P` (`--absolute-names`) flag. When the cache action
+  calls `/bin/tar ... -P ...`, BusyBox exits immediately with:
+
+  ```
+  /bin/tar: unrecognized option: P
+  BusyBox v1.31.1 () multi-call binary.
+  [warning]Tar failed with error: The process '/bin/tar' failed with exit code 1
+  ```
+
+  This causes both cache save and cache restore to fail silently (the workflow continues,
+  but the cache is never persisted or retrieved).
+
+  The issue has been present since actions/cache introduced zstd compression with
+  absolute-path support and was re-reported in actions/cache#1765 (June 2026) as a
+  re-open of the original actions/cache#352.
+fix: |
+  Install GNU tar in the Alpine container before the `actions/cache` step. BusyBox tar
+  must be replaced or overridden so that `/bin/tar` refers to the full GNU implementation.
+
+  **Option 1 — Install `tar` package in Alpine (recommended):**
+
+  ```yaml
+  - name: Install GNU tar
+    run: apk add --no-cache tar
+  ```
+
+  After `apk add tar`, Alpine's `/bin/tar` is replaced by GNU tar which supports `-P`.
+
+  **Option 2 — Use a non-Alpine base image that ships GNU tar:**
+
+  Prefer `ubuntu:24.04`, `debian:bookworm-slim`, or similar images where GNU tar is
+  present by default.
+
+  **Option 3 — Disable compression fallback (partial workaround):**
+
+  Some versions of `actions/cache` respect `SEGMENT_DOWNLOAD_TIMEOUT_MINS` or a `tar-*`
+  environment variable. Check if setting `CACHE_COMPRESSION=gzip` (if supported in your
+  version) avoids the `-P` flag. This is undocumented and version-dependent.
+fix_code:
+  - language: yaml
+    label: "Install GNU tar before actions/cache in Alpine container"
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          container:
+            image: alpine:3.19
+          steps:
+            - name: Install GNU tar (required for actions/cache)
+              run: apk add --no-cache tar
+
+            - name: Restore cache
+              uses: actions/cache@v4
+              with:
+                path: ~/.cache
+                key: ${{ runner.os }}-cache-${{ hashFiles('**/lockfiles') }}
+
+            - name: Build
+              run: make build
+prevention:
+  - "Always install GNU tar (`apk add --no-cache tar`) as an early step when using `actions/cache` in Alpine-based containers."
+  - "Test your full workflow in an Alpine container locally before relying on CI caching — BusyBox tar failures are silent (the workflow succeeds but the cache is never populated)."
+  - "Consider using `ubuntu-latest` or a Debian-based runner/container image to avoid BusyBox compatibility issues with Actions that expect GNU coreutils."
+  - "When using container jobs on self-hosted runners, verify the tar binary version with `tar --version` — GNU tar will print 'GNU tar' while BusyBox will not."
+docs:
+  - url: "https://github.com/actions/cache/issues/1765"
+    label: "actions/cache#1765: Post cache not working on Alpine runners (2026 re-open)"
+  - url: "https://github.com/actions/cache/issues/352"
+    label: "actions/cache#352: Original Alpine / BusyBox tar compatibility issue"
+  - url: "https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows"
+    label: "GitHub Docs: Caching dependencies to speed up workflows"
