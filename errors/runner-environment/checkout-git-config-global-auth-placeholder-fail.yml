@@ -1,0 +1,89 @@
+id: runner-environment-497
+title: 'actions/checkout Auth Setup Fails When GIT_CONFIG_GLOBAL Is Set in Runner Environment'
+category: runner-environment
+severity: error
+tags:
+  - checkout
+  - git-config
+  - GIT_CONFIG_GLOBAL
+  - self-hosted
+  - auth
+  - submodules
+  - git-credentials
+patterns:
+  - regex: 'Unable to replace auth placeholder in.*?\.gitconfig'
+    flags: 'i'
+  - regex: 'Error.*?Unable to replace.*?placeholder.*?gitconfig'
+    flags: 'i'
+  - regex: 'Failed to configure the global config'
+    flags: 'i'
+error_messages:
+  - "##[error]Unable to replace auth placeholder in /home/runner/work/_temp/<uuid>/.gitconfig"
+  - "Error: Unable to replace auth placeholder"
+root_cause: |
+  When actions/checkout sets up global git authentication (triggered by submodules: true,
+  persist-credentials: true, or private-repo checkout), it creates a temporary gitconfig
+  by following these steps:
+
+  1. Copies ~/.gitconfig into a temp directory (e.g. /home/runner/work/_temp/<uuid>/).
+  2. Overrides the HOME environment variable to point at that temp directory.
+  3. Writes an auth token placeholder via `git config --global url.<base>.insteadOf`
+     — expecting it to land in the temp config because HOME now points there.
+  4. Reads the temp config back and replaces the placeholder with the real token.
+
+  The problem: git honours GIT_CONFIG_GLOBAL OVER HOME when locating the global
+  config file. If GIT_CONFIG_GLOBAL is already set in the runner environment (a common
+  practice on self-hosted runners to isolate per-job git config), step 3 writes to
+  THAT file instead of the temp config. Step 4 reads the temp config, finds no
+  placeholder, and fails with "Unable to replace auth placeholder".
+
+  This is an open bug in actions/checkout (issue #2449). The checkout action only
+  overrides HOME, but never pins GIT_CONFIG_GLOBAL.
+fix: |
+  Unset GIT_CONFIG_GLOBAL for the checkout step using the step-level env block:
+
+    - name: Checkout
+      uses: actions/checkout@v4
+      env:
+        GIT_CONFIG_GLOBAL: ""    # unset so checkout controls global config
+      with:
+        submodules: true
+
+  If using actions/checkout@v6, also try persist-credentials: false combined with
+  manually configured HTTPS credentials. Track actions/checkout#2449 for an
+  official fix that pins GIT_CONFIG_GLOBAL alongside HOME.
+fix_code:
+  - language: yaml
+    label: Unset GIT_CONFIG_GLOBAL for the checkout step
+    code: |
+      - name: Checkout
+        uses: actions/checkout@v4
+        env:
+          GIT_CONFIG_GLOBAL: ""   # prevent git from redirecting config writes
+        with:
+          submodules: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+  - language: yaml
+    label: Unset at job level to protect all checkout steps
+    code: |
+      jobs:
+        build:
+          runs-on: self-hosted
+          env:
+            GIT_CONFIG_GLOBAL: ""   # reset for all steps in this job
+          steps:
+            - uses: actions/checkout@v4
+              with:
+                submodules: true
+prevention:
+  - "Avoid setting GIT_CONFIG_GLOBAL at workflow or job level when using actions/checkout."
+  - "On self-hosted runners, use GIT_CONFIG_NOSYSTEM=1 instead of GIT_CONFIG_GLOBAL for job isolation where possible."
+  - "If GIT_CONFIG_GLOBAL must be set on the runner host, override it to an empty string in the checkout step env block."
+  - "Track actions/checkout#2449 and upgrade to the patched version once released."
+docs:
+  - url: "https://github.com/actions/checkout/issues/2449"
+    label: "actions/checkout issue #2449 — Fix global auth when GIT_CONFIG_GLOBAL is set"
+  - url: "https://git-scm.com/docs/git-config#Documentation/git-config.txt-GITCONFIGGLOBAL"
+    label: "Git documentation — GIT_CONFIG_GLOBAL environment variable"
+  - url: "https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions"
+    label: "GitHub Docs — Security hardening for GitHub Actions"
