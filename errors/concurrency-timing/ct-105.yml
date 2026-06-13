@@ -1,0 +1,114 @@
+id: ct-105
+title: 'Environment Protection Approval Gate Holds `cancel-in-progress: false` Concurrency Slot — Intermediate Pushes Silently Dropped'
+category: concurrency-timing
+severity: silent-failure
+tags:
+  - concurrency
+  - cancel-in-progress
+  - environment-protection
+  - approval-gate
+  - human-review
+  - starvation
+  - deployment
+  - silent-failure
+patterns:
+  - regex: 'cancel-in-progress:\s*false'
+    flags: 'i'
+  - regex: 'environment:\s*\n\s+name:\s*\w+'
+    flags: 'im'
+  - regex: 'Canceling since a higher priority waiting request'
+    flags: 'i'
+error_messages:
+  - 'Canceling since a higher priority waiting request for'
+  - 'This run was waiting for a concurrent run to finish'
+  - 'Run was cancelled'
+root_cause: |
+  When a deployment workflow uses `concurrency.cancel-in-progress: false` at the
+  workflow or job level AND the workflow targets an environment with manual approval
+  protection rules (required reviewers), the first pending run occupies the single
+  available "pending" slot in the concurrency queue indefinitely while awaiting
+  human review.
+
+  GitHub Actions concurrency with `cancel-in-progress: false` allows exactly one
+  run to be executing and at most one run to be pending — a maximum of two active
+  runs per group. Any third or subsequent run that arrives while the queue is full
+  (one running, one pending-approval) is immediately cancelled with "Canceling since
+  a higher priority waiting request exists."
+
+  Unlike a wait-timer (which resolves automatically after a configured delay),
+  an approval gate can remain unresolved for hours or days. Every push to the
+  protected branch during that approval window is silently discarded. When the
+  approver finally reviews, they approve the OLDEST queued run, not the most
+  recent code — potentially deploying a version that is now out of date.
+fix: |
+  Choose between two strategies depending on whether you want the latest code or
+  ordered deployments:
+
+  **Option A (deploy latest, cancel stale):** Use `cancel-in-progress: true`.
+  Each new push cancels the previously pending approval, so approvers always
+  review the current code. The trade-off is that the approver must re-approve
+  after every new push.
+
+  **Option B (ordered deployments, no drops):** Split the workflow into two
+  separate jobs. Use `cancel-in-progress: true` on a pre-deployment job (lint,
+  test, artifact build) and a separate concurrency group with `cancel-in-progress:
+  false` only on the final deployment job that targets the environment. The test
+  jobs race and only the winner enters the deployment queue.
+
+  **Option C (awareness only):** Keep `cancel-in-progress: false` but add a
+  notification step that alerts on cancellation so the team knows intermediate
+  commits were skipped.
+fix_code:
+  - language: yaml
+    label: 'Option A — cancel-in-progress: true so approvers always see latest code'
+    code: |
+      concurrency:
+        group: deploy-${{ github.ref }}
+        cancel-in-progress: true   # pending approval is cancelled when newer push arrives
+
+      jobs:
+        deploy:
+          environment: production   # has required reviewers
+          runs-on: ubuntu-latest
+          steps:
+            - run: ./deploy.sh
+  - language: yaml
+    label: 'Option B — split jobs: CI races, deployment queues in order'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          concurrency:
+            group: build-${{ github.ref }}
+            cancel-in-progress: true   # only the latest build matters
+          steps:
+            - run: ./build.sh
+            - uses: actions/upload-artifact@v4
+              with:
+                name: artifact-${{ github.sha }}
+                path: dist/
+
+        deploy:
+          needs: build
+          runs-on: ubuntu-latest
+          environment: production      # approval gate lives here
+          concurrency:
+            group: deploy-production   # single slot; ordered, no drops
+            cancel-in-progress: false
+          steps:
+            - uses: actions/download-artifact@v4
+              with:
+                name: artifact-${{ github.sha }}
+            - run: ./deploy.sh
+prevention:
+  - 'Never combine `cancel-in-progress: false` with an environment that has human approval rules unless you explicitly want ordered deployment of every commit'
+  - 'Document in the workflow file which combination of concurrency strategy and environment protection is in use and why'
+  - 'Add a Slack/Teams notification on run cancellation so the team knows commits were skipped and can manually trigger a deployment if needed'
+  - 'Consider `cancel-in-progress: true` for non-production environments (staging) where you always want the latest code, and only use `cancel-in-progress: false` for production where you want ordered deploys'
+docs:
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-concurrency'
+    label: 'GitHub Actions — Using concurrency'
+  - url: 'https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment'
+    label: 'GitHub Actions — Managing environments for deployment'
+  - url: 'https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/reviewing-deployments'
+    label: 'GitHub Actions — Reviewing deployments'

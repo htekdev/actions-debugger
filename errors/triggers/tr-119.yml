@@ -1,0 +1,106 @@
+id: tr-119
+title: '`repository_dispatch` `client_payload` Property Names Containing Hyphens or Special Characters Are Inaccessible via Expression Syntax'
+category: triggers
+severity: silent-failure
+tags:
+  - repository_dispatch
+  - client_payload
+  - expression
+  - property-access
+  - hyphen
+  - dot-notation
+  - silent-failure
+  - api
+patterns:
+  - regex: 'github\.event\.client_payload\.[a-z0-9_]*-[a-z0-9_]'
+    flags: 'i'
+  - regex: 'client_payload.*[''"][a-z0-9_-]*-[a-z0-9_-]*[''"]'
+    flags: 'i'
+error_messages:
+  - 'Unrecognized named-value'
+  - 'Expected ''}''. Found ''-'''
+  - 'Variable named ''build'' is not defined'
+root_cause: |
+  GitHub Actions expression syntax supports only dot-notation property access
+  (`object.property`) and does not support bracket notation (`object['key']`).
+  When a `repository_dispatch` event is sent with a `client_payload` that contains
+  JSON keys using hyphens, dots, spaces, or other characters that are not valid
+  identifiers, those properties cannot be accessed in a workflow expression.
+
+  For example, dispatching with:
+    client_payload: {"build-type": "release", "target.env": "prod"}
+
+  means that `${{ github.event.client_payload.build-type }}` is a parse error:
+  the `-` is interpreted as a subtraction operator, producing "build" minus "type",
+  and the expression either errors or evaluates to a nonsensical number.
+  `${{ github.event.client_payload.target.env }}` silently evaluates as a nested
+  property access on an undefined sub-object and returns an empty string.
+
+  There is no bracket-notation workaround within a `${{ }}` expression. The
+  `fromJSON()` / `toJSON()` functions do not help because they do not provide
+  bracket-style access within the expression engine.
+
+  The only reliable fix is to restructure `client_payload` to use snake_case or
+  camelCase keys, or to parse the raw payload in a shell step via `jq`.
+fix: |
+  Use only snake_case or camelCase property names in `client_payload` so they
+  are valid identifier tokens accessible via dot notation.
+
+  If you need to parse an existing payload with non-identifier keys, write the
+  payload to a file and parse it with `jq` in a `run:` step — the expression
+  engine is bypassed and all key names work.
+fix_code:
+  - language: yaml
+    label: 'Use snake_case keys in client_payload (API caller side)'
+    code: |
+      # When triggering via GitHub REST API, use snake_case keys:
+      # POST /repos/{owner}/{repo}/dispatches
+      # {
+      #   "event_type": "deploy",
+      #   "client_payload": {
+      #     "build_type": "release",        <-- was: "build-type"
+      #     "target_env": "production"      <-- was: "target.env"
+      #   }
+      # }
+
+      # Workflow can now access these safely:
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Read dispatch inputs
+              run: |
+                echo "Build type: ${{ github.event.client_payload.build_type }}"
+                echo "Target env: ${{ github.event.client_payload.target_env }}"
+  - language: yaml
+    label: 'Parse non-identifier keys with jq in a run step'
+    code: |
+      jobs:
+        deploy:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Parse client_payload with jq
+              id: payload
+              run: |
+                # Write payload to file to use jq (bypasses expression engine)
+                echo '${{ toJSON(github.event.client_payload) }}' > payload.json
+                BUILD_TYPE=$(jq -r '.["build-type"]' payload.json)
+                TARGET_ENV=$(jq -r '.["target.env"]' payload.json)
+                echo "build_type=$BUILD_TYPE" >> $GITHUB_OUTPUT
+                echo "target_env=$TARGET_ENV" >> $GITHUB_OUTPUT
+
+            - name: Use parsed values
+              run: |
+                echo "Building ${{ steps.payload.outputs.build_type }} for ${{ steps.payload.outputs.target_env }}"
+prevention:
+  - 'Always use snake_case or camelCase for all `client_payload` keys in `repository_dispatch` calls — never use hyphens, dots, spaces, or other non-identifier characters'
+  - 'Document your `client_payload` schema in the workflow file using a comment so callers know which key format is expected'
+  - 'Add input validation in the workflow to fail-fast if expected payload keys resolve to empty strings'
+  - 'Use `actionlint` with `--format` checking — it will flag expression syntax errors caused by hyphenated property access'
+docs:
+  - url: 'https://docs.github.com/en/rest/repos/repos#create-a-repository-dispatch-event'
+    label: 'GitHub REST API — Create a repository dispatch event'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/evaluate-expressions-in-workflows-and-actions'
+    label: 'GitHub Actions — Evaluate expressions in workflows and actions'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#filter-pattern-cheat-sheet'
+    label: 'GitHub Actions — Workflow syntax: on.repository_dispatch'
