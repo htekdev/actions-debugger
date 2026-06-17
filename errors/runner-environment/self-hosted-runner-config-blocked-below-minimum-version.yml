@@ -24,48 +24,69 @@ error_messages:
   - "Configuration failed: runner version does not meet minimum version requirement"
   - "Registration blocked: runner is below minimum version v2.329.0"
 root_cause: |
-  Starting March 16, 2026, GitHub.com permanently blocks the configuration and
-  registration (./config.sh) of self-hosted runners older than v2.329.0 (released
-  October 15, 2025).
+  GitHub.com requires self-hosted runners to be on version v2.329.0 or later to
+  configure or (re)register via ./config.sh. This is the minimum version required for
+  GitHub's rearchitected Actions backend to recognize and accept the runner.
 
-  This is distinct from the runtime deprecation error ("Runner version vX.X.X is
-  deprecated and cannot receive messages") which affects runners that are already
-  registered but too old to pick up new jobs. This enforcement blocks the initial
-  config/registration step before a runner ever starts listening for jobs.
+  Enforcement history:
+  - Feb 2026: GitHub announced enforcement starting March 16, 2026 with brownouts Feb 23–Mar 15
+  - March 13, 2026: Enforcement PAUSED — v2.329.0 exposed kernel compatibility failures
+    in legacy cgroup environments. Teams below v2.329.0 could still register during the pause.
+  - June 12, 2026: Enforcement RE-ANNOUNCED with a new brownout calendar (GitHub Changelog)
 
-  Teams affected include:
-  - Self-hosted runners built from Docker images or VM snapshots containing old runner
-    binaries (especially ARC — Actions Runner Controller — custom runner images)
-  - Infrastructure-as-code pipelines that download a pinned runner version during setup
-  - Teams that provision ephemeral runners with a hardcoded runner release URL
-  - Self-hosted runners that auto-upgrade to a version below v2.329.0 and then
-    attempt to re-register
+  New enforcement timeline (June 2026 announcement):
+  - GitHub Enterprise Cloud with Data Residency: Full enforcement July 31, 2026
+    Brownouts (11 AM–3 PM ET): June 29 (Config), July 6/8 (Config),
+    July 13/15/17 (Config+Runtime), July 20/22/24 (Config+Runtime)
+  - GitHub Enterprise Cloud: Full enforcement September 25, 2026
+    Brownouts: August 24 (Config), Aug 31/Sep 2 (Config),
+    Sep 7/9/11 (Config+Runtime), Sep 14/16/18 (Config+Runtime)
 
-  GitHub Enterprise Server (GHES) customers are NOT affected by this enforcement —
-  it applies to github.com only.
+  This is distinct from the runtime deprecation error ("Runner version vX.X.X is deprecated
+  and cannot receive messages") which affects already-registered runners that fall behind the
+  rolling 30-day update requirement.
 
-  A brownout period ran from February 23 to March 15, 2026 with temporary 2-hour
-  registration blocks to warn teams. Full enforcement began March 16, 2026.
+  Teams affected:
+  - Self-hosted runners built from Docker images or VM snapshots with old runner binaries
+  - ARC (Actions Runner Controller) custom runner images pinned to old versions
+  - Infrastructure-as-code pipelines that download a hardcoded runner version URL
+  - Runners with auto-update disabled (--disableupdate flag or ARC disableUpdate=true)
+
+  Note: v2.329.0 is only the minimum for registration. Job execution requires staying within
+  30 days of the latest release. A runner pinned to v2.329.0 that never updates will stop
+  picking up jobs as newer releases ship.
+
+  GitHub Enterprise Server (GHES) customers are NOT affected by this enforcement.
 fix: |
-  Update all self-hosted runner installations to v2.329.0 or later before running
-  ./config.sh:
+  Upgrade all self-hosted runner installations to v2.329.0 or later:
 
   1. Download the latest runner release from https://github.com/actions/runner/releases
-  2. Update installation scripts, Dockerfiles, or Packer templates that pin a runner
-     version to reference v2.329.0 or later
-  3. For ARC (Actions Runner Controller): update the runner container image to one that
-     ships runner v2.329.0+; pull recent official ARC runner images
-  4. Rebuild/redeploy any VM images, AMIs, or container images that bake in the runner
-  5. For ephemeral runners: update the provisioning automation to download the latest
-     release at provision time rather than a hardcoded version URL
+  2. Update installation scripts, Dockerfiles, or Packer templates to reference v2.329.0+
+  3. For ARC: update runner container image to a version shipping runner v2.329.0+
+  4. Rebuild/redeploy VM images, AMIs, or container images that bake in the runner
+  5. For ephemeral runners: update provisioning to download the latest release dynamically
+  6. Remove any --disableupdate flags from runner startup scripts to allow auto-updates
+
+  Run the audit command below to identify runners below the minimum before brownouts:
 fix_code:
+  - language: yaml
+    label: "Audit runner versions via GitHub API before brownout windows"
+    code: |
+      # Check runner versions for a repo
+      gh api repos/{owner}/{repo}/actions/runners \
+        --jq '.runners[] | {name: .name, version: .version, status: .status}'
+
+      # Org-level audit
+      gh api orgs/{org}/actions/runners \
+        --jq '.runners[] | {name: .name, version: .version, status: .status}'
+
+      # Flag anything below 2.329.0 as a hard blocker before June 29 brownout
   - language: yaml
     label: "Fix: always download latest runner release during provisioning"
     code: |
-      # In your runner setup script, use the latest release instead of a pinned version:
       - name: Download latest GitHub Actions runner
         run: |
-          # Fetch latest version dynamically
+          # Fetch latest version dynamically — never pin to a specific old version
           RUNNER_VERSION=$(curl -s https://api.github.com/repos/actions/runner/releases/latest \
             | jq -r '.tag_name' | sed 's/^v//')
           curl -L -o actions-runner-linux-x64.tar.gz \
@@ -80,17 +101,22 @@ fix_code:
       spec:
         template:
           spec:
-            image: ghcr.io/actions/actions-runner:latest  # ✅ Always use latest official image
+            image: ghcr.io/actions/actions-runner:latest  # Always use latest official image
             # OR pin to a specific recent tag:
-            # image: ghcr.io/actions/actions-runner:2.329.0
+            # image: ghcr.io/actions/actions-runner:2.332.0
 prevention:
   - "Never pin a runner binary to a specific old version URL — always pull the latest runner release during provisioning"
-  - "Add a CI check or alerting on your runner provisioning pipeline to detect when the bundled runner version is nearing deprecation"
-  - "For ARC users: subscribe to actions/runner releases (watch the repo) to get notified of new versions and update custom runner images promptly"
-  - "Monitor the GitHub Changelog (github.blog/changelog) for runner version enforcement announcements — GitHub announces enforcement timelines months in advance with brownout periods"
+  - "Monitor for brownout windows — the first brownout for June 2026 enforcement is June 29 (11 AM–3 PM ET)"
+  - "Remove --disableupdate flags from runner startup scripts so auto-update keeps runners current"
+  - "For ARC users: configure Renovate or Dependabot to keep runner image tags within 30 days of the latest release"
+  - "Monitor the GitHub Changelog for enforcement timeline updates — GitHub has paused this enforcement once before"
 docs:
+  - url: "https://github.blog/changelog/2026-06-12-github-actions-minimum-version-enforcement-timeline-for-self-hosted-runners/"
+    label: "GitHub Changelog June 12, 2026: Minimum version enforcement timeline (brownout calendar)"
+  - url: "https://github.blog/changelog/2026-03-13-self-hosted-runner-minimum-version-enforcement-paused/"
+    label: "GitHub Changelog March 13, 2026: Enforcement paused (kernel compatibility issue)"
   - url: "https://github.blog/changelog/2026-02-05-github-actions-self-hosted-runner-minimum-version-enforcement-extended"
-    label: "GitHub Changelog: Self-hosted runner minimum version enforcement extended (Feb 2026)"
+    label: "GitHub Changelog Feb 2026: Self-hosted runner minimum version enforcement extended"
   - url: "https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners#requirements-for-self-hosted-runner-machines"
     label: "GitHub Docs: Requirements for self-hosted runner machines"
   - url: "https://github.com/actions/runner/releases"
