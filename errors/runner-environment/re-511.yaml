@@ -1,0 +1,153 @@
+id: re-511
+title: ubuntu-latest runner network timeout to specific external IPs (Brightbox hosting)
+category: runner-environment
+severity: error
+tags:
+  - ubuntu
+  - network
+  - connectivity
+  - timeout
+  - external-api
+  - runner-network
+description: |
+  Outbound HTTPS connections from ubuntu-latest runners to certain external IP ranges consistently time out, 
+  particularly IPs hosted on Brightbox (UK cloud provider). This started appearing around June 16, 2026.
+  
+  DNS resolution works correctly, but TCP connections to port 443 time out after 5-10 seconds. 
+  IPv6 connections fail with "Couldn't connect to server" (runners lack IPv6 routing).
+  
+  The issue appears to be specific to certain IP ranges/hosting providers and is not universal to all 
+  external HTTPS endpoints.
+
+patterns:
+  - regex: 'curl:.*Failed to connect to .* port 443 after \d+ ms: Timeout was reached'
+    flags: 'i'
+  - regex: 'curl:.*Connection timed out'
+    flags: 'i'
+  - regex: 'Failed to connect to .* port 443.*Timeout'
+    flags: 'i'
+
+error_messages:
+  - "curl: (28) Failed to connect to asciinema.org port 443 after 5002 ms: Timeout was reached"
+  - "curl: (7) Failed to connect to asciinema.org port 443 after 0 ms: Couldn't connect to server"
+  - "Connection timed out"
+
+root_cause: |
+  GitHub Actions ubuntu-latest runners are hosted on Azure infrastructure and route outbound traffic 
+  through Azure's network. Certain external IP ranges or hosting providers may be temporarily or 
+  permanently unreachable due to:
+  
+  1. Azure network routing policies or firewall rules
+  2. Network path issues between Azure and specific hosting providers
+  3. Geolocation or network topology constraints
+  4. Temporary Azure infrastructure changes affecting specific routes
+  
+  The issue is NOT a DNS problem (resolution succeeds) but a TCP connectivity problem at the network layer.
+  
+  Affected users report:
+  - DNS resolution works: `host asciinema.org` returns correct IPs
+  - IPv4 connection times out after 5+ seconds
+  - IPv6 fails immediately (runners lack IPv6 routing)
+  - Same endpoints are reachable from non-Azure networks
+  - Issue started appearing around June 16, 2026 for some destinations
+  
+  This is similar to historical incidents where specific cloud providers or IP ranges became unreachable 
+  from GitHub Actions runners due to upstream network changes.
+
+fix: |
+  Since this is an infrastructure-level network routing issue, developers cannot directly fix it. 
+  Workarounds include:
+  
+  1. **Use a different service/endpoint**: If possible, migrate to a different service provider whose 
+     IP ranges are reachable from Azure/GitHub Actions runners.
+  
+  2. **Use a proxy/relay**: Route traffic through an intermediary service (e.g., Cloudflare Workers, 
+     AWS Lambda, your own server) that can reach the target endpoint.
+  
+  3. **Self-hosted runner**: Use a self-hosted runner in a different network environment where the 
+     target endpoint is reachable.
+  
+  4. **Report to GitHub Support**: Open a support ticket with GitHub Actions if the issue persists, 
+     providing:
+     - The target IP address and hosting provider
+     - DNS resolution output from runner
+     - Curl/wget timeout errors with `-v` verbose output
+     - Timeframe when the issue started
+     - Link to failing workflow runs
+  
+  5. **Temporary bypass**: If the external API call is non-critical, add conditional logic to skip 
+     the step or continue on failure:
+     ```yaml
+     - name: Upload to external service
+       run: curl --connect-timeout 10 --max-time 30 https://target-service.example.com/upload
+       continue-on-error: true  # Don't fail the entire workflow
+     ```
+
+fix_code:
+  - language: yaml
+    label: "Add timeout and retry logic with fallback"
+    code: |
+      - name: Upload with retry and fallback
+        run: |
+          # Try with exponential backoff
+          for i in 1 2 3; do
+            if curl -f --connect-timeout 10 --max-time 30 \
+                    https://target-service.example.com/upload \
+                    -F "file=@recording.cast"; then
+              echo "Upload succeeded"
+              exit 0
+            fi
+            echo "Attempt $i failed, retrying in $((2**i)) seconds..."
+            sleep $((2**i))
+          done
+          
+          # Fallback: save artifact locally instead
+          echo "Upload failed after 3 attempts, saving as workflow artifact"
+          exit 0  # Don't fail the job
+        continue-on-error: true
+      
+      - name: Fallback - Save as workflow artifact
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recording
+          path: recording.cast
+
+  - language: yaml
+    label: "Proxy through Cloudflare Worker or relay service"
+    code: |
+      - name: Upload via relay proxy
+        env:
+          RELAY_ENDPOINT: ${{ secrets.RELAY_PROXY_URL }}
+        run: |
+          # Use a relay service that forwards to the unreachable endpoint
+          curl -f --connect-timeout 10 --max-time 30 \
+               -X POST "${RELAY_ENDPOINT}/forward" \
+               -F "target=https://asciinema.org/api/uploads" \
+               -F "file=@recording.cast"
+
+  - language: yaml
+    label: "Use self-hosted runner in different network"
+    code: |
+      jobs:
+        upload:
+          runs-on: self-hosted  # Use self-hosted runner not on Azure
+          steps:
+            - name: Upload to external service
+              run: curl -f https://target-service.example.com/upload -F "file=@recording.cast"
+
+prevention:
+  - "Design workflows to be resilient to external API failures with retries and fallback strategies"
+  - "Don't rely on external third-party services for critical CI/CD steps"
+  - "Use workflow artifacts or GitHub-native services when possible"
+  - "Add generous timeouts and retry logic for any external HTTP calls"
+  - "Monitor GitHub Actions status page and runner-images issue tracker for network-related incidents"
+  - "Have a backup plan (self-hosted runner, alternative service) for workflows depending on external APIs"
+
+docs:
+  - url: "https://github.com/actions/runner-images/issues/14256"
+    label: "GitHub runner-images issue #14256 - Outbound HTTPS timeout to asciinema.org"
+  - url: "https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners"
+    label: "Using self-hosted runners (alternative to hosted runners)"
+  - url: "https://docs.github.com/en/actions/learn-github-actions/usage-limits-billing-and-administration#usage-limits"
+    label: "GitHub Actions usage limits and network constraints"
