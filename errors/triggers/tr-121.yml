@@ -1,0 +1,166 @@
+id: tr-121
+title: 'github-actions[bot] pull requests now require manual approval before CI runs (June 2026)'
+category: triggers
+severity: warning
+tags:
+  - github-actions-bot
+  - GITHUB_TOKEN
+  - pull-request
+  - approval-required
+  - action-required
+  - workflow-approval
+  - bot-pr
+  - automation
+patterns:
+  - regex: 'Workflow requires approval|This workflow is waiting for approval'
+    flags: 'i'
+  - regex: 'action_required.*github-actions\[bot\]|github-actions\[bot\].*action_required'
+    flags: 'i'
+  - regex: 'Approve and run workflows'
+    flags: 'i'
+error_messages:
+  - 'This workflow is waiting for approval from a maintainer. Learn more about approving workflows from public forks.'
+  - 'Workflow run is in action_required state. Approval is required before jobs can start.'
+  - 'Required status checks have not passed. All required status checks must pass before merging.'
+root_cause: |
+  Starting June 11, 2026, GitHub changed how pull requests created by the
+  `github-actions[bot]` identity are treated for CI/CD workflow execution.
+
+  **Before June 11, 2026:**
+  Pull requests opened by `github-actions[bot]` (any workflow that creates a PR using
+  the built-in `GITHUB_TOKEN`) could NOT run CI/CD workflows at all. These PRs were
+  routinely merged without any branch protection checks ever firing — a silent compliance
+  gap that GitHub acknowledged in the changelog.
+
+  **After June 11, 2026:**
+  `github-actions[bot]` PRs CAN run workflows, but only after a user with write access
+  (or `actions: write` permission) manually approves the workflow run. The PR shows
+  "Waiting for approval" in the Checks section and the check suite is created with
+  `conclusion: action_required`. No jobs start until a human clicks "Approve and run
+  workflows" or the run is approved via API/CLI.
+
+  This mirrors the behavior already applied to Copilot coding agent PRs (see triggers-027)
+  and is motivated by the same security rationale: preventing auto-generated code from
+  automatically running workflows that have access to secrets, GITHUB_TOKEN, or deployment
+  environments.
+
+  **Common surprise scenarios:**
+  - Automated release workflows that open a "bump changelog" or "update version" PR via
+    `peter-evans/create-pull-request` with the default GITHUB_TOKEN — CI never runs
+    and required checks block the merge indefinitely.
+  - Repo maintenance bots written as GitHub Actions (not as registered GitHub Apps) that
+    create PRs — suddenly show "Waiting for approval" on every PR they open.
+  - Workflows that create PRs to trigger downstream review pipelines — the review
+    pipeline is now blocked until a human approves the workflow run.
+  - Auto-formatting or auto-fix workflows that commit and open a PR — same stall.
+
+  **Note:** This affects only PRs whose author is `github-actions[bot]` (the identity
+  used when `GITHUB_TOKEN` or `secrets.GITHUB_TOKEN` creates the PR). Dependabot and
+  Renovate have their own distinct bot identities and follow the fork approval rules
+  (triggers-022), NOT this new rule.
+fix: |
+  **Option 1: Manual approval (low-volume workflows)**
+  For each `github-actions[bot]` PR, a user with write access clicks "Approve and run
+  workflows" in the Checks section of the PR, or approves via CLI:
+    gh run list --repo owner/repo --branch <bot-branch>
+    gh run review <run-id> --approve --repo owner/repo
+
+  **Option 2: Switch to a GitHub App token for PR creation (recommended for automation)**
+  PRs created by a registered GitHub App using an installation token do not carry the
+  `github-actions[bot]` identity. The App's PR author is `<app-name>[bot]`, which may
+  or may not require approval depending on your repository's fork/outside-collaborator
+  settings. This approach also bypasses the loopback prevention in triggers-033, making
+  it the standard recommendation for workflows that both create PRs AND need CI to run.
+
+  **Option 3: Use a PAT for PR creation**
+  A PR created using a Personal Access Token (PAT) carries the PAT owner's identity, not
+  `github-actions[bot]`. If the PAT owner has write access to the repository, CI runs
+  immediately without approval.
+
+  **Option 4: Auto-approve via workflow (use with caution)**
+  A separate workflow triggered by `check_suite: [requested]` can approve runs from
+  `github-actions[bot]` automatically. This eliminates the approval gate entirely —
+  only appropriate for private repos where the bot's code changes are already trusted.
+fix_code:
+  - language: yaml
+    label: 'Approve a pending workflow run from github-actions[bot] via GitHub CLI'
+    code: |
+      # List runs awaiting approval for a bot-created PR branch:
+      gh run list --repo owner/repo --branch bot/automated-update-20260618
+      # STATUS: action_required — awaiting approval
+
+      # Approve a specific run (requires write access):
+      gh run review <run-id> --approve --repo owner/repo
+
+      # Or approve via REST API:
+      # POST /repos/{owner}/{repo}/actions/runs/{run_id}/approve
+  - language: yaml
+    label: 'Use GitHub App token instead of GITHUB_TOKEN to create PRs that CI runs on immediately'
+    code: |
+      jobs:
+        create-pr:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Generate GitHub App token
+              id: app-token
+              uses: actions/create-github-app-token@v1
+              with:
+                app-id: ${{ secrets.APP_ID }}
+                private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+            - uses: actions/checkout@v4
+              with:
+                token: ${{ steps.app-token.outputs.token }}
+
+            - name: Make changes
+              run: ./scripts/update-version.sh
+
+            # PR author = <your-app>[bot], not github-actions[bot]
+            # CI runs immediately without requiring approval
+            - uses: peter-evans/create-pull-request@v7
+              with:
+                token: ${{ steps.app-token.outputs.token }}
+                title: 'chore: automated version bump'
+                branch: 'bot/version-bump'
+  - language: yaml
+    label: 'Auto-approve workflow for github-actions[bot] PRs (private repos, trusted automation only)'
+    code: |
+      name: Auto-approve bot workflow runs
+      on:
+        check_suite:
+          types: [requested]
+
+      jobs:
+        approve:
+          runs-on: ubuntu-latest
+          # Scope to github-actions[bot] initiated runs only
+          if: github.event.check_suite.app.slug == 'github-actions'
+          permissions:
+            actions: write
+          steps:
+            - name: Find and approve the pending run
+              env:
+                GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                # Find the run ID for this check suite
+                RUN_ID=$(gh api \
+                  /repos/${{ github.repository }}/actions/runs \
+                  --jq ".workflow_runs[] | select(.check_suite_id == ${{ github.event.check_suite.id }}) | .id" \
+                  | head -1)
+                if [ -n "$RUN_ID" ]; then
+                  gh run review "$RUN_ID" --approve --repo ${{ github.repository }}
+                fi
+prevention:
+  - 'Migrate internal automation bots to registered GitHub Apps — App-identity PRs are not subject to the github-actions[bot] approval requirement and bypass the loopback prevention in triggers-033.'
+  - 'Audit existing workflows that use `peter-evans/create-pull-request`, `gh pr create`, or direct REST API calls with GITHUB_TOKEN to create PRs — all of these now produce action_required check suites.'
+  - 'Set up a monitoring workflow or PR check that alerts when a bot PR has been waiting for approval for more than N hours, to prevent silent stalls.'
+  - 'Document in workflow comments whether CI is expected to run immediately or will require manual approval, so maintainers know what to expect.'
+docs:
+  - url: 'https://github.blog/changelog/2026-06-11-bot-created-pull-requests-can-run-workflows-if-approved/'
+    label: 'GitHub Changelog: Bot-created pull requests can run workflows if approved (June 11, 2026)'
+  - url: 'https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-workflow-runs/approving-workflow-runs-from-public-forks'
+    label: 'GitHub Docs: Approving workflow runs from public forks'
+  - url: 'https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/making-authenticated-api-requests-with-a-github-app-in-a-github-actions-workflow'
+    label: 'GitHub Docs: Using GitHub App installation tokens in GitHub Actions'
+  - url: 'https://github.com/peter-evans/create-pull-request'
+    label: 'peter-evans/create-pull-request — action commonly used for bot PRs'
