@@ -1,0 +1,99 @@
+id: re-514
+title: 'windows-latest (win25-vs2026) WDK Kernel-Mode Headers Absent Despite Manifest Listing DriverKit'
+category: runner-environment
+severity: error
+tags:
+  - windows-latest
+  - win25-vs2026
+  - wdk
+  - windows-driver-kit
+  - kernel-driver
+  - ntgdi
+  - manifest-mismatch
+patterns:
+  - regex: 'Cannot open include file.*ntgdi\.h|Cannot open include file.*ntddk\.h|Cannot open include file.*wdm\.h'
+    flags: 'i'
+  - regex: 'error C1083.*km\\|wdk.*headers.*absent|DriverKit.*not.*installed'
+    flags: 'i'
+error_messages:
+  - "Source\\Include\\KNSoft\\NDK\\NT\\Win32K\\NtGdi.h(65,1): error C1083: Cannot open include file: 'ntgdi.h': No such file or directory"
+  - "fatal error C1083: Cannot open include file: 'km\\wdm.h': No such file or directory"
+  - "fatal error C1083: Cannot open include file: 'km\\ntddk.h': No such file or directory"
+root_cause: |
+  The `Windows2025-VS2026` runner image (`windows-latest`, `ImageOS=win25-vs2026`) lists
+  `Component.Microsoft.Windows.DriverKit`, `Windows Driver Kit Visual Studio Extension`,
+  and `Windows Software Development Kit` in its software manifest — strongly implying WDK
+  kernel-mode headers are available. In reality only the Windows SDK (user-mode headers,
+  `um/`) is installed; the WDK kernel-mode layout (`km/`, `wdf/`) is absent:
+
+    Include/10.0.26100.0/km/wdm.h    → not present
+    Include/10.0.26100.0/km/ntddk.h  → not present
+    Include/10.0.26100.0/um/ntgdi.h  → not present (WDK-owned even in um/)
+    Include/wdf/kmdf/1.33/wdf.h      → not present
+
+  The VS2026 image installs the DriverKit Visual Studio Extension (for IDE/IntelliSense
+  integration) but NOT the standalone WDK runtime headers-and-libs package. This is
+  intentional policy for Windows Server 2025 images (runner-images#13071), but the manifest
+  lists DriverKit components without clarifying that kernel-mode headers are absent, creating
+  a misleading gap for kernel driver builds.
+
+  Note: `windows-11-arm` (`ImageOS=win11-arm64`) DOES install the full WDK including
+  `Windows Driver Kit Headers and Libs 10.1.26100.6584` with all `km/` headers present.
+fix: |
+  Install the Windows Driver Kit explicitly in your workflow before building kernel-mode code.
+
+  Option 1 — winget (simplest, ensures latest WDK):
+    Use the winget install step below.
+
+  Option 2 — Direct MSI download:
+    Download and install the WDK MSI from the Microsoft download page.
+
+  Option 3 — Use `windows-11-arm` if an ARM64 build is acceptable:
+    The windows-11-arm runner has the full WDK preinstalled.
+fix_code:
+  - language: yaml
+    label: 'Install WDK via winget before building kernel-mode code on windows-latest'
+    code: |
+      jobs:
+        driver-build:
+          runs-on: windows-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Install Windows Driver Kit
+              run: winget install --id Microsoft.WindowsDriverKit --silent --accept-package-agreements --accept-source-agreements
+              shell: pwsh
+            - name: Build kernel driver
+              run: msbuild KernelDriver.vcxproj /p:Configuration=Release /p:Platform=x64
+              shell: cmd
+  - language: yaml
+    label: 'Install WDK via direct MSI download (pin specific version)'
+    code: |
+      jobs:
+        driver-build:
+          runs-on: windows-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Install Windows Driver Kit (MSI)
+              run: |
+                # WDK for Windows 11 SDK 10.0.26100
+                $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2272234"
+                Invoke-WebRequest -Uri $wdkUrl -OutFile "$env:TEMP\wdksetup.exe" -UseBasicParsing
+                Start-Process "$env:TEMP\wdksetup.exe" -ArgumentList "/quiet /norestart" -Wait
+              shell: pwsh
+            - name: Build kernel driver
+              run: msbuild KernelDriver.vcxproj /p:Configuration=Release /p:Platform=x64
+              shell: cmd
+prevention:
+  - "Do not rely on the manifest listing `Component.Microsoft.Windows.DriverKit` as confirmation that WDK kernel-mode headers are installed on `windows-latest` — only the VS extension is present, not the headers."
+  - "Add an explicit WDK install step to all jobs that build kernel-mode code (`.sys` drivers, `km/` headers, WDF)."
+  - "If your build requires `ntgdi.h`, `wdm.h`, `ntddk.h`, or `wdf/kmdf/` headers, treat them as not preinstalled on `windows-latest`/`win25-vs2026`."
+  - "Verify WDK header availability in CI with `Test-Path 'C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\km\wdm.h'` as a preflight check."
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14263'
+    label: 'runner-images#14263: Windows2025-VS2026 manifest lists DriverKit but WDK headers are absent (June 20, 2026)'
+  - url: 'https://github.com/actions/runner-images/issues/13071'
+    label: 'runner-images#13071: Standalone WDK intentionally not installed on Windows Server 2025 images'
+  - url: 'https://learn.microsoft.com/en-us/windows-hardware/drivers/download-the-wdk'
+    label: 'Microsoft Docs: Download the Windows Driver Kit'
+  - url: 'https://github.com/actions/runner-images/blob/main/images/windows/Windows2025-VS2026-Readme.md'
+    label: 'Windows2025-VS2026 image manifest (lists DriverKit components)'
