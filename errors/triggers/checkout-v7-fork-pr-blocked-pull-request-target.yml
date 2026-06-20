@@ -1,0 +1,160 @@
+id: tr-122
+title: '`actions/checkout` v7 Refuses to Check Out Fork PR Code in `pull_request_target` — Hard Error'
+category: triggers
+severity: error
+tags:
+  - pull_request_target
+  - actions-checkout
+  - fork
+  - pwn-request
+  - security
+  - checkout-v7
+  - workflow_run
+  - breaking-change
+patterns:
+  - regex: 'Refusing to check out fork pull request code from a .pull_request_target. workflow'
+    flags: 'i'
+  - regex: 'Refusing to check out fork pull request code from a .workflow_run. workflow'
+    flags: 'i'
+  - regex: 'allow-unsafe-pr-checkout.*pull_request_target|pull_request_target.*allow-unsafe-pr-checkout'
+    flags: 'i'
+error_messages:
+  - "Error: Refusing to check out fork pull request code from a 'pull_request_target' workflow. This workflow runs with the base repository's GITHUB_TOKEN, secrets, default-branch cache scope, and runner access. Fetching and executing a fork's code in that trusted context commonly leads to \"pwn request\" vulnerabilities. To opt in, review the risks at https://gh.io/securely-using-pull_request_target and set 'allow-unsafe-pr-checkout: true' on the actions/checkout step."
+  - "Error: Refusing to check out fork pull request code from a 'workflow_run' workflow."
+root_cause: |
+  Starting June 18, 2026, `actions/checkout` v7.0.0 actively REFUSES to check out
+  fork pull request code when the workflow trigger is `pull_request_target` or
+  `workflow_run` (where `workflow_run.event` starts with `pull_request`).
+
+  The action throws a hard error — the step fails and the workflow is stopped — when
+  ANY of the following conditions are met AND the PR is from a fork:
+
+  - `repository:` resolves to the fork PR's repository
+    (e.g., `repository: ${{ github.event.pull_request.head.repo.full_name }}`)
+  - `ref:` matches `refs/pull/<number>/head` or `refs/pull/<number>/merge`
+    (e.g., `ref: refs/pull/${{ github.event.pull_request.number }}/merge`)
+  - `ref:` resolves to the fork PR's head or merge commit SHA
+    (e.g., `ref: ${{ github.event.pull_request.head.sha }}`)
+
+  This change closes the most common "pwn request" attack vector — a pattern that
+  has been the root cause of multiple supply-chain incidents. In a pwn request,
+  an attacker-controlled fork PR is checked out inside a privileged workflow (one
+  that has base repository secrets and full GITHUB_TOKEN write access), allowing
+  the attacker's code to exfiltrate secrets or modify repository state.
+
+  **July 16, 2026 backport:** GitHub will backport enforcement to ALL currently
+  supported major versions. Workflows using floating major tags such as
+  `actions/checkout@v4`, `@v5`, or `@v6` will automatically pick up the blocking
+  behavior on July 16 without any workflow file changes. Only workflows pinned to
+  a specific SHA, minor, or patch version are unaffected by the backport and must
+  upgrade manually via Dependabot or another mechanism.
+
+  Same-repository pull requests are NOT affected. The `pull_request` event (which
+  runs without base-repo secrets) is also NOT affected.
+fix: |
+  **Option 1 — Remove the insecure ref/repository inputs (recommended).**
+  If your `pull_request_target` workflow checks out the fork PR code but does not
+  actually need to RUN that code with elevated access, remove the `ref:` or
+  `repository:` inputs. The default checkout in `pull_request_target` checks out
+  the BASE branch, not the PR — which is intentional and safe.
+
+  **Option 2 — Switch to `pull_request` for building and testing.**
+  Use `pull_request` for jobs that need to build and run the PR's code. The
+  `pull_request` event checks out PR changes correctly and runs without base-repo
+  secrets. Use `pull_request_target` only for privileged operations on trusted
+  (base-repo) code — labeling, commenting, triggering deployments.
+
+  **Option 3 — Opt out with `allow-unsafe-pr-checkout: true`.**
+  If your workflow genuinely requires checking out fork PR code with elevated trust
+  (e.g., generating coverage reports against a private artifact registry), you can
+  opt out explicitly. This is a deliberate security decision — read the guidance at
+  https://gh.io/securely-using-pull_request_target before opting out, and ensure
+  the job's permissions are scoped as narrowly as possible.
+
+  **Note:** Upgrade to `actions/checkout@v7` before July 16, 2026 to control your
+  timeline. After July 16, all floating major-version tags will enforce the block
+  automatically.
+fix_code:
+  - language: yaml
+    label: 'BEFORE (broken with v7): pull_request_target checking out fork PR head'
+    code: |
+      on: pull_request_target
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v7  # ERROR: refuses to checkout fork PR code
+              with:
+                ref: ${{ github.event.pull_request.head.sha }}
+                # ^^^ This pattern is now blocked by default in pull_request_target
+            - run: npm test
+  - language: yaml
+    label: 'AFTER — split into pull_request (build/test) + pull_request_target (privileged ops)'
+    code: |
+      # Workflow 1: ci.yml — pull_request handles build/test safely (no secrets)
+      on: pull_request
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v7
+              # default: checks out PR merge commit (correct and safe)
+            - run: npm ci && npm test
+
+      ---
+      # Workflow 2: label.yml — pull_request_target for privileged labeling (base code only)
+      on: pull_request_target
+
+      jobs:
+        label:
+          runs-on: ubuntu-latest
+          permissions:
+            pull-requests: write
+          steps:
+            - uses: actions/checkout@v7
+              # No ref: input — defaults to base branch (safe)
+            - name: Apply labels
+              run: gh pr edit ${{ github.event.number }} --add-label "needs-review"
+              env:
+                GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  - language: yaml
+    label: 'Opt-out (for workflows that genuinely need fork code with elevated trust)'
+    code: |
+      on: pull_request_target
+
+      jobs:
+        coverage:
+          runs-on: ubuntu-latest
+          permissions:
+            # IMPORTANT: minimize permissions when checking out fork code
+            contents: read
+            pull-requests: write
+            # Never add: secrets:, environments:, or id-token: write here
+          steps:
+            - uses: actions/checkout@v7
+              with:
+                ref: ${{ github.event.pull_request.head.sha }}
+                allow-unsafe-pr-checkout: true  # explicit opt-out — deliberate security decision
+            - name: Generate coverage report
+              run: npm run coverage
+prevention:
+  - 'Audit all `pull_request_target` workflows for `ref: ${{ github.event.pull_request.head.sha }}` or `ref: refs/pull/*/head` patterns — these will start failing with actions/checkout@v7'
+  - 'Run Dependabot or `gh` to upgrade `actions/checkout` to v7 before July 16, 2026 to control when the enforcement kicks in'
+  - 'Use `pull_request` for build and test jobs, `pull_request_target` only for privileged metadata operations (labeling, commenting, deployment approval)'
+  - 'If opting out with `allow-unsafe-pr-checkout: true`, ensure the job has no secret access, no environment access, and minimal GITHUB_TOKEN permissions'
+  - 'Same-repo PRs are unaffected — this only blocks fork PRs, which is the pwn-request attack vector'
+docs:
+  - url: 'https://github.blog/changelog/2026-06-18-safer-pull_request_target-defaults-for-github-actions-checkout/'
+    label: 'GitHub Changelog (June 18, 2026): Safer pull_request_target defaults for actions/checkout'
+  - url: 'https://github.com/actions/checkout/releases/tag/v7.0.0'
+    label: 'actions/checkout v7.0.0 release notes'
+  - url: 'https://github.com/actions/checkout/pull/2454'
+    label: 'actions/checkout PR #2454: block checking out fork PR for pull_request_target and workflow_run'
+  - url: 'https://gh.io/securely-using-pull_request_target'
+    label: 'GitHub guidance: Securely using pull_request_target'
+  - url: 'https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/'
+    label: 'GitHub Security Lab: Preventing pwn requests'
+  - url: 'https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions'
+    label: 'GitHub Docs: Security hardening for GitHub Actions'
