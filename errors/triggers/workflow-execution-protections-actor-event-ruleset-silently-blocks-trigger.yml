@@ -1,0 +1,123 @@
+id: tr-123
+title: 'Workflow Execution Protection Actor/Event Ruleset Silently Blocks Workflow from Triggering'
+category: triggers
+severity: silent-failure
+tags:
+  - workflow-execution-protections
+  - actor-rules
+  - event-rules
+  - rulesets
+  - enterprise
+  - organization
+  - silent-block
+  - policies
+patterns:
+  - regex: 'Workflow run was blocked by workflow execution protection policy'
+    flags: 'i'
+  - regex: 'Actor is not in the actor allow list|actor.*not.*allowed.*trigger'
+    flags: 'i'
+  - regex: 'Event.*blocked by workflow execution protection|event.*not permitted.*policy'
+    flags: 'i'
+  - regex: 'workflow execution protection.*blocked|execution protection.*prevent'
+    flags: 'i'
+error_messages:
+  - 'Workflow run was blocked by workflow execution protection policy'
+  - 'Actor is not in the actor allow list for this workflow'
+  - 'Event ''push'' is blocked by the workflow execution protection event rule'
+  - 'This workflow was blocked by your organization''s workflow execution protections policy'
+root_cause: |
+  GitHub announced Workflow Execution Protections in public preview on June 18, 2026
+  (GitHub Enterprise, organizations, and repositories). When an enterprise admin or
+  organization owner configures actor rules or event rules under
+  Settings → Actions → Policies (a new section separate from General), workflows that
+  don't satisfy the allow-list rules are silently blocked.
+
+  Two rule types exist:
+  - Actor rules: control who can trigger workflows. Targets include individual users,
+    repository roles (Read, Maintain, Admin), GitHub Apps, Copilot, and Dependabot.
+  - Event rules: control which events are permitted (push, pull_request,
+    pull_request_target, workflow_dispatch, etc.).
+
+  The failure mode is completely silent from the contributor's perspective:
+  - No workflow run is created in the repository's Actions tab.
+  - No email notification is sent to the actor.
+  - No PR check status is posted (PR checks never appear).
+  - The workflow YAML is never evaluated; the block happens before execution.
+
+  Evidence is only visible in the organization audit log (event:
+  "workflow_run.blocked_by_policy") or via the organization's Policies settings page.
+
+  Common misconfiguration scenarios:
+  1. Admin restricts workflow_dispatch to Maintain/Admin roles — Read-access contributors
+     and GitHub Apps (including Dependabot) can no longer trigger manual workflows.
+  2. Admin blocks pull_request_target organization-wide — all fork PR workflows stop.
+  3. Dependabot or a GitHub App is excluded from the actor allow-list — automated
+     security/update workflows silently stop running.
+  4. After a team member's role is downgraded from Maintain to Write, their workflow
+     triggers suddenly stop working with no error.
+
+  Evaluate mode: Admins can enable "evaluate mode" to shadow-run rules without enforcing
+  them, which makes blocked runs visible before the policy is activated.
+fix: |
+  1. Identify whether a protection policy is active:
+     - Navigate to Organization Settings → Actions → Policies (new section)
+     - Or Repository Settings → Actions → Policies
+     - Check for any active rulesets with actor or event rules
+
+  2. Find the blocking rule:
+     - Review the organization audit log for events matching the blocked workflow trigger
+     - Look for entries containing "workflow_run.blocked_by_policy"
+     - Query via API: GET /orgs/{org}/audit-log?phrase=workflow_run.blocked_by_policy
+
+  3. Fix the policy:
+     - Add the blocked actor (user/app/Dependabot/Copilot) to the actor allow-list
+     - Or ensure the triggered event is permitted in the event rules
+     - Or switch the ruleset to "evaluate" mode to observe without enforcing
+
+  4. If you need the policy active, adjust the actor allow-list to include required roles,
+     specific GitHub Apps, or Dependabot/Copilot.
+fix_code:
+  - language: yaml
+    label: 'Audit org audit log for blocked workflow runs via GitHub CLI'
+    code: |
+      # Query audit log for blocked workflow runs
+      gh api 'orgs/{org}/audit-log?phrase=workflow_run.blocked_by_policy&per_page=30' \
+        --jq '.[] | {actor: .actor, repo: .repo, event: .action, created_at: .created_at}'
+
+      # Or look for the specific event type
+      gh api 'orgs/{org}/audit-log?phrase=action%3Aworkflow_run.blocked_by_policy'
+  - language: yaml
+    label: 'Example: allow Dependabot and GitHub Apps in actor ruleset'
+    code: |
+      # In your org/repo Settings → Actions → Policies, the ruleset might look like:
+      # (conceptual — configured via GitHub UI or Rulesets API)
+      #
+      # Actor ruleset — allow list:
+      #   ✅ Dependabot
+      #   ✅ GitHub Apps (your specific apps)
+      #   ✅ Copilot
+      #   ✅ Repository role: Write (and above)
+      #
+      # If you restrict to Admin-only, Dependabot PRs and bot workflows will be blocked.
+      # Always include the GitHub Apps and service accounts that run your automation.
+  - language: yaml
+    label: 'Use evaluate mode to test policy without breaking workflows'
+    code: |
+      # In Settings → Actions → Policies:
+      # 1. Create your ruleset with actor/event rules
+      # 2. Set mode to "Evaluate" (not "Active")
+      # 3. Run workflows and check which would have been blocked
+      # 4. Adjust the allow-list before switching to "Active" enforcement
+prevention:
+  - 'Before activating a workflow execution protection policy, switch to "evaluate" mode and run all workflow types to identify what would be blocked'
+  - 'Always include Dependabot, Copilot, and critical GitHub Apps in your actor allow-list when configuring actor rules'
+  - 'Document which events each workflow requires — restricting pull_request_target organizationally will break all fork PR workflows'
+  - 'When changing team member roles (e.g., Maintain → Write), check whether any workflow execution protection policies restrict triggers by role'
+  - 'Monitor the organization audit log after enabling policies; "workflow_run.blocked_by_policy" events indicate triggers being silently dropped'
+docs:
+  - url: 'https://github.blog/changelog/2026-06-18-control-who-and-what-triggers-github-actions-workflows/'
+    label: 'GitHub Changelog June 18, 2026: Control who and what triggers GitHub Actions workflows'
+  - url: 'https://docs.github.com/en/organizations/managing-organization-settings/actions-policies/workflow-execution-protections'
+    label: 'GitHub Docs: Workflow execution protections'
+  - url: 'https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets'
+    label: 'GitHub Docs: About rulesets (the framework powering execution protections)'
