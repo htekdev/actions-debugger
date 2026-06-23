@@ -1,0 +1,132 @@
+id: ca-156
+title: 'actions/cache save silently fails with misleading ''Unable to reserve cache with key'' message when token has read-only cache access'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - actions-cache
+  - read-only
+  - pull_request_target
+  - fork
+  - cache-write-denied
+  - misleading-error
+  - permissions
+patterns:
+  - regex: 'Unable to reserve cache with key.*another job may be creating this cache'
+    flags: 'i'
+  - regex: 'cache write denied|cache.*read.only.*token|read.only.*cache.*token'
+    flags: 'i'
+  - regex: 'Warning: Unable to reserve cache with key'
+    flags: 'i'
+error_messages:
+  - 'Warning: Unable to reserve cache with key cache-key-123, another job may be creating this cache.'
+  - 'Warning: cache write denied'
+root_cause: |
+  `actions/cache` silently swallows the error when the GITHUB_TOKEN does not have write access to
+  the Actions cache service. Instead of surfacing a meaningful error, the action logs a misleading
+  warning: "Unable to reserve cache with key X, another job may be creating this cache." — implying
+  a concurrency race when the real cause is a permission denial.
+
+  This silent failure occurs in two scenarios:
+
+  1. **Fork pull_request workflows** — the GITHUB_TOKEN for PRs from forks is scoped read-only by
+     default. `actions/cache` save steps complete without error but the cache is never written.
+     Subsequent runs pay full restore cost since no cache was saved.
+
+  2. **pull_request_target workflows — UPCOMING** — GitHub is extending read-only cache access to
+     `pull_request_target` workflows (actions/cache#1768, June 2026). These workflows receive a
+     write-scoped GITHUB_TOKEN for repository operations, but the cache layer will enforce a
+     separate read-only cache token for security. Existing `pull_request_target` workflows that
+     rely on cache saves will silently stop caching without any obvious error.
+
+  Prior to `actions/cache@v5.1.0`, the "Unable to reserve cache with key" message was the only
+  signal — developers typically assume it means a race condition and add retries or `fail-on-cache-miss`,
+  which does not help. Version 5.1.0 surfaces the correct "cache write denied" message to make the
+  permission cause visible.
+fix: |
+  1. **Upgrade to actions/cache@v5.1.0+** — this version emits a "cache write denied" warning
+     instead of the misleading "another job may be creating this cache" message, making the root
+     cause visible in the workflow log.
+
+  2. **For pull_request workflows from forks** — cache restores (reads) still work; only saves
+     (writes) are denied. Use a two-workflow split: a `pull_request` workflow for tests that
+     restores cache and uploads artifacts, and a `workflow_run` or `push` workflow that writes
+     cache from the base branch.
+
+  3. **For pull_request_target** — if cache saves are required, use a PAT or GitHub App token
+     scoped to cache write, or restructure so caches are populated from a `push` or `schedule`
+     workflow on the base branch and only restored in `pull_request_target`.
+
+  4. **Do NOT diagnose as concurrency** — "Unable to reserve cache" is almost never a race between
+     jobs in the same run. If you see it consistently on every run for the same key, suspect
+     read-only token before investigating concurrency.
+fix_code:
+  - language: yaml
+    label: 'Upgrade actions/cache to v5.1.0+ for accurate cache-write-denied error message'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Cache dependencies
+              uses: actions/cache@v5   # v5.1.0+ emits "cache write denied" instead of misleading message
+              with:
+                path: ~/.npm
+                key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+                restore-keys: |
+                  ${{ runner.os }}-node-
+  - language: yaml
+    label: 'Two-workflow split — restore cache in pull_request, populate from push'
+    code: |
+      # Workflow 1: pr-ci.yml — runs on pull_request (cache restores work, saves are denied)
+      on: pull_request
+
+      jobs:
+        test:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+
+            - name: Restore cache (read-only in fork PRs — saves will be denied silently)
+              uses: actions/cache/restore@v5
+              with:
+                path: ~/.npm
+                key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+                restore-keys: ${{ runner.os }}-node-
+
+            - name: Run tests
+              run: npm test
+
+      ---
+      # Workflow 2: cache-prime.yml — runs on push to default branch (has cache write access)
+      on:
+        push:
+          branches: [main]
+
+      jobs:
+        prime-cache:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v4
+            - name: Populate cache from base branch
+              uses: actions/cache@v5
+              with:
+                path: ~/.npm
+                key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+            - run: npm ci
+prevention:
+  - 'Treat a recurring "Unable to reserve cache with key" warning on every run for the same key as a permission issue, not a concurrency race.'
+  - 'Use actions/cache@v5.1.0+ which surfaces "cache write denied" for clear diagnosis.'
+  - 'Know that pull_request workflows from forks have read-only cache access — cache restores work, saves do not.'
+  - 'Expect pull_request_target workflows to also receive read-only cache tokens in a future platform update (June 2026+); populate caches from push/schedule workflows instead.'
+  - 'Use actions/cache/restore@v5 explicitly in read-only contexts to make the intent clear and avoid confusing save failures.'
+docs:
+  - url: 'https://github.com/actions/cache/pull/1768'
+    label: 'actions/cache PR #1768: Bump @actions/cache to v5.1.0 — handle read-only cache access (June 18, 2026)'
+  - url: 'https://github.com/actions/toolkit/pull/2435'
+    label: 'actions/toolkit PR #2435: Handle cache write error due to read-only token'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request'
+    label: 'GitHub Docs: pull_request event — fork token restrictions'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#pull_request_target'
+    label: 'GitHub Docs: pull_request_target event'
