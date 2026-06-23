@@ -1,0 +1,141 @@
+id: re-515
+title: 'Self-Hosted Runner Silently Stops Receiving Workflow Jobs — Auto-Update Disabled, Runner Falls Behind 30-Day Version Floor'
+category: runner-environment
+severity: silent-failure
+tags:
+  - self-hosted
+  - runner
+  - auto-update
+  - version-enforcement
+  - 30-day-window
+  - disableupdate
+  - arc
+  - silent-failure
+patterns:
+  - regex: 'Runner version.*is deprecated and cannot receive messages'
+    flags: 'i'
+  - regex: 'Your runner.*outdated.*stop.*receiving workflow jobs'
+    flags: 'i'
+  - regex: 'runner.*version.*too old.*no longer.*receive.*jobs|no longer.*receive.*jobs.*runner.*version'
+    flags: 'i'
+  - regex: 'job.*queued.*no runners.*matching.*label|waiting for runner.*never assigned'
+    flags: 'i'
+error_messages:
+  - 'Runner version 2.329.0 is deprecated and cannot receive messages from the GitHub Actions service'
+  - 'Your runner is outdated and will stop receiving workflow jobs. Please upgrade to the latest runner version.'
+  - 'Job queued but no available runner with the label ''self-hosted'' picked it up within the timeout'
+  - 'This job was skipped because no runner is available'
+root_cause: |
+  GitHub Actions requires that already-registered self-hosted runners stay current within
+  a rolling 30-day update window. This is a separate requirement from the one-time minimum
+  registration version (v2.329.0, documented in re-284). A runner that successfully
+  registered at v2.329.0 will begin silently losing jobs if it is never updated again.
+
+  Enforcement mechanism:
+  - Each time a new runner release ships, a 30-day clock starts for each runner.
+  - If the runner has not installed the update within 30 days, GitHub stops dispatching
+    workflow jobs to that runner.
+  - When a critical security update is published, GitHub immediately pauses job queuing
+    until the update is applied (regardless of the 30-day window).
+
+  This failure mode is "silent" because:
+  1. The workflow run IS created — it shows "Queued" in the Actions tab.
+  2. The run may stay in Queued indefinitely (no automatic failure).
+  3. No error appears in the workflow YAML or the job log.
+  4. Maintainers typically blame concurrency, branch protection, or network issues before
+     checking runner version currency.
+
+  The annotation "Your runner is outdated and will stop receiving workflow jobs" appears
+  in the "Set up job" log section BEFORE the runner stops receiving jobs — it is a warning,
+  not the final failure message.
+
+  Who is most affected:
+  - Self-hosted runners with --disableupdate flag in runner startup scripts
+  - ARC (Actions Runner Controller) deployments with disableUpdate: true in RunnerDeployment
+  - VM/container images that bake in a specific runner binary version and are rebuilt
+    infrequently
+  - Air-gapped or isolated runners that cannot reach the GitHub runner update service
+
+  Enforcement brownout schedule (Config+Runtime phases):
+  GitHub Enterprise Cloud with Data Residency:
+    July 13, July 15, July 17 (first Config+Runtime days)
+    July 20, July 22, July 24 (full Config+Runtime week)
+    Full enforcement: July 31, 2026
+  GitHub Enterprise Cloud:
+    September 9, September 11 (first Config+Runtime days)
+    September 14, September 16, September 18 (full Config+Runtime week)
+    Full enforcement: September 25, 2026
+fix: |
+  1. Enable auto-update on all self-hosted runners:
+     - Remove --disableupdate from runner startup scripts
+     - Ensure the runner process can reach https://api.github.com and
+       https://objects.githubusercontent.com (for binary downloads)
+
+  2. For ARC (Actions Runner Controller):
+     - Remove or set disableUpdate: false in RunnerDeployment/AutoscalingRunnerSet spec
+     - Or update the runner container image to a version shipping the latest runner release
+
+  3. For pinned VM/container images:
+     - Add a dynamic runner download step that fetches the latest release from
+       https://github.com/actions/runner/releases/latest at provisioning time (see fix_code)
+     - Set up Renovate/Dependabot to keep runner image tags within 30 days of the latest
+
+  4. For air-gapped runners:
+     - Mirror runner releases to an internal artifact store
+     - Implement a scheduled job that checks for new runner releases and updates the store
+     - Configure the runner with --updatechannel pointing to your internal mirror
+
+  5. Audit current runner versions BEFORE brownout windows (July 13 for Data Residency,
+     September 9 for GH Enterprise Cloud):
+     - Use the REST API to check versions (see fix_code below)
+     - Check the "Set up job" log for the "Runner Image" and version lines
+fix_code:
+  - language: yaml
+    label: 'Audit runner versions via GitHub API before brownout windows'
+    code: |
+      # Check self-hosted runner versions for a repository
+      gh api repos/{owner}/{repo}/actions/runners \
+        --jq '.runners[] | {name: .name, version: .version, status: .status, busy: .busy}'
+
+      # Org-level audit — flag anything that has not updated in 30+ days
+      gh api orgs/{org}/actions/runners \
+        --jq '.runners[] | select(.version != null) | {name: .name, version: .version}'
+  - language: yaml
+    label: 'Fix: always download latest runner at provisioning time (never pin a version URL)'
+    code: |
+      #!/bin/bash
+      # Fetch the latest runner version dynamically — do NOT hardcode a version URL
+      RUNNER_VERSION=$(curl -s https://api.github.com/repos/actions/runner/releases/latest \
+        | jq -r '.tag_name' | sed 's/^v//')
+      curl -L -o actions-runner-linux-x64.tar.gz \
+        "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
+      tar xzf ./actions-runner-linux-x64.tar.gz
+      # Configure without --disableupdate so the runner can auto-update
+      ./config.sh --url https://github.com/{org} --token ${RUNNER_TOKEN}
+  - language: yaml
+    label: 'Fix for ARC: remove disableUpdate from RunnerDeployment spec'
+    code: |
+      apiVersion: actions.summerwind.dev/v1alpha1
+      kind: RunnerDeployment
+      metadata:
+        name: my-runners
+      spec:
+        template:
+          spec:
+            image: ghcr.io/actions/actions-runner:latest  # always use a recent tag
+            # REMOVE this line if present — it prevents auto-update:
+            # disableUpdate: true
+            # With auto-update enabled (default), the runner pulls updates automatically
+prevention:
+  - 'Never start a self-hosted runner with the --disableupdate flag — this is the most common cause of runners silently losing jobs after 30 days'
+  - 'For ARC deployments, do not set disableUpdate: true; let the runner auto-update within its running container'
+  - 'Set up a weekly automated check that queries the runners REST API and alerts if any runner version is more than 3 weeks behind the latest release'
+  - 'Audit runner versions before known brownout dates — the Config+Runtime brownouts start July 13, 2026 (Data Residency) and September 9, 2026 (GH Enterprise Cloud)'
+  - 'When the "Set up job" log shows "Your runner is outdated" annotation, treat it as an urgent alert, not a warning — update before the 30-day window closes'
+docs:
+  - url: 'https://github.blog/changelog/2026-06-12-github-actions-minimum-version-enforcement-timeline-for-self-hosted-runners/'
+    label: 'GitHub Changelog June 12, 2026: Minimum version enforcement timeline with brownout calendar'
+  - url: 'https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners#self-hosted-runner-version-requirements'
+    label: 'GitHub Docs: Self-hosted runner version requirements'
+  - url: 'https://github.com/actions/runner/releases'
+    label: 'actions/runner releases — check latest version'
