@@ -1,0 +1,90 @@
+id: sf-235
+title: 'Parallel Steps Writing to `$GITHUB_OUTPUT` Concurrently Cause Silent Data Loss'
+category: silent-failures
+severity: silent-failure
+tags:
+  - parallel-steps
+  - GITHUB_OUTPUT
+  - background
+  - race-condition
+  - outputs
+  - data-loss
+  - silent-failure
+patterns:
+  - regex: 'background:\s*true'
+    flags: 'i'
+  - regex: '>>.*\$GITHUB_OUTPUT.*&'
+    flags: 'i'
+error_messages:
+  - 'No error is thrown — output values are silently missing or corrupted when read by downstream steps'
+root_cause: |
+  GitHub Actions step outputs are written by appending `KEY=VALUE` lines to the
+  file at `$GITHUB_OUTPUT`. This file is a plain append-only text file — no locking
+  mechanism exists at the runner level.
+
+  When two or more parallel steps (using `background: true` or `parallel:`) both
+  write to `$GITHUB_OUTPUT` at the same time via `echo "key=value" >> $GITHUB_OUTPUT`,
+  a POSIX race condition occurs: the two processes can interleave their write buffers
+  at the byte level, producing a corrupted line such as `key1key2=value1\nvalue2` or
+  merging two writes onto a single line. The output parser then discards the
+  malformed line silently, and the affected step output evaluates to an empty string
+  or is simply absent when downstream steps reference `steps.<id>.outputs.<key>`.
+
+  No error is emitted — the corrupt line is quietly ignored. This is particularly
+  dangerous because subsequent `if:` conditions that check the output value silently
+  evaluate to false, causing jobs to skip critical steps with no visible failure.
+fix: |
+  Never write to `$GITHUB_OUTPUT` from concurrent parallel steps. Use one of these
+  safe patterns:
+
+  1. Write outputs only in a final sequential step that runs AFTER all parallel work
+     completes (after the `parallel:` block ends — parallel blocks auto-wait).
+  2. Have each parallel step write results to a unique named temp file, then collect
+     those files into `$GITHUB_OUTPUT` in a subsequent sequential step.
+  3. Use job outputs via uploaded artifacts rather than step outputs when parallel
+     steps need to exchange large data.
+fix_code:
+  - language: yaml
+    label: 'Write to $GITHUB_OUTPUT only after the parallel block completes'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - parallel:
+                steps:
+                  - name: Build A
+                    run: |
+                      ./build-a.sh
+                      # BAD: writing directly to $GITHUB_OUTPUT from parallel step
+                      # echo "result_a=success" >> $GITHUB_OUTPUT
+
+                      # GOOD: write to a unique temp file instead
+                      echo "success" > /tmp/build-a-result.txt
+
+                  - name: Build B
+                    run: |
+                      ./build-b.sh
+                      echo "success" > /tmp/build-b-result.txt
+
+            # parallel: block auto-waits — this step runs sequentially after both complete
+            - name: Collect outputs
+              id: collect
+              run: |
+                echo "result_a=$(cat /tmp/build-a-result.txt)" >> $GITHUB_OUTPUT
+                echo "result_b=$(cat /tmp/build-b-result.txt)" >> $GITHUB_OUTPUT
+
+            - name: Use outputs
+              run: echo "Results — A=${{ steps.collect.outputs.result_a }} B=${{ steps.collect.outputs.result_b }}"
+prevention:
+  - 'Write step outputs only in sequential steps that run after all parallel work completes'
+  - 'Treat $GITHUB_OUTPUT as a single-writer resource — concurrent appends are not safe due to missing file locking'
+  - 'Use unique temp files per parallel step for intermediate results; aggregate in a collect step'
+  - 'Audit any existing workflow that uses background: true or parallel: and writes to $GITHUB_OUTPUT'
+docs:
+  - url: 'https://github.blog/changelog/2026-06-25-actions-steps-can-now-be-run-in-parallel/'
+    label: 'GitHub Changelog — Actions steps can now be run in parallel (June 25, 2026)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions#setting-an-output-parameter'
+    label: 'GitHub Docs — Setting a step output parameter'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/passing-information-between-jobs'
+    label: 'GitHub Docs — Passing information between jobs'
