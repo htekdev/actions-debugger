@@ -1,0 +1,103 @@
+id: 'sf-236'
+title: '`upload-artifact/merge@v7` silently corrupts merged artifact when source artifacts share file paths'
+category: 'silent-failures'
+severity: 'silent-failure'
+tags:
+  - upload-artifact
+  - merge-artifacts
+  - v7
+  - file-corruption
+  - concurrent-write
+  - parallel-download
+  - silent-failure
+patterns:
+  - regex: 'upload-artifact/merge@v7'
+    flags: 'i'
+  - regex: 'separate-directories:\s*false'
+    flags: 'i'
+error_messages:
+  - 'Downloading artifact: build-linux'
+  - 'Downloading artifact: build-macos'
+  - 'Artifact successfully merged'
+root_cause: |
+  actions/upload-artifact/merge@v7 downloads all source artifacts to a shared temporary
+  directory (tmpDir) using up to PARALLEL_DOWNLOADS = 5 concurrent workers. When two or more
+  source artifacts contain files at the same relative path (e.g., checksums.txt, report.html,
+  README.md), concurrent workers call fs.createWriteStream(destPath) simultaneously. Both
+  streams truncate the file to 0 bytes and begin writing concurrently. Their async write()
+  calls interleave at the OS level, producing a file that is neither copy — a non-deterministic
+  mix of bytes from both streams. The corrupted file is silently uploaded as the merged artifact.
+  The action exits with code 0 and emits no error. The merged artifact appears valid in the
+  GitHub Actions UI but contains corrupted content that cannot be detected without checksumming.
+
+  Root cause confirmed in actions/upload-artifact#809 (June 2026). The bug is in
+  src/merge/merge-artifacts.ts — all artifacts share the same tmpDir with no file-path
+  conflict detection or locking.
+
+  Affected scenarios:
+  - Matrix builds where each job produces an artifact containing a same-named binary or manifest
+  - Release workflows where per-platform artifacts each include a checksums.txt or README.md
+  - Any workflow using merge action with separate-directories: false (the default) and overlapping paths
+fix: |
+  Option 1 — Set separate-directories: true on the merge action. This places each source
+  artifact's files under a subdirectory named after the artifact, eliminating write collisions.
+  The merged artifact's directory structure changes but corruption is avoided.
+
+  Option 2 — Rename files before uploading to include a unique dimension (OS, arch, matrix
+  value) so no two source artifacts share a file at the same relative path.
+
+  Option 3 — Validate checksums of all critical files in the merged artifact immediately after
+  the merge step, before using the merged artifact for signing, publishing, or deployment.
+fix_code:
+  - language: yaml
+    label: 'Option 1 — Use separate-directories: true to prevent concurrent write collision'
+    code: |
+      - name: Merge artifacts (safe — each source artifact gets its own subdirectory)
+        uses: actions/upload-artifact/merge@v7
+        with:
+          name: merged-artifacts
+          pattern: build-*
+          separate-directories: true
+          # Merged artifact directory structure:
+          #   merged-artifacts/
+          #     build-linux/checksums.txt
+          #     build-macos/checksums.txt
+          #     build-windows/checksums.txt
+  - language: yaml
+    label: 'Option 2 — Include unique dimension in filenames before upload to avoid path collision'
+    code: |
+      jobs:
+        build:
+          strategy:
+            matrix:
+              os: [ubuntu-latest, macos-latest, windows-latest]
+          runs-on: ${{ matrix.os }}
+          steps:
+            - name: Build and rename output to include OS identifier
+              run: cp dist/checksums.txt dist/checksums-${{ runner.os }}.txt
+            - uses: actions/upload-artifact@v7
+              with:
+                name: build-${{ runner.os }}
+                path: dist/checksums-${{ runner.os }}.txt
+
+        merge:
+          needs: build
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/upload-artifact/merge@v7
+              with:
+                name: all-checksums
+                pattern: build-*
+                # separate-directories: false is safe — all filenames are unique
+prevention:
+  - 'Audit source artifact contents for overlapping file paths before using upload-artifact/merge with separate-directories: false (the default).'
+  - 'Use separate-directories: true as the safe default when merging matrix artifacts whose internal file paths may overlap.'
+  - 'Add a checksum validation step immediately after artifact merge to detect corruption before the artifact is used for signing or publishing.'
+  - 'Include a unique build dimension (OS, arch, matrix value) in all output filenames in matrix jobs to eliminate same-path collision risk.'
+docs:
+  - url: 'https://github.com/actions/upload-artifact/issues/809'
+    label: 'actions/upload-artifact#809: upload-artifact/merge silently corrupts files when source artifacts share a path (June 2026)'
+  - url: 'https://github.com/actions/upload-artifact/blob/main/merge/README.md'
+    label: 'upload-artifact/merge README: separate-directories input documentation'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflows-do/storing-workflow-data-as-artifacts'
+    label: 'GitHub Docs: Storing workflow data as artifacts'
