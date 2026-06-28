@@ -1,0 +1,88 @@
+id: ct-106
+title: 'actions/checkout fails with "SyntaxError: Unexpected end of JSON input" when called from parallel background steps'
+category: concurrency-timing
+severity: error
+tags:
+  - checkout
+  - parallel-steps
+  - background
+  - race-condition
+  - json
+  - context
+  - v6
+patterns:
+  - regex: 'SyntaxError: Unexpected end of JSON input'
+    flags: 'i'
+  - regex: 'SyntaxError.*Unexpected end of JSON.*dist/index\.js.*Context'
+    flags: 'i'
+error_messages:
+  - 'SyntaxError: Unexpected end of JSON input'
+  - '    at JSON.parse (<anonymous>)'
+  - '    at new Context (/home/runner/work/_actions/actions/checkout/'
+root_cause: |
+  When `actions/checkout` is called from multiple `background: true` parallel steps
+  (introduced June 25, 2026 via the new Actions parallel steps feature), all simultaneously
+  executing instances race to initialise the same Actions toolkit context JSON file on the
+  shared runner filesystem.
+
+  The `Context` constructor in `actions/checkout` reads a well-known JSON path from
+  the runner environment (GITHUB_EVENT_PATH). When two parallel checkout steps both
+  start at the same moment, one instance writes (or re-reads) the file while the other
+  reads it mid-write, receiving a truncated or empty JSON string. `JSON.parse()` then
+  throws `SyntaxError: Unexpected end of JSON input`.
+
+  This race only manifests when `actions/checkout` is called from two or more steps
+  executing simultaneously under `background: true` or inside a `parallel:` block
+  within the same job. Sequential checkout calls are unaffected.
+
+  Source: actions/checkout issue #2484 (filed June 26, 2026 — "I have never seen this
+  before I started using `parallel`").
+fix: |
+  Do not call `actions/checkout` from multiple parallel background steps in the same job.
+  Checkout is a per-job setup action — run it once, sequentially, before the `parallel:`
+  or `background: true` block.
+
+  If you need separate repository states per parallel code path, use separate jobs
+  (each with its own isolated runner context) instead of parallel steps within one job.
+fix_code:
+  - language: yaml
+    label: 'Broken: checkout inside parallel steps — JSON race condition'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - name: Step A
+              background: true
+              uses: actions/checkout@v6   # ⚠️ races with Step B
+            - name: Step B
+              background: true
+              uses: actions/checkout@v6   # ⚠️ races with Step A
+            - wait-all: true
+  - language: yaml
+    label: 'Fixed: checkout once before the parallel block'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v6   # ✅ sequential, before parallel block
+            - name: Step A
+              background: true
+              run: ./build-a.sh
+            - name: Step B
+              background: true
+              run: ./build-b.sh
+            - wait-all: true
+prevention:
+  - 'Treat actions/checkout as a per-job setup step — run it once, sequentially, before any parallel: or background: block.'
+  - 'Use parallel steps only for run: commands and actions that do not write to shared runner filesystem context paths.'
+  - 'If separate independent checkouts are required, use separate jobs rather than parallel steps within one job.'
+  - 'Keep actions/checkout pinned to the latest patch version — this race condition may be patched in a future release.'
+docs:
+  - url: 'https://github.com/actions/checkout/issues/2484'
+    label: 'GitHub Issue: checkout SyntaxError with parallel background steps (#2484)'
+  - url: 'https://github.blog/changelog/2026-06-25-actions-steps-can-now-be-run-in-parallel/'
+    label: 'GitHub Changelog: Actions steps can now be run in parallel (June 25, 2026)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idstepsbackground'
+    label: 'GitHub Docs: Parallel steps background syntax'
