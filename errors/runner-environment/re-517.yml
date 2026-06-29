@@ -1,0 +1,104 @@
+id: re-517
+title: 'Node 22.23.0 Cached in Tool Cache Causes ERR_STREAM_PREMATURE_CLOSE for HTTP Clients'
+category: runner-environment
+severity: error
+tags:
+  - setup-node
+  - node-22
+  - tool-cache
+  - http-client
+  - ERR_STREAM_PREMATURE_CLOSE
+  - keep-alive
+  - regression
+patterns:
+  - regex: 'ERR_STREAM_PREMATURE_CLOSE'
+    flags: 'i'
+  - regex: 'Invalid response body while trying to fetch.*Premature close'
+    flags: 'i'
+  - regex: 'Premature close'
+    flags: 'i'
+  - regex: 'Found in cache @ .*/node/22\.23\.0/'
+    flags: 'i'
+error_messages:
+  - 'Invalid response body while trying to fetch https://...: Premature close'
+  - 'FetchError: Invalid response body while trying to fetch ... reason: Premature close'
+  - 'Error: Premature close'
+  - 'code: ERR_STREAM_PREMATURE_CLOSE'
+  - 'Found in cache @ /opt/hostedtoolcache/node/22.23.0/x64'
+root_cause: |
+  Node.js 22.23.0 contains a socket keep-alive / connection-reuse regression that
+  causes HTTP responses on reused (pooled) connections to be terminated prematurely.
+  The TCP connection is handed back to the pool before the response body has been
+  fully consumed, so the next request to reuse that connection receives an
+  ERR_STREAM_PREMATURE_CLOSE error mid-stream.
+
+  GitHub-hosted runner images built from 20260622.220.1 onward ship Node 22.23.0 in
+  the tool cache at /opt/hostedtoolcache/node/22.23.0/. When `actions/setup-node` is
+  called with `node-version: '22'` (a major-version spec) without `check-latest: true`,
+  it resolves to this cached 22.23.0 rather than fetching the patched 22.23.1 release.
+
+  HTTP clients that use connection pooling — including gaxios (used by Google APIs /
+  firebase-admin), node-fetch 3.x, undici, and others — intermittently fail when the
+  pooled socket is affected. The error surfaces as:
+    "Invalid response body while trying to fetch <url>: Premature close"
+  or simply as an `ERR_STREAM_PREMATURE_CLOSE` throw.
+
+  The regression was introduced in Node 22.23.0 and fixed in Node 22.23.1.
+  Source: nodejs/node#63989 (tracked as same regression class on 24.x line).
+fix: |
+  Option 1 — Use `check-latest: true` so setup-node fetches the latest 22.x patch:
+  ```yaml
+  - uses: actions/setup-node@v4
+    with:
+      node-version: '22'
+      check-latest: true
+  ```
+  This fetches 22.23.1 (or newer) from dist.nodejs.org rather than the cached 22.23.0.
+
+  Option 2 — Pin to the patched minor version explicitly:
+  ```yaml
+  - uses: actions/setup-node@v4
+    with:
+      node-version: '22.23.1'
+  ```
+
+  Option 3 — Use an .nvmrc or .node-version file pinned to 22.23.1 until the runner
+  image is updated:
+  ```yaml
+  - uses: actions/setup-node@v4
+    with:
+      node-version-file: '.nvmrc'
+  ```
+  with `.nvmrc` containing `22.23.1`.
+
+  The runner image will be updated to ship Node 22.23.1 in a future release. Once the
+  image rolls out, unpinned `node-version: '22'` (without check-latest) will resolve
+  to the patched version automatically.
+fix_code:
+  - language: yaml
+    label: 'Use check-latest to avoid stale tool cache (preferred)'
+    code: |
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          check-latest: true   # fetches 22.23.1+, bypassing cached 22.23.0
+  - language: yaml
+    label: 'Pin to patched version explicitly'
+    code: |
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.1'   # skip 22.23.0 which has keep-alive regression
+prevention:
+  - "Use `check-latest: true` with major-version specs so CI always resolves to the latest patch release rather than the potentially-stale tool cache."
+  - "When using HTTP clients that pool connections (gaxios, undici, node-fetch 3.x), pin Node versions explicitly and update promptly after regressions are patched."
+  - "Monitor the runner-images changelog and node-version tool cache updates; subscribe to actions/runner-images releases for image build notifications."
+  - "If intermittent ERR_STREAM_PREMATURE_CLOSE appears after an image build bump, compare the Node version in the tool cache by checking 'Found in cache @' lines in setup-node output."
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14303'
+    label: 'runner-images #14303 — Node 22.23.0 keep-alive regression report (June 29, 2026)'
+  - url: 'https://github.com/nodejs/node/issues/63989'
+    label: 'nodejs/node #63989 — Upstream premature close regression tracking issue'
+  - url: 'https://github.com/actions/setup-node#usage'
+    label: 'actions/setup-node — check-latest option documentation'
