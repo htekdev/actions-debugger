@@ -1,0 +1,98 @@
+id: runner-environment-521
+title: 'Clang -march=native "invalid feature combination: +avx10.1-256" on ubuntu-24.04 Runners'
+category: runner-environment
+severity: warning
+tags:
+  - clang
+  - march-native
+  - avx10
+  - ubuntu-24-04
+  - nondeterministic
+  - compiler
+  - cpu-features
+patterns:
+  - regex: 'invalid feature combination: \+avx10\.1-256.*will be promoted'
+    flags: 'i'
+  - regex: 'error:.*\+avx10\.1-256.*avx10\.1-512'
+    flags: 'i'
+  - regex: '\[-Werror,-Winvalid-feature-combination\].*avx10'
+    flags: 'i'
+error_messages:
+  - "error: invalid feature combination: +avx10.1-256; will be promoted to avx10.1-512 [-Werror,-Winvalid-feature-combination]"
+  - "invalid feature combination: +avx10.1-256; will be promoted to avx10.1-512 [-Werror,-Winvalid-feature-combination]"
+root_cause: |
+  When using `-march=native` with Clang 18 (shipped in `ubuntu-24.04` runner images since
+  image build 20260622.220.1), certain runner VMs trigger a Clang diagnostic:
+  `invalid feature combination: +avx10.1-256; will be promoted to avx10.1-512`.
+
+  **Why it's intermittent:** GitHub-hosted runner VMs are allocated from a pool of physical
+  hosts in Azure. A subset of these hosts have CPUs with AVX10.1-512 hardware support
+  (Intel Sierra Forest / Grand Ridge generation). When `-march=native` is passed, Clang
+  detects AVX10.1-256 from CPUID but the underlying hardware can promote this to
+  AVX10.1-512, creating a conflicting feature combination that Clang 18 flags with
+  `-Winvalid-feature-combination`. Most runner VMs are allocated to older hosts and never
+  trigger this warning.
+
+  **When it becomes a build error:** The warning is only fatal if the build passes
+  `-Werror` (either directly or via `-Werror,-Winvalid-feature-combination`). Since many
+  C/C++ CI setups use `-Werror` to enforce clean builds, the combination:
+  `-march=native -Werror` is a latent time bomb on `ubuntu-24.04` that silently passes
+  ~99% of the time and fails ~1% of the time depending on runner VM assignment.
+
+  Source: actions/runner-images#14296 (filed June 27, 2026 — confirmed by runner-images
+  team, assigned for investigation).
+fix: |
+  Choose one of the following fixes depending on your needs:
+
+  **Option 1 (recommended) — Suppress the specific warning:**
+  Add `-Wno-invalid-feature-combination` to your Clang flags. This suppresses only the
+  AVX10 feature combination diagnostic without disabling other `-Werror` checks.
+
+  **Option 2 — Replace `-march=native` with an explicit ISA target:**
+  Use a stable, explicit architecture level instead of auto-detecting the host CPU.
+  Common choices for CI portability:
+  - `-march=x86-64-v3` (AVX2 + FMA + BMI2 — widely available on Azure hosts)
+  - `-march=cascadelake` (AVX-512 — if you need 512-bit vectorization)
+  This ensures consistent behavior regardless of which physical host handles the runner.
+
+  **Option 3 — Pin to ubuntu-22.04:**
+  `ubuntu-22.04` ships Clang 14, which does not have AVX10 awareness and does not emit
+  this diagnostic. Not recommended long-term (ubuntu-22.04 is EOL June 2027).
+fix_code:
+  - language: yaml
+    label: 'Add -Wno-invalid-feature-combination to suppress AVX10 promotion warning'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-24.04
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build with Clang
+              run: |
+                cmake -DCMAKE_CXX_FLAGS="-march=native -Werror -Wno-invalid-feature-combination" .
+                cmake --build .
+  - language: yaml
+    label: 'Replace -march=native with explicit ISA for reproducible CI builds'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-24.04
+          steps:
+            - uses: actions/checkout@v4
+            - name: Build with explicit ISA target (portable across runner VMs)
+              run: |
+                # Use x86-64-v3 instead of native — stable, available on all Azure hosts
+                cmake -DCMAKE_CXX_FLAGS="-march=x86-64-v3 -Werror" .
+                cmake --build .
+prevention:
+  - 'Never combine `-march=native` with `-Werror` in CI — `-march=native` produces non-deterministic feature detection that varies with the physical host executing the runner.'
+  - 'Use explicit ISA targets (`-march=x86-64-v3`, `-march=cascadelake`) in CI for reproducible builds that do not depend on host CPU capabilities.'
+  - 'If you need native optimization for benchmarks, use a separate workflow step without `-Werror`, or add `-Wno-invalid-feature-combination` to the Clang flags for CI-only runs.'
+  - 'Audit your CMake presets and CI flags for `-march=native` whenever updating to a new runner image version.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14296'
+    label: 'runner-images#14296 — Clang -march=native AVX10.1 invalid feature combination on ubuntu-24.04 (June 27, 2026)'
+  - url: 'https://clang.llvm.org/docs/DiagnosticsReference.html#winvalid-feature-combination'
+    label: 'Clang Docs — -Winvalid-feature-combination diagnostic'
+  - url: 'https://gcc.gnu.org/onlinedocs/gcc/x86-Options.html'
+    label: 'GCC/Clang x86 -march target options'
