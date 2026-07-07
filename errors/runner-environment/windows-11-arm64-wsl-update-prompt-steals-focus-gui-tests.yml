@@ -1,0 +1,131 @@
+id: runner-environment-520
+title: 'Windows 11 ARM64 `wsl.exe --update` Prompt on Logon Steals Focus — GUI Automation Breaks'
+category: runner-environment
+severity: error
+tags:
+  - windows-11-arm
+  - arm64
+  - wsl
+  - gui
+  - focus
+  - regression
+  - browser-automation
+  - playwright
+  - selenium
+  - june-2026
+patterns:
+  - regex: 'wsl\.exe.*--update.*--confirm.*--prompt-before-exit'
+    flags: 'i'
+  - regex: 'windows.terminal.*stole.*focus|focus.*stolen.*wsl|wsl.*update.*window.*focus'
+    flags: 'i'
+  - regex: 'Timeout.*waiting for.*browser.*focus|element.*not.*focused.*arm64'
+    flags: 'i'
+error_messages:
+  - "Error: Timeout 30000ms exceeded. waiting for element to be focused."
+  - "browserType.launch: Target page, context or browser has been closed"
+  - "wsl.exe --update --confirm --prompt-before-exit"
+root_cause: |
+  Runner image builds shipping from late June 2026 for `windows-11-arm` introduced a Windows
+  startup logon trigger that runs `wsl.exe --update --confirm --prompt-before-exit`. This spawns
+  a visible Windows Terminal window that:
+  1. Takes foreground focus away from the test runner process.
+  2. Waits up to 60 seconds for a user interaction that never arrives in CI.
+  3. Remains topmost, preventing GUI automation frameworks from interacting with the window under test.
+
+  Effects on common frameworks:
+  - **Playwright** (headed mode): `page.click()` misses because the WSL window has focus.
+    `browserType.launch()` may fail with "target has been closed" if the runner's session
+    times out waiting for the WSL prompt to dismiss.
+  - **Selenium / WebDriver**: `driver.findElement().click()` acts on wrong window; element
+    interaction assertions fail.
+  - **WinForms / WPF UI tests**: `Form.ActiveForm` may return the WSL terminal window's handle,
+    and `SendKeys` targets the wrong window.
+  - **Screenshot-based tests**: screenshots capture the WSL terminal overlay instead of the app.
+
+  This is distinct from the known `windows-11-arm` non-interactive session limitation
+  (runner-environment-113 / ku-113). That issue is about Form.ActiveForm always being null;
+  this issue is about a pop-up window actively stealing focus from a running test session.
+
+  Tracked at actions/runner-images#14264 — open, under investigation by the runner team.
+fix: |
+  **Workaround 1 — Suppress WSL at session start (recommended while issue is open):**
+  Add a step before any GUI/browser automation to kill the WSL update window and disable
+  the startup trigger:
+
+  ```powershell
+  # Kill any WSL update window that appeared on logon
+  Get-Process -Name "WindowsTerminal" -ErrorAction SilentlyContinue | Stop-Process -Force
+  # Disable WSL update prompt for this session
+  Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" `
+    -Name "WslUpdatePrompt" -Value "" -ErrorAction SilentlyContinue
+  ```
+
+  **Workaround 2 — Avoid `windows-11-arm` for GUI automation until fixed:**
+  Route headed browser and GUI automation tests to `windows-latest` (x64 Windows Server 2025),
+  which does not exhibit this WSL update prompt regression.
+
+  **Workaround 3 — Use headless mode:**
+  Switch Playwright / Selenium to headless mode to avoid the focus-stealing issue entirely.
+  Headless browsers are not affected by the WSL window.
+
+  Monitor actions/runner-images#14264 for an official image patch.
+fix_code:
+  - language: yaml
+    label: 'Suppress WSL update window before GUI tests on windows-11-arm'
+    code: |
+      jobs:
+        gui-tests:
+          runs-on: windows-11-arm
+          steps:
+            - uses: actions/checkout@v6
+
+            - name: Suppress WSL update prompt (regression workaround — runner-images#14264)
+              shell: pwsh
+              run: |
+                # Kill any Windows Terminal window spawned by the WSL update logon trigger
+                Get-Process -Name "WindowsTerminal" -ErrorAction SilentlyContinue | Stop-Process -Force
+                Start-Sleep -Seconds 2  # allow window teardown to complete
+
+            - name: Run Playwright tests
+              run: npx playwright test
+  - language: yaml
+    label: 'Route GUI tests to windows-latest; arm-specific tests to windows-11-arm'
+    code: |
+      jobs:
+        tests:
+          strategy:
+            matrix:
+              include:
+                - os: windows-latest
+                  suite: gui        # headed browser / WinForms tests
+                - os: windows-11-arm
+                  suite: native     # ARM64 native code tests — no GUI
+          runs-on: ${{ matrix.os }}
+          steps:
+            - uses: actions/checkout@v6
+
+            - name: Run tests
+              run: dotnet test --filter Category=${{ matrix.suite }}
+  - language: yaml
+    label: 'Force headless mode on windows-11-arm to avoid focus issues'
+    code: |
+      - name: Run Playwright tests (headless on ARM64)
+        run: |
+          if [ "${{ runner.arch }}" = "ARM64" ]; then
+            npx playwright test --project=chromium-headless-shell
+          else
+            npx playwright test
+          fi
+        shell: bash
+prevention:
+  - "Avoid headed browser automation on `windows-11-arm` until actions/runner-images#14264 is resolved"
+  - "Add a 'kill WindowsTerminal' pre-step when running GUI tests on windows-11-arm"
+  - "Prefer headless mode for cross-platform browser tests to avoid session focus dependencies"
+  - "Subscribe to actions/runner-images#14264 for the official image fix"
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14264'
+    label: 'runner-images#14264: Windows 11 ARM64 image shows WSL update required prompt'
+  - url: 'https://github.com/actions/runner-images/issues/14049'
+    label: 'runner-images#14049: windows-11-arm non-interactive session (related context)'
+  - url: 'https://docs.github.com/en/actions/using-github-hosted-runners/using-github-hosted-runners/about-github-hosted-runners'
+    label: 'GitHub Docs: About GitHub-hosted runners'

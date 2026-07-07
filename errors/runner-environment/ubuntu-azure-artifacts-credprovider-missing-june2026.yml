@@ -1,0 +1,115 @@
+id: runner-environment-519
+title: 'Azure Artifacts Credential Provider Removed from Ubuntu Runners — NuGet Private Feed Auth Fails'
+category: runner-environment
+severity: error
+tags:
+  - azure-artifacts
+  - nuget
+  - credential-provider
+  - ubuntu
+  - dotnet
+  - private-feed
+  - regression
+  - june-2026
+patterns:
+  - regex: 'Path to the Azure Artifacts Credential Provider is null or empty'
+    flags: 'i'
+  - regex: 'CredentialProvider\.Microsoft.*not found|artifacts-credprovider.*missing'
+    flags: 'i'
+  - regex: 'Unable to obtain credentials for feed.*Azure Artifacts'
+    flags: 'i'
+  - regex: 'Response status code does not indicate success.*401.*nuget|nuget.*401.*azure\.artifacts'
+    flags: 'i'
+error_messages:
+  - "Value cannot be null. (Parameter 'Path to the Azure Artifacts Credential Provider is null or empty. See https://github.com/NuGet/Home/wiki/NuGet-cross-plat-authentication-plugin#plugin-installation-and-discovery to set up the Credential Provider.')"
+  - "Unable to obtain credentials for feed 'https://pkgs.dev.azure.com/...'"
+  - "CredentialProvider.Microsoft.exe: plugin not found"
+root_cause: |
+  As of runner image build `20260611.554` (deployed June 17, 2026), the Azure Artifacts
+  Credential Provider (`Microsoft.Net.Http.Headers.CredentialProvider.Microsoft.exe`) was
+  silently removed from the pre-installed tool set on all GitHub-hosted Ubuntu runner images.
+  Previously it was bundled at `~/.nuget/plugins/netcore/CredentialProvider.Microsoft/`.
+
+  Affected runner labels (as of June 17, 2026):
+  - `ubuntu-22.04`, `ubuntu-22.04-arm`
+  - `ubuntu-24.04`, `ubuntu-24.04-arm`
+  - `ubuntu-26.04`, `ubuntu-26.04-arm`
+  - `ubuntu-latest`, `ubuntu-slim`
+
+  macOS and Windows runners may be affected as well (see actions/runner-images#14270).
+
+  Any workflow that uses `dotnet restore`, `nuget restore`, or `msbuild /restore` against a
+  private Azure Artifacts NuGet feed relies on this provider for MSAL-based authentication.
+  The restore fails with HTTP 401 when the provider is absent, even if `NUGET_CREDENTIALPROVIDERS_PATH`
+  is set or `nugetAuthenticate@1` task is configured — that task only configures credentials, it
+  does not install the provider binary.
+fix: |
+  Add an explicit install step for the Azure Artifacts Credential Provider **before** any NuGet
+  restore or build step:
+
+  ```bash
+  sh -c "$(curl -fsSL https://aka.ms/install-artifacts-credprovider.sh)"
+  ```
+
+  This installs the provider to `~/.nuget/plugins/netcore/CredentialProvider.Microsoft/`.
+  Subsequent `dotnet restore`, `nuget restore`, and `msbuild /restore` commands will find and
+  use it automatically.
+
+  For workflows using `NuGetAuthenticate@1` or similar Azure DevOps task wrappers, the install
+  step must still be added — those tasks configure credentials but don't install the binary.
+fix_code:
+  - language: yaml
+    label: 'Install Azure Artifacts Credential Provider before dotnet restore'
+    code: |
+      jobs:
+        build:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v6
+
+            - name: Install Azure Artifacts Credential Provider
+              run: sh -c "$(curl -fsSL https://aka.ms/install-artifacts-credprovider.sh)"
+
+            - name: Restore NuGet packages
+              run: dotnet restore
+              env:
+                NUGET_CREDENTIALPROVIDERS_PATH: "${{ runner.temp }}/plugins/netcore"
+                VSS_NUGET_EXTERNAL_FEED_ENDPOINTS: |
+                  {
+                    "endpointCredentials": [{
+                      "endpoint": "https://pkgs.dev.azure.com/YOUR_ORG/_packaging/YOUR_FEED/nuget/v3/index.json",
+                      "username": "any",
+                      "password": "${{ secrets.AZURE_DEVOPS_PAT }}"
+                    }]
+                  }
+
+            - name: Build
+              run: dotnet build --no-restore
+  - language: yaml
+    label: 'Reusable composite step — install credential provider once'
+    code: |
+      # .github/actions/install-azartifacts-cred/action.yml
+      name: Install Azure Artifacts Credential Provider
+      description: Installs CredentialProvider.Microsoft on the runner
+      runs:
+        using: composite
+        steps:
+          - name: Install credential provider
+            shell: bash
+            run: sh -c "$(curl -fsSL https://aka.ms/install-artifacts-credprovider.sh)"
+prevention:
+  - "Do not assume the Azure Artifacts Credential Provider is pre-installed on Ubuntu runners after June 17, 2026"
+  - "Add the `install-artifacts-credprovider.sh` install step as the first step in any job that restores NuGet packages from private Azure Artifacts feeds"
+  - "For Windows runners, use the equivalent PowerShell script: `iex \"& { $(irm https://aka.ms/install-artifacts-credprovider.ps1) }\"`"
+  - "Pin the install script URL from `aka.ms` (Microsoft short link) rather than hardcoding the GitHub release URL — Microsoft keeps the alias stable"
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14270'
+    label: 'runner-images#14270: Azure Artifacts Credential Provider missing on Ubuntu Runner'
+  - url: 'https://github.com/microsoft/artifacts-credprovider'
+    label: 'microsoft/artifacts-credprovider — official provider repo'
+  - url: 'https://aka.ms/install-artifacts-credprovider.sh'
+    label: 'Official install script (Linux/macOS)'
+  - url: 'https://github.com/NuGet/Home/wiki/NuGet-cross-plat-authentication-plugin#plugin-installation-and-discovery'
+    label: 'NuGet cross-platform authentication plugin discovery guide'
+  - url: 'https://learn.microsoft.com/en-us/azure/devops/artifacts/nuget/nuget-exe?view=azure-devops'
+    label: 'Azure Artifacts: NuGet restore authentication guide'
