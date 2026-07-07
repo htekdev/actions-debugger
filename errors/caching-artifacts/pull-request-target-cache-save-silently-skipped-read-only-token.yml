@@ -1,0 +1,127 @@
+id: ca-157
+title: '`actions/cache` save silently skipped on `pull_request_target`, `issue_comment`, and fork `workflow_run` — cache token now read-only'
+category: caching-artifacts
+severity: silent-failure
+tags:
+  - pull_request_target
+  - issue_comment
+  - workflow_run
+  - fork
+  - cache
+  - read-only
+  - cache-poisoning
+  - breaking-change
+  - silent-failure
+patterns:
+  - regex: 'Cache save is skipped.*read.only|read-only cache token|cache.*write.*not.*permitted'
+    flags: 'i'
+  - regex: 'Warning: Cache not saved.*untrusted trigger|cache.*token.*read.only'
+    flags: 'i'
+  - regex: 'Cache hit.*but.*save.*skipped|save.*denied.*read.only.*token'
+    flags: 'i'
+error_messages:
+  - 'Warning: Cache not saved: cache token is read-only for untrusted triggers'
+  - 'Cache save is skipped because the GITHUB_TOKEN does not have cache write permission'
+  - 'Warning: Cache not saved — read-only cache token issued for this trigger'
+  - 'actions/cache: cache save skipped (read-only token)'
+root_cause: |
+  On June 26, 2026, GitHub began issuing read-only cache tokens when BOTH of these
+  conditions are true:
+
+  1. The triggering event is "untrusted" — meaning someone outside the repository's
+     collaborator set can fire the event. Untrusted triggers include:
+     - `pull_request_target` (can be triggered by fork PR authors)
+     - `issue_comment` (any user with read access can comment)
+     - Fork pull-request `workflow_run` cascades (the downstream workflow runs with
+       default-branch context but was triggered by a fork's PR)
+
+  2. The workflow's execution context AND cache scope come from the default-branch SHA.
+
+  Prior to this change, all triggers received read-write cache tokens. This allowed a
+  "cache poisoning" attack: an external actor could trigger an untrusted workflow, write
+  a malicious cache entry keyed to the default branch, and then a trusted workflow (e.g.,
+  `push` or `schedule`) would restore those poisoned entries and execute attacker-controlled
+  code with the repository's full secrets and identity.
+
+  When the read-only restriction applies:
+  - `actions/cache` steps that call the save action log a warning and complete without
+    saving. **The job does not fail.** This is a silent failure mode.
+  - `actions/cache/restore` (read-only restore steps) are unaffected.
+  - Triggers that keep full read-write cache access: `push`, `schedule`,
+    `workflow_dispatch`, `repository_dispatch`, `delete`, `registry_package`,
+    `page_build`, `pull_request` (non-default-branch scope), `release`.
+
+  Common symptom: After this change ships, workflows using `pull_request_target` or
+  `issue_comment` that previously populated the cache now show persistent cache misses
+  on subsequent runs, with no error — just degraded build performance and slow CI.
+fix: |
+  Move cache SAVES to a trusted trigger workflow (`push`, `schedule`, or
+  `workflow_dispatch`). Untrusted trigger workflows should only RESTORE cache.
+
+  Split pattern:
+  1. Create a `cache-warm.yml` workflow triggered by `push` that saves the cache.
+  2. Modify the `pull_request_target` / `issue_comment` workflow to use
+     `actions/cache/restore` instead of `actions/cache` (the combined save+restore action).
+
+  If the PR/issue workflow must also build artifacts that were previously cached, restore
+  from what the trusted workflow wrote. If there is no warm cache entry yet, accept the
+  cold build on those runs.
+fix_code:
+  - language: yaml
+    label: 'Trusted workflow: save cache on push to default branch'
+    code: |
+      # .github/workflows/cache-warm.yml
+      name: Warm cache
+      on:
+        push:
+          branches: [main]
+      jobs:
+        warm:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v6
+            - uses: actions/cache/save@v4
+              with:
+                key: deps-${{ hashFiles('package-lock.json') }}
+                path: node_modules
+            - run: npm ci
+  - language: yaml
+    label: 'Untrusted workflow: restore cache only (no save)'
+    code: |
+      # .github/workflows/pr-check.yml
+      name: PR check
+      on: pull_request_target
+
+      jobs:
+        check:
+          runs-on: ubuntu-latest
+          steps:
+            - uses: actions/checkout@v6
+            - uses: actions/cache/restore@v4   # restore only, not the combined save+restore
+              with:
+                key: deps-${{ hashFiles('package-lock.json') }}
+                path: node_modules
+            - run: npm test   # may be a cold run if cache isn't warm yet
+  - language: yaml
+    label: 'Wrong pattern: actions/cache on pull_request_target silently does nothing on save'
+    code: |
+      # This pattern silently skips the cache save step — no error, just no cache written
+      on: pull_request_target
+      jobs:
+        check:
+          steps:
+            - uses: actions/cache@v4   # save step is silently skipped — use cache/restore@v4 instead
+              with:
+                key: deps-${{ hashFiles('package-lock.json') }}
+                path: node_modules
+prevention:
+  - 'Use `actions/cache/restore@v4` (not `actions/cache@v4`) in untrusted-trigger workflows'
+  - 'Create a separate cache-warm workflow triggered by `push` that saves dependencies'
+  - 'Monitor cache hit rates in pull_request_target workflows — a sudden drop after June 26, 2026 is this change'
+  - 'Never rely on cache saves inside `issue_comment` or `pull_request_target` workflows for correctness'
+  - 'This is a security improvement — do not attempt to work around the read-only restriction'
+docs:
+  - url: 'https://github.blog/changelog/2026-06-26-read-only-actions-cache-for-untrusted-triggers/'
+    label: 'GitHub Changelog: Read-only Actions cache for untrusted triggers (Jun 26, 2026)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/caching-dependencies-to-speed-up-workflows'
+    label: 'GitHub Docs: Caching dependencies to speed up workflows'
