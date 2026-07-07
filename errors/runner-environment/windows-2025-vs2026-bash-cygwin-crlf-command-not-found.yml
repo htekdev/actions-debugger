@@ -1,0 +1,142 @@
+id: runner-environment-518
+title: 'windows-2025-vs2026 shell:bash Resolves to Cygwin Instead of Git Bash — CRLF Causes $''cmd\r'': command not found'
+category: runner-environment
+severity: error
+tags:
+  - windows
+  - bash
+  - cygwin
+  - crlf
+  - line-endings
+  - vs2026
+  - regression
+  - shell
+patterns:
+  - regex: '\$''[\w./]+\\r'': command not found'
+    flags: 'i'
+  - regex: 'line \d+: [\w./]+\\n: No such file or directory'
+    flags: 'i'
+  - regex: '\$''pwd\\r|pwd.r.: command not found'
+    flags: 'i'
+error_messages:
+  - "$'pwd\\r': command not found"
+  - "D:\\a\\_temp\\*.sh: line 2: ci/run.sh\n: No such file or directory"
+  - "$'bash\\r': command not found"
+  - "/bin/bash: ci/run.sh\r: No such file or directory"
+root_cause: |
+  On the `windows-2025-vs2026` runner image (build 20260622.153.1 and later),
+  the PATH ordering places Cygwin bash before Git Bash when `shell: bash` is
+  specified in a workflow step. Cygwin bash does NOT silently ignore carriage
+  returns (`\r`) in scripts by default, unlike Git Bash which is tolerant of
+  CRLF line endings.
+
+  GitHub Actions generates temporary shell script files for every `run:` inline
+  block. On Windows runners, these generated `.sh` files use CRLF (`\r\n`) line
+  endings. When Git Bash executes these scripts it silently strips the `\r`, so
+  workflows succeed on `windows-2025`. When Cygwin bash executes the same CRLF
+  scripts, it interprets the trailing `\r` as part of the command name and
+  attempts to run `$'pwd\r'` as a literal command — which doesn't exist.
+
+  This is a regression introduced by the VS2026 image update. The `windows-2025`
+  image correctly resolved `shell: bash` to Git Bash. The `windows-2025-vs2026`
+  image inadvertently elevated Cygwin's PATH position above Git Bash.
+
+  Affected image builds: 20260622.153.1+ on `windows-2025-vs2026` and `windows-latest`
+  (after VS2026 migration). Reported in actions/runner-images#14319 (June 30, 2026).
+
+  The distinctive symptom pattern:
+  - `$'pwd\r': command not found` — Cygwin bash attempting to execute `pwd\r` literally
+  - `D:\a\_temp\XXX.sh: line 2: ci/run.sh\n: No such file or directory` — newline embedded
+    in path argument because the `\r` shifted the parse of the next token
+fix: |
+  Option A (recommended) — Force Git Bash explicitly as the shell:
+    Specify the full path to Git Bash to bypass PATH resolution ambiguity.
+
+  Option B — Set SHELLOPTS=igncr environment variable:
+    This instructs Cygwin bash to ignore `\r` characters in scripts.
+    Add `SHELLOPTS: igncr` to the step or job env block.
+
+  Option C — Pin to windows-2025 (not windows-2025-vs2026):
+    If you do not need Visual Studio 2026, use `windows-2025` which still
+    resolves `shell: bash` to Git Bash. This is a short-term workaround only
+    as windows-2025 has its own planned retirement schedule.
+
+  Option D — Wait for GitHub to fix the image:
+    GitHub has been notified via runner-images#14319. A future image build
+    should restore the correct PATH ordering so Git Bash takes precedence.
+fix_code:
+  - language: yaml
+    label: 'Force Git Bash explicitly to avoid Cygwin resolution'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-2025-vs2026
+          defaults:
+            run:
+              # Force Git Bash; bypasses PATH ambiguity with Cygwin on VS2026 image
+              shell: 'C:\Program Files\Git\bin\bash.exe --noprofile --norc -eo pipefail {0}'
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run script
+              run: |
+                pwd
+                . ci/run.sh
+  - language: yaml
+    label: 'Set SHELLOPTS=igncr to make Cygwin bash ignore carriage returns'
+    code: |
+      jobs:
+        build:
+          runs-on: windows-2025-vs2026
+          env:
+            # Tell Cygwin bash to ignore \r characters in scripts (handles CRLF files)
+            SHELLOPTS: igncr
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run step with bash
+              shell: bash
+              run: |
+                pwd
+                . ci/run.sh
+  - language: yaml
+    label: 'Use windows-2025 as short-term fallback (VS2022 / Git Bash intact)'
+    code: |
+      jobs:
+        build:
+          # Fallback: windows-2025 still resolves shell:bash to Git Bash correctly
+          # Note: only use while awaiting runner-images#14319 fix in vs2026 image
+          runs-on: windows-2025
+          steps:
+            - uses: actions/checkout@v4
+            - name: Run script
+              shell: bash
+              run: |
+                pwd
+                . ci/run.sh
+  - language: yaml
+    label: 'Per-step shell override without changing job defaults'
+    code: |
+      steps:
+        - name: Run using explicit Git Bash (per-step override)
+          # Override only this step; other steps may still use default shell
+          shell: 'C:\Program Files\Git\bin\bash.exe {0}'
+          run: |
+            pwd
+            bash ci/run.sh
+prevention:
+  - 'When targeting windows-latest or windows-2025-vs2026, always test shell:bash steps
+    before assuming they behave identically to older Windows images.'
+  - 'Prefer PowerShell for Windows-native operations and reserve shell:bash for cross-platform
+    scripts that genuinely need POSIX compatibility — this avoids Cygwin/Git Bash ambiguity.'
+  - 'If your workflow installs Cygwin (e.g., egor-tensin/setup-cygwin action), always set
+    SHELLOPTS=igncr or configure core.autocrlf=input to prevent CRLF from breaking scripts.'
+  - 'Add a debug step that prints `which bash && bash --version` on Windows runners to verify
+    which bash implementation is active before running complex scripts.'
+  - 'Watch actions/runner-images#14319 for the official fix; once a patched image build
+    is released, you can remove the workarounds.'
+docs:
+  - url: 'https://github.com/actions/runner-images/issues/14319'
+    label: 'runner-images#14319: Wrong line endings causing errors in Bash shell on windows-2025-vs2026 (June 30, 2026)'
+  - url: 'https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idstepsshell'
+    label: 'GitHub Docs: workflow syntax — step shell override'
+  - url: 'https://github.com/actions/runner-images/blob/main/images/windows/Windows2025-vs2026-Readme.md'
+    label: 'windows-2025-vs2026 image README — installed software and PATH configuration'
